@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -18,9 +19,13 @@ type Store struct {
 
 func buildDSN(dbPath string, txLock string) string {
 	cleanPath := filepath.Clean(dbPath)
+	slashPath := filepath.ToSlash(cleanPath)
+	if !strings.HasPrefix(slashPath, "/") {
+		slashPath = "/" + slashPath
+	}
 	u := &url.URL{
 		Scheme: "file",
-		Path:   filepath.ToSlash(cleanPath),
+		Path:   slashPath,
 	}
 	q := url.Values{}
 	q.Set("_txlock", txLock)

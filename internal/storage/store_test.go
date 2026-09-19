@@ -3,6 +3,7 @@ package storage_test
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
@@ -48,9 +49,12 @@ func TestStore_ConnectionPRAGMAs_ReplacementConnection(t *testing.T) {
 }
 
 func TestStore_SafeURIEscaping(t *testing.T) {
-	// Test paths containing spaces, hash, and question mark
 	tempDir := t.TempDir()
-	trickyPath := filepath.Join(tempDir, "special dir #1 ? test")
+	specialName := "special dir #1 ? test"
+	if runtime.GOOS == "windows" {
+		specialName = "special dir #1 % test"
+	}
+	trickyPath := filepath.Join(tempDir, specialName)
 	if err := os.MkdirAll(trickyPath, 0700); err != nil {
 		t.Fatalf("failed to create tricky path: %v", err)
 	}
