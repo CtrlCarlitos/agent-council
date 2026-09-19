@@ -1,6 +1,6 @@
 # Design Specification: Harness Adapter Contract and Adversarial Fake Adapter (AC-006)
 
-Status: Amended Specification  
+Status: Implemented  
 Date: 2026-09-19  
 Issue: [AC-006 (#6)](https://github.com/CtrlCarlitos/agent-council/issues/6)  
 Target Branch: `feat/ac-006-adapter-contract`  
