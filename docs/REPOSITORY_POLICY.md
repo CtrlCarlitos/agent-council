@@ -21,7 +21,7 @@ back them through the operator's already authenticated GitHub CLI.
 | Branch cleanup | Delete branch on merge |
 | Auto-merge | Disabled |
 | Private vulnerability reporting | Attempt enable + read-back, report any failure |
-| License | Explicit owner decision pending |
+| License | MIT |
 
 The required CI workflow must exist on the proposed branch before merging. Its
 aggregate job is named exactly `ci` and fails if any platform check fails or is

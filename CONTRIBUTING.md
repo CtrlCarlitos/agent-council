@@ -44,6 +44,5 @@ MCP credentials, tokens, or SSH material. SECURITY.md explains private disclosur
 
 ## Licensing
 
-The owner has not selected a redistribution or contribution license. Resolve
-AC-020 before accepting third-party code or making commercial licensing claims.
-No contribution agreement or copyright transfer is created by this document.
+This project is licensed under the MIT License (see [LICENSE](LICENSE)). Contributions
+are accepted under the same terms.

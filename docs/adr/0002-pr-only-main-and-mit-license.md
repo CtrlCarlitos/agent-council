@@ -1,6 +1,6 @@
-# ADR-0002: PR-only main, solo-maintainer review policy, license pending
+# ADR-0002: PR-only main, solo-maintainer review policy, MIT license
 
-Status: accepted bootstrap defaults, pending live installation.
+Status: accepted bootstrap defaults.
 
 Use an active main ruleset with no bypass actors, required PR, resolved review
 threads, required CI, linear history, no force-push, and no branch deletion.
@@ -18,5 +18,5 @@ actual scaffold through a PR. It does not create an admin bypass to seed files.
 An owner able to edit settings can later change rules; the policy does not pretend
 it constrains a compromised administrator.
 
-The repository is public but licensing remains undecided. Do not select a permissive
-or copyleft license on the owner's behalf while commercial/SaaS options are open.
+The repository is public and licensed under the MIT License (see LICENSE).
+Native-provider commercial-use boundaries and hosted coordination remain separate research.

@@ -113,7 +113,4 @@ merges it or creates additional admin credentials. See [publishing instructions]
 
 ## License
 
-Pending the owner's explicit decision. A public repository was requested; an
-MIT, Apache, AGPL, source-available, or commercial license was not selected.
-Do not advertise this as open source or accept third-party contributions under
-an invented license. Track the decision in AC-020 before distribution or release.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.

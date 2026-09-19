@@ -369,7 +369,7 @@ class Publisher:
                 'not implemented.\n\n## Repository policy\n\nMain rules were installed/read back before this '
                 'branch was created. No bypass or automatic merge. Required `ci` must pass.\n\n'
                 '## Risks and limits\n\nNo native credentials, private transcripts or paid-provider tests. '
-                'License awaits an explicit owner decision. This scaffold is not a working council.\n\n'
+                'Licensed under MIT. This scaffold is not a working council.\n\n'
                 '## Review\n\nReview README, AGENTS.md, architecture, policy and test evidence, then merge '
                 'explicitly only after CI and scope are acceptable.\n')
         return self.client.call('POST', f'{self.base}/pulls', dict(

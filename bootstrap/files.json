@@ -47,7 +47,11 @@
     },
     {
       "path": "CONTRIBUTING.md",
-      "sha256": "14548fd1942004700121593810af9268150f31ff1ff25d6988bc6f6a6ba4c512"
+      "sha256": "b4c3656042ee9ce1511af93c8112630f5d1b3a59624c6f8c83505958054f2cd7"
+    },
+    {
+      "path": "LICENSE",
+      "sha256": "1df96abd93c3c5238bde0e53b751433ca19e7be539acf87a0c4c8bc087b888fd"
     },
     {
       "path": "Makefile",
@@ -55,7 +59,7 @@
     },
     {
       "path": "README.md",
-      "sha256": "2990dff4e83049d9cc7a6413a8559a6b42cf401971b233ca22115acec221151c"
+      "sha256": "cf96383adb1aa841695bf7594ff341b5755b13adcae82a9a80c4f1134a803216"
     },
     {
       "path": "SECURITY.md",
@@ -63,7 +67,7 @@
     },
     {
       "path": "bootstrap/issues.json",
-      "sha256": "41f6dce0edd4894011968daeb8e22c71b02ff225f8f572af4673cf3fbea1060c"
+      "sha256": "523651ceccddfb621e437a710a44e6323ac7ca248fa95c943401e19cf2f57890"
     },
     {
       "path": "bootstrap/plan.json",
@@ -79,7 +83,7 @@
     },
     {
       "path": "docs/ARCHITECTURE.md",
-      "sha256": "2d8d2ce40eab789f49130690dc49a00617c5abdc70ca1d5e3cc272553776ac79"
+      "sha256": "16b6c828380832e6a512cb077ec96785237baf0c4356dca06a43817cd687c6eb"
     },
     {
       "path": "docs/BOOTSTRAP_TEST_EVIDENCE.md",
@@ -91,11 +95,11 @@
     },
     {
       "path": "docs/REPOSITORY_POLICY.md",
-      "sha256": "645aea37f302949a73a094880024b116065a7b5f758c53d1d83d9850ee635523"
+      "sha256": "604da6aabcf6d21bf21ff1311de688698531b800f9ee33eee69d2357b058220b"
     },
     {
       "path": "docs/ROADMAP.md",
-      "sha256": "5bef10f4db88a67192a50ca8a7000c57eee1015076f5f052f3db34e43b4ffa5f"
+      "sha256": "67df830e4d474ba82212725fb49a2e885b4ec3d49c235293059e0e3039b6bec3"
     },
     {
       "path": "docs/SOURCES.md",
@@ -106,8 +110,8 @@
       "sha256": "f3a37c41b6ca231cdffd2c6612839f036fe45b48a612ed80b5072ce2fe809417"
     },
     {
-      "path": "docs/adr/0002-pr-only-main-and-license-pending.md",
-      "sha256": "c228aa38e93190e24b87b8e00a0bd5143e2a3fa665d1402e63137e86059f60b5"
+      "path": "docs/adr/0002-pr-only-main-and-mit-license.md",
+      "sha256": "396ccde27aa88f45ddeb3e6e510132fd2b8b16cf208b2666cbd7154b426fc62a"
     },
     {
       "path": "go.mod",
@@ -123,7 +127,7 @@
     },
     {
       "path": "scripts/publish.py",
-      "sha256": "395f33e476e870ebc1b62617192e1ad5361ee2ce4056ded31f6f735f8fafddbf"
+      "sha256": "d7d1e337eb7d5bc342bff5f601b0123ad5a0de365005d0662f8b94741db1258d"
     },
     {
       "path": "scripts/tests/test_publish.py",

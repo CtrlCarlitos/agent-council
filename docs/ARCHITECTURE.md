@@ -77,7 +77,7 @@ or publishing merely because another idea was discovered.
 Go + templ + HTMX is a candidate operator UI. Wails/Tauri, full terminal embedding,
 remote fleets, Takumi integration, and SaaS are not prerequisites. SQLite is the
 local durable store candidate; the initial kernel adds no database dependency.
-Licensing and provider commercial-use review remain explicit owner decisions.
+The repository is licensed under MIT. Provider commercial-use review and hosted coordination remain separate research.
 
 ## First live test
 

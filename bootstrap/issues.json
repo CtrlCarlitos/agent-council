@@ -482,20 +482,20 @@
   },
   {
     "key": "AC-020",
-    "title": "Decide repository license and native-provider commercial boundaries",
+    "title": "Define native-provider commercial boundaries",
     "milestone": "M0 — Foundation",
     "labels": [
       "type:docs",
       "area:delivery",
       "priority:now"
     ],
-    "problem": "Public visibility is requested, but no software license or right to resell provider usage has been chosen. Monetization and SaaS remain possibilities.",
-    "outcome": "Prepare the owner decision on licensing and future customer-owned-runner/hosted coordination boundaries, using primary provider terms.",
+    "problem": "The repository is licensed under MIT, but terms around native provider authentication, subscription use, and future customer-owned-runner or hosted delivery remain separate research.",
+    "outcome": "Document native-provider commercial boundaries and guidelines for customer-owned-runner and hosted coordination, using primary provider terms.",
     "acceptance": [
-      "Compare the licensing choices against the owner's goals; do not silently install MIT/AGPL/commercial terms.",
-      "Obtain an explicit owner decision before marking the project open source or accepting outside code under a license.",
+      "The project-license decision is complete (MIT); keep project licensing separate from provider usage terms.",
       "Review each provider/harness separately, distinguishing native end-user auth from token collection or subscription pooling.",
       "Treat selling orchestration separately from selling model usage; record uncertainties and dated primary sources.",
+      "Evaluate customer-owned-runner versus future hosted delivery boundaries under provider terms.",
       "Do not implement billing, acquire paid services, or copy tokens as part of this issue."
     ],
     "dependencies": [],
