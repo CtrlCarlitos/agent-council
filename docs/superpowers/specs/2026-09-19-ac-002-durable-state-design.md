@@ -210,11 +210,17 @@ All database modifications execute as short, connection-bound transactions using
   If 0 rows are updated, the transaction rolls back and returns `ErrStaleUpdate`.
 
 ### 4.2 Strict Command Idempotency Pipeline
-Every modifying command receives a unique operation identifier `op_id`. Before acquiring write locks or evaluating `row_version`:
-1. The store checks `journal_entries` for an existing `op_id`:
-   - **Matching Operation**: If `op_id` exists and its `command_type` and `command_fingerprint` match the incoming request, the store extracts and returns the original committed receipt from `payload_json`. No new transaction or journal entry is created. This lookup precedes `row_version` checks so genuine retries of committed commands are not falsely rejected as stale updates.
-   - **Idempotency Conflict**: If `op_id` exists with different `command_type`, target `session_id`, or mismatched `command_fingerprint`, the command returns `ErrIdempotencyConflict`.
-   - **Authority Check**: If caller lease or credentials do not match the original command, access is rejected with `ErrUnauthorizedOperation`.
+Every modifying command receives a unique operation identifier `op_id`. While an initial read check may serve as a fast path, the **authoritative idempotency evaluation occurs inside the write transaction**:
+1. Begin connection-bound write transaction (`_txlock=immediate`).
+2. Query `journal_entries` for an existing `op_id`:
+   - **Matching Operation**: If `op_id` exists, verify that its `command_type` and `command_fingerprint` match the incoming request. If caller lease matches, extract and return the original committed receipt from `payload_json` immediately. No new mutations or journal entries are created. This inside-transaction evaluation ensures that genuine retries of committed operations return their original receipt without being falsely rejected as stale updates.
+   - **Idempotency Conflict**: If `op_id` exists with a different `command_type`, target `session_id`, or mismatched `command_fingerprint`, return `ErrIdempotencyConflict`.
+   - **Authority Check**: If caller lease or credentials do not match the original command authority, return `ErrUnauthorizedOperation`.
+3. If `op_id` is absent:
+   - Validate caller lease, expected `row_version`, and complete domain guards against current database records.
+   - Apply mutations to transaction-local state.
+   - Persist state mutations, dispatch intent, and append the operation's committed receipt in `journal_entries`.
+   - Commit transaction and return the committed receipt.
 
 ### 4.3 Transaction Command Boundaries
 
@@ -322,14 +328,17 @@ While an operator may optionally configure a project-local directory, it is neve
   - Automatically installs `.gitignore` containing `*` in the state directory to prevent accidental staging of runtime data.
 
 ### 7.3 SQLite Durability and Connection Settings
-On every opened database connection (including new connections opened by `database/sql`), connection hooks execute and verify:
+The SQLite URI is safely constructed using URL query escaping (`url.PathEscape`) to handle special characters (`?`, `#`, spaces) and platform-specific path formats (including Windows paths).
+Write connections configure `_txlock=immediate` in their connection parameters, while hydration read transactions execute in deferred snapshot mode (`_txlock=deferred`).
+
+On every opened database connection (including replacement connections opened by `database/sql`), connection initialization hooks execute and read back:
 ```sql
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = FULL;
 PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
 ```
-- **Read-Back Verification**: Every setting is read back via `PRAGMA ...;` queries to confirm activation. If `foreign_keys` is not `1` or `journal_mode` is not `wal`, connection setup fails immediately.
+- **Read-Back Verification**: Every setting is read back via `PRAGMA ...;` queries to confirm activation. If `foreign_keys` is not `1`, `journal_mode` is not `wal`, or `synchronous` is not `2` (`FULL`), connection setup fails immediately.
 - **Durability (`synchronous = FULL`)**: Required to ensure that committed dispatch reservations and transitions survive OS crashes and power interruptions (subject to the filesystem and hardware storage stack honoring synchronization commands).
 - **Single Connection Discipline**: To eliminate writer lock contention within the process, `Store` configures `SetMaxOpenConns(1)`. WAL allows concurrent external readers, but permits only one writer across all processes.
 - **Connection-Bound Transactions**: All transactional queries execute strictly on `*sql.Tx`. Mixing `db.Exec` with `tx` operations is strictly prohibited.
