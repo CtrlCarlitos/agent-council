@@ -36,6 +36,20 @@ type decisionJournalPayload struct {
 
 var safeProfileIdentifierRegex = regexp.MustCompile(`^[a-zA-Z0-9_\-\.]+$`)
 var envAssignmentRegex = regexp.MustCompile(`(?i)[a-z0-9_]*(key|token|secret|password|bearer|auth)[a-z0-9_]*\s*=`)
+var envVarNameRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+func isSensitiveKey(k string) bool {
+	lower := strings.ToLower(k)
+	sensitiveTerms := []string{
+		"key", "token", "secret", "password", "passwd", "bearer", "auth", "credential", "api_key", "privkey",
+	}
+	for _, term := range sensitiveTerms {
+		if strings.Contains(lower, term) {
+			return true
+		}
+	}
+	return false
+}
 
 func validateConfigValue(v any) error {
 	switch val := v.(type) {
@@ -54,7 +68,7 @@ func validateConfigValue(v any) error {
 		}
 	case map[string]any:
 		for k, elem := range val {
-			if containsDisallowedCredential(k) || envAssignmentRegex.MatchString(k) {
+			if isSensitiveKey(k) || containsDisallowedCredential(k) || envAssignmentRegex.MatchString(k) {
 				return fmt.Errorf("%w: sensitive key pattern detected %q", ErrDisallowedToolingConfig, k)
 			}
 			if err := validateConfigValue(elem); err != nil {
@@ -101,6 +115,46 @@ func validateToolingConfig(configStr string) error {
 		if !allowedKeys[k] {
 			return fmt.Errorf("%w: disallowed configuration key %q", ErrDisallowedToolingConfig, k)
 		}
+		switch k {
+		case "workspace_root", "model", "permission_mode", "log_level":
+			if _, ok := v.(string); !ok {
+				return fmt.Errorf("%w: configuration field %q must be a string", ErrDisallowedToolingConfig, k)
+			}
+		case "timeout", "max_iterations":
+			if _, ok := v.(float64); !ok {
+				return fmt.Errorf("%w: configuration field %q must be a number", ErrDisallowedToolingConfig, k)
+			}
+		case "read_only":
+			if _, ok := v.(bool); !ok {
+				return fmt.Errorf("%w: configuration field %q must be a boolean", ErrDisallowedToolingConfig, k)
+			}
+		case "env_allowlist":
+			arr, ok := v.([]any)
+			if !ok {
+				return fmt.Errorf("%w: env_allowlist must be an array of variable names, not a map or scalar", ErrDisallowedToolingConfig)
+			}
+			for _, item := range arr {
+				str, isStr := item.(string)
+				if !isStr || !envVarNameRegex.MatchString(str) {
+					return fmt.Errorf("%w: invalid environment variable name %v in env_allowlist", ErrDisallowedToolingConfig, item)
+				}
+				if isSensitiveKey(str) {
+					return fmt.Errorf("%w: sensitive variable %q cannot be in env_allowlist", ErrDisallowedToolingConfig, str)
+				}
+			}
+		case "tooling", "tools":
+			switch tv := v.(type) {
+			case string:
+				if !safeProfileIdentifierRegex.MatchString(tv) {
+					return fmt.Errorf("%w: tooling profile string must be safe identifier", ErrDisallowedToolingConfig)
+				}
+			case []any, map[string]any:
+				// Valid shapes, validated recursively below
+			default:
+				return fmt.Errorf("%w: field %q has invalid shape", ErrDisallowedToolingConfig, k)
+			}
+		}
+
 		if err := validateConfigValue(v); err != nil {
 			return err
 		}

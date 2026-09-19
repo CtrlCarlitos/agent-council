@@ -154,7 +154,7 @@ func (s *Store) PublishArtifact(ctx context.Context, opID string, callerLease st
 		return ArtifactMetadata{}, fmt.Errorf("chmod staging file: %w", err)
 	}
 
-	// Cross-process no-clobber install via os.Link
+	// Cross-process no-clobber install via os.Link. Staged content was fully written and synced.
 	linkErr := os.Link(tmpName, destPath)
 	if linkErr == nil {
 		_ = os.Remove(tmpName)
@@ -166,39 +166,16 @@ func (s *Store) PublishArtifact(ctx context.Context, opID string, callerLease st
 			return ArtifactMetadata{}, ErrArtifactCorrupt
 		}
 	} else {
-		// Fallback for filesystems that do not support hardlinks (e.g. cross-device)
-		destF, err := os.OpenFile(destPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		if err == nil {
-			n, wErr := destF.Write(sanitizedContent)
-			if wErr == nil && n != len(sanitizedContent) {
-				wErr = io.ErrShortWrite
-			}
-			sErr := destF.Sync()
-			cErr := destF.Close()
-			_ = os.Remove(tmpName)
-			if wErr != nil || sErr != nil || cErr != nil {
-				_ = os.Remove(destPath) // fail closed: remove partial file
-				if wErr != nil {
-					return ArtifactMetadata{}, fmt.Errorf("write artifact fallback: %w", wErr)
-				}
-				if sErr != nil {
-					return ArtifactMetadata{}, fmt.Errorf("sync artifact fallback: %w", sErr)
-				}
-				return ArtifactMetadata{}, fmt.Errorf("close artifact fallback: %w", cErr)
-			}
-		} else if os.IsExist(err) {
-			_ = os.Remove(tmpName)
-			existingBytes, err := s.ReadArtifact(digest)
-			if err != nil || !bytes.Equal(existingBytes, sanitizedContent) {
-				return ArtifactMetadata{}, ErrArtifactCorrupt
-			}
-		} else {
-			_ = os.Remove(tmpName)
-			return ArtifactMetadata{}, fmt.Errorf("install artifact file: %w", linkErr)
-		}
+		_ = os.Remove(tmpName)
+		return ArtifactMetadata{}, fmt.Errorf("install artifact file: %w", linkErr)
 	}
 
-	// Sync parent directory before metadata commit (POSIX filesystems; Windows NTFS automatically journals directory entries)
+	// Sync parent directory before metadata commit on supported POSIX filesystems.
+	// On Windows, user-mode directory handles cannot be flushed via FlushFileBuffers (which returns
+	// ERROR_ACCESS_DENIED). File data is guaranteed durable via tmpFile.Sync() prior to os.Link.
+	// If a power loss occurs before the directory link is flushed to disk, the fail-closed
+	// read barrier (ReadArtifact digest and size verification) detects the missing blob and returns
+	// ErrArtifactNotFound, strictly preventing unverified execution without silent repair or corrupt data.
 	if runtime.GOOS != "windows" {
 		d, err := os.Open(destDir)
 		if err != nil {
@@ -277,9 +254,18 @@ VALUES (?, ?, ?, 'patch', ?, ?, ?);`, meta.ID, newRev, meta.RunID, digest, byteC
 		return ArtifactMetadata{}, fmt.Errorf("marshal artifact journal payload: %w", err)
 	}
 
+	var sessIDVal any = meta.SessionID
+	if meta.SessionID == "" {
+		sessIDVal = nil
+	}
+	var turnKeyVal any = meta.TurnKey
+	if meta.TurnKey == "" {
+		turnKeyVal = nil
+	}
+
 	_, err = tx.Tx().ExecContext(ctx, `
 INSERT INTO journal_entries (op_id, command_type, command_fingerprint, run_id, session_id, turn_key, event_kind, payload_version, payload_json, created_at)
-VALUES (?, 'publish_artifact', ?, ?, ?, ?, 'artifact_published', 1, ?, ?);`, opID, fp, meta.RunID, meta.SessionID, meta.TurnKey, string(ajpBytes), now)
+VALUES (?, 'publish_artifact', ?, ?, ?, ?, 'artifact_published', 1, ?, ?);`, opID, fp, meta.RunID, sessIDVal, turnKeyVal, string(ajpBytes), now)
 	if err != nil {
 		return ArtifactMetadata{}, fmt.Errorf("record artifact journal entry: %w", err)
 	}
@@ -300,6 +286,16 @@ func (s *Store) ReadArtifact(digest string) ([]byte, error) {
 	}
 
 	blobPath := filepath.Join(s.stateDir, "artifacts", digest[:2], digest)
+	artifactsDir := filepath.Join(s.stateDir, "artifacts")
+	rel, err := filepath.Rel(artifactsDir, blobPath)
+	if err != nil || strings.HasPrefix(rel, "..") || rel == "." {
+		return nil, fmt.Errorf("%w: artifact path outside artifacts directory", ErrArtifactCorrupt)
+	}
+
+	if err := ensureNoSymlink(blobPath); err != nil {
+		return nil, fmt.Errorf("%w: artifact symlink forbidden: %w", ErrArtifactCorrupt, err)
+	}
+
 	f, err := os.Open(blobPath)
 	if os.IsNotExist(err) {
 		return nil, ErrArtifactNotFound

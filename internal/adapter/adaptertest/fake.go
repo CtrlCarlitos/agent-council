@@ -444,9 +444,13 @@ func (f *FakeAdapter) runWorker(ref adapter.TurnRef, prompt string, cancelCh <-c
 	}
 }
 
+const maxTurnEventHistory = 128
+
 func (f *FakeAdapter) broadcastEvent(ref adapter.TurnRef, ev adapter.Event) {
 	f.mu.Lock()
-	f.eventHistory[ref] = append(f.eventHistory[ref], ev)
+	if len(f.eventHistory[ref]) < maxTurnEventHistory {
+		f.eventHistory[ref] = append(f.eventHistory[ref], ev)
+	}
 	streams := append([]*adapter.BufferedStream(nil), f.activeStreams[ref]...)
 	f.mu.Unlock()
 
@@ -498,7 +502,7 @@ func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter
 	stream := adapter.NewBufferedStream(ref, 64)
 
 	if f.faults.DropStreamEarly {
-		_ = stream.Send(adapter.Event{
+		_ = stream.SendOrOverflow(adapter.Event{
 			Ref:       ref,
 			Type:      adapter.EventProgress,
 			Status:    council.TurnRunning,
@@ -516,29 +520,33 @@ func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter
 	if resExists && (res.Status == council.TurnCompleted || res.Status == council.TurnCancelled) {
 		for _, pastEv := range f.eventHistory[ref] {
 			if err := stream.SendOrOverflow(pastEv); err != nil {
-				break
+				return stream, nil
 			}
 		}
-		_ = stream.Send(adapter.Event{
+		termEv := adapter.Event{
 			Ref:       ref,
 			Type:      adapter.EventTerminal,
 			Status:    res.Status,
 			Payload:   res.Output,
 			Timestamp: time.Now(),
 			Usage:     res.Usage,
-		})
-		_ = stream.CloseWithErr(nil)
+		}
+		if err := stream.SendOrOverflow(termEv); err == nil {
+			_ = stream.CloseWithErr(nil)
+		}
 		return stream, nil
 	}
 
 	// Send initial progress synchronously into the stream buffer before subscription
-	_ = stream.Send(adapter.Event{
+	if err := stream.SendOrOverflow(adapter.Event{
 		Ref:       ref,
 		Type:      adapter.EventProgress,
 		Status:    council.TurnRunning,
 		Payload:   "observing",
 		Timestamp: time.Now(),
-	})
+	}); err != nil {
+		return stream, nil
+	}
 
 	for _, pastEv := range f.eventHistory[ref] {
 		if err := stream.SendOrOverflow(pastEv); err != nil {

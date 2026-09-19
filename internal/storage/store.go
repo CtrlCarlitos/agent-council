@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -19,16 +20,58 @@ type Store struct {
 	testHookBeforeCommit func(boundary string)
 }
 
-func ensureNoSymlink(path string) error {
-	fi, err := os.Lstat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
+func isSystemRootSymlink(path string) bool {
+	if runtime.GOOS != "darwin" {
+		return false
 	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("%w: %s", ErrSymlinkForbidden, path)
+	clean := filepath.Clean(path)
+	return clean == "/var" || clean == "/tmp" || clean == "/etc"
+}
+
+// ensureNoSymlink verifies that path and all its ancestor components do not contain
+// symbolic links or Windows reparse points.
+func ensureNoSymlink(path string) error {
+	if path == "" {
+		return nil
+	}
+	cleanPath := filepath.Clean(path)
+	absPath, err := filepath.Abs(cleanPath)
+	if err == nil {
+		cleanPath = absPath
+	}
+
+	// Build list of ancestor components from root down to cleanPath
+	var components []string
+	curr := cleanPath
+	for {
+		components = append(components, curr)
+		parent := filepath.Dir(curr)
+		if parent == curr || parent == "." || parent == "" {
+			break
+		}
+		curr = parent
+	}
+
+	// Inspect each component from root to leaf
+	for i := len(components) - 1; i >= 0; i-- {
+		comp := components[i]
+		if isSystemRootSymlink(comp) {
+			continue
+		}
+		fi, err := os.Lstat(comp)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Leaf or partial subpath does not exist yet; remaining ancestors checked
+				break
+			}
+			return err
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: %s", ErrSymlinkForbidden, comp)
+		}
+		if runtime.GOOS == "windows" && (fi.Mode()&os.ModeIrregular != 0 && fi.Mode()&os.ModeDir != 0) {
+			return fmt.Errorf("%w: %s", ErrSymlinkForbidden, comp)
+		}
 	}
 	return nil
 }

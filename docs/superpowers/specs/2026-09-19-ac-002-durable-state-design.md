@@ -280,15 +280,20 @@ Artifacts (proposals, ballots, synthesis docs, findings, patches) are stored in 
 ### 6.1 Two-Phase Publication Sequence
 ```
 1. Write Payload to Temp File (<state_dir>/artifacts/tmp/tmp_<uuid>)
-2. Fsync Temp File (ensure bytes hit storage stack)
+2. Fsync Temp File (ensure byte content hits storage stack via FlushFileBuffers / fsync)
 3. Compute SHA-256 Digest & Byte Size
 4. Check Existing Destination File (<state_dir>/artifacts/<prefix>/<digest>):
    - If destination exists: read and verify its SHA-256 digest.
      * If valid: unlink temp file (converged duplicate content; safe reuse).
      * If corrupt: publication fails immediately with ErrArtifactCorrupt without modifying or repairing existing file.
-   - If destination does not exist: atomically move/install temp file to final digest path.
-     (On Windows: use replace/move helpers that accommodate non-atomic os.Rename).
-5. Fsync Parent Directory (on supported POSIX systems)
+   - If destination does not exist: atomically link temp file to final digest path via os.Link.
+     (No partial-write fallback is permitted; unlinked staging file is cleaned up on link failure).
+5. Directory Synchronization:
+   - On POSIX (Linux, macOS): fsync parent directory to flush directory entry metadata before DB commit.
+   - On Windows: User-mode directory handles cannot be flushed via FlushFileBuffers (ERROR_ACCESS_DENIED).
+     Durability relies on synchronous temp file data flush prior to linking, backed by the fail-closed
+     read verification barrier (Section 6.3): any post-crash uncommitted directory entry manifests as a missing
+     blob returning ErrArtifactNotFound, strictly preventing execution on corrupt or unverified artifacts.
 6. Commit SQLite Transaction:
    - Insert row into artifact_revisions (artifact_id, revision, run_id, kind, digest, byte_size, created_at).
    - Insert row into journal_entries (op_id, command_type='publish_artifact', ...).
