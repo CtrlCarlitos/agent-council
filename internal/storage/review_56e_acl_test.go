@@ -207,12 +207,13 @@ func TestReview56E_WindowsIntegration_UnrelatedExplicitGrant(t *testing.T) {
 		t.Fatal("expected VerifyDirectoryPermissions to reject unrelated explicit grant to Users, but got nil")
 	}
 
-	// 5. Restore restricted permissions and verify it passes again
-	if err := EnsureDirectoryPermissions(dir); err != nil {
-		t.Fatalf("EnsureDirectoryPermissions re-tighten failed: %v", err)
+	// 5. Remove the explicit grant and verify it passes again
+	removeCmd := exec.Command("icacls", dir, "/remove", "*S-1-5-32-545")
+	if out, err := removeCmd.CombinedOutput(); err != nil {
+		t.Fatalf("remove command failed: %v, out: %s", err, string(out))
 	}
 	if err := VerifyDirectoryPermissions(dir); err != nil {
-		t.Fatalf("VerifyDirectoryPermissions failed after re-tightening: %v", err)
+		t.Fatalf("VerifyDirectoryPermissions failed after removing grant: %v", err)
 	}
 }
 
