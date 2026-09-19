@@ -344,3 +344,28 @@ func TestErrSessionCreationUncertain(t *testing.T) {
 		t.Fatal("expected non-empty error string")
 	}
 }
+
+func TestCreateSessionRequest_Validation(t *testing.T) {
+	req := adapter.CreateSessionRequest{
+		SessionID:   "sess-123",
+		Contributor: council.Claude,
+		Config: adapter.SessionConfig{
+			WorkspaceRoot: "/tmp/ws",
+			Model:         "claude-3-5-sonnet",
+		},
+	}
+	if err := req.Validate(); err != nil {
+		t.Fatalf("expected valid session request, got: %v", err)
+	}
+
+	badReqs := []adapter.CreateSessionRequest{
+		{SessionID: "", Contributor: council.Claude},
+		{SessionID: "   ", Contributor: council.Claude},
+		{SessionID: "sess-1", Contributor: "unsupported_contrib"},
+	}
+	for _, br := range badReqs {
+		if err := br.Validate(); err == nil {
+			t.Fatalf("expected invalid session request %+v to fail", br)
+		}
+	}
+}
