@@ -160,7 +160,7 @@ func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	stream, in := adapter.NewBufferedStream(ref, 64)
+	stream, _ := adapter.NewBufferedStream(ref, 64)
 	f.activeStreams[ref] = stream
 
 	go func() {
@@ -172,10 +172,14 @@ func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter
 			Payload:   "started",
 			Timestamp: time.Now(),
 		}
-		in <- ev
+		if !stream.Send(ev) {
+			return
+		}
 
 		if f.faults.InjectDuplicates {
-			in <- ev
+			if !stream.Send(ev) {
+				return
+			}
 		}
 
 		// Handle scripted auto-denied tools if configured
@@ -189,7 +193,9 @@ func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter
 					Payload:    fmt.Sprintf("tool %s denied", tool),
 					Timestamp:  time.Now(),
 				}
-				in <- denialEv
+				if !stream.Send(denialEv) {
+					return
+				}
 			}
 		}
 
@@ -207,7 +213,24 @@ func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter
 			}
 		}
 
-		// Update result to completed in fake state
+		// Emit terminal event
+		term := adapter.Event{
+			Ref:       ref,
+			Type:      adapter.EventTerminal,
+			Status:    council.TurnCompleted,
+			Payload:   "completed output",
+			Timestamp: time.Now(),
+			Usage: adapter.ExecutionUsage{
+				InputTokens:  adapter.UsageMetric[int64]{Value: 10, Available: true},
+				OutputTokens: adapter.UsageMetric[int64]{Value: 20, Available: true},
+				TotalCostUSD: adapter.UsageMetric[float64]{Value: 0.001, Available: true},
+			},
+		}
+		if !stream.Send(term) {
+			return
+		}
+
+		// Update result in fake state upon successful terminal delivery
 		f.mu.Lock()
 		f.results[ref] = adapter.TurnResult{
 			Ref:          ref,
@@ -223,20 +246,6 @@ func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter
 		}
 		f.mu.Unlock()
 
-		// Emit terminal event
-		term := adapter.Event{
-			Ref:       ref,
-			Type:      adapter.EventTerminal,
-			Status:    council.TurnCompleted,
-			Payload:   "completed output",
-			Timestamp: time.Now(),
-			Usage: adapter.ExecutionUsage{
-				InputTokens:  adapter.UsageMetric[int64]{Value: 10, Available: true},
-				OutputTokens: adapter.UsageMetric[int64]{Value: 20, Available: true},
-				TotalCostUSD: adapter.UsageMetric[float64]{Value: 0.001, Available: true},
-			},
-		}
-		in <- term
 		_ = stream.CloseWithErr(nil)
 	}()
 
