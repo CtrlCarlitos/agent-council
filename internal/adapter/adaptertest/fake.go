@@ -46,6 +46,7 @@ type FakeAdapter struct {
 	results       map[adapter.TurnRef]adapter.TurnResult
 	retiredTurns  map[adapter.TurnRef]bool
 	activeStreams map[adapter.TurnRef][]*adapter.BufferedStream
+	eventHistory  map[adapter.TurnRef][]adapter.Event
 	workerCancels map[adapter.TurnRef]chan struct{}
 	workersWg     sync.WaitGroup
 	watchersWg    sync.WaitGroup
@@ -61,6 +62,7 @@ func NewFake(faults ScriptedFaults) *FakeAdapter {
 		results:       make(map[adapter.TurnRef]adapter.TurnResult),
 		retiredTurns:  make(map[adapter.TurnRef]bool),
 		activeStreams: make(map[adapter.TurnRef][]*adapter.BufferedStream),
+		eventHistory:  make(map[adapter.TurnRef][]adapter.Event),
 		workerCancels: make(map[adapter.TurnRef]chan struct{}),
 	}
 }
@@ -444,6 +446,7 @@ func (f *FakeAdapter) runWorker(ref adapter.TurnRef, prompt string, cancelCh <-c
 
 func (f *FakeAdapter) broadcastEvent(ref adapter.TurnRef, ev adapter.Event) {
 	f.mu.Lock()
+	f.eventHistory[ref] = append(f.eventHistory[ref], ev)
 	streams := append([]*adapter.BufferedStream(nil), f.activeStreams[ref]...)
 	f.mu.Unlock()
 
@@ -511,6 +514,11 @@ func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter
 
 	res, resExists := f.results[ref]
 	if resExists && (res.Status == council.TurnCompleted || res.Status == council.TurnCancelled) {
+		for _, pastEv := range f.eventHistory[ref] {
+			if err := stream.SendOrOverflow(pastEv); err != nil {
+				break
+			}
+		}
 		_ = stream.Send(adapter.Event{
 			Ref:       ref,
 			Type:      adapter.EventTerminal,
@@ -531,6 +539,12 @@ func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter
 		Payload:   "observing",
 		Timestamp: time.Now(),
 	})
+
+	for _, pastEv := range f.eventHistory[ref] {
+		if err := stream.SendOrOverflow(pastEv); err != nil {
+			break
+		}
+	}
 
 	f.activeStreams[ref] = append(f.activeStreams[ref], stream)
 
