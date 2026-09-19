@@ -80,6 +80,12 @@ func Open(opts StoreOptions) (*Store, error) {
 		return nil, fmt.Errorf("verify read db pragmas: %w", err)
 	}
 
+	// Run migration lifecycle
+	if err := s.Migrate(); err != nil {
+		s.Close()
+		return nil, err
+	}
+
 	return s, nil
 }
 
