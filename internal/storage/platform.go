@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,7 +13,9 @@ func EnsureDirectoryPermissions(dir string) error {
 	if runtime.GOOS == "windows" {
 		// Restrict ACL to current user if icacls is available
 		cmd := exec.Command("icacls", dir, "/inheritance:r", "/grant:r", "*S-1-3-4:(OI)(CI)F")
-		_ = cmd.Run()
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("icacls dir failed: %w", err)
+		}
 		return nil
 	}
 	return os.Chmod(dir, 0700)
@@ -21,6 +24,10 @@ func EnsureDirectoryPermissions(dir string) error {
 // EnsureFilePermissions ensures file permissions are restricted to owner (0600 on POSIX).
 func EnsureFilePermissions(file string) error {
 	if runtime.GOOS == "windows" {
+		cmd := exec.Command("icacls", file, "/inheritance:r", "/grant:r", "*S-1-3-4:F")
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("icacls file failed: %w", err)
+		}
 		return nil
 	}
 	return os.Chmod(file, 0600)
@@ -39,7 +46,9 @@ func (s *Store) TightenStateDirPermissions() error {
 	for _, f := range files {
 		if !f.IsDir() {
 			path := filepath.Join(s.stateDir, f.Name())
-			_ = EnsureFilePermissions(path)
+			if err := EnsureFilePermissions(path); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

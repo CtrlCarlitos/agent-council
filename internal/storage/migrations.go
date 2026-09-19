@@ -39,8 +39,14 @@ func (s *Store) CurrentSchemaVersion() (int, error) {
 }
 
 func (s *Store) Migrate() error {
-	// First check or create schema_migrations table
-	_, err := s.writeDB.Exec(`
+	tx, err := s.BeginWrite(context.Background())
+	if err != nil {
+		return fmt.Errorf("begin migration tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// First check or create schema_migrations table inside transaction
+	_, err = tx.Tx().Exec(`
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER NOT NULL PRIMARY KEY,
     name TEXT NOT NULL,
@@ -51,9 +57,14 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 		return fmt.Errorf("create schema_migrations table: %w", err)
 	}
 
-	currentVer, err := s.CurrentSchemaVersion()
+	var maxVer sql.NullInt64
+	err = tx.Tx().QueryRow("SELECT max(version) FROM schema_migrations;").Scan(&maxVer)
 	if err != nil {
 		return fmt.Errorf("check current schema version: %w", err)
+	}
+	var currentVer int
+	if maxVer.Valid {
+		currentVer = int(maxVer.Int64)
 	}
 
 	expectedChecksum := schemaChecksum()
@@ -65,23 +76,17 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 	if currentVer == 1 {
 		// Verify checksum
 		var recordedChecksum string
-		err := s.writeDB.QueryRow("SELECT checksum FROM schema_migrations WHERE version = 1;").Scan(&recordedChecksum)
+		err := tx.Tx().QueryRow("SELECT checksum FROM schema_migrations WHERE version = 1;").Scan(&recordedChecksum)
 		if err != nil {
 			return fmt.Errorf("read recorded checksum: %w", err)
 		}
 		if recordedChecksum != expectedChecksum {
 			return ErrMigrationChecksumMismatch
 		}
-		return nil // Clean no-op
+		return nil // Clean no-op, rollback read
 	}
 
-	// currentVer == 0: apply schema v1 in an immediate transaction
-	tx, err := s.BeginWrite(context.Background())
-	if err != nil {
-		return fmt.Errorf("begin migration tx: %w", err)
-	}
-	defer tx.Rollback()
-
+	// currentVer == 0: apply schema v1
 	if _, err := tx.Tx().Exec(schemaSQL); err != nil {
 		return fmt.Errorf("execute schema v1: %w", err)
 	}

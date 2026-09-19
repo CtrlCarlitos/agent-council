@@ -18,6 +18,14 @@ var (
 	ErrRecoveryGenerationOverflow = errors.New("recovery generation overflow: exceeds maximum int64 range")
 	ErrHostLost                   = errors.New("host lost: session visibility is host lost")
 	ErrInvalidPath                = errors.New("invalid path: path traversal detected")
+	ErrSessionArchived            = errors.New("session archived")
+	ErrControllerDisconnected     = errors.New("controller disconnected")
+	ErrPromptNotQueued            = errors.New("prompt not queued")
+	ErrInvalidExpectedVersion     = errors.New("invalid expected version: must be positive")
+	ErrArtifactOversized          = errors.New("artifact exceeds maximum permitted size")
+	ErrDisallowedToolingConfig    = errors.New("tooling configuration violates security policy")
+	ErrTurnAlreadyExists          = errors.New("turn identifier already exists")
+	ErrSymlinkForbidden           = errors.New("symlink state directory not permitted")
 )
 
 type QueryRower interface {

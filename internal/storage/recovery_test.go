@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/CtrlCarlitos/agent-council/internal/adapter"
 	"github.com/CtrlCarlitos/agent-council/internal/council"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
@@ -19,7 +18,7 @@ func TestStore_HydrateState_ExactStateReconstruction(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	_, err = storeA.CreateRun(ctx, "op-run-1", "run-1", "lease-1")
+	_, err = storeA.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-1")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -37,12 +36,12 @@ func TestStore_HydrateState_ExactStateReconstruction(t *testing.T) {
 
 	// Session 1: completed turn and native binding
 	_, err = storeA.SetNativeBinding(ctx, "op-bind-1", "lease-1", "sess-1", 1, storage.NativeBinding{
-		LogicalSessionID: "sess-1", NativeSessionID: "native-1", Harness: "claude-code", Model: "claude-3-7-sonnet", WorkspaceMode: "branch", ToolingConfig: "full",
+		LogicalSessionID: "sess-1", NativeSessionID: "native-1", Harness: "claude-code", Model: "claude-3-7-sonnet", WorkspaceMode: "branch", ToolingConfig: "{\"tooling\":[\"full\"]}",
 	})
 	if err != nil {
 		t.Fatalf("set binding 1: %v", err)
 	}
-	_, err = storeA.QueuePrompt(ctx, "op-q-1", "lease-1", "sess-1", 2, storage.PendingPrompt{SessionID: "sess-1", Prompt: "P1", CreatedAt: time.Now()})
+	_, err = storeA.QueuePrompt(ctx, "op-q-1", "lease-1", "sess-1", 2, storage.PendingPrompt{SessionID: "sess-1", TurnKey: "turn-1", Prompt: "P1", CreatedAt: time.Now()})
 	if err != nil {
 		t.Fatalf("queue prompt 1: %v", err)
 	}
@@ -50,22 +49,19 @@ func TestStore_HydrateState_ExactStateReconstruction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("release turn 1: %v", err)
 	}
-	_, err = storeA.ReconcileSession(ctx, "op-rec-1", "lease-1", adapter.RecoveryRef{
-		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-1"},
-		Generation: 1,
-	}, adapter.ReconciliationOutcome{Status: adapter.ReconciliationReachableTerminal, Observed: council.TurnCompleted, Result: "finished"})
+	_, err = storeA.RecordTerminalOutcome(ctx, "op-term-1", "lease-1", "sess-1", 4, "turn-1", council.TurnCompleted, "finished")
 	if err != nil {
-		t.Fatalf("reconcile turn 1: %v", err)
+		t.Fatalf("record terminal outcome 1: %v", err)
 	}
 
 	// Session 2: pending prompt
-	_, err = storeA.QueuePrompt(ctx, "op-q-2", "lease-1", "sess-2", 1, storage.PendingPrompt{SessionID: "sess-2", Prompt: "Pending P2", CreatedAt: time.Now()})
+	_, err = storeA.QueuePrompt(ctx, "op-q-2", "lease-1", "sess-2", 1, storage.PendingPrompt{SessionID: "sess-2", TurnKey: "turn-2", Prompt: "Pending P2", CreatedAt: time.Now()})
 	if err != nil {
 		t.Fatalf("queue prompt 2: %v", err)
 	}
 
 	// Session 3: uncertain turn (intent_recorded)
-	_, err = storeA.QueuePrompt(ctx, "op-q-3", "lease-1", "sess-3", 1, storage.PendingPrompt{SessionID: "sess-3", Prompt: "Uncertain P3", CreatedAt: time.Now()})
+	_, err = storeA.QueuePrompt(ctx, "op-q-3", "lease-1", "sess-3", 1, storage.PendingPrompt{SessionID: "sess-3", TurnKey: "turn-3", Prompt: "Uncertain P3", CreatedAt: time.Now()})
 	if err != nil {
 		t.Fatalf("queue prompt 3: %v", err)
 	}
@@ -114,14 +110,17 @@ func TestStore_HydrateState_ExactStateReconstruction(t *testing.T) {
 	if s1.ActiveTurn != nil {
 		t.Fatalf("session 1 active turn should be nil, got %v", s1.ActiveTurn)
 	}
+	if s1.Turns["turn-1"].Status != "completed" {
+		t.Fatalf("session 1 turn-1 expected completed, got %s", s1.Turns["turn-1"].Status)
+	}
 	if s1.NativeBinding == nil || s1.NativeBinding.NativeSessionID != "native-1" {
 		t.Fatalf("session 1 native binding missing or incorrect: %v", s1.NativeBinding)
 	}
 
 	// Session 2: pending prompt
 	s2 := hydrated.Sessions["sess-2"]
-	if s2.PendingPrompt == nil || s2.PendingPrompt.Prompt != "Pending P2" {
-		t.Fatalf("session 2 pending prompt mismatch: %v", s2.PendingPrompt)
+	if len(s2.PendingPrompts) != 1 || s2.PendingPrompts["turn-2"].Prompt != "Pending P2" {
+		t.Fatalf("session 2 pending prompt mismatch: %v", s2.PendingPrompts)
 	}
 
 	// Session 3: active turn with intent_recorded
@@ -138,8 +137,8 @@ func TestStore_HydrateState_ExactStateReconstruction(t *testing.T) {
 
 	// Session 4: idle parked
 	s4 := hydrated.Sessions["sess-4"]
-	if s4.State != "parked" || s4.PendingPrompt != nil || s4.ActiveTurn != nil {
-		t.Fatalf("session 4 expected clean parked, got state=%s, p=%v, t=%v", s4.State, s4.PendingPrompt, s4.ActiveTurn)
+	if s4.State != "parked" || len(s4.PendingPrompts) != 0 || s4.ActiveTurn != nil {
+		t.Fatalf("session 4 expected clean parked, got state=%s, p=%v, t=%v", s4.State, s4.PendingPrompts, s4.ActiveTurn)
 	}
 
 	// Verify journal entries reconstructed

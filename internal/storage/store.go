@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -18,6 +19,10 @@ type Store struct {
 }
 
 func buildDSN(dbPath string, txLock string) string {
+	absPath, err := filepath.Abs(dbPath)
+	if err == nil {
+		dbPath = absPath
+	}
 	cleanPath := filepath.Clean(dbPath)
 	slashPath := filepath.ToSlash(cleanPath)
 	if !strings.HasPrefix(slashPath, "/") {
@@ -29,6 +34,7 @@ func buildDSN(dbPath string, txLock string) string {
 	}
 	q := url.Values{}
 	q.Set("_txlock", txLock)
+	q.Set("_timeout", "5000")
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("_pragma", "journal_mode(WAL)")
 	q.Add("_pragma", "synchronous(FULL)")
@@ -41,8 +47,20 @@ func Open(opts StoreOptions) (*Store, error) {
 	if opts.StateDir == "" {
 		return nil, fmt.Errorf("state directory required")
 	}
+
+	// Reject symlinked state directories
+	fi, err := os.Lstat(opts.StateDir)
+	if err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("%w: %s", ErrSymlinkForbidden, opts.StateDir)
+	}
+
 	if err := os.MkdirAll(opts.StateDir, 0700); err != nil {
 		return nil, fmt.Errorf("create state directory: %w", err)
+	}
+
+	// Tighten permissions on state directory before creating database or sidecars
+	if err := EnsureDirectoryPermissions(opts.StateDir); err != nil {
+		return nil, fmt.Errorf("ensure state directory permissions: %w", err)
 	}
 
 	// Install .gitignore with *
@@ -91,14 +109,25 @@ func Open(opts StoreOptions) (*Store, error) {
 		return nil, err
 	}
 
-	_ = s.TightenStateDirPermissions()
+	if err := s.TightenStateDirPermissions(); err != nil {
+		s.Close()
+		return nil, fmt.Errorf("tighten state dir permissions: %w", err)
+	}
 
 	return s, nil
 }
 
 func (s *Store) verifyConnectionPRAGMAs(db *sql.DB) error {
 	var jm string
-	if err := db.QueryRow("PRAGMA journal_mode;").Scan(&jm); err != nil || jm != "wal" {
+	var err error
+	for attempt := 0; attempt < 25; attempt++ {
+		err = db.QueryRow("PRAGMA journal_mode;").Scan(&jm)
+		if err == nil && jm == "wal" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil || jm != "wal" {
 		return fmt.Errorf("failed to verify WAL mode (got %q, err %v)", jm, err)
 	}
 	var fk int

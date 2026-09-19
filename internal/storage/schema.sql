@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS native_bindings (
     native_session_id TEXT NOT NULL,
     harness TEXT NOT NULL,
     model TEXT NOT NULL,
+    workspace_mode TEXT NOT NULL,
     config_json TEXT NOT NULL, -- Allowlisted configuration; no provider credentials
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL

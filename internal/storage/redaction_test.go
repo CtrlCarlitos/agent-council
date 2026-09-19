@@ -19,7 +19,7 @@ func TestStore_CredentialRedaction_RealStorageBoundary(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "lease-1")
+	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-1")
 	_, _ = store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable",
 	})
@@ -32,7 +32,7 @@ func TestStore_CredentialRedaction_RealStorageBoundary(t *testing.T) {
 
 	// 1. QueuePrompt with raw secrets
 	r, err := store.QueuePrompt(ctx, "op-q-sec", "lease-1", "sess-1", 1, storage.PendingPrompt{
-		SessionID: "sess-1", Prompt: rawPrompt, CreatedAt: time.Now(),
+		SessionID: "sess-1", TurnKey: "turn-sec", Prompt: rawPrompt, CreatedAt: time.Now(),
 	})
 	if err != nil {
 		t.Fatalf("queue prompt: %v", err)

@@ -22,7 +22,7 @@ func TestArtifactStore_ReadArtifact_VerifyBeforeExposure(t *testing.T) {
 	defer store.Close()
 
 	ctx := context.Background()
-	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "lease-1")
+	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-1")
 	_, _ = store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable",
 	})
@@ -70,7 +70,7 @@ func TestArtifactStore_PublishArtifact_NoSilentRepair(t *testing.T) {
 	defer store.Close()
 
 	ctx := context.Background()
-	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "lease-1")
+	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-1")
 	_, _ = store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable",
 	})
@@ -116,7 +116,7 @@ func TestArtifactStore_PublishArtifact_ConcurrentIdentical(t *testing.T) {
 	defer store.Close()
 
 	ctx := context.Background()
-	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "lease-1")
+	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-1")
 	_, _ = store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable",
 	})
@@ -155,7 +155,7 @@ func TestArtifactStore_PublishArtifact_PathTraversalRejected(t *testing.T) {
 	defer store.Close()
 
 	ctx := context.Background()
-	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "lease-1")
+	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-1")
 	_, _ = store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable",
 	})

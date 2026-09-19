@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -24,6 +27,12 @@ type ArtifactMetadata struct {
 	ByteCount int64     `json:"byte_count"`
 	Revision  int64     `json:"revision"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+type artifactJournalPayload struct {
+	CallerLease   string           `json:"caller_lease"`
+	Receipt       OperationReceipt `json:"receipt"`
+	CommittedMeta ArtifactMetadata `json:"committed_meta"`
 }
 
 const maxArtifactSize = 100 * 1024 * 1024 // 100MB
@@ -49,15 +58,45 @@ func (s *Store) PublishArtifact(ctx context.Context, opID string, callerLease st
 		return ArtifactMetadata{}, ErrInvalidPath
 	}
 
-	// 2. Pre-write sanitization of content
+	// 2. Enforce pre-write content size bound
+	if int64(len(content)) > maxArtifactSize {
+		return ArtifactMetadata{}, ErrArtifactOversized
+	}
+
+	// 3. Pre-authorization: validate caller authority against runs.controller_lease BEFORE creating any files
+	var runLease string
+	err := s.readDB.QueryRowContext(ctx, "SELECT controller_lease FROM runs WHERE run_id = ?;", meta.RunID).Scan(&runLease)
+	if err != nil || runLease != callerLease {
+		return ArtifactMetadata{}, ErrUnauthorizedOperation
+	}
+
+	// 4. Pre-write sanitization of content
 	sanitizedContent := []byte(SanitizeText(string(content)))
 
-	// 3. Compute digest and byte count
+	// 5. Compute digest and byte count
 	sum := sha256.Sum256(sanitizedContent)
 	digest := hex.EncodeToString(sum[:])
 	byteCount := int64(len(sanitizedContent))
 
-	// 4. Filesystem staging and atomic no-clobber installation
+	fp := computeFingerprint("publish_artifact", meta.ID, meta.RunID, meta.SessionID, meta.TurnKey, meta.Name, digest, fmt.Sprintf("%d", byteCount))
+
+	// Check idempotency first before file creation
+	var storedCmdType, storedFingerprint, payloadJSON string
+	err = s.readDB.QueryRowContext(ctx, "SELECT command_type, command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;", opID).Scan(&storedCmdType, &storedFingerprint, &payloadJSON)
+	if err == nil {
+		var ajp artifactJournalPayload
+		if err := json.Unmarshal([]byte(payloadJSON), &ajp); err == nil && ajp.CommittedMeta.ID != "" {
+			if ajp.CallerLease != callerLease {
+				return ArtifactMetadata{}, ErrUnauthorizedOperation
+			}
+			if storedCmdType != "publish_artifact" || storedFingerprint != fp {
+				return ArtifactMetadata{}, ErrIdempotencyConflict
+			}
+			return ajp.CommittedMeta, nil
+		}
+	}
+
+	// 6. Filesystem staging and atomic no-clobber installation
 	artifactMu.Lock()
 	defer artifactMu.Unlock()
 
@@ -65,74 +104,96 @@ func (s *Store) PublishArtifact(ctx context.Context, opID string, callerLease st
 	destDir := filepath.Join(artifactsDir, digest[:2])
 	destPath := filepath.Join(destDir, digest)
 
-	if info, err := os.Stat(destPath); err == nil {
-		// Existing destination: must verify digest and size; if corrupt, fail immediately without repairing
-		if info.Size() != byteCount {
-			return ArtifactMetadata{}, ErrArtifactCorrupt
-		}
+	tmpDir := filepath.Join(artifactsDir, "tmp")
+	if err := os.MkdirAll(tmpDir, 0700); err != nil {
+		return ArtifactMetadata{}, fmt.Errorf("create tmp dir: %w", err)
+	}
+	if err := os.MkdirAll(destDir, 0700); err != nil {
+		return ArtifactMetadata{}, fmt.Errorf("create dest dir: %w", err)
+	}
+
+	// Staging file
+	tmpFile, err := os.CreateTemp(tmpDir, "blob-*")
+	if err != nil {
+		return ArtifactMetadata{}, fmt.Errorf("create staging file: %w", err)
+	}
+	tmpName := tmpFile.Name()
+
+	if _, err := tmpFile.Write(sanitizedContent); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpName)
+		return ArtifactMetadata{}, fmt.Errorf("write staging file: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpName)
+		return ArtifactMetadata{}, fmt.Errorf("sync staging file: %w", err)
+	}
+	tmpFile.Close()
+
+	if err := os.Chmod(tmpName, 0600); err != nil {
+		os.Remove(tmpName)
+		return ArtifactMetadata{}, fmt.Errorf("chmod staging file: %w", err)
+	}
+
+	// Cross-process no-clobber install via os.Link
+	linkErr := os.Link(tmpName, destPath)
+	if linkErr == nil {
+		_ = os.Remove(tmpName)
+	} else if os.IsExist(linkErr) {
+		_ = os.Remove(tmpName)
+		// Verify existing destination: size and content digest; if corrupt, fail without repair
 		existingBytes, err := s.ReadArtifact(digest)
 		if err != nil || !bytes.Equal(existingBytes, sanitizedContent) {
 			return ArtifactMetadata{}, ErrArtifactCorrupt
 		}
-	} else if os.IsNotExist(err) {
-		tmpDir := filepath.Join(artifactsDir, "tmp")
-		if err := os.MkdirAll(tmpDir, 0700); err != nil {
-			return ArtifactMetadata{}, fmt.Errorf("create tmp dir: %w", err)
-		}
-		if err := os.MkdirAll(destDir, 0700); err != nil {
-			return ArtifactMetadata{}, fmt.Errorf("create dest dir: %w", err)
-		}
-
-		tmpFile, err := os.CreateTemp(tmpDir, "blob-*")
-		if err != nil {
-			return ArtifactMetadata{}, fmt.Errorf("create staging file: %w", err)
-		}
-		tmpName := tmpFile.Name()
-
-		if _, err := tmpFile.Write(sanitizedContent); err != nil {
-			tmpFile.Close()
-			os.Remove(tmpName)
-			return ArtifactMetadata{}, fmt.Errorf("write staging file: %w", err)
-		}
-		if err := tmpFile.Sync(); err != nil {
-			tmpFile.Close()
-			os.Remove(tmpName)
-			return ArtifactMetadata{}, fmt.Errorf("sync staging file: %w", err)
-		}
-		tmpFile.Close()
-
-		if err := os.Chmod(tmpName, 0600); err != nil {
-			os.Remove(tmpName)
-			return ArtifactMetadata{}, fmt.Errorf("chmod staging file: %w", err)
-		}
-
-		if err := os.Rename(tmpName, destPath); err != nil {
-			os.Remove(tmpName)
-			return ArtifactMetadata{}, fmt.Errorf("install artifact file: %w", err)
-		}
 	} else {
-		return ArtifactMetadata{}, fmt.Errorf("stat artifact destination: %w", err)
+		// Fallback for filesystems that do not support hardlinks (e.g. cross-device)
+		destF, err := os.OpenFile(destPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err == nil {
+			_, _ = destF.Write(sanitizedContent)
+			_ = destF.Sync()
+			_ = destF.Close()
+			_ = os.Remove(tmpName)
+		} else if os.IsExist(err) {
+			_ = os.Remove(tmpName)
+			existingBytes, err := s.ReadArtifact(digest)
+			if err != nil || !bytes.Equal(existingBytes, sanitizedContent) {
+				return ArtifactMetadata{}, ErrArtifactCorrupt
+			}
+		} else {
+			_ = os.Remove(tmpName)
+			return ArtifactMetadata{}, fmt.Errorf("install artifact file: %w", linkErr)
+		}
 	}
 
-	// 4. Record metadata in relational store inside write transaction
-	fp := computeFingerprint("publish_artifact", meta.ID, meta.RunID, meta.SessionID, meta.TurnKey, meta.Name, digest, fmt.Sprintf("%d", byteCount))
+	// Sync parent directory before metadata commit
+	if d, err := os.Open(destDir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
 
+	// 7. Record metadata in relational store inside write transaction
 	tx, err := s.BeginWrite(ctx)
 	if err != nil {
 		return ArtifactMetadata{}, err
 	}
 	defer tx.Rollback()
 
-	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "publish_artifact", fp); err != nil {
-		return ArtifactMetadata{}, err
-	} else if receipt != nil {
-		return meta, nil
-	}
-
-	var runLease string
-	err = tx.Tx().QueryRowContext(ctx, "SELECT controller_lease FROM runs WHERE run_id = ?;", meta.RunID).Scan(&runLease)
-	if err != nil || runLease != callerLease {
-		return ArtifactMetadata{}, ErrUnauthorizedOperation
+	// Recheck idempotency inside write lock
+	var storedCmdType2, storedFingerprint2, payloadJSON2 string
+	err = tx.Tx().QueryRowContext(ctx, "SELECT command_type, command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;", opID).Scan(&storedCmdType2, &storedFingerprint2, &payloadJSON2)
+	if err == nil {
+		var ajp artifactJournalPayload
+		if err := json.Unmarshal([]byte(payloadJSON2), &ajp); err == nil && ajp.CommittedMeta.ID != "" {
+			if ajp.CallerLease != callerLease {
+				return ArtifactMetadata{}, ErrUnauthorizedOperation
+			}
+			if storedCmdType2 != "publish_artifact" || storedFingerprint2 != fp {
+				return ArtifactMetadata{}, ErrIdempotencyConflict
+			}
+			return ajp.CommittedMeta, nil
+		}
 	}
 
 	var maxRev int64
@@ -165,8 +226,21 @@ VALUES (?, ?, ?, 'patch', ?, ?, ?);`, meta.ID, newRev, meta.RunID, digest, byteC
 		Payload:          digest,
 	}
 
-	if err := recordJournalEntry(tx.Tx(), opID, "publish_artifact", fp, meta.RunID, meta.SessionID, meta.TurnKey, "artifact_published", opReceipt, callerLease); err != nil {
-		return ArtifactMetadata{}, err
+	ajp := artifactJournalPayload{
+		CallerLease:   callerLease,
+		Receipt:       opReceipt,
+		CommittedMeta: committedMeta,
+	}
+	ajpBytes, err := json.Marshal(ajp)
+	if err != nil {
+		return ArtifactMetadata{}, fmt.Errorf("marshal artifact journal payload: %w", err)
+	}
+
+	_, err = tx.Tx().ExecContext(ctx, `
+INSERT INTO journal_entries (op_id, command_type, command_fingerprint, run_id, session_id, turn_key, event_kind, payload_version, payload_json, created_at)
+VALUES (?, 'publish_artifact', ?, ?, ?, ?, 'artifact_published', 1, ?, ?);`, opID, fp, meta.RunID, meta.SessionID, meta.TurnKey, string(ajpBytes), now)
+	if err != nil {
+		return ArtifactMetadata{}, fmt.Errorf("record artifact journal entry: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -211,4 +285,34 @@ func (s *Store) ReadArtifact(digest string) ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
+}
+
+func (s *Store) ReadArtifactRevision(ctx context.Context, artifactID string, revision int64) (ArtifactMetadata, []byte, error) {
+	if strings.TrimSpace(artifactID) == "" || revision <= 0 {
+		return ArtifactMetadata{}, nil, errors.New("invalid artifact id or revision")
+	}
+
+	var meta ArtifactMetadata
+	var createdAtStr string
+	err := s.readDB.QueryRowContext(ctx, `
+SELECT artifact_id, revision, run_id, kind, digest, byte_size, created_at
+FROM artifact_revisions
+WHERE artifact_id = ? AND revision = ?;`, artifactID, revision).Scan(&meta.ID, &meta.Revision, &meta.RunID, &meta.Name, &meta.Digest, &meta.ByteCount, &createdAtStr)
+	if err == sql.ErrNoRows {
+		return ArtifactMetadata{}, nil, ErrArtifactNotFound
+	}
+	if err != nil {
+		return ArtifactMetadata{}, nil, fmt.Errorf("query artifact revision: %w", err)
+	}
+	meta.CreatedAt = parseTime(createdAtStr)
+
+	data, err := s.ReadArtifact(meta.Digest)
+	if err != nil {
+		return ArtifactMetadata{}, nil, err
+	}
+	if int64(len(data)) != meta.ByteCount {
+		return ArtifactMetadata{}, nil, ErrArtifactCorrupt
+	}
+
+	return meta, data, nil
 }

@@ -17,14 +17,14 @@ func TestStore_Idempotency_InsideTx(t *testing.T) {
 	defer store.Close()
 
 	ctx := context.Background()
-	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "lease-1")
+	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-1")
 	_, _ = store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable",
 	})
 
 	// Initial QueuePrompt
 	r1, err := store.QueuePrompt(ctx, "op-q-1", "lease-1", "sess-1", 1, storage.PendingPrompt{
-		SessionID: "sess-1", Prompt: "Review this diff", CreatedAt: time.Now(),
+		SessionID: "sess-1", TurnKey: "turn-1", Prompt: "Review this diff", CreatedAt: time.Now(),
 	})
 	if err != nil {
 		t.Fatalf("first queue prompt: %v", err)
@@ -32,7 +32,7 @@ func TestStore_Idempotency_InsideTx(t *testing.T) {
 
 	// Simultaneous / duplicate QueuePrompt with identical op_id and parameters -> returns original receipt
 	r2, err := store.QueuePrompt(ctx, "op-q-1", "lease-1", "sess-1", 1, storage.PendingPrompt{
-		SessionID: "sess-1", Prompt: "Review this diff", CreatedAt: time.Now(),
+		SessionID: "sess-1", TurnKey: "turn-1", Prompt: "Review this diff", CreatedAt: time.Now(),
 	})
 	if err != nil {
 		t.Fatalf("duplicate queue prompt: %v", err)
@@ -52,7 +52,7 @@ func TestStore_Idempotency_InsideTx(t *testing.T) {
 
 	// Conflicting reuse of same op_id with different prompt text -> ErrIdempotencyConflict
 	_, err = store.QueuePrompt(ctx, "op-q-1", "lease-1", "sess-1", 1, storage.PendingPrompt{
-		SessionID: "sess-1", Prompt: "DIFFERENT PROMPT TEXT", CreatedAt: time.Now(),
+		SessionID: "sess-1", TurnKey: "turn-1", Prompt: "DIFFERENT PROMPT TEXT", CreatedAt: time.Now(),
 	})
 	if err != storage.ErrIdempotencyConflict {
 		t.Fatalf("expected ErrIdempotencyConflict on mismatched parameters, got %v", err)
@@ -60,7 +60,7 @@ func TestStore_Idempotency_InsideTx(t *testing.T) {
 
 	// Unauthorized caller retrying existing op_id -> ErrUnauthorizedOperation
 	_, err = store.QueuePrompt(ctx, "op-q-1", "lease-attacker", "sess-1", 1, storage.PendingPrompt{
-		SessionID: "sess-1", Prompt: "Review this diff", CreatedAt: time.Now(),
+		SessionID: "sess-1", TurnKey: "turn-1", Prompt: "Review this diff", CreatedAt: time.Now(),
 	})
 	if err != storage.ErrUnauthorizedOperation {
 		t.Fatalf("expected ErrUnauthorizedOperation on unauthorized receipt lookup, got %v", err)

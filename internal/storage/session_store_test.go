@@ -17,7 +17,7 @@ func TestStore_OptimisticConcurrency_StaleUpdateRejected(t *testing.T) {
 	defer store.Close()
 
 	ctx := context.Background()
-	_, err = store.CreateRun(ctx, "op-run-1", "run-1", "lease-1")
+	_, err = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-1")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -36,7 +36,7 @@ func TestStore_OptimisticConcurrency_StaleUpdateRejected(t *testing.T) {
 
 	// Queue a prompt with expectedVersion = initialVersion -> succeeds, bumps to initialVersion + 1
 	r1, err := store.QueuePrompt(ctx, "op-q-1", "lease-1", "sess-1", initialVersion, storage.PendingPrompt{
-		SessionID: "sess-1", Prompt: "first prompt", CreatedAt: time.Now(),
+		SessionID: "sess-1", TurnKey: "turn-1", Prompt: "first prompt", CreatedAt: time.Now(),
 	})
 	if err != nil {
 		t.Fatalf("queue prompt 1: %v", err)
@@ -47,7 +47,7 @@ func TestStore_OptimisticConcurrency_StaleUpdateRejected(t *testing.T) {
 
 	// Attempt to replace prompt with STALE expectedVersion = initialVersion -> rejected with ErrStaleUpdate
 	_, err = store.ReplacePendingPrompt(ctx, "op-rep-stale", "lease-1", "sess-1", initialVersion, storage.PendingPrompt{
-		SessionID: "sess-1", Prompt: "stale prompt", CreatedAt: time.Now(),
+		SessionID: "sess-1", TurnKey: "turn-1", Prompt: "stale prompt", CreatedAt: time.Now(),
 	})
 	if err != storage.ErrStaleUpdate {
 		t.Fatalf("expected ErrStaleUpdate on stale replacement, got %v", err)
@@ -55,7 +55,7 @@ func TestStore_OptimisticConcurrency_StaleUpdateRejected(t *testing.T) {
 
 	// Replacement with correct expectedVersion = initialVersion + 1 succeeds
 	r2, err := store.ReplacePendingPrompt(ctx, "op-rep-valid", "lease-1", "sess-1", initialVersion+1, storage.PendingPrompt{
-		SessionID: "sess-1", Prompt: "valid prompt replacement", CreatedAt: time.Now(),
+		SessionID: "sess-1", TurnKey: "turn-1", Prompt: "valid prompt replacement", CreatedAt: time.Now(),
 	})
 	if err != nil {
 		t.Fatalf("valid replacement failed: %v", err)
@@ -65,7 +65,7 @@ func TestStore_OptimisticConcurrency_StaleUpdateRejected(t *testing.T) {
 	}
 
 	// Discard with correct expectedVersion succeeds
-	r3, err := store.DiscardPendingPrompt(ctx, "op-disc-1", "lease-1", "sess-1", initialVersion+2)
+	r3, err := store.DiscardPendingPrompt(ctx, "op-disc-1", "lease-1", "sess-1", initialVersion+2, "turn-1")
 	if err != nil {
 		t.Fatalf("discard pending prompt: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestStore_Authority_LeaseValidation(t *testing.T) {
 	defer store.Close()
 
 	ctx := context.Background()
-	_, err = store.CreateRun(ctx, "op-run-1", "run-1", "lease-valid")
+	_, err = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-valid")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
