@@ -122,17 +122,19 @@ type TurnRecord struct {
 // Session stores logical state. It is not concurrency-safe or durable; the future
 // transactional store owns those responsibilities. Never use it as an auth boundary.
 type Session struct {
-	ID               Contributor
-	State            State
-	Lifecycle        SessionLifecycle
-	ControllerStatus ControllerConnection
-	Visibility       ExecutionVisibility
-	ControllerLease  string
-	Pending          map[string]string
-	Active           string
-	ActiveTurn       *TurnRecord
-	Turns            map[string]*TurnRecord
-	RecoveryContext  string
+	ID                 Contributor
+	State              State
+	Lifecycle          SessionLifecycle
+	ControllerStatus   ControllerConnection
+	Visibility         ExecutionVisibility
+	ControllerLease    string
+	Pending            map[string]string
+	Active             string
+	ActiveTurn         *TurnRecord
+	Turns              map[string]*TurnRecord
+	RecoveryContext    string
+	RecoveryGeneration uint64
+	ActiveRecoveryGen  uint64
 }
 
 func NewSession(id Contributor, lease string) (*Session, error) {
@@ -283,21 +285,29 @@ func (s *Session) Fail(key, reason string) error {
 	return nil
 }
 
-func (s *Session) RecordHostLoss() error {
-	if s.State != Running || s.ActiveTurn == nil {
-		return errors.New("cannot record host loss on inactive session")
+func (s *Session) RecordHostLoss() (uint64, error) {
+	if s.Visibility == VisibilityHostLost {
+		return s.ActiveRecoveryGen, nil
 	}
+	if s.State != Running || s.ActiveTurn == nil {
+		return 0, errors.New("cannot record host loss on inactive session")
+	}
+	s.RecoveryGeneration++
+	s.ActiveRecoveryGen = s.RecoveryGeneration
 	s.Visibility = VisibilityHostLost
 	s.RecoveryContext = s.Active
-	return nil
+	return s.ActiveRecoveryGen, nil
 }
 
-func (s *Session) ReconcileHost(key string, status TurnStatus, result string) error {
+func (s *Session) ReconcileHost(key string, gen uint64, status TurnStatus, result string) error {
 	if s.Visibility != VisibilityHostLost {
 		return errors.New("session host is not lost")
 	}
 	if key == "" {
 		return errors.New("empty turn identity")
+	}
+	if gen == 0 || gen != s.ActiveRecoveryGen {
+		return errors.New("stale or invalid recovery generation")
 	}
 
 	// Active turn exists
@@ -316,12 +326,14 @@ func (s *Session) ReconcileHost(key string, status TurnStatus, result string) er
 			}
 			s.Visibility = VisibilityReachable
 			s.RecoveryContext = ""
+			s.ActiveRecoveryGen = 0
 			s.State = Running
 			return nil
 		case TurnCancelling:
 			s.ActiveTurn.Status = TurnCancelling
 			s.Visibility = VisibilityReachable
 			s.RecoveryContext = ""
+			s.ActiveRecoveryGen = 0
 			s.State = Running
 			return nil
 		case TurnCompleted, TurnCancelled, TurnFailed, TurnInterrupted:
@@ -332,6 +344,7 @@ func (s *Session) ReconcileHost(key string, status TurnStatus, result string) er
 			s.State = Parked
 			s.Visibility = VisibilityReachable
 			s.RecoveryContext = ""
+			s.ActiveRecoveryGen = 0
 			return nil
 		default:
 			return errors.New("invalid reconciliation target status")
@@ -350,6 +363,7 @@ func (s *Session) ReconcileHost(key string, status TurnStatus, result string) er
 	case TurnCompleted, TurnCancelled, TurnFailed, TurnInterrupted:
 		s.Visibility = VisibilityReachable
 		s.RecoveryContext = ""
+		s.ActiveRecoveryGen = 0
 		return nil
 	case TurnRunning, TurnCancelling:
 		return errors.New("reconciliation status conflicts with recorded terminal outcome")

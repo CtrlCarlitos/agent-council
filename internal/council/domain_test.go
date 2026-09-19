@@ -339,7 +339,8 @@ func TestHostUnreachableRecordsUncertaintyAndBlocksRelease(t *testing.T) {
 	_, _ = s.Release("lease", "turn-1")
 
 	// Host contact is lost while turn-1 is running
-	if err := s.RecordHostLoss(); err != nil {
+	gen, err := s.RecordHostLoss()
+	if err != nil {
 		t.Fatalf("failed to record host loss: %v", err)
 	}
 
@@ -364,7 +365,7 @@ func TestHostUnreachableRecordsUncertaintyAndBlocksRelease(t *testing.T) {
 	}
 
 	// Reconcile host with failed status
-	if err := s.ReconcileHost("turn-1", TurnFailed, "process exited during disconnect"); err != nil {
+	if err := s.ReconcileHost("turn-1", gen, TurnFailed, "process exited during disconnect"); err != nil {
 		t.Fatalf("host reconciliation failed: %v", err)
 	}
 
@@ -395,18 +396,20 @@ type turnSnapshot struct {
 }
 
 type sessionSnapshot struct {
-	id               Contributor
-	state            State
-	lifecycle        SessionLifecycle
-	controllerStatus ControllerConnection
-	visibility       ExecutionVisibility
-	lease            string
-	active           string
-	hasActiveTurn    bool
-	activeTurn       turnSnapshot
-	pending          map[string]string
-	turns            map[string]turnSnapshot
-	recoveryContext  string
+	id                 Contributor
+	state              State
+	lifecycle          SessionLifecycle
+	controllerStatus   ControllerConnection
+	visibility         ExecutionVisibility
+	lease              string
+	active             string
+	hasActiveTurn      bool
+	activeTurn         turnSnapshot
+	pending            map[string]string
+	turns              map[string]turnSnapshot
+	recoveryContext    string
+	recoveryGeneration uint64
+	activeRecoveryGen  uint64
 }
 
 func snapshotSession(s *Session) sessionSnapshot {
@@ -436,18 +439,20 @@ func snapshotSession(s *Session) sessionSnapshot {
 		}
 	}
 	return sessionSnapshot{
-		id:               s.ID,
-		state:            s.State,
-		lifecycle:        s.Lifecycle,
-		controllerStatus: s.ControllerStatus,
-		visibility:       s.Visibility,
-		lease:            s.ControllerLease,
-		active:           s.Active,
-		hasActiveTurn:    hasAct,
-		activeTurn:       actSnap,
-		pending:          p,
-		turns:            turns,
-		recoveryContext:  s.RecoveryContext,
+		id:                 s.ID,
+		state:              s.State,
+		lifecycle:          s.Lifecycle,
+		controllerStatus:   s.ControllerStatus,
+		visibility:         s.Visibility,
+		lease:              s.ControllerLease,
+		active:             s.Active,
+		hasActiveTurn:      hasAct,
+		activeTurn:         actSnap,
+		pending:            p,
+		turns:              turns,
+		recoveryContext:    s.RecoveryContext,
+		recoveryGeneration: s.RecoveryGeneration,
+		activeRecoveryGen:  s.ActiveRecoveryGen,
 	}
 }
 
@@ -457,7 +462,9 @@ func assertSnapshotEqual(t *testing.T, opName string, before, after sessionSnaps
 		before.lifecycle != after.lifecycle || before.controllerStatus != after.controllerStatus ||
 		before.visibility != after.visibility || before.lease != after.lease ||
 		before.active != after.active || before.hasActiveTurn != after.hasActiveTurn ||
-		before.recoveryContext != after.recoveryContext {
+		before.recoveryContext != after.recoveryContext ||
+		before.recoveryGeneration != after.recoveryGeneration ||
+		before.activeRecoveryGen != after.activeRecoveryGen {
 		t.Fatalf("%s mutated session scalar state: before=%+v after=%+v", opName, before, after)
 	}
 	if before.hasActiveTurn {
@@ -543,7 +550,7 @@ func TestStatePreservationOnRejectedOperations(t *testing.T) {
 
 	// 7. ReconcileHost when host is not lost
 	snap = snapshotSession(s)
-	if err := s.ReconcileHost("t1", TurnCompleted, "res"); err == nil {
+	if err := s.ReconcileHost("t1", 1, TurnCompleted, "res"); err == nil {
 		t.Fatal("reconcile host succeeded when host not lost")
 	}
 	assertSnapshotEqual(t, "reconcile when not lost", snap, snapshotSession(s))

@@ -56,7 +56,8 @@ func TestReviewR2_StaleTurnCannotReconcileTerminalHostLoss(t *testing.T) {
 			_, _ = s.Release("lease", "t-loss")
 
 			// 3. Lose contact with host
-			if err := s.RecordHostLoss(); err != nil {
+			gen, err := s.RecordHostLoss()
+			if err != nil {
 				t.Fatalf("record host loss failed: %v", err)
 			}
 
@@ -73,7 +74,7 @@ func TestReviewR2_StaleTurnCannotReconcileTerminalHostLoss(t *testing.T) {
 			}
 
 			// 5. Deliver a stale reconciliation reply for t-old
-			err = s.ReconcileHost("t-old", TurnCompleted, "t-old-stale")
+			err = s.ReconcileHost("t-old", gen, TurnCompleted, "t-old-stale")
 			if err == nil {
 				t.Fatal("stale reconciliation for t-old was accepted after t-loss terminal delivery")
 			}
@@ -92,7 +93,7 @@ func TestReviewR2_StaleTurnCannotReconcileTerminalHostLoss(t *testing.T) {
 			}
 
 			// Positive control: valid reconciliation for t-loss succeeds and restores reachability
-			if err := s.ReconcileHost("t-loss", TurnCompleted, "reconcile valid"); err != nil {
+			if err := s.ReconcileHost("t-loss", gen, TurnCompleted, "reconcile valid"); err != nil {
 				t.Fatalf("valid reconciliation for t-loss failed: %v", err)
 			}
 			if s.Visibility != VisibilityReachable {
@@ -112,11 +113,13 @@ func TestReviewR2_StaleTurnCannotReconcileTerminalHostLoss(t *testing.T) {
 
 func TestReviewR2_MalformedOrContradictoryReconciliationRejectedWhenNoActiveTurn(t *testing.T) {
 	cases := []struct {
-		name      string
-		key       string
-		status    TurnStatus
-		result    string
-		wantError string
+		name       string
+		key        string
+		genOffset  uint64
+		useZeroGen bool
+		status     TurnStatus
+		result     string
+		wantError  string
 	}{
 		{
 			name:      "Empty turn identity",
@@ -124,6 +127,22 @@ func TestReviewR2_MalformedOrContradictoryReconciliationRejectedWhenNoActiveTurn
 			status:    TurnCompleted,
 			result:    "ok",
 			wantError: "empty turn identity",
+		},
+		{
+			name:       "Zero generation",
+			key:        "t-loss",
+			useZeroGen: true,
+			status:     TurnCompleted,
+			result:     "ok",
+			wantError:  "stale or invalid recovery generation",
+		},
+		{
+			name:      "Stale generation",
+			key:       "t-loss",
+			genOffset: 99,
+			status:    TurnCompleted,
+			result:    "ok",
+			wantError: "stale or invalid recovery generation",
 		},
 		{
 			name:      "Empty status",
@@ -179,7 +198,10 @@ func TestReviewR2_MalformedOrContradictoryReconciliationRejectedWhenNoActiveTurn
 			_ = s.Queue("lease", "t-loss", "loss task")
 			_ = s.Queue("lease", "t-next", "next task")
 			_, _ = s.Release("lease", "t-loss")
-			_ = s.RecordHostLoss()
+			gen, err := s.RecordHostLoss()
+			if err != nil {
+				t.Fatalf("RecordHostLoss failed: %v", err)
+			}
 
 			// Complete t-loss
 			if err := s.CompleteWithResult("t-loss", "original-result"); err != nil {
@@ -188,8 +210,15 @@ func TestReviewR2_MalformedOrContradictoryReconciliationRejectedWhenNoActiveTurn
 
 			origRecord := *s.Turns["t-loss"]
 
+			targetGen := gen
+			if tc.useZeroGen {
+				targetGen = 0
+			} else if tc.genOffset != 0 {
+				targetGen = gen + tc.genOffset
+			}
+
 			// Attempt malformed or contradictory reconciliation
-			err = s.ReconcileHost(tc.key, tc.status, tc.result)
+			err = s.ReconcileHost(tc.key, targetGen, tc.status, tc.result)
 			if err == nil {
 				t.Fatalf("%s: expected error, got nil (visibility=%s)", tc.name, s.Visibility)
 			}

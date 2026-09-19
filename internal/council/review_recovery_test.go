@@ -10,8 +10,11 @@ func TestReviewStaleReconciliationMustNotFinishAnotherTurn(t *testing.T) {
 	// 1. Start t1 -> lose host contact -> reconcile t1 as completed
 	_ = s.Queue("lease", "t1", "task 1")
 	_, _ = s.Release("lease", "t1")
-	_ = s.RecordHostLoss()
-	if err := s.ReconcileHost("t1", TurnCompleted, "t1-result-from-original-probe"); err != nil {
+	gen1, err := s.RecordHostLoss()
+	if err != nil {
+		t.Fatalf("RecordHostLoss failed: %v", err)
+	}
+	if err := s.ReconcileHost("t1", gen1, TurnCompleted, "t1-result-from-original-probe"); err != nil {
 		t.Fatalf("reconcile t1 failed: %v", err)
 	}
 	if s.State != Parked || s.Active != "" {
@@ -21,10 +24,16 @@ func TestReviewStaleReconciliationMustNotFinishAnotherTurn(t *testing.T) {
 	// 2. Start t2 -> lose host contact
 	_ = s.Queue("lease", "t2", "task 2")
 	_, _ = s.Release("lease", "t2")
-	_ = s.RecordHostLoss()
+	gen2, err := s.RecordHostLoss()
+	if err != nil {
+		t.Fatalf("RecordHostLoss t2 failed: %v", err)
+	}
+	if gen2 <= gen1 {
+		t.Fatalf("expected gen2 > gen1, got gen1=%d gen2=%d", gen1, gen2)
+	}
 
-	// 3. Deliver a duplicate of the old t1 reconciliation reply
-	err = s.ReconcileHost("t1", TurnCompleted, "t1-stale-duplicate")
+	// 3. Deliver a duplicate of the old t1 reconciliation reply (with old gen1)
+	err = s.ReconcileHost("t1", gen1, TurnCompleted, "t1-stale-duplicate")
 	if err == nil {
 		t.Fatal("stale t1 reconciliation was accepted while t2 is active")
 	}
@@ -84,7 +93,10 @@ func TestReviewTerminalDeliveryAfterHostLossRemainsRecoverable(t *testing.T) {
 			_, _ = s.Release("lease", "t1")
 
 			// Host loss occurs while t1 is active
-			_ = s.RecordHostLoss()
+			gen, err := s.RecordHostLoss()
+			if err != nil {
+				t.Fatalf("RecordHostLoss failed: %v", err)
+			}
 
 			// Terminal delivery arrives
 			err = tc.op(s, "t1")
@@ -94,14 +106,14 @@ func TestReviewTerminalDeliveryAfterHostLossRemainsRecoverable(t *testing.T) {
 					t.Fatalf("rejected terminal delivery mutated state: active=%s, state=%s", s.Active, s.State)
 				}
 				// ReconcileHost can resolve the turn and restore reachability
-				if err := s.ReconcileHost("t1", TurnCompleted, "reconciled"); err != nil {
+				if err := s.ReconcileHost("t1", gen, TurnCompleted, "reconciled"); err != nil {
 					t.Fatalf("ReconcileHost failed after rejected terminal delivery: %v", err)
 				}
 			} else {
 				// Policy: terminal delivery was accepted.
 				// If VisibilityHostLost remains, there MUST be a valid recovery path to restore reachability!
 				if s.Visibility == VisibilityHostLost {
-					if err := s.ReconcileHost("t1", TurnCompleted, "reconcile reachability"); err != nil {
+					if err := s.ReconcileHost("t1", gen, TurnCompleted, "reconcile reachability"); err != nil {
 						t.Fatalf("session left permanently stuck after %s during host loss: %v", tc.name, err)
 					}
 				}
@@ -134,13 +146,16 @@ func TestReviewReconcileReachableStillActiveTurn(t *testing.T) {
 		_ = s.Queue("lease", "t2", "task 2")
 		_, _ = s.Release("lease", "t1")
 
-		_ = s.RecordHostLoss()
+		gen, err := s.RecordHostLoss()
+		if err != nil {
+			t.Fatalf("RecordHostLoss failed: %v", err)
+		}
 		if s.Visibility != VisibilityHostLost {
 			t.Fatal("expected VisibilityHostLost")
 		}
 
 		// Reconcile host observing that t1 is still running
-		if err := s.ReconcileHost("t1", TurnRunning, ""); err != nil {
+		if err := s.ReconcileHost("t1", gen, TurnRunning, ""); err != nil {
 			t.Fatalf("reconciliation of running turn rejected: %v", err)
 		}
 
@@ -183,15 +198,20 @@ func TestReviewReconcileReachableStillActiveTurn(t *testing.T) {
 		_ = s.Queue("lease", "t2", "task 2")
 		_, _ = s.Release("lease", "t1")
 
-		_ = s.RequestCancel("lease")
+		if err := s.RequestCancel("lease"); err != nil {
+			t.Fatalf("RequestCancel failed: %v", err)
+		}
 		if s.ActiveTurn.Status != TurnCancelling {
 			t.Fatalf("expected TurnCancelling, got %s", s.ActiveTurn.Status)
 		}
 
-		_ = s.RecordHostLoss()
+		gen, err := s.RecordHostLoss()
+		if err != nil {
+			t.Fatalf("RecordHostLoss failed: %v", err)
+		}
 
 		// Reconcile host contact restored; t1 is still active
-		if err := s.ReconcileHost("t1", TurnCancelling, ""); err != nil {
+		if err := s.ReconcileHost("t1", gen, TurnCancelling, ""); err != nil {
 			t.Fatalf("reconciliation of cancelling turn rejected: %v", err)
 		}
 
