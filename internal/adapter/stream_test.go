@@ -260,3 +260,32 @@ func TestBufferedStream_NormalCompletionDrainsCleanly(t *testing.T) {
 		t.Fatalf("expected nil Err() on normal completion, got %v", stream.Err())
 	}
 }
+
+func TestBufferedStream_ConcurrentSendOrOverflowAndCloseRace(t *testing.T) {
+	for i := 0; i < 500; i++ {
+		ref := adapter.TurnRef{SessionID: "s1", TurnKey: "t1"}
+		stream, _ := adapter.NewBufferedStream(ref, 2)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				_ = stream.SendOrOverflow(adapter.Event{
+					Ref:     ref,
+					Type:    adapter.EventProgress,
+					Status:  council.TurnRunning,
+					Payload: "p",
+				})
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+			_ = stream.Close()
+		}()
+
+		wg.Wait()
+	}
+}

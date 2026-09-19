@@ -193,14 +193,18 @@ func (s *BufferedStream) SendOrOverflow(ev Event) error {
 		s.mu.RUnlock()
 		return ErrStreamClosed
 	}
+	s.wg.Add(1)
 	s.mu.RUnlock()
 
 	select {
 	case <-s.ctx.Done():
+		s.wg.Done()
 		return ErrStreamClosed
 	case s.events <- ev:
+		s.wg.Done()
 		return nil
 	default:
+		s.wg.Done()
 		_ = s.CloseWithErr(ErrBufferOverflow)
 		return ErrBufferOverflow
 	}
