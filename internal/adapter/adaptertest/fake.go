@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,16 +21,17 @@ type DispatchState struct {
 
 // ScriptedFaults specifies adversarial behaviors and deterministic synchronization gates.
 type ScriptedFaults struct {
-	HoldDispatchAck   chan struct{}
-	DispatchStatus    adapter.DispatchStatus
-	DispatchError     error
-	AutoDenyTools     map[string]bool
-	DropStreamEarly   bool
-	InjectDuplicates  bool
-	MalformedOutput   bool
-	StallStream       chan struct{}
-	StaleRecoveryRef  *adapter.RecoveryRef
-	ProbeCapabilities adapter.AdapterCapabilities
+	HoldDispatchAck    chan struct{}
+	HoldExecutionStart chan struct{}
+	DispatchStatus     adapter.DispatchStatus
+	DispatchError      error
+	AutoDenyTools      map[string]bool
+	DropStreamEarly    bool
+	InjectDuplicates   bool
+	MalformedOutput    bool
+	StallStream        chan struct{}
+	StaleRecoveryRef   *adapter.RecoveryRef
+	ProbeCapabilities  adapter.AdapterCapabilities
 }
 
 // FakeAdapter implements adapter.Adapter with deterministic script controls for testing.
@@ -41,7 +43,8 @@ type FakeAdapter struct {
 	dispatches    map[adapter.TurnRef]*DispatchState
 	prompts       map[adapter.TurnRef]string
 	results       map[adapter.TurnRef]adapter.TurnResult
-	activeStreams map[adapter.TurnRef]*adapter.BufferedStream
+	retiredTurns  map[adapter.TurnRef]bool
+	activeStreams map[adapter.TurnRef][]*adapter.BufferedStream
 }
 
 // NewFake constructs a FakeAdapter configured with the provided scripted faults.
@@ -52,7 +55,8 @@ func NewFake(faults ScriptedFaults) *FakeAdapter {
 		dispatches:    make(map[adapter.TurnRef]*DispatchState),
 		prompts:       make(map[adapter.TurnRef]string),
 		results:       make(map[adapter.TurnRef]adapter.TurnResult),
-		activeStreams: make(map[adapter.TurnRef]*adapter.BufferedStream),
+		retiredTurns:  make(map[adapter.TurnRef]bool),
+		activeStreams: make(map[adapter.TurnRef][]*adapter.BufferedStream),
 	}
 }
 
@@ -69,12 +73,43 @@ func (f *FakeAdapter) TurnState(ref adapter.TurnRef) DispatchState {
 
 // Probe returns the configured capabilities and model inventory without billing.
 func (f *FakeAdapter) Probe(ctx context.Context) (adapter.ProbeReport, error) {
-	caps := f.faults.ProbeCapabilities.Normalize()
+	caps := f.faults.ProbeCapabilities
+	if caps.SessionResumption == "" && caps.MidTurnCancellation == "" &&
+		caps.ToolApprovalRouting == "" && caps.StreamingObservation == "" && caps.StructuredOutput == "" {
+		caps = adapter.AdapterCapabilities{
+			SessionResumption:    adapter.CapabilitySupported,
+			MidTurnCancellation:  adapter.CapabilitySupported,
+			ToolApprovalRouting:  adapter.CapabilitySupported,
+			StreamingObservation: adapter.CapabilitySupported,
+			StructuredOutput:     adapter.CapabilitySupported,
+		}
+	} else {
+		caps = caps.Normalize()
+	}
 	return adapter.ProbeReport{
 		HarnessVersion: adapter.UsageMetric[string]{Value: "1.0.0-fake", Available: true},
 		Capabilities:   caps,
 		ModelInventory: adapter.UsageMetric[[]string]{Value: []string{"fake-model-1"}, Available: true},
 	}, nil
+}
+
+func deepCopyTools(tools []string) []string {
+	if tools == nil {
+		return nil
+	}
+	return append([]string(nil), tools...)
+}
+
+func toolsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // CreateSession establishes an isolated conversation binding for a logical session.
@@ -86,21 +121,36 @@ func (f *FakeAdapter) CreateSession(ctx context.Context, req adapter.CreateSessi
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	toolsCopy := deepCopyTools(req.Config.Tooling)
+
 	if existing, exists := f.sessions[req.SessionID]; exists {
-		if existing.Config.Model != req.Config.Model || existing.Config.WorkspaceRoot != req.Config.WorkspaceRoot {
+		if existing.Contributor != req.Contributor ||
+			existing.Config.Model != req.Config.Model ||
+			existing.Config.WorkspaceRoot != req.Config.WorkspaceRoot ||
+			!toolsEqual(existing.Config.Tooling, req.Config.Tooling) {
 			return adapter.SessionBinding{}, errors.New("cannot recreate existing session with changed config")
 		}
-		return existing, nil
+		// Return existing binding with protected tooling slice
+		ret := existing
+		ret.Config.Tooling = deepCopyTools(existing.Config.Tooling)
+		return ret, nil
 	}
 
 	binding := adapter.SessionBinding{
 		SessionID:       req.SessionID,
 		Contributor:     req.Contributor,
 		NativeSessionID: fmt.Sprintf("native-%s", req.SessionID),
-		Config:          req.Config,
+		Config: adapter.SessionConfig{
+			WorkspaceRoot: req.Config.WorkspaceRoot,
+			Model:         req.Config.Model,
+			Tooling:       toolsCopy,
+		},
 	}
 	f.sessions[req.SessionID] = binding
-	return binding, nil
+
+	ret := binding
+	ret.Config.Tooling = deepCopyTools(binding.Config.Tooling)
+	return ret, nil
 }
 
 // ResumeSession attaches to a previously verified native session binding.
@@ -109,7 +159,12 @@ func (f *FakeAdapter) ResumeSession(ctx context.Context, binding adapter.Session
 	defer f.mu.Unlock()
 
 	existing, exists := f.sessions[binding.SessionID]
-	if !exists || existing.NativeSessionID != binding.NativeSessionID {
+	if !exists ||
+		existing.NativeSessionID != binding.NativeSessionID ||
+		existing.Contributor != binding.Contributor ||
+		existing.Config.Model != binding.Config.Model ||
+		existing.Config.WorkspaceRoot != binding.Config.WorkspaceRoot ||
+		!toolsEqual(existing.Config.Tooling, binding.Config.Tooling) {
 		return errors.New("unknown or mismatched native session binding")
 	}
 	return nil
@@ -122,29 +177,57 @@ func (f *FakeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt 
 	}
 
 	f.mu.Lock()
-	st := &DispatchState{Received: true, Accepted: true, Started: true}
-	f.dispatches[ref] = st
-	f.prompts[ref] = prompt
-	f.results[ref] = adapter.TurnResult{
-		Ref:          ref,
-		Status:       council.TurnRunning,
-		ResultStatus: adapter.ResultPending,
-		CompletedAt:  time.Time{},
+	// Verify session exists
+	if _, exists := f.sessions[ref.SessionID]; !exists {
+		f.dispatches[ref] = &DispatchState{Received: true, Accepted: false, Started: false}
+		f.mu.Unlock()
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: "session not found"}, errors.New("session not found")
 	}
-	hold := f.faults.HoldDispatchAck
+
+	// Verify turn identifier has not been retired
+	if f.retiredTurns[ref] {
+		f.mu.Unlock()
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: "turn already retired"}, errors.New("turn identifier already retired")
+	}
+
 	status := f.faults.DispatchStatus
 	dispErr := f.faults.DispatchError
-	f.mu.Unlock()
+	holdAck := f.faults.HoldDispatchAck
+	holdStart := f.faults.HoldExecutionStart
+
+	if status == adapter.DispatchRejected {
+		f.dispatches[ref] = &DispatchState{Received: true, Accepted: false, Started: false}
+		f.mu.Unlock()
+		if dispErr != nil {
+			return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: dispErr.Error()}, dispErr
+		}
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: "dispatch rejected by script"}, errors.New("dispatch rejected by script")
+	}
 
 	if status == "" {
 		status = adapter.DispatchAccepted
 	}
 
-	if hold != nil {
+	started := (holdStart == nil)
+	f.dispatches[ref] = &DispatchState{Received: true, Accepted: true, Started: started}
+	f.prompts[ref] = prompt
+	promptVal := prompt
+	f.results[ref] = adapter.TurnResult{
+		Ref:          ref,
+		Status:       council.TurnRunning,
+		ResultStatus: adapter.ResultPending,
+	}
+
+	// Launch background worker driving this turn's execution independently of observation
+	go f.runWorker(ref, promptVal)
+
+	f.mu.Unlock()
+
+	if holdAck != nil {
 		select {
 		case <-ctx.Done():
 			return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown, Reason: ctx.Err().Error()}, ctx.Err()
-		case <-hold:
+		case <-holdAck:
 		}
 	}
 
@@ -155,100 +238,152 @@ func (f *FakeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt 
 	return adapter.DispatchOutcome{Ref: ref, Status: status}, nil
 }
 
+func (f *FakeAdapter) runWorker(ref adapter.TurnRef, prompt string) {
+	if f.faults.HoldExecutionStart != nil {
+		<-f.faults.HoldExecutionStart
+		f.mu.Lock()
+		if st := f.dispatches[ref]; st != nil {
+			st.Started = true
+		}
+		f.mu.Unlock()
+	}
+
+	// Broadcast initial progress
+	progEv := adapter.Event{
+		Ref:       ref,
+		Type:      adapter.EventProgress,
+		Status:    council.TurnRunning,
+		Payload:   "started",
+		Timestamp: time.Now(),
+	}
+	f.broadcastEvent(ref, progEv)
+
+	if f.faults.InjectDuplicates {
+		f.broadcastEvent(ref, progEv)
+	}
+
+	if len(f.faults.AutoDenyTools) > 0 || strings.Contains(f.prompts[ref], "test tool denial") {
+		tools := f.faults.AutoDenyTools
+		if len(tools) == 0 {
+			tools = map[string]bool{"bash": true}
+		}
+		for tool := range tools {
+			denialEv := adapter.Event{
+				Ref:        ref,
+				Type:       adapter.EventToolDenied,
+				Status:     council.TurnRunning,
+				ApprovalID: fmt.Sprintf("app-deny-%s", tool),
+				Payload:    fmt.Sprintf("tool %s denied", tool),
+				Timestamp:  time.Now(),
+			}
+			f.broadcastEvent(ref, denialEv)
+		}
+	}
+
+	if f.faults.StallStream != nil {
+		<-f.faults.StallStream
+	}
+
+	f.mu.Lock()
+	// If the turn was already cancelled, do not overwrite with completion!
+	if res, ok := f.results[ref]; ok && (res.Status == council.TurnCancelled || res.Status == council.TurnCompleted) {
+		f.mu.Unlock()
+		return
+	}
+
+	f.results[ref] = adapter.TurnResult{
+		Ref:          ref,
+		Status:       council.TurnCompleted,
+		ResultStatus: adapter.ResultAvailable,
+		Output:       "completed output",
+		CompletedAt:  time.Now(),
+		Usage: adapter.ExecutionUsage{
+			InputTokens:  adapter.UsageMetric[int64]{Value: 10, Available: true},
+			OutputTokens: adapter.UsageMetric[int64]{Value: 20, Available: true},
+			TotalCostUSD: adapter.UsageMetric[float64]{Value: 0.001, Available: true},
+		},
+	}
+	f.retiredTurns[ref] = true
+	streams := append([]*adapter.BufferedStream(nil), f.activeStreams[ref]...)
+	f.activeStreams[ref] = nil
+	f.mu.Unlock()
+
+	termEv := adapter.Event{
+		Ref:       ref,
+		Type:      adapter.EventTerminal,
+		Status:    council.TurnCompleted,
+		Payload:   "completed output",
+		Timestamp: time.Now(),
+		Usage: adapter.ExecutionUsage{
+			InputTokens:  adapter.UsageMetric[int64]{Value: 10, Available: true},
+			OutputTokens: adapter.UsageMetric[int64]{Value: 20, Available: true},
+			TotalCostUSD: adapter.UsageMetric[float64]{Value: 0.001, Available: true},
+		},
+	}
+	for _, s := range streams {
+		_ = s.Send(termEv)
+		_ = s.CloseWithErr(nil)
+	}
+}
+
+func (f *FakeAdapter) broadcastEvent(ref adapter.TurnRef, ev adapter.Event) {
+	f.mu.Lock()
+	streams := append([]*adapter.BufferedStream(nil), f.activeStreams[ref]...)
+	f.mu.Unlock()
+
+	for _, s := range streams {
+		_ = s.Send(ev)
+	}
+}
+
 // Observe establishes an event subscription for a running turn.
 func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter.Stream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	stream, _ := adapter.NewBufferedStream(ref, 64)
-	f.activeStreams[ref] = stream
+	st, exists := f.dispatches[ref]
+	if !exists || !st.Received {
+		return nil, errors.New("turn not found or not dispatched")
+	}
 
-	go func() {
-		// Emit initial progress event
-		ev := adapter.Event{
-			Ref:       ref,
-			Type:      adapter.EventProgress,
-			Status:    council.TurnRunning,
-			Payload:   "started",
-			Timestamp: time.Now(),
-		}
-		if !stream.Send(ev) {
-			return
-		}
+	stream := adapter.NewBufferedStream(ref, 64)
 
-		if f.faults.InjectDuplicates {
-			if !stream.Send(ev) {
-				return
-			}
-		}
-
-		// Handle scripted auto-denied tools if configured
-		if len(f.faults.AutoDenyTools) > 0 {
-			for tool := range f.faults.AutoDenyTools {
-				denialEv := adapter.Event{
-					Ref:        ref,
-					Type:       adapter.EventToolDenied,
-					Status:     council.TurnRunning,
-					ApprovalID: fmt.Sprintf("app-deny-%s", tool),
-					Payload:    fmt.Sprintf("tool %s denied", tool),
-					Timestamp:  time.Now(),
-				}
-				if !stream.Send(denialEv) {
-					return
-				}
-			}
-		}
-
-		if f.faults.DropStreamEarly {
-			_ = stream.CloseWithErr(errors.New("transport dropped early"))
-			return
-		}
-
-		if f.faults.StallStream != nil {
-			select {
-			case <-f.faults.StallStream:
-			case <-ctx.Done():
-				_ = stream.CloseWithErr(ctx.Err())
-				return
-			}
-		}
-
-		// Emit terminal event
-		term := adapter.Event{
+	res, resExists := f.results[ref]
+	if resExists && (res.Status == council.TurnCompleted || res.Status == council.TurnCancelled) {
+		_ = stream.Send(adapter.Event{
 			Ref:       ref,
 			Type:      adapter.EventTerminal,
-			Status:    council.TurnCompleted,
-			Payload:   "completed output",
+			Status:    res.Status,
+			Payload:   res.Output,
 			Timestamp: time.Now(),
-			Usage: adapter.ExecutionUsage{
-				InputTokens:  adapter.UsageMetric[int64]{Value: 10, Available: true},
-				OutputTokens: adapter.UsageMetric[int64]{Value: 20, Available: true},
-				TotalCostUSD: adapter.UsageMetric[float64]{Value: 0.001, Available: true},
-			},
-		}
-		if !stream.Send(term) {
-			return
-		}
-
-		// Update result in fake state upon successful terminal delivery
-		f.mu.Lock()
-		f.results[ref] = adapter.TurnResult{
-			Ref:          ref,
-			Status:       council.TurnCompleted,
-			ResultStatus: adapter.ResultAvailable,
-			Output:       "completed output",
-			CompletedAt:  time.Now(),
-			Usage: adapter.ExecutionUsage{
-				InputTokens:  adapter.UsageMetric[int64]{Value: 10, Available: true},
-				OutputTokens: adapter.UsageMetric[int64]{Value: 20, Available: true},
-				TotalCostUSD: adapter.UsageMetric[float64]{Value: 0.001, Available: true},
-			},
-		}
-		f.mu.Unlock()
-
+			Usage:     res.Usage,
+		})
 		_ = stream.CloseWithErr(nil)
-	}()
+		return stream, nil
+	}
 
+	// Send initial progress synchronously into the stream buffer before subscription
+	_ = stream.Send(adapter.Event{
+		Ref:       ref,
+		Type:      adapter.EventProgress,
+		Status:    council.TurnRunning,
+		Payload:   "observing",
+		Timestamp: time.Now(),
+	})
+
+	if f.faults.DropStreamEarly {
+		go func() {
+			time.Sleep(5 * time.Millisecond)
+			_ = stream.CloseWithErr(errors.New("transport dropped early"))
+		}()
+		return stream, nil
+	}
+
+	f.activeStreams[ref] = append(f.activeStreams[ref], stream)
 	return stream, nil
 }
 
@@ -263,7 +398,7 @@ func (f *FakeAdapter) Cancel(ctx context.Context, ref adapter.TurnRef) (adapter.
 	}
 
 	res := f.results[ref]
-	if res.Status == council.TurnCompleted {
+	if res.Status == council.TurnCompleted || res.Status == council.TurnCancelled {
 		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelAlreadyTerminal}, nil
 	}
 
@@ -272,6 +407,24 @@ func (f *FakeAdapter) Cancel(ctx context.Context, ref adapter.TurnRef) (adapter.
 	res.Output = "cancelled"
 	res.CompletedAt = time.Now()
 	f.results[ref] = res
+	f.retiredTurns[ref] = true
+
+	streams := append([]*adapter.BufferedStream(nil), f.activeStreams[ref]...)
+	f.activeStreams[ref] = nil
+
+	go func() {
+		cancelEv := adapter.Event{
+			Ref:       ref,
+			Type:      adapter.EventTerminal,
+			Status:    council.TurnCancelled,
+			Payload:   "cancelled",
+			Timestamp: time.Now(),
+		}
+		for _, s := range streams {
+			_ = s.Send(cancelEv)
+			_ = s.CloseWithErr(nil)
+		}
+	}()
 
 	return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelConfirmed}, nil
 }

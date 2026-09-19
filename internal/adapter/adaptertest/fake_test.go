@@ -18,6 +18,14 @@ func TestFakeAdapter_DispatchGateAndTracking(t *testing.T) {
 	})
 
 	ref := adapter.TurnRef{SessionID: "s1", TurnKey: "t1"}
+	_, err := fake.CreateSession(context.Background(), adapter.CreateSessionRequest{
+		SessionID:   ref.SessionID,
+		Contributor: council.Claude,
+		Config:      adapter.SessionConfig{Model: "claude-3-5-sonnet"},
+	})
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
 
 	doneDispatch := make(chan adapter.DispatchOutcome)
 	go func() {
@@ -132,7 +140,16 @@ func TestFakeAdapter_DropStreamEarly(t *testing.T) {
 	})
 
 	ref := adapter.TurnRef{SessionID: "s1", TurnKey: "t1"}
-	_, err := fake.Dispatch(context.Background(), ref, "prompt")
+	_, err := fake.CreateSession(context.Background(), adapter.CreateSessionRequest{
+		SessionID:   ref.SessionID,
+		Contributor: council.Claude,
+		Config:      adapter.SessionConfig{Model: "claude-3-5-sonnet"},
+	})
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	_, err = fake.Dispatch(context.Background(), ref, "prompt")
 	if err != nil {
 		t.Fatalf("dispatch failed: %v", err)
 	}
@@ -161,6 +178,15 @@ func TestFakeAdapter_ToolDenialStream(t *testing.T) {
 	})
 
 	ref := adapter.TurnRef{SessionID: "s1", TurnKey: "t1"}
+	_, err := fake.CreateSession(context.Background(), adapter.CreateSessionRequest{
+		SessionID:   ref.SessionID,
+		Contributor: council.Claude,
+		Config:      adapter.SessionConfig{Model: "claude-3-5-sonnet", Tooling: []string{"bash"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
 	_, _ = fake.Dispatch(context.Background(), ref, "run bash")
 
 	stream, err := fake.Observe(context.Background(), ref)
@@ -198,6 +224,15 @@ func TestFakeAdapter_CollectMalformed(t *testing.T) {
 	})
 
 	ref := adapter.TurnRef{SessionID: "s1", TurnKey: "t1"}
+	_, err := fake.CreateSession(context.Background(), adapter.CreateSessionRequest{
+		SessionID:   ref.SessionID,
+		Contributor: council.Claude,
+		Config:      adapter.SessionConfig{Model: "claude-3-5-sonnet"},
+	})
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
 	_, _ = fake.Dispatch(context.Background(), ref, "prompt")
 
 	res, err := fake.Collect(context.Background(), ref)

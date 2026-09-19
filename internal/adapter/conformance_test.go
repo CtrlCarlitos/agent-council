@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/adaptertest"
@@ -12,7 +13,16 @@ import (
 )
 
 type fakeFixture struct {
-	fake *adaptertest.FakeAdapter
+	fake  *adaptertest.FakeAdapter
+	stall chan struct{}
+}
+
+func newConformingFixture(t *testing.T) conformance.Fixture {
+	stall := make(chan struct{})
+	fake := adaptertest.NewFake(adaptertest.ScriptedFaults{
+		StallStream: stall,
+	})
+	return &fakeFixture{fake: fake, stall: stall}
 }
 
 func (f *fakeFixture) Adapter() adapter.Adapter { return f.fake }
@@ -20,12 +30,17 @@ func (f *fakeFixture) TurnState(ref adapter.TurnRef) (bool, bool, bool) {
 	st := f.fake.TurnState(ref)
 	return st.Received, st.Accepted, st.Started
 }
-func (f *fakeFixture) Cleanup() error { return nil }
+func (f *fakeFixture) Cleanup() error {
+	select {
+	case <-f.stall:
+	default:
+		close(f.stall)
+	}
+	return nil
+}
 
 func TestConformance_ConformingFakePasses(t *testing.T) {
-	conformance.Run(t, func(t *testing.T) conformance.Fixture {
-		return &fakeFixture{fake: adaptertest.NewFake(adaptertest.ScriptedFaults{})}
-	})
+	conformance.Run(t, newConformingFixture)
 }
 
 // collidingSessionAdapter intentionally forces identical native session IDs for all logical sessions.
@@ -71,7 +86,16 @@ type eofCompletingAdapter struct {
 }
 
 func (e *eofCompletingAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter.Stream, error) {
-	stream, _ := adapter.NewBufferedStream(ref, 10)
+	stream := adapter.NewBufferedStream(ref, 10)
+	go func() {
+		_ = stream.Send(adapter.Event{
+			Ref:       ref,
+			Type:      adapter.EventProgress,
+			Status:    council.TurnRunning,
+			Payload:   "observing",
+			Timestamp: time.Now(),
+		})
+	}()
 	return &eofStream{
 		Stream: stream,
 		onClose: func() {
@@ -100,14 +124,24 @@ func (e *eofCompletingAdapter) Collect(ctx context.Context, ref adapter.TurnRef)
 }
 
 type eofFixture struct {
-	ad adapter.Adapter
+	ad    adapter.Adapter
+	stall chan struct{}
 }
 
 func (e *eofFixture) Adapter() adapter.Adapter { return e.ad }
 func (e *eofFixture) TurnState(ref adapter.TurnRef) (bool, bool, bool) {
 	return true, true, true
 }
-func (e *eofFixture) Cleanup() error { return nil }
+func (e *eofFixture) Cleanup() error {
+	if e.stall != nil {
+		select {
+		case <-e.stall:
+		default:
+			close(e.stall)
+		}
+	}
+	return nil
+}
 
 func TestConformance_SensitivityChecks(t *testing.T) {
 	t.Run("DetectsRewrittenRecoveryGeneration", func(t *testing.T) {
@@ -144,8 +178,13 @@ func TestConformance_SensitivityChecks(t *testing.T) {
 	})
 
 	t.Run("DetectsEOFAsCompletion", func(t *testing.T) {
-		brokenAdapter := &eofCompletingAdapter{FakeAdapter: adaptertest.NewFake(adaptertest.ScriptedFaults{})}
-		f := &eofFixture{ad: brokenAdapter}
+		stall := make(chan struct{})
+		brokenAdapter := &eofCompletingAdapter{
+			FakeAdapter: adaptertest.NewFake(adaptertest.ScriptedFaults{
+				StallStream: stall,
+			}),
+		}
+		f := &eofFixture{ad: brokenAdapter, stall: stall}
 
 		violations := conformance.Check(context.Background(), f, conformance.ScenarioObservationClose)
 		if len(violations) == 0 {
@@ -153,6 +192,26 @@ func TestConformance_SensitivityChecks(t *testing.T) {
 		}
 		if violations[0].Code != conformance.ViolationEOFAsCompletion {
 			t.Fatalf("expected ViolationEOFAsCompletion, got %s", violations[0].Code)
+		}
+	})
+
+	t.Run("DetectsRewrittenRecoveryReference", func(t *testing.T) {
+		staleRef := &adapter.RecoveryRef{
+			TurnRef:    adapter.TurnRef{SessionID: "s-other", TurnKey: "t-other"},
+			Generation: 2,
+		}
+		brokenFake := adaptertest.NewFake(adaptertest.ScriptedFaults{
+			StaleRecoveryRef: staleRef,
+		})
+
+		f := &fakeFixture{fake: brokenFake}
+		violations := conformance.Check(context.Background(), f, conformance.ScenarioRecoveryIntegrity)
+
+		if len(violations) == 0 {
+			t.Fatal("expected ViolationReferenceSubstituted, got 0 violations")
+		}
+		if violations[0].Code != conformance.ViolationReferenceSubstituted {
+			t.Fatalf("expected ViolationReferenceSubstituted, got %s", violations[0].Code)
 		}
 	})
 }

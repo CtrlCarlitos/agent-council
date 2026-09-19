@@ -159,18 +159,18 @@ func TestEvent_Validation(t *testing.T) {
 
 func TestBufferedStream_ProducerUnblockedOnClose(t *testing.T) {
 	ref := adapter.TurnRef{SessionID: "s1", TurnKey: "t1"}
-	stream, in := adapter.NewBufferedStream(ref, 2)
+	stream := adapter.NewBufferedStream(ref, 2)
 
 	// Send 2 events to fill buffer
-	in <- adapter.Event{Ref: ref, Type: adapter.EventProgress, Status: council.TurnRunning, Payload: "1"}
-	in <- adapter.Event{Ref: ref, Type: adapter.EventProgress, Status: council.TurnRunning, Payload: "2"}
+	_ = stream.Send(adapter.Event{Ref: ref, Type: adapter.EventProgress, Status: council.TurnRunning, Payload: "1"})
+	_ = stream.Send(adapter.Event{Ref: ref, Type: adapter.EventProgress, Status: council.TurnRunning, Payload: "2"})
 
 	// Launch producer trying to send a 3rd event
 	doneProducer := make(chan struct{})
 	go func() {
 		defer close(doneProducer)
 		ev := adapter.Event{Ref: ref, Type: adapter.EventProgress, Status: council.TurnRunning, Payload: "3"}
-		stream.Send(ev)
+		_ = stream.Send(ev)
 	}()
 
 	// Give the goroutine a moment to enter stream.Send and block
@@ -196,7 +196,7 @@ func TestBufferedStream_ProducerUnblockedOnClose(t *testing.T) {
 
 func TestBufferedStream_ConcurrentCloseIsIdempotent(t *testing.T) {
 	ref := adapter.TurnRef{SessionID: "s1", TurnKey: "t1"}
-	stream, _ := adapter.NewBufferedStream(ref, 10)
+	stream := adapter.NewBufferedStream(ref, 10)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {
@@ -215,11 +215,11 @@ func TestBufferedStream_ConcurrentCloseIsIdempotent(t *testing.T) {
 
 func TestBufferedStream_SlowConsumerOverflow(t *testing.T) {
 	ref := adapter.TurnRef{SessionID: "s1", TurnKey: "t1"}
-	stream, in := adapter.NewBufferedStream(ref, 2)
+	stream := adapter.NewBufferedStream(ref, 2)
 
 	// Fill buffer
-	in <- adapter.Event{Ref: ref, Type: adapter.EventProgress, Status: council.TurnRunning, Payload: "1"}
-	in <- adapter.Event{Ref: ref, Type: adapter.EventProgress, Status: council.TurnRunning, Payload: "2"}
+	_ = stream.Send(adapter.Event{Ref: ref, Type: adapter.EventProgress, Status: council.TurnRunning, Payload: "1"})
+	_ = stream.Send(adapter.Event{Ref: ref, Type: adapter.EventProgress, Status: council.TurnRunning, Payload: "2"})
 
 	// Pushing beyond capacity with SendOrOverflow
 	err := stream.SendOrOverflow(adapter.Event{Ref: ref, Type: adapter.EventProgress, Status: council.TurnRunning, Payload: "3"})
@@ -239,10 +239,10 @@ func TestBufferedStream_SlowConsumerOverflow(t *testing.T) {
 
 func TestBufferedStream_NormalCompletionDrainsCleanly(t *testing.T) {
 	ref := adapter.TurnRef{SessionID: "s1", TurnKey: "t1"}
-	stream, in := adapter.NewBufferedStream(ref, 5)
+	stream := adapter.NewBufferedStream(ref, 5)
 
-	in <- adapter.Event{Ref: ref, Type: adapter.EventProgress, Status: council.TurnRunning, Payload: "p1"}
-	in <- adapter.Event{Ref: ref, Type: adapter.EventTerminal, Status: council.TurnCompleted, Payload: "done"}
+	_ = stream.Send(adapter.Event{Ref: ref, Type: adapter.EventProgress, Status: council.TurnRunning, Payload: "p1"})
+	_ = stream.Send(adapter.Event{Ref: ref, Type: adapter.EventTerminal, Status: council.TurnCompleted, Payload: "done"})
 
 	if err := stream.CloseWithErr(nil); err != nil {
 		t.Fatalf("CloseWithErr(nil) failed: %v", err)
@@ -264,7 +264,7 @@ func TestBufferedStream_NormalCompletionDrainsCleanly(t *testing.T) {
 func TestBufferedStream_ConcurrentSendOrOverflowAndCloseRace(t *testing.T) {
 	for i := 0; i < 500; i++ {
 		ref := adapter.TurnRef{SessionID: "s1", TurnKey: "t1"}
-		stream, _ := adapter.NewBufferedStream(ref, 2)
+		stream := adapter.NewBufferedStream(ref, 2)
 
 		var wg sync.WaitGroup
 		wg.Add(2)

@@ -110,26 +110,27 @@ type BufferedStream struct {
 	events chan Event
 	ctx    context.Context
 	cancel context.CancelFunc
+	done   chan struct{}
 	mu     sync.RWMutex
 	wg     sync.WaitGroup
 	err    error
 	closed bool
 }
 
-// NewBufferedStream initializes a new BufferedStream and returns the write channel.
-func NewBufferedStream(ref TurnRef, capacity int) (*BufferedStream, chan<- Event) {
+// NewBufferedStream initializes a new BufferedStream bound to a specific turn reference.
+func NewBufferedStream(ref TurnRef, capacity int) *BufferedStream {
 	if capacity <= 0 {
 		capacity = DefaultBufferCapacity
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	events := make(chan Event, capacity)
-	bs := &BufferedStream{
+	return &BufferedStream{
 		ref:    ref,
 		events: events,
 		ctx:    ctx,
 		cancel: cancel,
+		done:   make(chan struct{}),
 	}
-	return bs, events
 }
 
 // Events returns the receive-only channel of events.
@@ -144,16 +145,17 @@ func (s *BufferedStream) Err() error {
 	return s.err
 }
 
-// Close idempotently terminates observation and sets ErrStreamClosed if not already set.
+// Close idempotently terminates observation and waits for all senders and cleanup to complete.
 func (s *BufferedStream) Close() error {
 	return s.CloseWithErr(ErrStreamClosed)
 }
 
-// CloseWithErr idempotently terminates observation with a specified terminal error.
+// CloseWithErr idempotently terminates observation with a specified error, waiting for all cleanup.
 func (s *BufferedStream) CloseWithErr(err error) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
+		<-s.done
 		return nil
 	}
 	s.closed = true
@@ -163,15 +165,24 @@ func (s *BufferedStream) CloseWithErr(err error) error {
 
 	s.wg.Wait()
 	close(s.events)
+	close(s.done)
 	return nil
 }
 
-// Send attempts to send an event into the buffer, unblocking and returning false if closed.
-func (s *BufferedStream) Send(ev Event) bool {
+// Send validates the event against the stream's turn reference and envelope rules before sending.
+// Returns ErrStreamClosed if observation has been closed.
+func (s *BufferedStream) Send(ev Event) error {
+	if ev.Ref != s.ref {
+		return fmt.Errorf("event turn reference %v does not match stream reference %v", ev.Ref, s.ref)
+	}
+	if err := ev.Validate(); err != nil {
+		return err
+	}
+
 	s.mu.RLock()
 	if s.closed {
 		s.mu.RUnlock()
-		return false
+		return ErrStreamClosed
 	}
 	s.wg.Add(1)
 	s.mu.RUnlock()
@@ -179,15 +190,22 @@ func (s *BufferedStream) Send(ev Event) bool {
 
 	select {
 	case <-s.ctx.Done():
-		return false
+		return ErrStreamClosed
 	case s.events <- ev:
-		return true
+		return nil
 	}
 }
 
-// SendOrOverflow attempts to send an event into available buffer capacity.
+// SendOrOverflow validates the event and attempts to send it into available buffer capacity.
 // If the buffer is full, it immediately closes the stream with ErrBufferOverflow and returns it.
 func (s *BufferedStream) SendOrOverflow(ev Event) error {
+	if ev.Ref != s.ref {
+		return fmt.Errorf("event turn reference %v does not match stream reference %v", ev.Ref, s.ref)
+	}
+	if err := ev.Validate(); err != nil {
+		return err
+	}
+
 	s.mu.RLock()
 	if s.closed {
 		s.mu.RUnlock()

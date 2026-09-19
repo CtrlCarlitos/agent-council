@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
 	"github.com/CtrlCarlitos/agent-council/internal/council"
@@ -25,10 +26,13 @@ type ViolationCode string
 const (
 	ViolationEOFAsCompletion           ViolationCode = "EOF_TREATED_AS_COMPLETION"
 	ViolationGenerationSubstituted     ViolationCode = "RECOVERY_GENERATION_SUBSTITUTED"
+	ViolationReferenceSubstituted      ViolationCode = "RECOVERY_REFERENCE_SUBSTITUTED"
 	ViolationSessionIDCollision        ViolationCode = "SESSION_ID_COLLISION"
 	ViolationUnboundedPayload          ViolationCode = "UNBOUNDED_PAYLOAD_ACCEPTED"
 	ViolationPrematureDenialRetirement ViolationCode = "PREMATURE_DENIAL_RETIREMENT"
 	ViolationCapabilityFabricated      ViolationCode = "CAPABILITY_FABRICATED"
+	ViolationPrerequisiteFailed        ViolationCode = "PREREQUISITE_FAILED"
+	ViolationUnexpectedError           ViolationCode = "UNEXPECTED_ERROR"
 )
 
 // Violation reports a structured failure of adapter contract conformance.
@@ -52,22 +56,39 @@ func Check(ctx context.Context, fixture Fixture, scenario Scenario) []Violation 
 	var violations []Violation
 	ad := fixture.Adapter()
 
+	probeReport, probeErr := ad.Probe(ctx)
+	if probeErr != nil {
+		violations = append(violations, Violation{
+			Code:        ViolationUnexpectedError,
+			Description: fmt.Sprintf("probe failed: %v", probeErr),
+		})
+		return violations
+	}
+
 	switch scenario {
 	case ScenarioSessionIsolation:
 		req1 := adapter.CreateSessionRequest{
-			SessionID:   "session-1",
+			SessionID:   "session-iso-1",
 			Contributor: council.Claude,
 			Config:      adapter.SessionConfig{Model: "claude-3-5-sonnet"},
 		}
 		b1, err1 := ad.CreateSession(ctx, req1)
 		req2 := adapter.CreateSessionRequest{
-			SessionID:   "session-2",
+			SessionID:   "session-iso-2",
 			Contributor: council.Claude,
 			Config:      adapter.SessionConfig{Model: "claude-3-5-sonnet"},
 		}
 		b2, err2 := ad.CreateSession(ctx, req2)
 
-		if err1 == nil && err2 == nil && b1.NativeSessionID == b2.NativeSessionID {
+		if err1 != nil || err2 != nil {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: fmt.Sprintf("session creation failed: err1=%v err2=%v", err1, err2),
+			})
+			return violations
+		}
+
+		if b1.NativeSessionID == b2.NativeSessionID {
 			violations = append(violations, Violation{
 				Code:        ViolationSessionIDCollision,
 				Description: "two distinct logical sessions bound to identical native session ID",
@@ -75,49 +96,183 @@ func Check(ctx context.Context, fixture Fixture, scenario Scenario) []Violation 
 		}
 
 	case ScenarioObservationClose:
-		ref := adapter.TurnRef{SessionID: "s1", TurnKey: "t1"}
-		_, _ = ad.Dispatch(ctx, ref, "test prompt")
+		if probeReport.Capabilities.StreamingObservation == adapter.CapabilityUnsupported {
+			return nil
+		}
+
+		req := adapter.CreateSessionRequest{
+			SessionID:   "s-obs",
+			Contributor: council.Claude,
+			Config:      adapter.SessionConfig{Model: "claude-3-5-sonnet"},
+		}
+		if _, err := ad.CreateSession(ctx, req); err != nil {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: fmt.Sprintf("session creation failed: %v", err),
+			})
+			return violations
+		}
+
+		ref := adapter.TurnRef{SessionID: "s-obs", TurnKey: "t-obs"}
+		outcome, err := ad.Dispatch(ctx, ref, "test observation prompt")
+		if err != nil || outcome.Status != adapter.DispatchAccepted {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: fmt.Sprintf("dispatch failed or rejected: err=%v outcome=%+v", err, outcome),
+			})
+			return violations
+		}
+
+		rec, acc, _ := fixture.TurnState(ref)
+		if !rec || !acc {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: fmt.Sprintf("fixture turn state did not record dispatch: rec=%v acc=%v", rec, acc),
+			})
+			return violations
+		}
+
 		stream, err := ad.Observe(ctx, ref)
-		if err == nil {
-			_ = stream.Close()
-			// Stream closing must not fabricate completion in Collect
-			res, err := ad.Collect(ctx, ref)
-			if err == nil && res.Status == council.TurnCompleted {
-				violations = append(violations, Violation{
-					Code:        ViolationEOFAsCompletion,
-					Description: "closing stream fabricated terminal turn completion",
-				})
+		if err != nil {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: fmt.Sprintf("observe failed: %v", err),
+			})
+			return violations
+		}
+
+		// Wait for initial progress event proving active stream
+		var sawProgress bool
+		select {
+		case ev, ok := <-stream.Events():
+			if ok && ev.Type == adapter.EventProgress && ev.Status == council.TurnRunning {
+				sawProgress = true
 			}
+		case <-time.After(200 * time.Millisecond):
+		}
+
+		if !sawProgress {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: "observation stream did not emit active progress event",
+			})
+			_ = stream.Close()
+			return violations
+		}
+
+		// Check status before closing stream to distinguish natural completion from fabricated completion
+		resBefore, errBefore := ad.Collect(ctx, ref)
+
+		// Close observation stream
+		_ = stream.Close()
+
+		// Collect status immediately after closing stream
+		resAfter, errAfter := ad.Collect(ctx, ref)
+
+		// If the turn was actively running before Close(), but immediately jumps to Completed upon Close(),
+		// observation closure fabricated turn completion!
+		if errBefore == nil && resBefore.Status == council.TurnRunning && errAfter == nil && resAfter.Status == council.TurnCompleted {
+			violations = append(violations, Violation{
+				Code:        ViolationEOFAsCompletion,
+				Description: "closing stream fabricated terminal turn completion while turn was still actively running",
+			})
 		}
 
 	case ScenarioRecoveryIntegrity:
 		ref := adapter.RecoveryRef{
-			TurnRef:    adapter.TurnRef{SessionID: "s1", TurnKey: "t1"},
+			TurnRef:    adapter.TurnRef{SessionID: "s-rec", TurnKey: "t-rec"},
 			Generation: 2,
 		}
 		outcome, err := ad.Reconcile(ctx, ref)
-		if err == nil && outcome.Ref.Generation != ref.Generation {
+		if err != nil {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: fmt.Sprintf("reconciliation failed: %v", err),
+			})
+			return violations
+		}
+
+		if outcome.Ref.Generation != ref.Generation {
 			violations = append(violations, Violation{
 				Code:        ViolationGenerationSubstituted,
 				Description: fmt.Sprintf("reconciliation substituted generation: expected %d, got %d", ref.Generation, outcome.Ref.Generation),
 			})
 		}
 
+		if outcome.Ref.SessionID != ref.SessionID || outcome.Ref.TurnKey != ref.TurnKey {
+			violations = append(violations, Violation{
+				Code:        ViolationReferenceSubstituted,
+				Description: fmt.Sprintf("reconciliation substituted turn ref: expected %+v, got %+v", ref.TurnRef, outcome.Ref.TurnRef),
+			})
+		}
+
 	case ScenarioPrematureDenialRetirement:
+		if probeReport.Capabilities.ToolApprovalRouting == adapter.CapabilityUnsupported {
+			return nil
+		}
+
+		req := adapter.CreateSessionRequest{
+			SessionID:   "s-deny",
+			Contributor: council.Agy,
+			Config:      adapter.SessionConfig{Model: "agy-1", Tooling: []string{"bash"}},
+		}
+		if _, err := ad.CreateSession(ctx, req); err != nil {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: fmt.Sprintf("session creation failed: %v", err),
+			})
+			return violations
+		}
+
 		ref := adapter.TurnRef{SessionID: "s-deny", TurnKey: "t-deny"}
-		_, _ = ad.Dispatch(ctx, ref, "test tool denial")
+		outcome, err := ad.Dispatch(ctx, ref, "test tool denial")
+		if err != nil || outcome.Status != adapter.DispatchAccepted {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: fmt.Sprintf("dispatch failed or rejected: err=%v outcome=%+v", err, outcome),
+			})
+			return violations
+		}
+
 		stream, err := ad.Observe(ctx, ref)
-		if err == nil {
-			for ev := range stream.Events() {
+		if err != nil {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: fmt.Sprintf("observe failed: %v", err),
+			})
+			return violations
+		}
+
+		var sawDenial bool
+		timeout := time.After(300 * time.Millisecond)
+		for {
+			select {
+			case ev, ok := <-stream.Events():
+				if !ok {
+					goto streamDone
+				}
 				if ev.Type == adapter.EventToolDenied {
+					sawDenial = true
 					if ev.Status != council.TurnRunning {
 						violations = append(violations, Violation{
 							Code:        ViolationPrematureDenialRetirement,
 							Description: fmt.Sprintf("EventToolDenied carried non-running status: %s", ev.Status),
 						})
 					}
+					goto streamDone
 				}
+			case <-timeout:
+				goto streamDone
 			}
+		}
+
+	streamDone:
+		_ = stream.Close()
+		if !sawDenial {
+			violations = append(violations, Violation{
+				Code:        ViolationCapabilityFabricated,
+				Description: "adapter advertised ToolApprovalRouting capability but did not emit EventToolDenied",
+			})
 		}
 	}
 
