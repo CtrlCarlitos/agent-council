@@ -406,6 +406,7 @@ type sessionSnapshot struct {
 	activeTurn       turnSnapshot
 	pending          map[string]string
 	turns            map[string]turnSnapshot
+	recoveryContext  string
 }
 
 func snapshotSession(s *Session) sessionSnapshot {
@@ -446,6 +447,7 @@ func snapshotSession(s *Session) sessionSnapshot {
 		activeTurn:       actSnap,
 		pending:          p,
 		turns:            turns,
+		recoveryContext:  s.RecoveryContext,
 	}
 }
 
@@ -454,7 +456,8 @@ func assertSnapshotEqual(t *testing.T, opName string, before, after sessionSnaps
 	if before.id != after.id || before.state != after.state ||
 		before.lifecycle != after.lifecycle || before.controllerStatus != after.controllerStatus ||
 		before.visibility != after.visibility || before.lease != after.lease ||
-		before.active != after.active || before.hasActiveTurn != after.hasActiveTurn {
+		before.active != after.active || before.hasActiveTurn != after.hasActiveTurn ||
+		before.recoveryContext != after.recoveryContext {
 		t.Fatalf("%s mutated session scalar state: before=%+v after=%+v", opName, before, after)
 	}
 	if before.hasActiveTurn {

@@ -132,6 +132,7 @@ type Session struct {
 	Active           string
 	ActiveTurn       *TurnRecord
 	Turns            map[string]*TurnRecord
+	RecoveryContext  string
 }
 
 func NewSession(id Contributor, lease string) (*Session, error) {
@@ -287,12 +288,16 @@ func (s *Session) RecordHostLoss() error {
 		return errors.New("cannot record host loss on inactive session")
 	}
 	s.Visibility = VisibilityHostLost
+	s.RecoveryContext = s.Active
 	return nil
 }
 
 func (s *Session) ReconcileHost(key string, status TurnStatus, result string) error {
 	if s.Visibility != VisibilityHostLost {
 		return errors.New("session host is not lost")
+	}
+	if key == "" {
+		return errors.New("empty turn identity")
 	}
 
 	// Active turn exists
@@ -310,11 +315,13 @@ func (s *Session) ReconcileHost(key string, status TurnStatus, result string) er
 				s.ActiveTurn.Status = TurnRunning
 			}
 			s.Visibility = VisibilityReachable
+			s.RecoveryContext = ""
 			s.State = Running
 			return nil
 		case TurnCancelling:
 			s.ActiveTurn.Status = TurnCancelling
 			s.Visibility = VisibilityReachable
+			s.RecoveryContext = ""
 			s.State = Running
 			return nil
 		case TurnCompleted, TurnCancelled, TurnFailed, TurnInterrupted:
@@ -324,6 +331,7 @@ func (s *Session) ReconcileHost(key string, status TurnStatus, result string) er
 			s.ActiveTurn = nil
 			s.State = Parked
 			s.Visibility = VisibilityReachable
+			s.RecoveryContext = ""
 			return nil
 		default:
 			return errors.New("invalid reconciliation target status")
@@ -331,13 +339,25 @@ func (s *Session) ReconcileHost(key string, status TurnStatus, result string) er
 	}
 
 	// No active turn (e.g. terminal delivery arrived while host was lost)
-	if key != "" {
-		if _, exists := s.Turns[key]; !exists {
-			return errors.New("reconciliation key does not match any known turn")
+	if key != s.RecoveryContext {
+		if _, exists := s.Turns[key]; exists {
+			return errors.New("stale reconciliation for past turn")
 		}
+		return errors.New("reconciliation key does not match recovery context")
 	}
-	s.Visibility = VisibilityReachable
-	return nil
+
+	switch status {
+	case TurnCompleted, TurnCancelled, TurnFailed, TurnInterrupted:
+		s.Visibility = VisibilityReachable
+		s.RecoveryContext = ""
+		return nil
+	case TurnRunning, TurnCancelling:
+		return errors.New("reconciliation status conflicts with recorded terminal outcome")
+	case TurnPending:
+		return errors.New("cannot reconcile with pending status")
+	default:
+		return errors.New("empty or unknown status")
+	}
 }
 
 func (s *Session) DisconnectController() {
