@@ -49,12 +49,15 @@ func (s *Store) PublishArtifact(ctx context.Context, opID string, callerLease st
 		return ArtifactMetadata{}, ErrInvalidPath
 	}
 
-	// 2. Compute digest and byte count
-	sum := sha256.Sum256(content)
-	digest := hex.EncodeToString(sum[:])
-	byteCount := int64(len(content))
+	// 2. Pre-write sanitization of content
+	sanitizedContent := []byte(SanitizeText(string(content)))
 
-	// 3. Filesystem staging and atomic no-clobber installation
+	// 3. Compute digest and byte count
+	sum := sha256.Sum256(sanitizedContent)
+	digest := hex.EncodeToString(sum[:])
+	byteCount := int64(len(sanitizedContent))
+
+	// 4. Filesystem staging and atomic no-clobber installation
 	artifactMu.Lock()
 	defer artifactMu.Unlock()
 
@@ -68,7 +71,7 @@ func (s *Store) PublishArtifact(ctx context.Context, opID string, callerLease st
 			return ArtifactMetadata{}, ErrArtifactCorrupt
 		}
 		existingBytes, err := s.ReadArtifact(digest)
-		if err != nil || !bytes.Equal(existingBytes, content) {
+		if err != nil || !bytes.Equal(existingBytes, sanitizedContent) {
 			return ArtifactMetadata{}, ErrArtifactCorrupt
 		}
 	} else if os.IsNotExist(err) {
@@ -86,7 +89,7 @@ func (s *Store) PublishArtifact(ctx context.Context, opID string, callerLease st
 		}
 		tmpName := tmpFile.Name()
 
-		if _, err := tmpFile.Write(content); err != nil {
+		if _, err := tmpFile.Write(sanitizedContent); err != nil {
 			tmpFile.Close()
 			os.Remove(tmpName)
 			return ArtifactMetadata{}, fmt.Errorf("write staging file: %w", err)

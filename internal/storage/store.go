@@ -86,6 +86,8 @@ func Open(opts StoreOptions) (*Store, error) {
 		return nil, err
 	}
 
+	_ = s.TightenStateDirPermissions()
+
 	return s, nil
 }
 
