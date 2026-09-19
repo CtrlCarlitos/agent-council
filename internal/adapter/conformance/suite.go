@@ -230,6 +230,15 @@ func Check(ctx context.Context, fixture Fixture, scenario Scenario) []Violation 
 				addCompletionViolation(fmt.Sprintf("%s reported TurnCompleted while completion was not allowed", source))
 				return
 			}
+
+			// Permission or inactivity alone does not establish a terminal outcome.
+			violations = append(violations, Violation{
+				Code: ViolationPrerequisiteFailed,
+				Description: fmt.Sprintf(
+					"%s claimed terminal status %s without independent terminal evidence",
+					source, status,
+				),
+			})
 		}
 
 		// Validate terminal replay against independent fixture evidence
