@@ -38,13 +38,16 @@ func (f *fakeFixture) IsCompletionAllowed(ref adapter.TurnRef) bool {
 		return false
 	}
 }
+func (f *fakeFixture) IsExecutionActive(ref adapter.TurnRef) bool {
+	return f.fake.IsExecutionActive(ref)
+}
 func (f *fakeFixture) Cleanup() error {
 	select {
 	case <-f.stall:
 	default:
 		close(f.stall)
 	}
-	return nil
+	return f.fake.Close()
 }
 
 func TestConformance_ConformingFakePasses(t *testing.T) {
@@ -74,6 +77,7 @@ func (c *collidingFixture) TurnState(ref adapter.TurnRef) (bool, bool, bool) {
 	return false, false, false
 }
 func (c *collidingFixture) IsCompletionAllowed(ref adapter.TurnRef) bool { return false }
+func (c *collidingFixture) IsExecutionActive(ref adapter.TurnRef) bool   { return false }
 func (c *collidingFixture) Cleanup() error                               { return nil }
 
 type eofStream struct {
@@ -142,6 +146,9 @@ func (e *eofFixture) TurnState(ref adapter.TurnRef) (bool, bool, bool) {
 	return true, true, true
 }
 func (e *eofFixture) IsCompletionAllowed(ref adapter.TurnRef) bool {
+	return false
+}
+func (e *eofFixture) IsExecutionActive(ref adapter.TurnRef) bool {
 	return false
 }
 func (e *eofFixture) Cleanup() error {

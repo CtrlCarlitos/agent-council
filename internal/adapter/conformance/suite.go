@@ -16,6 +16,7 @@ type Fixture interface {
 	Adapter() adapter.Adapter
 	TurnState(ref adapter.TurnRef) (received, accepted, started bool)
 	IsCompletionAllowed(ref adapter.TurnRef) bool
+	IsExecutionActive(ref adapter.TurnRef) bool
 	Cleanup() error
 }
 
@@ -158,20 +159,23 @@ func Check(ctx context.Context, fixture Fixture, scenario Scenario) []Violation 
 			return violations
 		}
 
-		// Wait for initial progress event proving active stream
-		var sawProgress bool
+		// Wait for initial progress event or terminal event (if turn completed before observation)
+		var sawValidEvent bool
 		select {
 		case ev, ok := <-stream.Events():
-			if ok && ev.Type == adapter.EventProgress && ev.Status == council.TurnRunning {
-				sawProgress = true
+			if ok {
+				if (ev.Type == adapter.EventProgress && ev.Status == council.TurnRunning) ||
+					ev.Type == adapter.EventTerminal {
+					sawValidEvent = true
+				}
 			}
 		case <-time.After(200 * time.Millisecond):
 		}
 
-		if !sawProgress {
+		if !sawValidEvent {
 			violations = append(violations, Violation{
 				Code:        ViolationUnexpectedError,
-				Description: "observation stream did not emit active progress event",
+				Description: "observation stream did not emit active progress or terminal event",
 			})
 			_ = stream.Close()
 			return violations
@@ -370,6 +374,12 @@ func Check(ctx context.Context, fixture Fixture, scenario Scenario) []Violation 
 				})
 				return violations
 			}
+			if outcome.Ref != ref {
+				violations = append(violations, Violation{
+					Code:        ViolationReferenceSubstituted,
+					Description: fmt.Sprintf("cancel substituted turn ref: expected %+v, got %+v", ref, outcome.Ref),
+				})
+			}
 			if outcome.Disposition != adapter.CancelUnsupported {
 				violations = append(violations, Violation{
 					Code:        ViolationCapabilityFabricated,
@@ -407,7 +417,46 @@ func Check(ctx context.Context, fixture Fixture, scenario Scenario) []Violation 
 			})
 			return violations
 		}
-		if outcome.Disposition != adapter.CancelConfirmed && outcome.Disposition != adapter.CancelAlreadyTerminal {
+		if outcome.Ref != ref {
+			violations = append(violations, Violation{
+				Code:        ViolationReferenceSubstituted,
+				Description: fmt.Sprintf("cancel substituted turn ref: expected %+v, got %+v", ref, outcome.Ref),
+			})
+			return violations
+		}
+
+		switch outcome.Disposition {
+		case adapter.CancelConfirmed:
+			if fixture.IsExecutionActive(ref) {
+				violations = append(violations, Violation{
+					Code:        ViolationUnexpectedError,
+					Description: "adapter claimed CancelConfirmed but turn execution remains active",
+				})
+			}
+			res, colErr := ad.Collect(ctx, ref)
+			if colErr == nil && res.Status != council.TurnCancelled {
+				violations = append(violations, Violation{
+					Code:        ViolationUnexpectedError,
+					Description: fmt.Sprintf("adapter claimed CancelConfirmed but collected status is %s", res.Status),
+				})
+			}
+		case adapter.CancelAlreadyTerminal:
+			if fixture.IsExecutionActive(ref) {
+				violations = append(violations, Violation{
+					Code:        ViolationUnexpectedError,
+					Description: "adapter claimed CancelAlreadyTerminal but turn execution remains active",
+				})
+			}
+			res, colErr := ad.Collect(ctx, ref)
+			if colErr == nil && (res.Status == council.TurnRunning || res.Status == council.TurnCancelling) {
+				violations = append(violations, Violation{
+					Code:        ViolationUnexpectedError,
+					Description: fmt.Sprintf("adapter claimed CancelAlreadyTerminal but collected status is %s", res.Status),
+				})
+			}
+		case adapter.CancelRequested:
+			// Acknowledged cancellation request: execution may continue
+		default:
 			violations = append(violations, Violation{
 				Code:        ViolationUnexpectedError,
 				Description: fmt.Sprintf("unexpected cancel disposition: %s", outcome.Disposition),

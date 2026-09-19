@@ -30,6 +30,7 @@ func (c *collectFailingFixture) TurnState(ref adapter.TurnRef) (bool, bool, bool
 	return true, true, true
 }
 func (c *collectFailingFixture) IsCompletionAllowed(ref adapter.TurnRef) bool { return false }
+func (c *collectFailingFixture) IsExecutionActive(ref adapter.TurnRef) bool   { return false }
 func (c *collectFailingFixture) Cleanup() error                               { return nil }
 
 func TestReviewD910_ConformanceCheckerDetectsCollectFailure(t *testing.T) {
@@ -78,6 +79,7 @@ func (c *contradictoryReconcileFixture) TurnState(ref adapter.TurnRef) (bool, bo
 	return true, true, true
 }
 func (c *contradictoryReconcileFixture) IsCompletionAllowed(ref adapter.TurnRef) bool { return false }
+func (c *contradictoryReconcileFixture) IsExecutionActive(ref adapter.TurnRef) bool   { return false }
 func (c *contradictoryReconcileFixture) Cleanup() error                               { return nil }
 
 func TestReviewD910_ConformanceCheckerDetectsContradictoryReconciliation(t *testing.T) {
@@ -132,6 +134,7 @@ func (l *legitimateCompletionFixture) TurnState(ref adapter.TurnRef) (bool, bool
 	return true, true, true
 }
 func (l *legitimateCompletionFixture) IsCompletionAllowed(ref adapter.TurnRef) bool { return l.allowed }
+func (l *legitimateCompletionFixture) IsExecutionActive(ref adapter.TurnRef) bool   { return false }
 func (l *legitimateCompletionFixture) Cleanup() error                               { return nil }
 
 func TestReviewD910_ConformanceCheckerDoesNotFalselyFlagLegitimateCompletion(t *testing.T) {
@@ -181,6 +184,7 @@ func (u *unsupportedFixture) TurnState(ref adapter.TurnRef) (bool, bool, bool) {
 	return true, true, true
 }
 func (u *unsupportedFixture) IsCompletionAllowed(ref adapter.TurnRef) bool { return false }
+func (u *unsupportedFixture) IsExecutionActive(ref adapter.TurnRef) bool   { return false }
 func (u *unsupportedFixture) Cleanup() error                               { return nil }
 
 func TestReviewD910_ConformanceCheckerTestsUnsupportedContract(t *testing.T) {

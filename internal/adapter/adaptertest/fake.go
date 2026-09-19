@@ -46,6 +46,8 @@ type FakeAdapter struct {
 	results       map[adapter.TurnRef]adapter.TurnResult
 	retiredTurns  map[adapter.TurnRef]bool
 	activeStreams map[adapter.TurnRef][]*adapter.BufferedStream
+	workerCancels map[adapter.TurnRef]chan struct{}
+	workersWg     sync.WaitGroup
 }
 
 // NewFake constructs a FakeAdapter configured with the provided scripted faults.
@@ -58,6 +60,7 @@ func NewFake(faults ScriptedFaults) *FakeAdapter {
 		results:       make(map[adapter.TurnRef]adapter.TurnResult),
 		retiredTurns:  make(map[adapter.TurnRef]bool),
 		activeStreams: make(map[adapter.TurnRef][]*adapter.BufferedStream),
+		workerCancels: make(map[adapter.TurnRef]chan struct{}),
 	}
 }
 
@@ -70,6 +73,44 @@ func (f *FakeAdapter) TurnState(ref adapter.TurnRef) DispatchState {
 		return DispatchState{}
 	}
 	return *st
+}
+
+// IsExecutionActive reports whether a turn execution is currently accepted and unretired.
+func (f *FakeAdapter) IsExecutionActive(ref adapter.TurnRef) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, exists := f.dispatches[ref]
+	if !exists || !st.Accepted {
+		return false
+	}
+	return !f.retiredTurns[ref]
+}
+
+// ActiveStreamCount returns the number of active subscriptions registered for a turn.
+func (f *FakeAdapter) ActiveStreamCount(ref adapter.TurnRef) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.activeStreams[ref])
+}
+
+// WaitWorkers waits for all background worker goroutines to exit.
+func (f *FakeAdapter) WaitWorkers() {
+	f.workersWg.Wait()
+}
+
+// Close cancels all active workers and unblocks all execution gates.
+func (f *FakeAdapter) Close() error {
+	f.mu.Lock()
+	for _, ch := range f.workerCancels {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
+	f.mu.Unlock()
+	f.workersWg.Wait()
+	return nil
 }
 
 // Probe returns the configured capabilities and model inventory without billing.
@@ -233,8 +274,12 @@ func (f *FakeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt 
 		ResultStatus: adapter.ResultPending,
 	}
 
+	cancelCh := make(chan struct{})
+	f.workerCancels[ref] = cancelCh
+	f.workersWg.Add(1)
+
 	// Launch background worker driving this turn's execution independently of observation
-	go f.runWorker(ref, promptVal)
+	go f.runWorker(ref, promptVal, cancelCh)
 
 	f.mu.Unlock()
 
@@ -253,9 +298,15 @@ func (f *FakeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt 
 	return adapter.DispatchOutcome{Ref: ref, Status: status}, nil
 }
 
-func (f *FakeAdapter) runWorker(ref adapter.TurnRef, prompt string) {
+func (f *FakeAdapter) runWorker(ref adapter.TurnRef, prompt string, cancelCh <-chan struct{}) {
+	defer f.workersWg.Done()
+
 	if f.faults.HoldExecutionStart != nil {
-		<-f.faults.HoldExecutionStart
+		select {
+		case <-f.faults.HoldExecutionStart:
+		case <-cancelCh:
+			return
+		}
 		f.mu.Lock()
 		if res, ok := f.results[ref]; ok && res.Status == council.TurnCancelled {
 			f.mu.Unlock()
@@ -311,7 +362,11 @@ func (f *FakeAdapter) runWorker(ref adapter.TurnRef, prompt string) {
 	}
 
 	if f.faults.StallStream != nil {
-		<-f.faults.StallStream
+		select {
+		case <-f.faults.StallStream:
+		case <-cancelCh:
+			return
+		}
 	}
 
 	f.mu.Lock()
@@ -403,6 +458,9 @@ func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter
 	if !exists || !st.Received {
 		return nil, errors.New("turn not found or not dispatched")
 	}
+	if !st.Accepted {
+		return nil, errors.New("turn was rejected: no execution to observe")
+	}
 
 	stream := adapter.NewBufferedStream(ref, 64)
 
@@ -439,19 +497,20 @@ func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter
 
 	f.activeStreams[ref] = append(f.activeStreams[ref], stream)
 
-	// Watch observation context cancellation without cancelling the worker
-	if ctx.Done() != nil {
-		go func() {
-			select {
-			case <-ctx.Done():
-				f.mu.Lock()
-				f.removeActiveStream(ref, stream)
-				f.mu.Unlock()
-				_ = stream.CloseWithErr(ctx.Err())
-			case <-stream.Done():
-			}
-		}()
-	}
+	// Watch observation context cancellation or explicit close to unregister stream
+	go func() {
+		select {
+		case <-ctx.Done():
+			f.mu.Lock()
+			f.removeActiveStream(ref, stream)
+			f.mu.Unlock()
+			_ = stream.CloseWithErr(ctx.Err())
+		case <-stream.Done():
+			f.mu.Lock()
+			f.removeActiveStream(ref, stream)
+			f.mu.Unlock()
+		}
+	}()
 
 	return stream, nil
 }
@@ -468,6 +527,18 @@ func (f *FakeAdapter) Cancel(ctx context.Context, ref adapter.TurnRef) (adapter.
 	st, exists := f.dispatches[ref]
 	if !exists || !st.Received {
 		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown, Reason: "turn not found"}, nil
+	}
+	if !st.Accepted {
+		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown, Reason: "turn was rejected: no execution to cancel"}, nil
+	}
+
+	// Unblock any worker waiting behind execution gates
+	if ch, ok := f.workerCancels[ref]; ok {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
 	}
 
 	res := f.results[ref]
@@ -508,6 +579,14 @@ func (f *FakeAdapter) Collect(ctx context.Context, ref adapter.TurnRef) (adapter
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	st, existsDisp := f.dispatches[ref]
+	if existsDisp && !st.Accepted {
+		return adapter.TurnResult{
+			Ref:          ref,
+			ResultStatus: adapter.ResultUnavailable,
+		}, errors.New("result unavailable: turn was rejected")
+	}
+
 	res, exists := f.results[ref]
 	if !exists {
 		return adapter.TurnResult{
@@ -533,6 +612,17 @@ func (f *FakeAdapter) Reconcile(ctx context.Context, ref adapter.RecoveryRef) (a
 	targetRef := ref
 	if f.faults.StaleRecoveryRef != nil {
 		targetRef = *f.faults.StaleRecoveryRef
+	}
+
+	st, existsDisp := f.dispatches[targetRef.TurnRef]
+	if existsDisp && !st.Accepted {
+		return adapter.ReconciliationOutcome{
+			Ref:          targetRef,
+			Reachability: council.VisibilityReachable,
+			Status:       adapter.ReconciliationDefinitivelyMissing,
+			Observed:     council.TurnFailed,
+			Result:       "turn was rejected: no execution to reconcile",
+		}, nil
 	}
 
 	res, exists := f.results[targetRef.TurnRef]
