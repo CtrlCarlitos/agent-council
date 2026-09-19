@@ -75,7 +75,7 @@
   func (s *Store) StateDir() string
   ```
 
-- [ ] **Step 1: Write the failing tests for Store Open, Engine Version, PRAGMAs on initial and replacement connections, and safe URI escaping**
+- [x] **Step 1: Write the failing tests for Store Open, Engine Version, PRAGMAs on initial and replacement connections, and safe URI escaping**
 
 ```go
 // internal/storage/store_test.go
@@ -181,12 +181,12 @@ func verifyPRAGMAs(t *testing.T, db storage.QueryRower) {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `go test -v ./internal/storage -run '^TestStore_OpenCloseAndPRAGMAs$'`  
 Expected: FAIL (package `internal/storage` does not exist yet).
 
-- [ ] **Step 3: Update `go.mod` to Go 1.25.0 and install pinned dependencies**
+- [x] **Step 3: Update `go.mod` to Go 1.25.0 and install pinned dependencies**
 
 Update `go.mod`:
 ```
@@ -203,7 +203,7 @@ Update `.github/workflows/ci.yml`:
 Set `go-version: '1.25.0'`.
 Run: `go mod tidy`
 
-- [ ] **Step 4: Implement `internal/storage/types.go` and `internal/storage/store.go`**
+- [x] **Step 4: Implement `internal/storage/types.go` and `internal/storage/store.go`**
 
 In `internal/storage/types.go`:
 ```go
@@ -373,12 +373,12 @@ func (s *Store) StateDir() string {
 }
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `go test -v ./internal/storage -run '^TestStore_'`  
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add go.mod go.sum .github/workflows/ci.yml internal/storage/types.go internal/storage/store.go internal/storage/store_test.go
@@ -408,7 +408,7 @@ git commit -m "feat(storage): configure Go 1.25 baseline, SQLite 3.53.4, safe UR
   func (tx *WriteTx) Tx() *sql.Tx
   ```
 
-- [ ] **Step 1: Write the failing tests for schema migrations lifecycle and two-store write-lock exclusivity**
+- [x] **Step 1: Write the failing tests for schema migrations lifecycle and two-store write-lock exclusivity**
 
 ```go
 // internal/storage/migration_test.go
@@ -537,12 +537,12 @@ func TestStore_WriteLockExclusivity(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `go test -v ./internal/storage -run '^(TestStore_Migrations_Lifecycle|TestStore_WriteLockExclusivity)$'`  
 Expected: FAIL.
 
-- [ ] **Step 3: Define schema in `internal/storage/schema.sql`**
+- [x] **Step 3: Define schema in `internal/storage/schema.sql`**
 
 Include:
 - `runs` table with `controller_lease`, `active_coordinator`
@@ -555,7 +555,7 @@ Include:
 - `artifacts` table
 - `schema_migrations` table
 
-- [ ] **Step 4: Implement `internal/storage/migrations.go` and `internal/storage/tx.go`**
+- [x] **Step 4: Implement `internal/storage/migrations.go` and `internal/storage/tx.go`**
 
 In `internal/storage/migrations.go`:
 Embed `schema.sql` via `//go:embed schema.sql`. Compute SHA-256 checksum of the schema text.
@@ -601,17 +601,17 @@ func (tx *WriteTx) Tx() *sql.Tx {
 }
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `go test -v ./internal/storage -run '^(TestStore_Migrations_Lifecycle|TestStore_WriteLockExclusivity)$'`  
 Expected: PASS.
 
-- [ ] **Step 6: Internal Verification Gate 1**
+- [x] **Step 6: Internal Verification Gate 1**
 
 Run: `go test -race -v ./internal/storage/...`  
 Expected: All tests pass.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add internal/storage/schema.sql internal/storage/migrations.go internal/storage/tx.go internal/storage/migration_test.go internal/storage/tx_test.go
@@ -653,7 +653,7 @@ git commit -m "feat(storage): implement schema migrations lifecycle and immediat
   func (s *Store) DiscardPendingPrompt(ctx context.Context, opID string, callerLease string, sessionID string, expectedVersion int64) (OperationReceipt, error)
   ```
 
-- [ ] **Step 1: Write the failing tests for optimistic concurrency, lease authority, and authoritative inside-transaction idempotency**
+- [x] **Step 1: Write the failing tests for optimistic concurrency, lease authority, and authoritative inside-transaction idempotency**
 
 ```go
 // internal/storage/session_store_test.go
@@ -790,12 +790,12 @@ func TestStore_Idempotency_InsideTx(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `go test -v ./internal/storage -run '^(TestStore_OptimisticConcurrency_|TestStore_Authority_|TestStore_Idempotency_)'`  
 Expected: FAIL.
 
-- [ ] **Step 3: Implement authoritative inside-transaction idempotency and relational mutation methods in `internal/storage/session_store.go`**
+- [x] **Step 3: Implement authoritative inside-transaction idempotency and relational mutation methods in `internal/storage/session_store.go`**
 
 Implement:
 1. `checkOrRecordIdempotency(tx *sql.Tx, opID string, callerLease string, cmdType string, sessionID string, fingerprint string) (*OperationReceipt, error)`
@@ -809,12 +809,12 @@ Implement:
    - Apply token redaction (`sanitizeText(prompt.Prompt)`) before saving prompt into `pending_prompts` and constructing receipt.
 3. Implement `CreateRun`, `CreateSession`, `QueuePrompt`, `ReplacePendingPrompt`, `DiscardPendingPrompt` following the inside-tx sequence.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `go test -v ./internal/storage -run '^(TestStore_OptimisticConcurrency_|TestStore_Authority_|TestStore_Idempotency_)'`  
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/storage/session_store.go internal/storage/session_store_test.go internal/storage/idempotency_test.go
@@ -844,7 +844,7 @@ git commit -m "feat(storage): implement relational session store with authoritat
   func (s *Store) ReconcileSession(ctx context.Context, opID string, callerLease string, ref adapter.RecoveryRef, outcome adapter.ReconciliationOutcome) (OperationReceipt, error)
   ```
 
-- [ ] **Step 1: Write the failing tests for domain command transitions, guards, host loss protection, and native bindings**
+- [x] **Step 1: Write the failing tests for domain command transitions, guards, host loss protection, and native bindings**
 
 ```go
 // internal/storage/transitions_test.go
@@ -1005,12 +1005,12 @@ func TestStore_RecordDispatchObservation_LateArrivalIgnored(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `go test -v ./internal/storage -run '^(TestStore_ReleaseGuards_|TestStore_NativeBindings_|TestStore_ReconcileSession_|TestStore_RecordDispatchObservation_)'`  
 Expected: FAIL.
 
-- [ ] **Step 3: Implement domain transitions in `internal/storage/transitions.go`**
+- [x] **Step 3: Implement domain transitions in `internal/storage/transitions.go`**
 
 Implement:
 - `ReleaseTurn`: validates caller lease, checks `Visibility != VisibilityHostLost`, retrieves and deletes from `pending_prompts`, inserts into `turns` (`status = 'running'`), inserts into `dispatch_intents` (`phase = 'intent_recorded'`), updates session `state = 'running'`, `active_key = turnKey`, bumps `row_version`. Returns `ReleaseReceipt` containing the exact `SanitizedPrompt` so callers dispatch the sanitized text.
@@ -1018,12 +1018,12 @@ Implement:
 - `ReconcileSession`: validates `ref.TurnKey == session.ActiveTurnKey` and generation matches. If outcome is terminal, updates turn status, updates intent to `resolved`, clears active turn key on session, bumps `row_version`.
 - `RecordDispatchObservation`: updates `dispatch_intents.phase`. If intent already `resolved`, returns cleanly with `"late_observation_ignored"`.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `go test -v ./internal/storage -run '^(TestStore_ReleaseGuards_|TestStore_NativeBindings_|TestStore_ReconcileSession_|TestStore_RecordDispatchObservation_)'`  
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/storage/transitions.go internal/storage/transitions_test.go
@@ -1058,7 +1058,7 @@ git commit -m "feat(storage): implement complete domain command transitions, gua
   func (s *Store) HydrateState(ctx context.Context) (*HydratedState, error)
   ```
 
-- [ ] **Step 1: Write the failing tests for complete read hydration and multi-boundary crash recovery**
+- [x] **Step 1: Write the failing tests for complete read hydration and multi-boundary crash recovery**
 
 ```go
 // internal/storage/recovery_test.go
@@ -1273,12 +1273,12 @@ func runCrashSubprocess() {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `go test -v ./internal/storage -run '^(TestStore_HydrateState_|TestStore_CrashRecovery_)'`  
 Expected: FAIL.
 
-- [ ] **Step 3: Implement `internal/storage/recovery.go`**
+- [x] **Step 3: Implement `internal/storage/recovery.go`**
 
 Implement `HydrateState(ctx context.Context)`:
 1. Begins read snapshot on `readDB` (`_txlock=deferred`).
@@ -1287,17 +1287,17 @@ Implement `HydrateState(ctx context.Context)`:
 4. Loads journal entries into slice.
 5. Assembles `HydratedState` without any side effects or status mutations.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `go test -v ./internal/storage -run '^(TestStore_HydrateState_|TestStore_CrashRecovery_)'`  
 Expected: PASS.
 
-- [ ] **Step 5: Internal Verification Gate 2**
+- [x] **Step 5: Internal Verification Gate 2**
 
 Run: `go test -race -v ./internal/storage/...`  
 Expected: All tests in Tasks 1–5 pass under race detector.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add internal/storage/recovery.go internal/storage/recovery_test.go internal/storage/crash_recovery_test.go
@@ -1330,7 +1330,7 @@ git commit -m "feat(storage): implement consistent read hydration and multi-boun
   func (s *Store) ReadArtifact(digest string) ([]byte, error)
   ```
 
-- [ ] **Step 1: Write the failing tests for safe artifact read (verify before exposure), no silent repair, and concurrent publication convergence**
+- [x] **Step 1: Write the failing tests for safe artifact read (verify before exposure), no silent repair, and concurrent publication convergence**
 
 ```go
 // internal/storage/artifact_store_test.go
@@ -1478,12 +1478,12 @@ func TestArtifactStore_PublishArtifact_ConcurrentIdentical(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `go test -v ./internal/storage -run '^TestArtifactStore_'`  
 Expected: FAIL.
 
-- [ ] **Step 3: Implement `internal/storage/artifact_store.go`**
+- [x] **Step 3: Implement `internal/storage/artifact_store.go`**
 
 Implement:
 1. `PublishArtifact`:
@@ -1508,12 +1508,12 @@ Implement:
    - If byte count or digest does not match: returns `nil, ErrArtifactCorrupt` (zero bytes exposed).
    - Returns verified bytes.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `go test -v ./internal/storage -run '^TestArtifactStore_'`  
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/storage/artifact_store.go internal/storage/artifact_store_test.go
@@ -1538,7 +1538,7 @@ git commit -m "feat(storage): implement two-phase content-addressed verified art
   func EnsureFilePermissions(file string) error
   ```
 
-- [ ] **Step 1: Write the failing tests for storage permissions, Windows ACL, and pre-write credential redaction through real storage commands**
+- [x] **Step 1: Write the failing tests for storage permissions, Windows ACL, and pre-write credential redaction through real storage commands**
 
 ```go
 // internal/storage/platform_test.go
@@ -1668,12 +1668,12 @@ func TestStore_CredentialRedaction_RealStorageBoundary(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `go test -v ./internal/storage -run '^(TestStore_PermissionsAndGitignore|TestStore_CredentialRedaction_)'`  
 Expected: FAIL.
 
-- [ ] **Step 3: Implement `internal/storage/platform.go` and `internal/storage/redaction.go`**
+- [x] **Step 3: Implement `internal/storage/platform.go` and `internal/storage/redaction.go`**
 
 In `internal/storage/redaction.go`:
 Implement regex matching for GitHub tokens (`ghp_[A-Za-z0-9_]{36}`), OpenAI/Anthropic API keys (`sk-[A-Za-z0-9_]{32,}`), Slack tokens (`xox[baprs]-[A-Za-z0-9_]+`), replacing them with `[REDACTED]`.
@@ -1682,12 +1682,12 @@ Connect this to `QueuePrompt`, `ReplacePendingPrompt`, `ReleaseTurn`, `PublishAr
 In `internal/storage/platform.go`:
 Implement POSIX `0700`/`0600` permission setting and Windows `icacls` restriction to user SID when on Windows.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `go test -v ./internal/storage -run '^(TestStore_PermissionsAndGitignore|TestStore_CredentialRedaction_)'`  
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/storage/platform.go internal/storage/redaction.go internal/storage/platform_test.go internal/storage/redaction_test.go
@@ -1703,21 +1703,21 @@ git commit -m "feat(storage): enforce platform permissions, sidecar protection, 
 - Test: All packages across repo
 
 **Steps:**
-- [ ] **Step 1: Run complete pure-Go suite with CGO_ENABLED=0**
+- [x] **Step 1: Run complete pure-Go suite with CGO_ENABLED=0**
 
 ```bash
 CGO_ENABLED=0 go test -v ./...
 ```
 Expected: All tests pass across all packages (`internal/adapter/...`, `internal/storage/...`, etc.).
 
-- [ ] **Step 2: Run race detector suite with CGO_ENABLED=1**
+- [x] **Step 2: Run race detector suite with CGO_ENABLED=1**
 
 ```bash
 CGO_ENABLED=1 go test -race -count=3 ./...
 ```
 Expected: All tests pass with zero data races.
 
-- [ ] **Step 3: Run linter and formatting checks**
+- [x] **Step 3: Run linter and formatting checks**
 
 ```bash
 go vet ./...
@@ -1725,14 +1725,14 @@ test -z "$(gofmt -s -l .)"
 ```
 Expected: Zero vet issues, zero unformatted files.
 
-- [ ] **Step 4: Verify Python test suite and repository integrity**
+- [x] **Step 4: Verify Python test suite and repository integrity**
 
 ```bash
 pytest
 ```
 Expected: All Python tests pass.
 
-- [ ] **Step 5: Commit any adjustments, push branch to origin, and open PR for Issue #2**
+- [x] **Step 5: Commit any adjustments, push branch to origin, and open PR for Issue #2**
 
 ```bash
 git push origin feat/ac-002-durable-state
