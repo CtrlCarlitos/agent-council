@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/adaptertest"
@@ -96,11 +97,13 @@ func TestCouncilBoundary_UnacknowledgedDispatchPreservesReservation(t *testing.T
 		t.Fatalf("expected prompt 'prompt 1', got %q", prompt1)
 	}
 
-	// Dispatch t1 to fake with held acknowledgement
+	// Dispatch t1 to fake with held acknowledgement and stalled stream
 	holdAck := make(chan struct{})
+	stall := make(chan struct{})
 	fake := adaptertest.NewFake(adaptertest.ScriptedFaults{
 		HoldDispatchAck: holdAck,
 		DispatchStatus:  adapter.DispatchUnknown,
+		StallStream:     stall,
 	})
 
 	turnRef1 := adapter.TurnRef{SessionID: adapter.SessionID(fmt.Sprintf("sess-%s", sess.ID)), TurnKey: "t1"}
@@ -134,18 +137,75 @@ func TestCouncilBoundary_UnacknowledgedDispatchPreservesReservation(t *testing.T
 		t.Fatalf("session state corrupted after DispatchUnknown: active=%s state=%s", sess.Active, sess.State)
 	}
 
-	// Authoritative reconciliation resolves the unknown turn
+	// Open domain recovery episode
+	gen, err := sess.RecordHostLoss()
+	if err != nil {
+		t.Fatalf("RecordHostLoss failed: %v", err)
+	}
+	if sess.Visibility != council.VisibilityHostLost {
+		t.Fatalf("expected VisibilityHostLost, got %s", sess.Visibility)
+	}
+
+	// Reconciliation handler validates reference, generation, and outcome
+	reconcileHandler := func(out adapter.ReconciliationOutcome) error {
+		if err := out.Validate(); err != nil {
+			return err
+		}
+		if out.Ref.Generation != gen {
+			return errors.New("mismatched generation")
+		}
+		if out.Ref.TurnRef != turnRef1 {
+			return errors.New("mismatched turn ref")
+		}
+		return sess.ReconcileHost(out.Ref.TurnKey, out.Ref.Generation, out.Observed, out.Result)
+	}
+
+	// 1. Reconcile while turn is running (nonterminal outcome)
 	recOutcome, err := fake.Reconcile(ctx, adapter.RecoveryRef{
 		TurnRef:    turnRef1,
-		Generation: 1,
+		Generation: gen,
 	})
 	if err != nil {
 		t.Fatalf("reconcile failed: %v", err)
 	}
+	if recOutcome.Status != adapter.ReconciliationReachableActive {
+		t.Fatalf("expected ReconciliationReachableActive, got %s", recOutcome.Status)
+	}
+	if recOutcome.Observed != council.TurnRunning {
+		t.Fatalf("expected TurnRunning, got %s", recOutcome.Observed)
+	}
 
-	// Deliver reconciled outcome to Council
-	if err := sess.CompleteWithResult(recOutcome.Ref.TurnKey, recOutcome.Result); err != nil {
-		t.Fatalf("reconciling turn in Council failed: %v", err)
+	// Deliver nonterminal outcome to Council
+	if err := reconcileHandler(recOutcome); err != nil {
+		t.Fatalf("delivering nonterminal reconciliation failed: %v", err)
+	}
+
+	// Session is reachable again, but STILL running t1!
+	if sess.Visibility != council.VisibilityReachable || sess.State != council.Running || sess.Active != "t1" {
+		t.Fatalf("unexpected state after nonterminal recovery: visibility=%s state=%s active=%s",
+			sess.Visibility, sess.State, sess.Active)
+	}
+
+	// Reservation must STILL be occupied: releasing t2 must STILL fail!
+	if _, err := sess.Release("lease-1", "t2"); err == nil {
+		t.Fatal("release of t2 permitted while t1 is still running after nonterminal reconciliation")
+	}
+
+	// 2. Unblock execution and wait for authoritative completion
+	close(stall)
+	time.Sleep(20 * time.Millisecond)
+
+	termResult, err := fake.Collect(ctx, turnRef1)
+	if err != nil {
+		t.Fatalf("collect failed: %v", err)
+	}
+	if termResult.Status != council.TurnCompleted {
+		t.Fatalf("expected TurnCompleted, got %s", termResult.Status)
+	}
+
+	// Authoritative terminal completion delivered to Council
+	if err := sess.CompleteWithResult(turnRef1.TurnKey, termResult.Output); err != nil {
+		t.Fatalf("CompleteWithResult failed: %v", err)
 	}
 
 	if sess.State != council.Parked || sess.Active != "" {

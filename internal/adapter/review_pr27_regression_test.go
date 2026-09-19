@@ -311,7 +311,8 @@ func (g *genericFixture) Adapter() adapter.Adapter { return g.ad }
 func (g *genericFixture) TurnState(ref adapter.TurnRef) (bool, bool, bool) {
 	return false, false, false
 }
-func (g *genericFixture) Cleanup() error { return nil }
+func (g *genericFixture) IsCompletionAllowed(ref adapter.TurnRef) bool { return false }
+func (g *genericFixture) Cleanup() error                               { return nil }
 
 type erroringFakeAdapter struct {
 	adaptertest.FakeAdapter

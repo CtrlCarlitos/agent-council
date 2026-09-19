@@ -2,6 +2,7 @@ package conformance
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 type Fixture interface {
 	Adapter() adapter.Adapter
 	TurnState(ref adapter.TurnRef) (received, accepted, started bool)
+	IsCompletionAllowed(ref adapter.TurnRef) bool
 	Cleanup() error
 }
 
@@ -49,6 +51,8 @@ const (
 	ScenarioObservationClose          Scenario = "observation_close"
 	ScenarioRecoveryIntegrity         Scenario = "recovery_integrity"
 	ScenarioPrematureDenialRetirement Scenario = "premature_denial_retirement"
+	ScenarioSessionResumption         Scenario = "session_resumption"
+	ScenarioMidTurnCancellation       Scenario = "mid_turn_cancellation"
 )
 
 // Check runs a specific conformance scenario against a fixture, returning all detected violations.
@@ -97,7 +101,20 @@ func Check(ctx context.Context, fixture Fixture, scenario Scenario) []Violation 
 
 	case ScenarioObservationClose:
 		if probeReport.Capabilities.StreamingObservation == adapter.CapabilityUnsupported {
-			return nil
+			ref := adapter.TurnRef{SessionID: "s-obs", TurnKey: "t-obs"}
+			_, err := ad.Observe(ctx, ref)
+			if err == nil {
+				violations = append(violations, Violation{
+					Code:        ViolationCapabilityFabricated,
+					Description: "adapter advertised StreamingObservation as unsupported but Observe succeeded",
+				})
+			} else if !errors.Is(err, adapter.ErrUnsupportedCapability) {
+				violations = append(violations, Violation{
+					Code:        ViolationUnexpectedError,
+					Description: fmt.Sprintf("unsupported StreamingObservation returned unexpected error: %v", err),
+				})
+			}
+			return violations
 		}
 
 		req := adapter.CreateSessionRequest{
@@ -162,20 +179,37 @@ func Check(ctx context.Context, fixture Fixture, scenario Scenario) []Violation 
 
 		// Check status before closing stream to distinguish natural completion from fabricated completion
 		resBefore, errBefore := ad.Collect(ctx, ref)
+		if errBefore != nil {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: fmt.Sprintf("collect before stream close failed: %v", errBefore),
+			})
+			_ = stream.Close()
+			return violations
+		}
 
 		// Close observation stream
 		_ = stream.Close()
 
 		// Collect status immediately after closing stream
 		resAfter, errAfter := ad.Collect(ctx, ref)
+		if errAfter != nil {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: fmt.Sprintf("collect after stream close failed: %v", errAfter),
+			})
+			return violations
+		}
 
 		// If the turn was actively running before Close(), but immediately jumps to Completed upon Close(),
-		// observation closure fabricated turn completion!
-		if errBefore == nil && resBefore.Status == council.TurnRunning && errAfter == nil && resAfter.Status == council.TurnCompleted {
-			violations = append(violations, Violation{
-				Code:        ViolationEOFAsCompletion,
-				Description: "closing stream fabricated terminal turn completion while turn was still actively running",
-			})
+		// verify whether completion was legitimately allowed by independent fixture gates.
+		if resBefore.Status == council.TurnRunning && resAfter.Status == council.TurnCompleted {
+			if !fixture.IsCompletionAllowed(ref) {
+				violations = append(violations, Violation{
+					Code:        ViolationEOFAsCompletion,
+					Description: "closing stream fabricated terminal turn completion while completion was not allowed",
+				})
+			}
 		}
 
 	case ScenarioRecoveryIntegrity:
@@ -190,6 +224,13 @@ func Check(ctx context.Context, fixture Fixture, scenario Scenario) []Violation 
 				Description: fmt.Sprintf("reconciliation failed: %v", err),
 			})
 			return violations
+		}
+
+		if err := outcome.Validate(); err != nil {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: fmt.Sprintf("reconciliation outcome validation failed: %v", err),
+			})
 		}
 
 		if outcome.Ref.Generation != ref.Generation {
@@ -274,6 +315,104 @@ func Check(ctx context.Context, fixture Fixture, scenario Scenario) []Violation 
 				Description: "adapter advertised ToolApprovalRouting capability but did not emit EventToolDenied",
 			})
 		}
+
+	case ScenarioSessionResumption:
+		binding := adapter.SessionBinding{
+			SessionID:       "s-resumption",
+			Contributor:     council.Claude,
+			NativeSessionID: "native-resumption-1",
+			Config:          adapter.SessionConfig{Model: "claude-3-5-sonnet"},
+		}
+		if probeReport.Capabilities.SessionResumption == adapter.CapabilityUnsupported {
+			err := ad.ResumeSession(ctx, binding)
+			if err == nil {
+				violations = append(violations, Violation{
+					Code:        ViolationCapabilityFabricated,
+					Description: "adapter advertised SessionResumption as unsupported but ResumeSession succeeded",
+				})
+			} else if !errors.Is(err, adapter.ErrUnsupportedCapability) {
+				violations = append(violations, Violation{
+					Code:        ViolationUnexpectedError,
+					Description: fmt.Sprintf("unsupported SessionResumption returned unexpected error: %v", err),
+				})
+			}
+			return violations
+		}
+
+		req := adapter.CreateSessionRequest{
+			SessionID:   "s-resumption",
+			Contributor: council.Claude,
+			Config:      adapter.SessionConfig{Model: "claude-3-5-sonnet"},
+		}
+		b, err := ad.CreateSession(ctx, req)
+		if err != nil {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: fmt.Sprintf("session creation for resumption test failed: %v", err),
+			})
+			return violations
+		}
+		if err := ad.ResumeSession(ctx, b); err != nil {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: fmt.Sprintf("supported ResumeSession failed on valid binding: %v", err),
+			})
+		}
+
+	case ScenarioMidTurnCancellation:
+		ref := adapter.TurnRef{SessionID: "s-cancel", TurnKey: "t-cancel"}
+		if probeReport.Capabilities.MidTurnCancellation == adapter.CapabilityUnsupported {
+			outcome, err := ad.Cancel(ctx, ref)
+			if err != nil {
+				violations = append(violations, Violation{
+					Code:        ViolationUnexpectedError,
+					Description: fmt.Sprintf("cancel returned unexpected error: %v", err),
+				})
+				return violations
+			}
+			if outcome.Disposition != adapter.CancelUnsupported {
+				violations = append(violations, Violation{
+					Code:        ViolationCapabilityFabricated,
+					Description: fmt.Sprintf("adapter advertised MidTurnCancellation as unsupported but Cancel returned %s", outcome.Disposition),
+				})
+			}
+			return violations
+		}
+
+		req := adapter.CreateSessionRequest{
+			SessionID:   "s-cancel",
+			Contributor: council.Claude,
+			Config:      adapter.SessionConfig{Model: "claude-3-5-sonnet"},
+		}
+		if _, err := ad.CreateSession(ctx, req); err != nil {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: fmt.Sprintf("session creation for cancel test failed: %v", err),
+			})
+			return violations
+		}
+		dispOutcome, err := ad.Dispatch(ctx, ref, "test cancel prompt")
+		if err != nil || dispOutcome.Status != adapter.DispatchAccepted {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: fmt.Sprintf("dispatch failed for cancel test: err=%v outcome=%+v", err, dispOutcome),
+			})
+			return violations
+		}
+		outcome, err := ad.Cancel(ctx, ref)
+		if err != nil {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: fmt.Sprintf("cancel failed: %v", err),
+			})
+			return violations
+		}
+		if outcome.Disposition != adapter.CancelConfirmed && outcome.Disposition != adapter.CancelAlreadyTerminal {
+			violations = append(violations, Violation{
+				Code:        ViolationUnexpectedError,
+				Description: fmt.Sprintf("unexpected cancel disposition: %s", outcome.Disposition),
+			})
+		}
 	}
 
 	return violations
@@ -314,6 +453,24 @@ func Run(t *testing.T, factory FixtureFactory) {
 		f := factory(t)
 		defer func() { _ = f.Cleanup() }()
 		violations := Check(context.Background(), f, ScenarioPrematureDenialRetirement)
+		if len(violations) > 0 {
+			t.Fatalf("unexpected violations: %+v", violations)
+		}
+	})
+
+	t.Run("SessionResumption", func(t *testing.T) {
+		f := factory(t)
+		defer func() { _ = f.Cleanup() }()
+		violations := Check(context.Background(), f, ScenarioSessionResumption)
+		if len(violations) > 0 {
+			t.Fatalf("unexpected violations: %+v", violations)
+		}
+	})
+
+	t.Run("MidTurnCancellation", func(t *testing.T) {
+		f := factory(t)
+		defer func() { _ = f.Cleanup() }()
+		violations := Check(context.Background(), f, ScenarioMidTurnCancellation)
 		if len(violations) > 0 {
 			t.Fatalf("unexpected violations: %+v", violations)
 		}

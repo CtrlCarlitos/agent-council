@@ -32,6 +32,7 @@ type ScriptedFaults struct {
 	StallStream        chan struct{}
 	StaleRecoveryRef   *adapter.RecoveryRef
 	ProbeCapabilities  adapter.AdapterCapabilities
+	EmitProgressCount  int
 }
 
 // FakeAdapter implements adapter.Adapter with deterministic script controls for testing.
@@ -155,6 +156,10 @@ func (f *FakeAdapter) CreateSession(ctx context.Context, req adapter.CreateSessi
 
 // ResumeSession attaches to a previously verified native session binding.
 func (f *FakeAdapter) ResumeSession(ctx context.Context, binding adapter.SessionBinding) error {
+	if f.faults.ProbeCapabilities.SessionResumption == adapter.CapabilityUnsupported {
+		return adapter.ErrUnsupportedCapability
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -172,6 +177,10 @@ func (f *FakeAdapter) ResumeSession(ctx context.Context, binding adapter.Session
 
 // Dispatch submits a prompt turn for execution.
 func (f *FakeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt string) (adapter.DispatchOutcome, error) {
+	if err := ctx.Err(); err != nil {
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: err.Error()}, err
+	}
+
 	if err := ref.Validate(); err != nil {
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: err.Error()}, err
 	}
@@ -188,6 +197,12 @@ func (f *FakeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt 
 	if f.retiredTurns[ref] {
 		f.mu.Unlock()
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: "turn already retired"}, errors.New("turn identifier already retired")
+	}
+
+	// Verify turn identifier is not currently active
+	if _, exists := f.dispatches[ref]; exists && !f.retiredTurns[ref] {
+		f.mu.Unlock()
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: "turn is already active"}, errors.New("turn is already active")
 	}
 
 	status := f.faults.DispatchStatus
@@ -242,6 +257,10 @@ func (f *FakeAdapter) runWorker(ref adapter.TurnRef, prompt string) {
 	if f.faults.HoldExecutionStart != nil {
 		<-f.faults.HoldExecutionStart
 		f.mu.Lock()
+		if res, ok := f.results[ref]; ok && res.Status == council.TurnCancelled {
+			f.mu.Unlock()
+			return
+		}
 		if st := f.dispatches[ref]; st != nil {
 			st.Started = true
 		}
@@ -262,7 +281,18 @@ func (f *FakeAdapter) runWorker(ref adapter.TurnRef, prompt string) {
 		f.broadcastEvent(ref, progEv)
 	}
 
-	if len(f.faults.AutoDenyTools) > 0 || strings.Contains(f.prompts[ref], "test tool denial") {
+	for i := 0; i < f.faults.EmitProgressCount; i++ {
+		ev := adapter.Event{
+			Ref:       ref,
+			Type:      adapter.EventProgress,
+			Status:    council.TurnRunning,
+			Payload:   fmt.Sprintf("progress-%d", i),
+			Timestamp: time.Now(),
+		}
+		f.broadcastEvent(ref, ev)
+	}
+
+	if len(f.faults.AutoDenyTools) > 0 || strings.Contains(prompt, "test tool denial") {
 		tools := f.faults.AutoDenyTools
 		if len(tools) == 0 {
 			tools = map[string]bool{"bash": true}
@@ -321,8 +351,9 @@ func (f *FakeAdapter) runWorker(ref adapter.TurnRef, prompt string) {
 		},
 	}
 	for _, s := range streams {
-		_ = s.Send(termEv)
-		_ = s.CloseWithErr(nil)
+		if err := s.SendOrOverflow(termEv); err == nil {
+			_ = s.CloseWithErr(nil)
+		}
 	}
 }
 
@@ -332,12 +363,35 @@ func (f *FakeAdapter) broadcastEvent(ref adapter.TurnRef, ev adapter.Event) {
 	f.mu.Unlock()
 
 	for _, s := range streams {
-		_ = s.Send(ev)
+		if err := s.SendOrOverflow(ev); err != nil {
+			f.mu.Lock()
+			f.removeActiveStream(ref, s)
+			f.mu.Unlock()
+		}
+	}
+}
+
+func (f *FakeAdapter) removeActiveStream(ref adapter.TurnRef, stream *adapter.BufferedStream) {
+	list := f.activeStreams[ref]
+	var remaining []*adapter.BufferedStream
+	for _, cur := range list {
+		if cur != stream {
+			remaining = append(remaining, cur)
+		}
+	}
+	if len(remaining) == 0 {
+		delete(f.activeStreams, ref)
+	} else {
+		f.activeStreams[ref] = remaining
 	}
 }
 
 // Observe establishes an event subscription for a running turn.
 func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter.Stream, error) {
+	if f.faults.ProbeCapabilities.StreamingObservation == adapter.CapabilityUnsupported {
+		return nil, adapter.ErrUnsupportedCapability
+	}
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -384,11 +438,30 @@ func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter
 	}
 
 	f.activeStreams[ref] = append(f.activeStreams[ref], stream)
+
+	// Watch observation context cancellation without cancelling the worker
+	if ctx.Done() != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				f.mu.Lock()
+				f.removeActiveStream(ref, stream)
+				f.mu.Unlock()
+				_ = stream.CloseWithErr(ctx.Err())
+			case <-stream.Done():
+			}
+		}()
+	}
+
 	return stream, nil
 }
 
 // Cancel requests cooperative cancellation of an active turn.
 func (f *FakeAdapter) Cancel(ctx context.Context, ref adapter.TurnRef) (adapter.CancelOutcome, error) {
+	if f.faults.ProbeCapabilities.MidTurnCancellation == adapter.CapabilityUnsupported {
+		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnsupported, Reason: "cancellation unsupported"}, nil
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -421,8 +494,9 @@ func (f *FakeAdapter) Cancel(ctx context.Context, ref adapter.TurnRef) (adapter.
 			Timestamp: time.Now(),
 		}
 		for _, s := range streams {
-			_ = s.Send(cancelEv)
-			_ = s.CloseWithErr(nil)
+			if err := s.SendOrOverflow(cancelEv); err == nil {
+				_ = s.CloseWithErr(nil)
+			}
 		}
 	}()
 

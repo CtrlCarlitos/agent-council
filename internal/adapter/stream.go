@@ -145,6 +145,11 @@ func (s *BufferedStream) Err() error {
 	return s.err
 }
 
+// Done returns a channel that is closed after all stream cleanup has finished.
+func (s *BufferedStream) Done() <-chan struct{} {
+	return s.done
+}
+
 // Close idempotently terminates observation and waits for all senders and cleanup to complete.
 func (s *BufferedStream) Close() error {
 	return s.CloseWithErr(ErrStreamClosed)

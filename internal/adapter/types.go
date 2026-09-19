@@ -111,6 +111,9 @@ func (u ExecutionUsage) Validate() error {
 	return nil
 }
 
+// ErrUnsupportedCapability is returned when an operation requires a capability that the adapter reports unsupported.
+var ErrUnsupportedCapability = errors.New("unsupported capability")
+
 // CapabilityStatus describes the level of support for an adapter capability.
 type CapabilityStatus string
 
