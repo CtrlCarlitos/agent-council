@@ -13,9 +13,24 @@ import (
 )
 
 type Store struct {
-	writeDB  *sql.DB
-	readDB   *sql.DB
-	stateDir string
+	writeDB              *sql.DB
+	readDB               *sql.DB
+	stateDir             string
+	testHookBeforeCommit func(boundary string)
+}
+
+func ensureNoSymlink(path string) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: %s", ErrSymlinkForbidden, path)
+	}
+	return nil
 }
 
 func buildDSN(dbPath string, txLock string) string {
@@ -48,10 +63,22 @@ func Open(opts StoreOptions) (*Store, error) {
 		return nil, fmt.Errorf("state directory required")
 	}
 
-	// Reject symlinked state directories
-	fi, err := os.Lstat(opts.StateDir)
-	if err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("%w: %s", ErrSymlinkForbidden, opts.StateDir)
+	// Reject symlinked state directories and components
+	if err := ensureNoSymlink(opts.StateDir); err != nil {
+		return nil, err
+	}
+	dbPath := filepath.Join(opts.StateDir, "state.db")
+	if err := ensureNoSymlink(dbPath); err != nil {
+		return nil, err
+	}
+	if err := ensureNoSymlink(filepath.Join(opts.StateDir, "state.db-wal")); err != nil {
+		return nil, err
+	}
+	if err := ensureNoSymlink(filepath.Join(opts.StateDir, "state.db-shm")); err != nil {
+		return nil, err
+	}
+	if err := ensureNoSymlink(filepath.Join(opts.StateDir, "artifacts")); err != nil {
+		return nil, err
 	}
 
 	if err := os.MkdirAll(opts.StateDir, 0700); err != nil {
@@ -69,7 +96,6 @@ func Open(opts StoreOptions) (*Store, error) {
 		_ = os.WriteFile(gitignorePath, []byte("*\n"), 0600)
 	}
 
-	dbPath := filepath.Join(opts.StateDir, "state.db")
 	writeDSN := buildDSN(dbPath, "immediate")
 	writeDB, err := sql.Open("sqlite", writeDSN)
 	if err != nil {
@@ -86,9 +112,10 @@ func Open(opts StoreOptions) (*Store, error) {
 	}
 
 	s := &Store{
-		writeDB:  writeDB,
-		readDB:   readDB,
-		stateDir: opts.StateDir,
+		writeDB:              writeDB,
+		readDB:               readDB,
+		stateDir:             opts.StateDir,
+		testHookBeforeCommit: opts.TestHookBeforeCommit,
 	}
 
 	// Verify PRAGMAs on write connection

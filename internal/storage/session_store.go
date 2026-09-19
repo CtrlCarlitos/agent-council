@@ -270,8 +270,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 	err = tx.Tx().QueryRowContext(ctx, "SELECT prompt FROM pending_prompts WHERE session_id = ? AND turn_key = ?;", sessionID, prompt.TurnKey).Scan(&existingPendingPrompt)
 	if err == nil {
 		if existingPendingPrompt == sanitized {
-			// Idempotent submission of identical pending prompt
-			return OperationReceipt{
+			receipt := OperationReceipt{
 				OpID:             opID,
 				CommandType:      "queue_prompt",
 				SessionID:        sessionID,
@@ -279,7 +278,14 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 				CommittedVersion: currentVer,
 				CreatedAt:        time.Now().UTC(),
 				Payload:          sanitized,
-			}, nil
+			}
+			if err := recordJournalEntry(tx.Tx(), opID, "queue_prompt", fp, runID, sessionID, prompt.TurnKey, "prompt_identical_noop", receipt, callerLease); err != nil {
+				return OperationReceipt{}, err
+			}
+			if err := tx.Commit(); err != nil {
+				return OperationReceipt{}, err
+			}
+			return receipt, nil
 		}
 		return OperationReceipt{}, errors.New("duplicate pending key with different content")
 	} else if err != sql.ErrNoRows {

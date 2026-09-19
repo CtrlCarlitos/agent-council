@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -27,6 +28,43 @@ type releaseJournalPayload struct {
 	Receipt     ReleaseReceipt `json:"receipt"`
 }
 
+type decisionJournalPayload struct {
+	CallerLease string           `json:"caller_lease"`
+	Receipt     OperationReceipt `json:"receipt"`
+	Decision    DecisionRecord   `json:"decision"`
+}
+
+var safeProfileIdentifierRegex = regexp.MustCompile(`^[a-zA-Z0-9_\-\.]+$`)
+var envAssignmentRegex = regexp.MustCompile(`(?i)[a-z0-9_]*(key|token|secret|password|bearer|auth)[a-z0-9_]*\s*=`)
+
+func validateConfigValue(v any) error {
+	switch val := v.(type) {
+	case string:
+		if containsDisallowedCredential(val) {
+			return fmt.Errorf("%w: sensitive credential pattern detected", ErrDisallowedToolingConfig)
+		}
+		if envAssignmentRegex.MatchString(val) {
+			return fmt.Errorf("%w: suspicious credential assignment detected", ErrDisallowedToolingConfig)
+		}
+	case []any:
+		for _, elem := range val {
+			if err := validateConfigValue(elem); err != nil {
+				return err
+			}
+		}
+	case map[string]any:
+		for k, elem := range val {
+			if containsDisallowedCredential(k) || envAssignmentRegex.MatchString(k) {
+				return fmt.Errorf("%w: sensitive key pattern detected %q", ErrDisallowedToolingConfig, k)
+			}
+			if err := validateConfigValue(elem); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func validateToolingConfig(configStr string) error {
 	trimmed := strings.TrimSpace(configStr)
 	if trimmed == "" || trimmed == "{}" {
@@ -35,10 +73,18 @@ func validateToolingConfig(configStr string) error {
 	if containsDisallowedCredential(trimmed) {
 		return ErrDisallowedToolingConfig
 	}
+	if envAssignmentRegex.MatchString(trimmed) {
+		return fmt.Errorf("%w: credential assignment pattern in config", ErrDisallowedToolingConfig)
+	}
+
 	var m map[string]any
 	if err := json.Unmarshal([]byte(trimmed), &m); err != nil {
-		return nil // Non-JSON string without credentials is accepted
+		if !safeProfileIdentifierRegex.MatchString(trimmed) {
+			return fmt.Errorf("%w: configuration must be valid JSON object or safe identifier", ErrDisallowedToolingConfig)
+		}
+		return nil
 	}
+
 	allowedKeys := map[string]bool{
 		"workspace_root":  true,
 		"model":           true,
@@ -55,8 +101,8 @@ func validateToolingConfig(configStr string) error {
 		if !allowedKeys[k] {
 			return fmt.Errorf("%w: disallowed configuration key %q", ErrDisallowedToolingConfig, k)
 		}
-		if s, ok := v.(string); ok && containsDisallowedCredential(s) {
-			return fmt.Errorf("%w: sensitive credential pattern detected in %q", ErrDisallowedToolingConfig, k)
+		if err := validateConfigValue(v); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -280,6 +326,10 @@ INSERT INTO journal_entries (op_id, command_type, command_fingerprint, run_id, s
 VALUES (?, 'release_turn', ?, ?, ?, ?, 'turn_released', 1, ?, ?);`, opID, fp, runID, sessionID, turnKey, string(payloadBytes), now)
 	if err != nil {
 		return ReleaseReceipt{}, fmt.Errorf("record release journal entry: %w", err)
+	}
+
+	if s.testHookBeforeCommit != nil {
+		s.testHookBeforeCommit("pre_commit_release")
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -509,7 +559,11 @@ SELECT phase FROM dispatch_intents WHERE session_id = ? AND turn_key = ?;`, sess
 		return OperationReceipt{}, fmt.Errorf("query dispatch intent: %w", err)
 	}
 
-	// Late arrival rule: if intent is already resolved, observation is ignored as clean no-op
+	if phase != "receipt_acknowledged" && phase != "acceptance_unknown" {
+		return OperationReceipt{}, fmt.Errorf("invalid dispatch observation phase %q: only acknowledgement or uncertainty phases permitted", phase)
+	}
+
+	// Late arrival rule: if intent is already resolved, observation is ignored as clean no-op with durable receipt
 	if currentPhase == "resolved" {
 		receipt := OperationReceipt{
 			OpID:             opID,
@@ -519,6 +573,31 @@ SELECT phase FROM dispatch_intents WHERE session_id = ? AND turn_key = ?;`, sess
 			CommittedVersion: currentVer,
 			CreatedAt:        time.Now().UTC(),
 			Payload:          "late_observation_ignored",
+		}
+		if err := recordJournalEntry(tx.Tx(), opID, "record_dispatch_observation", fp, runID, sessionID, turnKey, "dispatch_late_observation_ignored", receipt, callerLease); err != nil {
+			return OperationReceipt{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return OperationReceipt{}, err
+		}
+		return receipt, nil
+	}
+
+	if currentPhase == phase {
+		receipt := OperationReceipt{
+			OpID:             opID,
+			CommandType:      "record_dispatch_observation",
+			SessionID:        sessionID,
+			TurnKey:          turnKey,
+			CommittedVersion: currentVer,
+			CreatedAt:        time.Now().UTC(),
+			Payload:          phase,
+		}
+		if err := recordJournalEntry(tx.Tx(), opID, "record_dispatch_observation", fp, runID, sessionID, turnKey, "dispatch_observation_noop", receipt, callerLease); err != nil {
+			return OperationReceipt{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return OperationReceipt{}, err
 		}
 		return receipt, nil
 	}
@@ -611,6 +690,24 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 	err = tx.Tx().QueryRowContext(ctx, "SELECT status FROM turns WHERE session_id = ? AND turn_key = ?;", sessionID, turnKey).Scan(&turnStatus)
 	if err != nil {
 		return OperationReceipt{}, fmt.Errorf("query turn status: %w", err)
+	}
+	if turnStatus == "cancelling" {
+		receipt := OperationReceipt{
+			OpID:             opID,
+			CommandType:      "request_cancel",
+			SessionID:        sessionID,
+			TurnKey:          turnKey,
+			CommittedVersion: currentVer,
+			CreatedAt:        time.Now().UTC(),
+			Payload:          "cancelling",
+		}
+		if err := recordJournalEntry(tx.Tx(), opID, "request_cancel", fp, runID, sessionID, turnKey, "cancel_noop", receipt, callerLease); err != nil {
+			return OperationReceipt{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return OperationReceipt{}, err
+		}
+		return receipt, nil
 	}
 	if turnStatus != "running" {
 		return OperationReceipt{}, fmt.Errorf("turn %s is in status %s, cannot cancel", turnKey, turnStatus)
@@ -706,6 +803,45 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 	}
 	if lifecycle == "archived" {
 		return OperationReceipt{}, ErrSessionArchived
+	}
+
+	// First query existing turn status and result
+	var existingTurnStatus, existingTurnResult string
+	err = tx.Tx().QueryRowContext(ctx, "SELECT status, result FROM turns WHERE session_id = ? AND turn_key = ?;", sessionID, turnKey).Scan(&existingTurnStatus, &existingTurnResult)
+	if err == sql.ErrNoRows {
+		return OperationReceipt{}, fmt.Errorf("turn %s not found", turnKey)
+	}
+	if err != nil {
+		return OperationReceipt{}, fmt.Errorf("query turn: %w", err)
+	}
+
+	isTerminal := func(s string) bool {
+		return s == "completed" || s == "cancelled" || s == "failed" || s == "interrupted"
+	}
+
+	if isTerminal(existingTurnStatus) {
+		if existingTurnStatus == statusStr && existingTurnResult == sanitizedResult {
+			// Exact duplicate: return durable receipt without mutating history
+			receipt := OperationReceipt{
+				OpID:             opID,
+				CommandType:      "record_terminal_outcome",
+				SessionID:        sessionID,
+				TurnKey:          turnKey,
+				CommittedVersion: currentVer,
+				CreatedAt:        time.Now().UTC(),
+				Payload:          statusStr,
+			}
+			eventKind := "turn_" + statusStr + "_duplicate"
+			if err := recordJournalEntry(tx.Tx(), opID, "record_terminal_outcome", fp, runID, sessionID, turnKey, eventKind, receipt, callerLease); err != nil {
+				return OperationReceipt{}, err
+			}
+			if err := tx.Commit(); err != nil {
+				return OperationReceipt{}, err
+			}
+			return receipt, nil
+		}
+		// Conflicting terminal outcome on already-terminal turn: reject!
+		return OperationReceipt{}, fmt.Errorf("%w: turn %s is already terminal (%s), conflicting with %s", ErrConflictingTerminalOutcome, turnKey, existingTurnStatus, statusStr)
 	}
 
 	if visibility == "host_lost" {
@@ -830,6 +966,12 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 			CreatedAt:        time.Now().UTC(),
 			Payload:          fmt.Sprintf("%d", activeRecGen),
 		}
+		if err := recordJournalEntry(tx.Tx(), opID, "record_host_loss", fp, runID, sessionID, activeKey.String, "host_loss_noop", receipt, callerLease); err != nil {
+			return OperationReceipt{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return OperationReceipt{}, err
+		}
 		return receipt, nil
 	}
 
@@ -890,13 +1032,13 @@ func (s *Store) SetControllerConnection(ctx context.Context, opID string, caller
 		return *receipt, nil
 	}
 
-	var runID, runLease, lifecycle string
+	var runID, runLease, lifecycle, currentStatus string
 	var currentVer int64
 	err = tx.Tx().QueryRowContext(ctx, `
-SELECT s.run_id, r.controller_lease, s.row_version, s.lifecycle
+SELECT s.run_id, r.controller_lease, s.row_version, s.lifecycle, s.controller_status
 FROM sessions s
 JOIN runs r ON s.run_id = r.run_id
-WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifecycle)
+WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifecycle, &currentStatus)
 	if err != nil {
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
@@ -909,6 +1051,24 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 	}
 	if lifecycle == "archived" {
 		return OperationReceipt{}, ErrSessionArchived
+	}
+
+	if currentStatus == string(status) {
+		receipt := OperationReceipt{
+			OpID:             opID,
+			CommandType:      "set_controller_connection",
+			SessionID:        sessionID,
+			CommittedVersion: currentVer,
+			CreatedAt:        time.Now().UTC(),
+			Payload:          string(status),
+		}
+		if err := recordJournalEntry(tx.Tx(), opID, "set_controller_connection", fp, runID, sessionID, "", "connection_noop", receipt, callerLease); err != nil {
+			return OperationReceipt{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return OperationReceipt{}, err
+		}
+		return receipt, nil
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -978,13 +1138,20 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &state
 		return OperationReceipt{}, ErrStaleUpdate
 	}
 	if lifecycle == "archived" {
-		return OperationReceipt{
+		receipt := OperationReceipt{
 			OpID:             opID,
 			CommandType:      "archive_session",
 			SessionID:        sessionID,
 			CommittedVersion: currentVer,
 			CreatedAt:        time.Now().UTC(),
-		}, nil
+		}
+		if err := recordJournalEntry(tx.Tx(), opID, "archive_session", fp, runID, sessionID, "", "session_archived_noop", receipt, callerLease); err != nil {
+			return OperationReceipt{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return OperationReceipt{}, err
+		}
+		return receipt, nil
 	}
 
 	if state == "running" || (activeKey.Valid && activeKey.String != "") || visibility == "host_lost" {
@@ -1024,7 +1191,8 @@ func (s *Store) RecordDecision(ctx context.Context, opID string, callerLease str
 		return OperationReceipt{}, errors.New("invalid decision parameters")
 	}
 
-	fp := computeFingerprint("record_decision", runID, artifactID, fmt.Sprintf("%d", revision), decisionPayload)
+	sanitizedPayload := SanitizeText(decisionPayload)
+	fp := computeFingerprint("record_decision", runID, artifactID, fmt.Sprintf("%d", revision), sanitizedPayload)
 
 	tx, err := s.BeginWrite(ctx)
 	if err != nil {
@@ -1044,25 +1212,61 @@ func (s *Store) RecordDecision(ctx context.Context, opID string, callerLease str
 		return OperationReceipt{}, ErrUnauthorizedOperation
 	}
 
-	// Verify that referenced (artifact_id, revision) exists in artifact_revisions for this run
-	var count int
+	// Verify that referenced (artifact_id, revision) exists in artifact_revisions for this run and query digest
+	var digest string
 	err = tx.Tx().QueryRowContext(ctx, `
-SELECT count(*) FROM artifact_revisions
-WHERE artifact_id = ? AND revision = ? AND run_id = ?;`, artifactID, revision, runID).Scan(&count)
-	if err != nil || count == 0 {
+SELECT digest FROM artifact_revisions
+WHERE artifact_id = ? AND revision = ? AND run_id = ?;`, artifactID, revision, runID).Scan(&digest)
+	if err == sql.ErrNoRows {
 		return OperationReceipt{}, ErrArtifactNotFound
 	}
+	if err != nil {
+		return OperationReceipt{}, fmt.Errorf("query artifact revision: %w", err)
+	}
+
+	now := time.Now().UTC()
+	nowStr := now.Format(time.RFC3339Nano)
 
 	receipt := OperationReceipt{
 		OpID:             opID,
 		CommandType:      "record_decision",
 		CommittedVersion: revision,
-		CreatedAt:        time.Now().UTC(),
-		Payload:          decisionPayload,
+		CreatedAt:        now,
+		Payload:          sanitizedPayload,
 	}
 
-	if err := recordJournalEntry(tx.Tx(), opID, "record_decision", fp, runID, "", "", "controller_decision", receipt, callerLease); err != nil {
-		return OperationReceipt{}, err
+	dec := DecisionRecord{
+		OpID:            opID,
+		RunID:           runID,
+		ArtifactID:      artifactID,
+		Revision:        revision,
+		Digest:          digest,
+		DecisionPayload: sanitizedPayload,
+		CreatedAt:       now,
+	}
+
+	jp := decisionJournalPayload{
+		CallerLease: callerLease,
+		Receipt:     receipt,
+		Decision:    dec,
+	}
+	jpBytes, err := json.Marshal(jp)
+	if err != nil {
+		return OperationReceipt{}, fmt.Errorf("marshal decision journal payload: %w", err)
+	}
+
+	_, err = tx.Tx().ExecContext(ctx, `
+INSERT INTO journal_entries (op_id, command_type, command_fingerprint, run_id, session_id, turn_key, event_kind, payload_version, payload_json, created_at)
+VALUES (?, 'record_decision', ?, ?, NULL, NULL, 'controller_decision', 1, ?, ?);`, opID, fp, runID, string(jpBytes), nowStr)
+	if err != nil {
+		return OperationReceipt{}, fmt.Errorf("insert journal entry: %w", err)
+	}
+
+	_, err = tx.Tx().ExecContext(ctx, `
+INSERT INTO decisions (op_id, run_id, artifact_id, revision, digest, decision_payload, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?);`, opID, runID, artifactID, revision, digest, sanitizedPayload, nowStr)
+	if err != nil {
+		return OperationReceipt{}, fmt.Errorf("insert decision: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {

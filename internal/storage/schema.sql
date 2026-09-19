@@ -117,3 +117,20 @@ CREATE TABLE IF NOT EXISTS artifact_revisions (
 CREATE INDEX IF NOT EXISTS idx_turns_session_status ON turns(session_id, status);
 CREATE INDEX IF NOT EXISTS idx_journal_run_seq ON journal_entries(run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_artifacts_digest ON artifact_revisions(digest);
+
+-- Explicit Controller Decisions (Typed references to evaluated artifact revisions)
+CREATE TABLE IF NOT EXISTS decisions (
+    decision_id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    op_id TEXT NOT NULL UNIQUE REFERENCES journal_entries(op_id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+    artifact_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    digest TEXT NOT NULL,
+    decision_payload TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (artifact_id, revision) REFERENCES artifact_revisions(artifact_id, revision) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_decisions_run ON decisions(run_id);
+CREATE INDEX IF NOT EXISTS idx_decisions_artifact ON decisions(artifact_id, revision);
+

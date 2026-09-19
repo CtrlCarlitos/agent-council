@@ -26,6 +26,7 @@ var (
 	ErrDisallowedToolingConfig    = errors.New("tooling configuration violates security policy")
 	ErrTurnAlreadyExists          = errors.New("turn identifier already exists")
 	ErrSymlinkForbidden           = errors.New("symlink state directory not permitted")
+	ErrConflictingTerminalOutcome = errors.New("conflicting terminal outcome on already-terminal turn")
 )
 
 type QueryRower interface {
@@ -33,7 +34,18 @@ type QueryRower interface {
 }
 
 type StoreOptions struct {
-	StateDir string
+	StateDir             string
+	TestHookBeforeCommit func(boundary string)
+}
+
+type DecisionRecord struct {
+	OpID            string    `json:"op_id"`
+	RunID           string    `json:"run_id"`
+	ArtifactID      string    `json:"artifact_id"`
+	Revision        int64     `json:"revision"`
+	Digest          string    `json:"digest"`
+	DecisionPayload string    `json:"decision_payload"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 type OperationReceipt struct {

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,6 +16,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/CtrlCarlitos/agent-council/internal/adapter"
+	"github.com/CtrlCarlitos/agent-council/internal/adapter/adaptertest"
+	"github.com/CtrlCarlitos/agent-council/internal/council"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
@@ -100,8 +104,16 @@ func TestStore_CrashRecovery_MultiBoundaryMatrix(t *testing.T) {
 				t.Fatalf("checkpoint %q not reached before subprocess exit; stderr: %s", expectedCheckpoint, stderr.String())
 			}
 
-			// Wait for deliberate crash exit
-			_ = cmd.Wait()
+			// Wait for deliberate crash exit and assert exit code 42
+			waitErr := cmd.Wait()
+			var exitErr *exec.ExitError
+			if errors.As(waitErr, &exitErr) {
+				if exitErr.ExitCode() != 42 {
+					t.Fatalf("expected subprocess to exit with code 42, got %d", exitErr.ExitCode())
+				}
+			} else {
+				t.Fatalf("expected ExitError with code 42, got %v", waitErr)
+			}
 
 			// Parent reopens store and asserts durable state invariant
 			store, err := storage.Open(storage.StoreOptions{StateDir: tempDir})
@@ -190,7 +202,19 @@ func TestStore_CrashRecovery_MultiBoundaryMatrix(t *testing.T) {
 func runCrashSubprocess() {
 	boundary := os.Getenv("SUBPROCESS_CRASH_BOUNDARY")
 	stateDir := os.Getenv("SUBPROCESS_STATE_DIR")
-	store, err := storage.Open(storage.StoreOptions{StateDir: stateDir})
+
+	hook := func(b string) {
+		if b == boundary {
+			fmt.Fprintln(os.Stdout, "CHECKPOINT:"+boundary)
+			_ = os.Stdout.Sync()
+			os.Exit(42)
+		}
+	}
+
+	store, err := storage.Open(storage.StoreOptions{
+		StateDir:             stateDir,
+		TestHookBeforeCommit: hook,
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stdout, "ERROR:open store: %v\n", err)
 		os.Exit(1)
@@ -199,21 +223,13 @@ func runCrashSubprocess() {
 	ctx := context.Background()
 	switch boundary {
 	case "pre_commit_release":
-		// Begin write tx, perform full release operations, emit checkpoint, crash before commit
-		tx, err := store.BeginWrite(ctx)
+		// Invoke production ReleaseTurn, which invokes TestHookBeforeCommit("pre_commit_release") before tx.Commit()
+		_, err := store.ReleaseTurn(ctx, "op-crash-rel", "lease-1", "sess-1", 2, "turn-init")
 		if err != nil {
-			fmt.Fprintf(os.Stdout, "ERROR:begin write: %v\n", err)
+			fmt.Fprintf(os.Stdout, "ERROR:release turn: %v\n", err)
 			os.Exit(1)
 		}
-		_, _ = tx.Tx().Exec("DELETE FROM pending_prompts WHERE session_id = 'sess-1' AND turn_key = 'turn-init';")
-		_, _ = tx.Tx().Exec("INSERT INTO turns (session_id, turn_key, prompt, status, result, attempt_id, created_at) VALUES ('sess-1', 'turn-init', 'Initial Prompt', 'running', '', 'att_2', '2026-09-19T00:00:00Z');")
-		_, _ = tx.Tx().Exec("INSERT INTO dispatch_intents (session_id, turn_key, attempt_id, phase, recorded_at, updated_at) VALUES ('sess-1', 'turn-init', 'att_2', 'intent_recorded', '2026-09-19T00:00:00Z', '2026-09-19T00:00:00Z');")
-		_, _ = tx.Tx().Exec("UPDATE sessions SET active_key = 'turn-init', state = 'running', row_version = 2 WHERE session_id = 'sess-1';")
-
-		fmt.Fprintln(os.Stdout, "CHECKPOINT:pre_commit_release")
-		_ = os.Stdout.Sync()
-		// Abrupt exit without tx.Commit()
-		os.Exit(42)
+		os.Exit(1)
 
 	case "post_intent_unacknowledged":
 		_, err := store.ReleaseTurn(ctx, "op-crash-rel", "lease-1", "sess-1", 2, "turn-init")
@@ -231,11 +247,32 @@ func runCrashSubprocess() {
 			fmt.Fprintf(os.Stdout, "ERROR:release turn: %v\n", err)
 			os.Exit(1)
 		}
+
+		// Dispatch via real FakeAdapter
+		fake := adaptertest.NewFake(adaptertest.ScriptedFaults{})
+		_, err = fake.CreateSession(ctx, adapter.CreateSessionRequest{
+			SessionID:   adapter.SessionID("sess-1"),
+			Contributor: council.Claude,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stdout, "ERROR:fake create session: %v\n", err)
+			os.Exit(1)
+		}
+
+		outcome, err := fake.Dispatch(ctx, adapter.TurnRef{
+			SessionID: "sess-1",
+			TurnKey:   "turn-init",
+		}, "Initial Prompt")
+		if err != nil || outcome.Status != adapter.DispatchAccepted {
+			fmt.Fprintf(os.Stdout, "ERROR:fake dispatch: %v, status=%s\n", err, outcome.Status)
+			os.Exit(1)
+		}
+
 		// External harness accepted: record independent receipt on disk
 		evidence := map[string]string{
-			"status":   "accepted",
+			"status":   string(outcome.Status),
 			"turn_key": "turn-init",
-			"harness":  "claude-native",
+			"harness":  "claude-fake",
 		}
 		evidenceBytes, _ := json.Marshal(evidence)
 		_ = os.WriteFile(filepath.Join(stateDir, "external_harness_acceptance.json"), evidenceBytes, 0600)
@@ -245,16 +282,20 @@ func runCrashSubprocess() {
 		os.Exit(42)
 
 	case "uncommitted_artifact_metadata":
-		// Install blob into artifacts/ dir using real digest and permissions
+		// Call production PublishArtifact, which invokes TestHookBeforeCommit("uncommitted_artifact_metadata") before tx.Commit()
 		content := []byte("crash-recovery-artifact-body")
-		sum := sha256.Sum256(content)
-		digest := hex.EncodeToString(sum[:])
-		blobDir := filepath.Join(stateDir, "artifacts", digest[:2])
-		_ = os.MkdirAll(blobDir, 0700)
-		_ = os.WriteFile(filepath.Join(blobDir, digest), content, 0600)
-
-		fmt.Fprintln(os.Stdout, "CHECKPOINT:uncommitted_artifact_metadata")
-		_ = os.Stdout.Sync()
-		os.Exit(42)
+		meta := storage.ArtifactMetadata{
+			ID:        "art-1",
+			RunID:     "run-1",
+			SessionID: "sess-1",
+			TurnKey:   "turn-init",
+			Name:      "patch.diff",
+		}
+		_, err = store.PublishArtifact(ctx, "op-art-crash", "lease-1", meta, content)
+		if err != nil {
+			fmt.Fprintf(os.Stdout, "ERROR:publish artifact: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(1)
 	}
 }

@@ -101,10 +101,22 @@ func (s *Store) PublishArtifact(ctx context.Context, opID string, callerLease st
 	defer artifactMu.Unlock()
 
 	artifactsDir := filepath.Join(s.stateDir, "artifacts")
+	if err := ensureNoSymlink(artifactsDir); err != nil {
+		return ArtifactMetadata{}, err
+	}
 	destDir := filepath.Join(artifactsDir, digest[:2])
+	if err := ensureNoSymlink(destDir); err != nil {
+		return ArtifactMetadata{}, err
+	}
 	destPath := filepath.Join(destDir, digest)
+	if err := ensureNoSymlink(destPath); err != nil {
+		return ArtifactMetadata{}, err
+	}
 
 	tmpDir := filepath.Join(artifactsDir, "tmp")
+	if err := ensureNoSymlink(tmpDir); err != nil {
+		return ArtifactMetadata{}, err
+	}
 	if err := os.MkdirAll(tmpDir, 0700); err != nil {
 		return ArtifactMetadata{}, fmt.Errorf("create tmp dir: %w", err)
 	}
@@ -119,20 +131,25 @@ func (s *Store) PublishArtifact(ctx context.Context, opID string, callerLease st
 	}
 	tmpName := tmpFile.Name()
 
-	if _, err := tmpFile.Write(sanitizedContent); err != nil {
-		tmpFile.Close()
-		os.Remove(tmpName)
-		return ArtifactMetadata{}, fmt.Errorf("write staging file: %w", err)
+	n, writeErr := tmpFile.Write(sanitizedContent)
+	if writeErr == nil && n != len(sanitizedContent) {
+		writeErr = io.ErrShortWrite
 	}
-	if err := tmpFile.Sync(); err != nil {
-		tmpFile.Close()
-		os.Remove(tmpName)
-		return ArtifactMetadata{}, fmt.Errorf("sync staging file: %w", err)
+	syncErr := tmpFile.Sync()
+	closeErr := tmpFile.Close()
+	if writeErr != nil || syncErr != nil || closeErr != nil {
+		_ = os.Remove(tmpName)
+		if writeErr != nil {
+			return ArtifactMetadata{}, fmt.Errorf("write staging file: %w", writeErr)
+		}
+		if syncErr != nil {
+			return ArtifactMetadata{}, fmt.Errorf("sync staging file: %w", syncErr)
+		}
+		return ArtifactMetadata{}, fmt.Errorf("close staging file: %w", closeErr)
 	}
-	tmpFile.Close()
 
 	if err := os.Chmod(tmpName, 0600); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return ArtifactMetadata{}, fmt.Errorf("chmod staging file: %w", err)
 	}
 
@@ -151,10 +168,23 @@ func (s *Store) PublishArtifact(ctx context.Context, opID string, callerLease st
 		// Fallback for filesystems that do not support hardlinks (e.g. cross-device)
 		destF, err := os.OpenFile(destPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 		if err == nil {
-			_, _ = destF.Write(sanitizedContent)
-			_ = destF.Sync()
-			_ = destF.Close()
+			n, wErr := destF.Write(sanitizedContent)
+			if wErr == nil && n != len(sanitizedContent) {
+				wErr = io.ErrShortWrite
+			}
+			sErr := destF.Sync()
+			cErr := destF.Close()
 			_ = os.Remove(tmpName)
+			if wErr != nil || sErr != nil || cErr != nil {
+				_ = os.Remove(destPath) // fail closed: remove partial file
+				if wErr != nil {
+					return ArtifactMetadata{}, fmt.Errorf("write artifact fallback: %w", wErr)
+				}
+				if sErr != nil {
+					return ArtifactMetadata{}, fmt.Errorf("sync artifact fallback: %w", sErr)
+				}
+				return ArtifactMetadata{}, fmt.Errorf("close artifact fallback: %w", cErr)
+			}
 		} else if os.IsExist(err) {
 			_ = os.Remove(tmpName)
 			existingBytes, err := s.ReadArtifact(digest)
@@ -168,9 +198,17 @@ func (s *Store) PublishArtifact(ctx context.Context, opID string, callerLease st
 	}
 
 	// Sync parent directory before metadata commit
-	if d, err := os.Open(destDir); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
+	d, err := os.Open(destDir)
+	if err != nil {
+		return ArtifactMetadata{}, fmt.Errorf("open dest dir for sync: %w", err)
+	}
+	dSyncErr := d.Sync()
+	dCloseErr := d.Close()
+	if dSyncErr != nil || dCloseErr != nil {
+		if dSyncErr != nil {
+			return ArtifactMetadata{}, fmt.Errorf("sync dest dir: %w", dSyncErr)
+		}
+		return ArtifactMetadata{}, fmt.Errorf("close dest dir: %w", dCloseErr)
 	}
 
 	// 7. Record metadata in relational store inside write transaction
@@ -241,6 +279,10 @@ INSERT INTO journal_entries (op_id, command_type, command_fingerprint, run_id, s
 VALUES (?, 'publish_artifact', ?, ?, ?, ?, 'artifact_published', 1, ?, ?);`, opID, fp, meta.RunID, meta.SessionID, meta.TurnKey, string(ajpBytes), now)
 	if err != nil {
 		return ArtifactMetadata{}, fmt.Errorf("record artifact journal entry: %w", err)
+	}
+
+	if s.testHookBeforeCommit != nil {
+		s.testHookBeforeCommit("uncommitted_artifact_metadata")
 	}
 
 	if err := tx.Commit(); err != nil {

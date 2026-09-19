@@ -7,7 +7,7 @@ import (
 var (
 	githubTokenRegex   = regexp.MustCompile(`gh[pousr]_[A-Za-z0-9_]{16,}`)
 	anthropicKeyRegex  = regexp.MustCompile(`sk-ant-(?:api03-)?[A-Za-z0-9_\-]{20,}`)
-	bearerTokenRegex   = regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9_\-\.]{16,}`)
+	bearerTokenRegex   = regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9_\-\.]{8,}`)
 	genericApiKeyRegex = regexp.MustCompile(`sk-[A-Za-z0-9_\-]{20,}`)
 	slackTokenRegex    = regexp.MustCompile(`xox[baprs]-[A-Za-z0-9_\-]+`)
 )
