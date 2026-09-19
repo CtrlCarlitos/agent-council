@@ -48,6 +48,7 @@ type FakeAdapter struct {
 	activeStreams map[adapter.TurnRef][]*adapter.BufferedStream
 	workerCancels map[adapter.TurnRef]chan struct{}
 	workersWg     sync.WaitGroup
+	watchersWg    sync.WaitGroup
 }
 
 // NewFake constructs a FakeAdapter configured with the provided scripted faults.
@@ -98,7 +99,8 @@ func (f *FakeAdapter) WaitWorkers() {
 	f.workersWg.Wait()
 }
 
-// Close cancels all active workers and unblocks all execution gates.
+// Close cancels all active workers, closes all active observation streams,
+// unregisters all subscriptions, and joins all worker and watcher goroutines.
 func (f *FakeAdapter) Close() error {
 	f.mu.Lock()
 	for _, ch := range f.workerCancels {
@@ -108,8 +110,26 @@ func (f *FakeAdapter) Close() error {
 			close(ch)
 		}
 	}
+	for ref := range f.dispatches {
+		f.retiredTurns[ref] = true
+	}
+	var allStreams []*adapter.BufferedStream
+	for _, streams := range f.activeStreams {
+		allStreams = append(allStreams, streams...)
+	}
 	f.mu.Unlock()
+
+	for _, s := range allStreams {
+		_ = s.Close()
+	}
+
 	f.workersWg.Wait()
+	f.watchersWg.Wait()
+
+	f.mu.Lock()
+	f.activeStreams = make(map[adapter.TurnRef][]*adapter.BufferedStream)
+	f.mu.Unlock()
+
 	return nil
 }
 
@@ -498,7 +518,9 @@ func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter
 	f.activeStreams[ref] = append(f.activeStreams[ref], stream)
 
 	// Watch observation context cancellation or explicit close to unregister stream
+	f.watchersWg.Add(1)
 	go func() {
+		defer f.watchersWg.Done()
 		select {
 		case <-ctx.Done():
 			f.mu.Lock()

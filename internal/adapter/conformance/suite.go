@@ -161,12 +161,14 @@ func Check(ctx context.Context, fixture Fixture, scenario Scenario) []Violation 
 
 		// Wait for initial progress event or terminal event (if turn completed before observation)
 		var sawValidEvent bool
+		var initialEvent adapter.Event
 		select {
 		case ev, ok := <-stream.Events():
 			if ok {
 				if (ev.Type == adapter.EventProgress && ev.Status == council.TurnRunning) ||
 					ev.Type == adapter.EventTerminal {
 					sawValidEvent = true
+					initialEvent = ev
 				}
 			}
 		case <-time.After(200 * time.Millisecond):
@@ -181,6 +183,25 @@ func Check(ctx context.Context, fixture Fixture, scenario Scenario) []Violation 
 			return violations
 		}
 
+		addCompletionViolation := func(desc string) {
+			for _, v := range violations {
+				if v.Code == ViolationEOFAsCompletion {
+					return
+				}
+			}
+			violations = append(violations, Violation{
+				Code:        ViolationEOFAsCompletion,
+				Description: desc,
+			})
+		}
+
+		// Validate terminal replay against independent fixture evidence
+		if initialEvent.Type == adapter.EventTerminal {
+			if !fixture.IsCompletionAllowed(ref) || fixture.IsExecutionActive(ref) {
+				addCompletionViolation("observation stream emitted terminal event replay while execution remains active or completion not allowed")
+			}
+		}
+
 		// Check status before closing stream to distinguish natural completion from fabricated completion
 		resBefore, errBefore := ad.Collect(ctx, ref)
 		if errBefore != nil {
@@ -190,6 +211,12 @@ func Check(ctx context.Context, fixture Fixture, scenario Scenario) []Violation 
 			})
 			_ = stream.Close()
 			return violations
+		}
+
+		if resBefore.Status == council.TurnCompleted {
+			if !fixture.IsCompletionAllowed(ref) || fixture.IsExecutionActive(ref) {
+				addCompletionViolation("collect reported terminal completion before stream close while execution remains active or completion not allowed")
+			}
 		}
 
 		// Close observation stream
@@ -205,14 +232,9 @@ func Check(ctx context.Context, fixture Fixture, scenario Scenario) []Violation 
 			return violations
 		}
 
-		// If the turn was actively running before Close(), but immediately jumps to Completed upon Close(),
-		// verify whether completion was legitimately allowed by independent fixture gates.
-		if resBefore.Status == council.TurnRunning && resAfter.Status == council.TurnCompleted {
-			if !fixture.IsCompletionAllowed(ref) {
-				violations = append(violations, Violation{
-					Code:        ViolationEOFAsCompletion,
-					Description: "closing stream fabricated terminal turn completion while completion was not allowed",
-				})
+		if resAfter.Status == council.TurnCompleted {
+			if !fixture.IsCompletionAllowed(ref) || fixture.IsExecutionActive(ref) {
+				addCompletionViolation("collect reported terminal completion after stream close while execution remains active or completion not allowed")
 			}
 		}
 
