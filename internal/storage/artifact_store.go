@@ -171,11 +171,16 @@ func (s *Store) PublishArtifact(ctx context.Context, opID string, callerLease st
 	}
 
 	// Sync parent directory before metadata commit on supported POSIX filesystems.
-	// On Windows, user-mode directory handles cannot be flushed via FlushFileBuffers (which returns
-	// ERROR_ACCESS_DENIED). File data is guaranteed durable via tmpFile.Sync() prior to os.Link.
-	// If a power loss occurs before the directory link is flushed to disk, the fail-closed
-	// read barrier (ReadArtifact digest and size verification) detects the missing blob and returns
-	// ErrArtifactNotFound, strictly preventing unverified execution without silent repair or corrupt data.
+	// Windows artifact availability after sudden power loss:
+	// AC-002 flushes staged file contents and installs a complete digest-addressed file via os.Link.
+	// The current Windows implementation does not establish a crash-durable namespace-publication barrier
+	// before committing SQLite artifact metadata (user-mode directory handles cannot be flushed via
+	// FlushFileBuffers, which returns ERROR_ACCESS_DENIED). Therefore, a successful publication receipt
+	// does not guarantee that the artifact file remains available after abrupt power loss, even if its
+	// database revision record survives.
+	// Reads return content only when the file exists and its size and digest match the committed revision;
+	// missing or altered content returns explicit errors (ErrArtifactNotFound / ErrArtifactCorrupt) without
+	// exposing unverified bytes. This detects unavailable or corrupt artifacts; it does not prevent their loss.
 	if runtime.GOOS != "windows" {
 		d, err := os.Open(destDir)
 		if err != nil {

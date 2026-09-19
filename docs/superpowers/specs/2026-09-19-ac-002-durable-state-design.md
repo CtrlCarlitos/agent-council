@@ -291,9 +291,9 @@ Artifacts (proposals, ballots, synthesis docs, findings, patches) are stored in 
 5. Directory Synchronization:
    - On POSIX (Linux, macOS): fsync parent directory to flush directory entry metadata before DB commit.
    - On Windows: User-mode directory handles cannot be flushed via FlushFileBuffers (ERROR_ACCESS_DENIED).
-     Durability relies on synchronous temp file data flush prior to linking, backed by the fail-closed
-     read verification barrier (Section 6.3): any post-crash uncommitted directory entry manifests as a missing
-     blob returning ErrArtifactNotFound, strictly preventing execution on corrupt or unverified artifacts.
+     **Windows artifact availability after sudden power loss**: AC-002 flushes staged file contents and installs a complete digest-addressed file without replacing an existing destination. The current Windows implementation does not establish a crash-durable namespace-publication barrier before committing SQLite artifact metadata. Therefore, a successful publication receipt does not guarantee that the artifact file remains available after abrupt power loss, even if its database revision record survives.
+     Revision reads require the file to exist and require its byte count and digest to match the committed metadata before returning any content. Missing or altered artifacts return explicit errors without unverified bytes. Historical records are retained, but operations that require the unavailable artifact must remain blocked pending explicit recovery. This integrity check detects missing/corrupt content; it neither prevents file loss nor reconstructs lost bytes.
+     Ordinary CI verifies process-crash recovery and simulated missing/corrupt files. It is not evidence of physical power-loss durability on Windows or every underlying filesystem/storage stack.
 6. Commit SQLite Transaction:
    - Insert row into artifact_revisions (artifact_id, revision, run_id, kind, digest, byte_size, created_at).
    - Insert row into journal_entries (op_id, command_type='publish_artifact', ...).
