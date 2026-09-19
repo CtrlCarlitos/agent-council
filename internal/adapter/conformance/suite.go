@@ -17,6 +17,7 @@ type Fixture interface {
 	TurnState(ref adapter.TurnRef) (received, accepted, started bool)
 	IsCompletionAllowed(ref adapter.TurnRef) bool
 	IsExecutionActive(ref adapter.TurnRef) bool
+	TerminalOutcome(ref adapter.TurnRef) council.TurnStatus
 	Cleanup() error
 }
 
@@ -195,11 +196,45 @@ func Check(ctx context.Context, fixture Fixture, scenario Scenario) []Violation 
 			})
 		}
 
+		isTerminalStatus := func(s council.TurnStatus) bool {
+			switch s {
+			case council.TurnCompleted, council.TurnCancelled, council.TurnFailed, council.TurnInterrupted:
+				return true
+			default:
+				return false
+			}
+		}
+
+		checkTerminalEvidence := func(status council.TurnStatus, source string) {
+			if !isTerminalStatus(status) {
+				return
+			}
+
+			// 1. If execution remains active or unresolved, any terminal outcome is a contradiction
+			if fixture.IsExecutionActive(ref) {
+				addCompletionViolation(fmt.Sprintf("%s claimed terminal status %s while execution remains active", source, status))
+				return
+			}
+
+			// 2. Execution is inactive: verify claimed terminal status matches independent fixture evidence
+			expectedOutcome := fixture.TerminalOutcome(ref)
+			if expectedOutcome != "" {
+				if status != expectedOutcome {
+					addCompletionViolation(fmt.Sprintf("%s reported terminal status %s, expected %s", source, status, expectedOutcome))
+				}
+				return
+			}
+
+			// 3. If no specific terminal outcome is recorded, verify completion permission for TurnCompleted
+			if status == council.TurnCompleted && !fixture.IsCompletionAllowed(ref) {
+				addCompletionViolation(fmt.Sprintf("%s reported TurnCompleted while completion was not allowed", source))
+				return
+			}
+		}
+
 		// Validate terminal replay against independent fixture evidence
 		if initialEvent.Type == adapter.EventTerminal {
-			if !fixture.IsCompletionAllowed(ref) || fixture.IsExecutionActive(ref) {
-				addCompletionViolation("observation stream emitted terminal event replay while execution remains active or completion not allowed")
-			}
+			checkTerminalEvidence(initialEvent.Status, "initial terminal event")
 		}
 
 		// Check status before closing stream to distinguish natural completion from fabricated completion
@@ -213,11 +248,7 @@ func Check(ctx context.Context, fixture Fixture, scenario Scenario) []Violation 
 			return violations
 		}
 
-		if resBefore.Status == council.TurnCompleted {
-			if !fixture.IsCompletionAllowed(ref) || fixture.IsExecutionActive(ref) {
-				addCompletionViolation("collect reported terminal completion before stream close while execution remains active or completion not allowed")
-			}
-		}
+		checkTerminalEvidence(resBefore.Status, "collect before stream close")
 
 		// Close observation stream
 		_ = stream.Close()
@@ -232,11 +263,7 @@ func Check(ctx context.Context, fixture Fixture, scenario Scenario) []Violation 
 			return violations
 		}
 
-		if resAfter.Status == council.TurnCompleted {
-			if !fixture.IsCompletionAllowed(ref) || fixture.IsExecutionActive(ref) {
-				addCompletionViolation("collect reported terminal completion after stream close while execution remains active or completion not allowed")
-			}
-		}
+		checkTerminalEvidence(resAfter.Status, "collect after stream close")
 
 	case ScenarioRecoveryIntegrity:
 		ref := adapter.RecoveryRef{

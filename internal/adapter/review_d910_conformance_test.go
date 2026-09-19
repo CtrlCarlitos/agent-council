@@ -31,7 +31,10 @@ func (c *collectFailingFixture) TurnState(ref adapter.TurnRef) (bool, bool, bool
 }
 func (c *collectFailingFixture) IsCompletionAllowed(ref adapter.TurnRef) bool { return false }
 func (c *collectFailingFixture) IsExecutionActive(ref adapter.TurnRef) bool   { return false }
-func (c *collectFailingFixture) Cleanup() error                               { return nil }
+func (c *collectFailingFixture) TerminalOutcome(ref adapter.TurnRef) council.TurnStatus {
+	return ""
+}
+func (c *collectFailingFixture) Cleanup() error { return nil }
 
 func TestReviewD910_ConformanceCheckerDetectsCollectFailure(t *testing.T) {
 	fake := adaptertest.NewFake(adaptertest.ScriptedFaults{})
@@ -61,12 +64,13 @@ type contradictoryReconcileAdapter struct {
 }
 
 func (c *contradictoryReconcileAdapter) Reconcile(ctx context.Context, ref adapter.RecoveryRef) (adapter.ReconciliationOutcome, error) {
+	// Contradictory: ReachableActive paired with TurnCompleted!
 	return adapter.ReconciliationOutcome{
 		Ref:          ref,
 		Reachability: council.VisibilityReachable,
 		Status:       adapter.ReconciliationReachableActive,
-		Observed:     council.TurnCompleted, // Contradictory: reachable active cannot be TurnCompleted!
-		Result:       "done",
+		Observed:     council.TurnCompleted,
+		Result:       "contradictory outcome",
 	}, nil
 }
 
@@ -80,7 +84,10 @@ func (c *contradictoryReconcileFixture) TurnState(ref adapter.TurnRef) (bool, bo
 }
 func (c *contradictoryReconcileFixture) IsCompletionAllowed(ref adapter.TurnRef) bool { return false }
 func (c *contradictoryReconcileFixture) IsExecutionActive(ref adapter.TurnRef) bool   { return false }
-func (c *contradictoryReconcileFixture) Cleanup() error                               { return nil }
+func (c *contradictoryReconcileFixture) TerminalOutcome(ref adapter.TurnRef) council.TurnStatus {
+	return ""
+}
+func (c *contradictoryReconcileFixture) Cleanup() error { return nil }
 
 func TestReviewD910_ConformanceCheckerDetectsContradictoryReconciliation(t *testing.T) {
 	fake := adaptertest.NewFake(adaptertest.ScriptedFaults{})
@@ -135,7 +142,13 @@ func (l *legitimateCompletionFixture) TurnState(ref adapter.TurnRef) (bool, bool
 }
 func (l *legitimateCompletionFixture) IsCompletionAllowed(ref adapter.TurnRef) bool { return l.allowed }
 func (l *legitimateCompletionFixture) IsExecutionActive(ref adapter.TurnRef) bool   { return false }
-func (l *legitimateCompletionFixture) Cleanup() error                               { return nil }
+func (l *legitimateCompletionFixture) TerminalOutcome(ref adapter.TurnRef) council.TurnStatus {
+	if l.allowed {
+		return council.TurnCompleted
+	}
+	return ""
+}
+func (l *legitimateCompletionFixture) Cleanup() error { return nil }
 
 func TestReviewD910_ConformanceCheckerDoesNotFalselyFlagLegitimateCompletion(t *testing.T) {
 	fake := adaptertest.NewFake(adaptertest.ScriptedFaults{})
@@ -185,7 +198,10 @@ func (u *unsupportedFixture) TurnState(ref adapter.TurnRef) (bool, bool, bool) {
 }
 func (u *unsupportedFixture) IsCompletionAllowed(ref adapter.TurnRef) bool { return false }
 func (u *unsupportedFixture) IsExecutionActive(ref adapter.TurnRef) bool   { return false }
-func (u *unsupportedFixture) Cleanup() error                               { return nil }
+func (u *unsupportedFixture) TerminalOutcome(ref adapter.TurnRef) council.TurnStatus {
+	return ""
+}
+func (u *unsupportedFixture) Cleanup() error { return nil }
 
 func TestReviewD910_ConformanceCheckerTestsUnsupportedContract(t *testing.T) {
 	fake := adaptertest.NewFake(adaptertest.ScriptedFaults{

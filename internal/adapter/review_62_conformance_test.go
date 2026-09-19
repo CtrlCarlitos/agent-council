@@ -60,6 +60,9 @@ func (b *brokenTerminalReplayFixture) IsCompletionAllowed(ref adapter.TurnRef) b
 func (b *brokenTerminalReplayFixture) IsExecutionActive(ref adapter.TurnRef) bool {
 	return b.fake.IsExecutionActive(ref)
 }
+func (b *brokenTerminalReplayFixture) TerminalOutcome(ref adapter.TurnRef) council.TurnStatus {
+	return ""
+}
 func (b *brokenTerminalReplayFixture) Cleanup() error {
 	select {
 	case <-b.stall:

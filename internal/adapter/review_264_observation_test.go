@@ -47,6 +47,9 @@ func (p *preCompletingFixture) IsCompletionAllowed(ref adapter.TurnRef) bool { r
 func (p *preCompletingFixture) IsExecutionActive(ref adapter.TurnRef) bool {
 	return p.fake.IsExecutionActive(ref)
 }
+func (p *preCompletingFixture) TerminalOutcome(ref adapter.TurnRef) council.TurnStatus {
+	return council.TurnCompleted
+}
 func (p *preCompletingFixture) Cleanup() error { return p.fake.Close() }
 
 func TestReview264_ObservePreCompletedTurnTerminalReplay(t *testing.T) {

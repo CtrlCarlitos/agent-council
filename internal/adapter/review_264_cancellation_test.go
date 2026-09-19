@@ -7,6 +7,7 @@ import (
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/adaptertest"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/conformance"
+	"github.com/CtrlCarlitos/agent-council/internal/council"
 )
 
 // 1. Adapter that truthfully returns CancelRequested while worker remains running
@@ -38,6 +39,9 @@ func (c *cancelRequestedFixture) TurnState(ref adapter.TurnRef) (bool, bool, boo
 func (c *cancelRequestedFixture) IsCompletionAllowed(ref adapter.TurnRef) bool { return false }
 func (c *cancelRequestedFixture) IsExecutionActive(ref adapter.TurnRef) bool {
 	return c.fake.IsExecutionActive(ref)
+}
+func (c *cancelRequestedFixture) TerminalOutcome(ref adapter.TurnRef) council.TurnStatus {
+	return c.fake.ExecutionStatus(ref)
 }
 func (c *cancelRequestedFixture) Cleanup() error {
 	select {
@@ -90,6 +94,9 @@ func (f *falseConfirmationFixture) TurnState(ref adapter.TurnRef) (bool, bool, b
 func (f *falseConfirmationFixture) IsCompletionAllowed(ref adapter.TurnRef) bool { return false }
 func (f *falseConfirmationFixture) IsExecutionActive(ref adapter.TurnRef) bool {
 	return f.fake.IsExecutionActive(ref)
+}
+func (f *falseConfirmationFixture) TerminalOutcome(ref adapter.TurnRef) council.TurnStatus {
+	return f.fake.ExecutionStatus(ref)
 }
 func (f *falseConfirmationFixture) Cleanup() error {
 	select {
@@ -154,6 +161,9 @@ func (f *falseAlreadyTerminalFixture) IsCompletionAllowed(ref adapter.TurnRef) b
 func (f *falseAlreadyTerminalFixture) IsExecutionActive(ref adapter.TurnRef) bool {
 	return f.fake.IsExecutionActive(ref)
 }
+func (f *falseAlreadyTerminalFixture) TerminalOutcome(ref adapter.TurnRef) council.TurnStatus {
+	return f.fake.ExecutionStatus(ref)
+}
 func (f *falseAlreadyTerminalFixture) Cleanup() error {
 	select {
 	case <-f.stall:
@@ -216,7 +226,10 @@ func (s *substitutedTurnRefFixture) TurnState(ref adapter.TurnRef) (bool, bool, 
 }
 func (s *substitutedTurnRefFixture) IsCompletionAllowed(ref adapter.TurnRef) bool { return false }
 func (s *substitutedTurnRefFixture) IsExecutionActive(ref adapter.TurnRef) bool   { return false }
-func (s *substitutedTurnRefFixture) Cleanup() error                               { return s.fake.Close() }
+func (s *substitutedTurnRefFixture) TerminalOutcome(ref adapter.TurnRef) council.TurnStatus {
+	return ""
+}
+func (s *substitutedTurnRefFixture) Cleanup() error { return s.fake.Close() }
 
 func TestReview264_CancellationCheckerDetectsSubstitutedTurnRef(t *testing.T) {
 	fake := adaptertest.NewFake(adaptertest.ScriptedFaults{})

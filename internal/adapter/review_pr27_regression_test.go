@@ -313,7 +313,10 @@ func (g *genericFixture) TurnState(ref adapter.TurnRef) (bool, bool, bool) {
 }
 func (g *genericFixture) IsCompletionAllowed(ref adapter.TurnRef) bool { return false }
 func (g *genericFixture) IsExecutionActive(ref adapter.TurnRef) bool   { return false }
-func (g *genericFixture) Cleanup() error                               { return nil }
+func (g *genericFixture) TerminalOutcome(ref adapter.TurnRef) council.TurnStatus {
+	return ""
+}
+func (g *genericFixture) Cleanup() error { return nil }
 
 type erroringFakeAdapter struct {
 	adaptertest.FakeAdapter

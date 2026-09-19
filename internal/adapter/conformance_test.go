@@ -41,6 +41,9 @@ func (f *fakeFixture) IsCompletionAllowed(ref adapter.TurnRef) bool {
 func (f *fakeFixture) IsExecutionActive(ref adapter.TurnRef) bool {
 	return f.fake.IsExecutionActive(ref)
 }
+func (f *fakeFixture) TerminalOutcome(ref adapter.TurnRef) council.TurnStatus {
+	return f.fake.ExecutionStatus(ref)
+}
 func (f *fakeFixture) Cleanup() error {
 	select {
 	case <-f.stall:
@@ -78,7 +81,10 @@ func (c *collidingFixture) TurnState(ref adapter.TurnRef) (bool, bool, bool) {
 }
 func (c *collidingFixture) IsCompletionAllowed(ref adapter.TurnRef) bool { return false }
 func (c *collidingFixture) IsExecutionActive(ref adapter.TurnRef) bool   { return false }
-func (c *collidingFixture) Cleanup() error                               { return nil }
+func (c *collidingFixture) TerminalOutcome(ref adapter.TurnRef) council.TurnStatus {
+	return ""
+}
+func (c *collidingFixture) Cleanup() error { return nil }
 
 type eofStream struct {
 	adapter.Stream
@@ -150,6 +156,9 @@ func (e *eofFixture) IsCompletionAllowed(ref adapter.TurnRef) bool {
 }
 func (e *eofFixture) IsExecutionActive(ref adapter.TurnRef) bool {
 	return false
+}
+func (e *eofFixture) TerminalOutcome(ref adapter.TurnRef) council.TurnStatus {
+	return ""
 }
 func (e *eofFixture) Cleanup() error {
 	if e.stall != nil {

@@ -87,6 +87,16 @@ func (f *FakeAdapter) IsExecutionActive(ref adapter.TurnRef) bool {
 	return !f.retiredTurns[ref]
 }
 
+// ExecutionStatus returns the authoritative turn status recorded within the fake.
+func (f *FakeAdapter) ExecutionStatus(ref adapter.TurnRef) council.TurnStatus {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if res, ok := f.results[ref]; ok {
+		return res.Status
+	}
+	return ""
+}
+
 // ActiveStreamCount returns the number of active subscriptions registered for a turn.
 func (f *FakeAdapter) ActiveStreamCount(ref adapter.TurnRef) int {
 	f.mu.Lock()
@@ -484,6 +494,21 @@ func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter
 
 	stream := adapter.NewBufferedStream(ref, 64)
 
+	if f.faults.DropStreamEarly {
+		_ = stream.Send(adapter.Event{
+			Ref:       ref,
+			Type:      adapter.EventProgress,
+			Status:    council.TurnRunning,
+			Payload:   "observing",
+			Timestamp: time.Now(),
+		})
+		go func() {
+			time.Sleep(5 * time.Millisecond)
+			_ = stream.CloseWithErr(errors.New("transport dropped early"))
+		}()
+		return stream, nil
+	}
+
 	res, resExists := f.results[ref]
 	if resExists && (res.Status == council.TurnCompleted || res.Status == council.TurnCancelled) {
 		_ = stream.Send(adapter.Event{
@@ -506,14 +531,6 @@ func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter
 		Payload:   "observing",
 		Timestamp: time.Now(),
 	})
-
-	if f.faults.DropStreamEarly {
-		go func() {
-			time.Sleep(5 * time.Millisecond)
-			_ = stream.CloseWithErr(errors.New("transport dropped early"))
-		}()
-		return stream, nil
-	}
 
 	f.activeStreams[ref] = append(f.activeStreams[ref], stream)
 
