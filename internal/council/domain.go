@@ -79,29 +79,86 @@ const (
 	Archived State = "archived"
 )
 
+type SessionLifecycle string
+
+const (
+	SessionActive   SessionLifecycle = "active"
+	SessionArchived SessionLifecycle = "archived"
+)
+
+type TurnStatus string
+
+const (
+	TurnPending     TurnStatus = "pending"
+	TurnRunning     TurnStatus = "running"
+	TurnCompleted   TurnStatus = "completed"
+	TurnInterrupted TurnStatus = "interrupted"
+	TurnCancelling  TurnStatus = "cancelling"
+	TurnCancelled   TurnStatus = "cancelled"
+	TurnFailed      TurnStatus = "failed"
+)
+
+type ControllerConnection string
+
+const (
+	ControllerConnected    ControllerConnection = "connected"
+	ControllerDisconnected ControllerConnection = "disconnected"
+)
+
+type ExecutionVisibility string
+
+const (
+	VisibilityReachable ExecutionVisibility = "reachable"
+	VisibilityHostLost  ExecutionVisibility = "host_lost"
+)
+
+type TurnRecord struct {
+	Key    string
+	Prompt string
+	Status TurnStatus
+	Result string
+}
+
 // Session stores logical state. It is not concurrency-safe or durable; the future
 // transactional store owns those responsibilities. Never use it as an auth boundary.
 type Session struct {
-	ID              Contributor
-	State           State
-	ControllerLease string
-	Pending         map[string]string
-	Active          string
+	ID               Contributor
+	State            State
+	Lifecycle        SessionLifecycle
+	ControllerStatus ControllerConnection
+	Visibility       ExecutionVisibility
+	ControllerLease  string
+	Pending          map[string]string
+	Active           string
+	ActiveTurn       *TurnRecord
+	Turns            map[string]*TurnRecord
 }
 
 func NewSession(id Contributor, lease string) (*Session, error) {
 	if !ValidContributor(id) || strings.TrimSpace(lease) == "" {
 		return nil, errors.New("invalid contributor or lease")
 	}
-	return &Session{ID: id, State: Parked, ControllerLease: lease, Pending: map[string]string{}}, nil
+	return &Session{
+		ID:               id,
+		State:            Parked,
+		Lifecycle:        SessionActive,
+		ControllerStatus: ControllerConnected,
+		Visibility:       VisibilityReachable,
+		ControllerLease:  lease,
+		Pending:          map[string]string{},
+		Turns:            map[string]*TurnRecord{},
+	}, nil
 }
 
 func (s *Session) authorize(lease string) error {
 	if lease == "" || lease != s.ControllerLease {
 		return errors.New("controller lease mismatch")
 	}
-	if s.State == Archived {
+	if s.Lifecycle == SessionArchived || s.State == Archived {
 		return errors.New("session archived")
+	}
+	if s.ControllerStatus == ControllerDisconnected {
+		return errors.New("controller disconnected")
 	}
 	return nil
 }
@@ -116,8 +173,17 @@ func (s *Session) Queue(lease, key, prompt string) error {
 	if s.Active == key {
 		return errors.New("key already active")
 	}
-	if _, ok := s.Pending[key]; ok {
-		return errors.New("duplicate pending key")
+	if prior, exists := s.Turns[key]; exists {
+		if prior.Prompt != prompt {
+			return errors.New("retired turn identifier cannot be reused with different content")
+		}
+		return errors.New("turn identifier already retired")
+	}
+	if existingPrompt, ok := s.Pending[key]; ok {
+		if existingPrompt == prompt {
+			return nil // Idempotent submission of identical pending prompt.
+		}
+		return errors.New("duplicate pending key with different content")
 	}
 	s.Pending[key] = prompt
 	return nil
@@ -127,6 +193,12 @@ func (s *Session) Release(lease, key string) (string, error) {
 	if err := s.authorize(lease); err != nil {
 		return "", err
 	}
+	if s.Visibility == VisibilityHostLost {
+		return "", errors.New("host lost; reconciliation required before release")
+	}
+	if s.ActiveTurn != nil && s.ActiveTurn.Status == TurnCancelling {
+		return "", errors.New("cancellation unresolved; release blocked")
+	}
 	if s.State != Parked {
 		return "", errors.New("session already processing a turn")
 	}
@@ -135,15 +207,122 @@ func (s *Session) Release(lease, key string) (string, error) {
 		return "", errors.New("pending prompt not found")
 	}
 	delete(s.Pending, key)
+	turn := &TurnRecord{
+		Key:    key,
+		Prompt: prompt,
+		Status: TurnRunning,
+	}
+	s.Turns[key] = turn
+	s.ActiveTurn = turn
 	s.Active, s.State = key, Running
 	return prompt, nil
 }
 
 func (s *Session) Complete(key string) error {
-	if s.State != Running || s.Active != key {
+	return s.CompleteWithResult(key, "")
+}
+
+func (s *Session) CompleteWithResult(key, result string) error {
+	if prior, exists := s.Turns[key]; exists && prior.Status == TurnCompleted {
+		return errors.New("turn already completed")
+	}
+	if s.State != Running || s.Active != key || s.ActiveTurn == nil {
 		return errors.New("completion does not match active turn")
 	}
-	s.Active, s.State = "", Parked // Never auto-dispatch another pending prompt.
+	s.ActiveTurn.Status = TurnCompleted
+	s.ActiveTurn.Result = result
+	s.Active = ""
+	s.ActiveTurn = nil
+	s.State = Parked // Never auto-dispatch another pending prompt.
+	return nil
+}
+
+func (s *Session) RequestCancel(lease string) error {
+	if err := s.authorize(lease); err != nil {
+		return err
+	}
+	if s.State != Running || s.ActiveTurn == nil || s.ActiveTurn.Status != TurnRunning {
+		return errors.New("no active running turn to cancel")
+	}
+	s.ActiveTurn.Status = TurnCancelling
+	return nil
+}
+
+func (s *Session) ConfirmCancel(key string) error {
+	if s.Active != key || s.ActiveTurn == nil || s.ActiveTurn.Status != TurnCancelling {
+		return errors.New("cancel confirmation does not match cancelling turn")
+	}
+	s.ActiveTurn.Status = TurnCancelled
+	s.Active = ""
+	s.ActiveTurn = nil
+	s.State = Parked
+	return nil
+}
+
+func (s *Session) Interrupt(key string) error {
+	if s.Active != key || s.ActiveTurn == nil || (s.ActiveTurn.Status != TurnRunning && s.ActiveTurn.Status != TurnCancelling) {
+		return errors.New("interruption does not match active turn")
+	}
+	s.ActiveTurn.Status = TurnInterrupted
+	s.Active = ""
+	s.ActiveTurn = nil
+	s.State = Parked
+	return nil
+}
+
+func (s *Session) Fail(key, reason string) error {
+	if s.Active != key || s.ActiveTurn == nil {
+		return errors.New("failure does not match active turn")
+	}
+	s.ActiveTurn.Status = TurnFailed
+	s.ActiveTurn.Result = reason
+	s.Active = ""
+	s.ActiveTurn = nil
+	s.State = Parked
+	return nil
+}
+
+func (s *Session) RecordHostLoss() error {
+	if s.State != Running || s.ActiveTurn == nil {
+		return errors.New("cannot record host loss on inactive session")
+	}
+	s.Visibility = VisibilityHostLost
+	return nil
+}
+
+func (s *Session) ReconcileHost(status TurnStatus, result string) error {
+	if s.Visibility != VisibilityHostLost {
+		return errors.New("session host is not lost")
+	}
+	if s.ActiveTurn == nil {
+		return errors.New("no active turn to reconcile")
+	}
+	switch status {
+	case TurnCompleted, TurnCancelled, TurnFailed, TurnInterrupted:
+		s.ActiveTurn.Status = status
+		s.ActiveTurn.Result = result
+		s.Active = ""
+		s.ActiveTurn = nil
+		s.State = Parked
+		s.Visibility = VisibilityReachable
+		return nil
+	default:
+		return errors.New("invalid reconciliation target status")
+	}
+}
+
+func (s *Session) DisconnectController() {
+	s.ControllerStatus = ControllerDisconnected
+}
+
+func (s *Session) ReconnectController(lease string) error {
+	if lease == "" || lease != s.ControllerLease {
+		return errors.New("controller lease mismatch")
+	}
+	if s.Lifecycle == SessionArchived || s.State == Archived {
+		return errors.New("session archived")
+	}
+	s.ControllerStatus = ControllerConnected
 	return nil
 }
 
@@ -158,14 +337,29 @@ func (s *Session) Discard(lease, key string) error {
 	return nil
 }
 
+func (s *Session) Replace(lease, key, newPrompt string) error {
+	if err := s.authorize(lease); err != nil {
+		return err
+	}
+	if strings.TrimSpace(newPrompt) == "" {
+		return errors.New("empty prompt")
+	}
+	if _, ok := s.Pending[key]; !ok {
+		return errors.New("pending prompt not found")
+	}
+	s.Pending[key] = newPrompt
+	return nil
+}
+
 func (s *Session) Archive(lease string) error {
 	if err := s.authorize(lease); err != nil {
 		return err
 	}
-	if s.State == Running {
+	if s.State == Running || s.ActiveTurn != nil || s.Visibility == VisibilityHostLost {
 		return errors.New("cannot archive a running turn")
 	}
 	s.State = Archived // Retains pending data; archive does not purge.
+	s.Lifecycle = SessionArchived
 	return nil
 }
 
