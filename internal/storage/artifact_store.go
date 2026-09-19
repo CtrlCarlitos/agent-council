@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -197,18 +198,20 @@ func (s *Store) PublishArtifact(ctx context.Context, opID string, callerLease st
 		}
 	}
 
-	// Sync parent directory before metadata commit
-	d, err := os.Open(destDir)
-	if err != nil {
-		return ArtifactMetadata{}, fmt.Errorf("open dest dir for sync: %w", err)
-	}
-	dSyncErr := d.Sync()
-	dCloseErr := d.Close()
-	if dSyncErr != nil || dCloseErr != nil {
-		if dSyncErr != nil {
-			return ArtifactMetadata{}, fmt.Errorf("sync dest dir: %w", dSyncErr)
+	// Sync parent directory before metadata commit (POSIX filesystems; Windows NTFS automatically journals directory entries)
+	if runtime.GOOS != "windows" {
+		d, err := os.Open(destDir)
+		if err != nil {
+			return ArtifactMetadata{}, fmt.Errorf("open dest dir for sync: %w", err)
 		}
-		return ArtifactMetadata{}, fmt.Errorf("close dest dir: %w", dCloseErr)
+		dSyncErr := d.Sync()
+		dCloseErr := d.Close()
+		if dSyncErr != nil || dCloseErr != nil {
+			if dSyncErr != nil {
+				return ArtifactMetadata{}, fmt.Errorf("sync dest dir: %w", dSyncErr)
+			}
+			return ArtifactMetadata{}, fmt.Errorf("close dest dir: %w", dCloseErr)
+		}
 	}
 
 	// 7. Record metadata in relational store inside write transaction
