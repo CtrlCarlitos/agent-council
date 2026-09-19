@@ -290,25 +290,54 @@ func (s *Session) RecordHostLoss() error {
 	return nil
 }
 
-func (s *Session) ReconcileHost(status TurnStatus, result string) error {
+func (s *Session) ReconcileHost(key string, status TurnStatus, result string) error {
 	if s.Visibility != VisibilityHostLost {
 		return errors.New("session host is not lost")
 	}
-	if s.ActiveTurn == nil {
-		return errors.New("no active turn to reconcile")
+
+	// Active turn exists
+	if s.ActiveTurn != nil {
+		if key != s.Active {
+			if _, exists := s.Turns[key]; exists {
+				return errors.New("stale reconciliation for past turn")
+			}
+			return errors.New("reconciliation key does not match active turn")
+		}
+
+		switch status {
+		case TurnRunning:
+			if s.ActiveTurn.Status != TurnCancelling {
+				s.ActiveTurn.Status = TurnRunning
+			}
+			s.Visibility = VisibilityReachable
+			s.State = Running
+			return nil
+		case TurnCancelling:
+			s.ActiveTurn.Status = TurnCancelling
+			s.Visibility = VisibilityReachable
+			s.State = Running
+			return nil
+		case TurnCompleted, TurnCancelled, TurnFailed, TurnInterrupted:
+			s.ActiveTurn.Status = status
+			s.ActiveTurn.Result = result
+			s.Active = ""
+			s.ActiveTurn = nil
+			s.State = Parked
+			s.Visibility = VisibilityReachable
+			return nil
+		default:
+			return errors.New("invalid reconciliation target status")
+		}
 	}
-	switch status {
-	case TurnCompleted, TurnCancelled, TurnFailed, TurnInterrupted:
-		s.ActiveTurn.Status = status
-		s.ActiveTurn.Result = result
-		s.Active = ""
-		s.ActiveTurn = nil
-		s.State = Parked
-		s.Visibility = VisibilityReachable
-		return nil
-	default:
-		return errors.New("invalid reconciliation target status")
+
+	// No active turn (e.g. terminal delivery arrived while host was lost)
+	if key != "" {
+		if _, exists := s.Turns[key]; !exists {
+			return errors.New("reconciliation key does not match any known turn")
+		}
 	}
+	s.Visibility = VisibilityReachable
+	return nil
 }
 
 func (s *Session) DisconnectController() {

@@ -364,7 +364,7 @@ func TestHostUnreachableRecordsUncertaintyAndBlocksRelease(t *testing.T) {
 	}
 
 	// Reconcile host with failed status
-	if err := s.ReconcileHost(TurnFailed, "process exited during disconnect"); err != nil {
+	if err := s.ReconcileHost("turn-1", TurnFailed, "process exited during disconnect"); err != nil {
 		t.Fatalf("host reconciliation failed: %v", err)
 	}
 
@@ -387,16 +387,25 @@ func TestHostUnreachableRecordsUncertaintyAndBlocksRelease(t *testing.T) {
 	}
 }
 
+type turnSnapshot struct {
+	key    string
+	prompt string
+	status TurnStatus
+	result string
+}
+
 type sessionSnapshot struct {
+	id               Contributor
 	state            State
 	lifecycle        SessionLifecycle
 	controllerStatus ControllerConnection
 	visibility       ExecutionVisibility
 	lease            string
 	active           string
+	hasActiveTurn    bool
+	activeTurn       turnSnapshot
 	pending          map[string]string
-	turnCount        int
-	turnStatuses     map[string]TurnStatus
+	turns            map[string]turnSnapshot
 }
 
 func snapshotSession(s *Session) sessionSnapshot {
@@ -404,30 +413,61 @@ func snapshotSession(s *Session) sessionSnapshot {
 	for k, v := range s.Pending {
 		p[k] = v
 	}
-	ts := make(map[string]TurnStatus, len(s.Turns))
+	turns := make(map[string]turnSnapshot, len(s.Turns))
 	for k, v := range s.Turns {
-		ts[k] = v.Status
+		if v != nil {
+			turns[k] = turnSnapshot{
+				key:    v.Key,
+				prompt: v.Prompt,
+				status: v.Status,
+				result: v.Result,
+			}
+		}
+	}
+	var actSnap turnSnapshot
+	hasAct := s.ActiveTurn != nil
+	if hasAct {
+		actSnap = turnSnapshot{
+			key:    s.ActiveTurn.Key,
+			prompt: s.ActiveTurn.Prompt,
+			status: s.ActiveTurn.Status,
+			result: s.ActiveTurn.Result,
+		}
 	}
 	return sessionSnapshot{
+		id:               s.ID,
 		state:            s.State,
 		lifecycle:        s.Lifecycle,
 		controllerStatus: s.ControllerStatus,
 		visibility:       s.Visibility,
 		lease:            s.ControllerLease,
 		active:           s.Active,
+		hasActiveTurn:    hasAct,
+		activeTurn:       actSnap,
 		pending:          p,
-		turnCount:        len(s.Turns),
-		turnStatuses:     ts,
+		turns:            turns,
 	}
 }
 
 func assertSnapshotEqual(t *testing.T, opName string, before, after sessionSnapshot) {
 	t.Helper()
-	if before.state != after.state || before.lifecycle != after.lifecycle ||
-		before.controllerStatus != after.controllerStatus || before.visibility != after.visibility ||
-		before.lease != after.lease || before.active != after.active ||
-		before.turnCount != after.turnCount {
+	if before.id != after.id || before.state != after.state ||
+		before.lifecycle != after.lifecycle || before.controllerStatus != after.controllerStatus ||
+		before.visibility != after.visibility || before.lease != after.lease ||
+		before.active != after.active || before.hasActiveTurn != after.hasActiveTurn {
 		t.Fatalf("%s mutated session scalar state: before=%+v after=%+v", opName, before, after)
+	}
+	if before.hasActiveTurn {
+		if before.activeTurn != after.activeTurn {
+			t.Fatalf("%s mutated activeTurn: before=%+v after=%+v", opName, before.activeTurn, after.activeTurn)
+		}
+		// Consistency check between ActiveTurn and history map
+		if before.activeTurn.key != before.active {
+			t.Fatalf("%s inconsistent active key: active=%s turn.key=%s", opName, before.active, before.activeTurn.key)
+		}
+		if hist, ok := after.turns[after.active]; !ok || hist != after.activeTurn {
+			t.Fatalf("%s active turn not consistent with turns history: active=%+v hist=%+v", opName, after.activeTurn, hist)
+		}
 	}
 	if len(before.pending) != len(after.pending) {
 		t.Fatalf("%s mutated pending length: before=%d after=%d", opName, len(before.pending), len(after.pending))
@@ -437,9 +477,13 @@ func assertSnapshotEqual(t *testing.T, opName string, before, after sessionSnaps
 			t.Fatalf("%s mutated pending[%q]: before=%q after=%q", opName, k, v, after.pending[k])
 		}
 	}
-	for k, v := range before.turnStatuses {
-		if after.turnStatuses[k] != v {
-			t.Fatalf("%s mutated turn[%q].Status: before=%s after=%s", opName, k, v, after.turnStatuses[k])
+	if len(before.turns) != len(after.turns) {
+		t.Fatalf("%s mutated turns length: before=%d after=%d", opName, len(before.turns), len(after.turns))
+	}
+	for k, v := range before.turns {
+		act, ok := after.turns[k]
+		if !ok || act != v {
+			t.Fatalf("%s mutated turn[%q]: before=%+v after=%+v", opName, k, v, act)
 		}
 	}
 }
@@ -494,34 +538,41 @@ func TestStatePreservationOnRejectedOperations(t *testing.T) {
 	}
 	assertSnapshotEqual(t, "discard non-existent key", snap, snapshotSession(s))
 
-	// 7. Now release t1 legitimately
+	// 7. ReconcileHost when host is not lost
+	snap = snapshotSession(s)
+	if err := s.ReconcileHost("t1", TurnCompleted, "res"); err == nil {
+		t.Fatal("reconcile host succeeded when host not lost")
+	}
+	assertSnapshotEqual(t, "reconcile when not lost", snap, snapshotSession(s))
+
+	// 8. Now release t1 legitimately
 	_, _ = s.Release("valid-lease", "t1")
 
-	// 8. Stale controller attempts RequestCancel on active turn
+	// 9. Stale controller attempts RequestCancel on active turn
 	snap = snapshotSession(s)
 	if err := s.RequestCancel("stale-lease"); err == nil {
 		t.Fatal("stale request cancel succeeded")
 	}
 	assertSnapshotEqual(t, "stale RequestCancel", snap, snapshotSession(s))
 
-	// 9. Stale completion on active turn
+	// 10. Stale completion on active turn
 	snap = snapshotSession(s)
 	if err := s.CompleteWithResult("wrong-key", "result"); err == nil {
 		t.Fatal("wrong key completion succeeded")
 	}
 	assertSnapshotEqual(t, "wrong Complete", snap, snapshotSession(s))
 
-	// 10. Attempt Archive while turn is active
+	// 11. Attempt Archive while turn is active
 	snap = snapshotSession(s)
 	if err := s.Archive("valid-lease"); err == nil {
 		t.Fatal("archive active turn succeeded")
 	}
 	assertSnapshotEqual(t, "active Archive", snap, snapshotSession(s))
 
-	// 11. Complete t1 legitimately
+	// 12. Complete t1 legitimately
 	_ = s.CompleteWithResult("t1", "result 1")
 
-	// 12. Attempt Queue with retired key t1
+	// 13. Attempt Queue with retired key t1
 	snap = snapshotSession(s)
 	if err := s.Queue("valid-lease", "t1", "different task"); err == nil {
 		t.Fatal("queue retired key succeeded")
