@@ -1,0 +1,24 @@
+name: Bug report
+description: Reproducible behavior with sanitized evidence
+title: "[bug] "
+labels: ["type:bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "Security vulnerabilities belong in private reporting. Never include tokens or private transcripts."
+  - type: textarea
+    id: problem
+    attributes:
+      label: Expected and observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction, versions, and execution environment
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence and limitations

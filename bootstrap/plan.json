@@ -1,0 +1,117 @@
+{
+  "owner": "CtrlCarlitos",
+  "name": "agent-council",
+  "description": "Local-first, controller-led orchestration of four independent native coding-agent perspectives.",
+  "branch": "chore/bootstrap",
+  "ruleset_name": "main-pr-and-ci",
+  "settings": {
+    "default_branch": "main",
+    "has_issues": true,
+    "has_wiki": false,
+    "has_projects": false,
+    "allow_squash_merge": true,
+    "allow_merge_commit": false,
+    "allow_rebase_merge": false,
+    "allow_auto_merge": false,
+    "delete_branch_on_merge": true
+  },
+  "labels": [
+    {
+      "name": "type:feature",
+      "color": "1D76DB",
+      "description": "New accepted workflow capability"
+    },
+    {
+      "name": "type:bug",
+      "color": "D73A4A",
+      "description": "Reproducible defect"
+    },
+    {
+      "name": "type:docs",
+      "color": "0075CA",
+      "description": "Documentation and decisions"
+    },
+    {
+      "name": "type:security",
+      "color": "B60205",
+      "description": "Security boundaries and misuse resistance"
+    },
+    {
+      "name": "area:core",
+      "color": "5319E7",
+      "description": "Council domain and orchestration"
+    },
+    {
+      "name": "area:storage",
+      "color": "7057FF",
+      "description": "Durable data and recovery"
+    },
+    {
+      "name": "area:harness",
+      "color": "006B75",
+      "description": "Native harness adapters"
+    },
+    {
+      "name": "area:mcp",
+      "color": "0E8A16",
+      "description": "Agent invocation and MCP"
+    },
+    {
+      "name": "area:security",
+      "color": "B60205",
+      "description": "Permission and resource policy"
+    },
+    {
+      "name": "area:git",
+      "color": "C5DEF5",
+      "description": "Git and GitHub integration"
+    },
+    {
+      "name": "area:ui",
+      "color": "D4C5F9",
+      "description": "Optional operator interface"
+    },
+    {
+      "name": "area:delivery",
+      "color": "BFDADC",
+      "description": "Delivery, operations and licensing"
+    },
+    {
+      "name": "priority:now",
+      "color": "D93F0B",
+      "description": "First live council prerequisites"
+    },
+    {
+      "name": "priority:next",
+      "color": "FBCA04",
+      "description": "After first live council"
+    },
+    {
+      "name": "priority:later",
+      "color": "C2E0C6",
+      "description": "Explicitly deferred"
+    }
+  ],
+  "milestones": [
+    {
+      "title": "M0 — Foundation",
+      "description": "Domain contracts, conformance tests, and owner decisions."
+    },
+    {
+      "title": "M1 — Durable runner",
+      "description": "Service lifetime, persistent sessions, limits and recovery."
+    },
+    {
+      "title": "M2 — Native agents and MCP",
+      "description": "Four native adapters, controller tools and explicit skill integration."
+    },
+    {
+      "title": "M3 — First real council",
+      "description": "Reproduce the README experiment with real harnesses."
+    },
+    {
+      "title": "M4 — Git and optional interface",
+      "description": "Safe publication and optional graphical inspection based on observed friction."
+    }
+  ]
+}

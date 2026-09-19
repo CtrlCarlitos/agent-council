@@ -1,0 +1,22 @@
+name: Workflow improvement
+description: A real coordination problem and a testable outcome
+title: "[feature] "
+labels: ["type:feature"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Operator problem
+      description: Describe the actual workflow, not just a desired library or feature.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome and acceptance criteria
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Boundaries, risks, dependencies, and what should remain out of scope

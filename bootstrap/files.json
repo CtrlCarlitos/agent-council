@@ -1,0 +1,141 @@
+{
+  "schema": 1,
+  "files": [
+    {
+      "path": ".editorconfig",
+      "sha256": "97de1dbdf3681171e0f26b433b6dbc1dfaef538296a07898c4af3c8d22c966c5"
+    },
+    {
+      "path": ".gitattributes",
+      "sha256": "d8048b168d1459ff5b125767200f94db24a2b45cada5e03b4c23fd774abb16d8"
+    },
+    {
+      "path": ".github/CODEOWNERS",
+      "sha256": "cbc657c0500f53f4b885e633ed7595ab3c7a2c3c8b01e4594082371291551122"
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/bug.yml",
+      "sha256": "df5acf76e4c79ce1dea28f6ecfdc28c73f487bad2470aa18d122bacad662824b"
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/config.yml",
+      "sha256": "13064e7bea658e01e718b414fbb7b3b244f36411fe25ee2055c151f7b534547a"
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/feature.yml",
+      "sha256": "6c8cf8c7113d39e588f6efd6c3b83d6577a0a10e28934a480f5b027169b2c85c"
+    },
+    {
+      "path": ".github/dependabot.yml",
+      "sha256": "2535f42a73bc922725d2a62f3cd31d2ffd08a8b03ee59bbb825604599de0506d"
+    },
+    {
+      "path": ".github/pull_request_template.md",
+      "sha256": "cbf75086afee8316034d5532d162d580a9b5e6e82cee92964365902af8793277"
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "sha256": "6b8d29dbe41ecc1809eeee519b92e9b8256fe318e3cbe73666055a180ac7772f"
+    },
+    {
+      "path": ".gitignore",
+      "sha256": "1fd216d733395cf2ab85a4025f1e1f39737deb02abd9772481e873091404963c"
+    },
+    {
+      "path": "AGENTS.md",
+      "sha256": "35be65b4ddfb455619ce1ee4655d5f8f53cef00edb75115c61bd390b7ba9c7b0"
+    },
+    {
+      "path": "CONTRIBUTING.md",
+      "sha256": "b4c3656042ee9ce1511af93c8112630f5d1b3a59624c6f8c83505958054f2cd7"
+    },
+    {
+      "path": "LICENSE",
+      "sha256": "1df96abd93c3c5238bde0e53b751433ca19e7be539acf87a0c4c8bc087b888fd"
+    },
+    {
+      "path": "Makefile",
+      "sha256": "00cfbca7cd4eaecb28ffe4e312ed7d29b4ed0322008f7474c637445f39d8d1d1"
+    },
+    {
+      "path": "README.md",
+      "sha256": "cf96383adb1aa841695bf7594ff341b5755b13adcae82a9a80c4f1134a803216"
+    },
+    {
+      "path": "SECURITY.md",
+      "sha256": "3e0997df109ee17b2929309cefc4ed9f3c72094acbd58730e782aaadc2f7a851"
+    },
+    {
+      "path": "bootstrap/issues.json",
+      "sha256": "523651ceccddfb621e437a710a44e6323ac7ca248fa95c943401e19cf2f57890"
+    },
+    {
+      "path": "bootstrap/plan.json",
+      "sha256": "eb08bb9b9929efafc9bdc06bb383d13b4aa71348973c601c3d1c6924a385985d"
+    },
+    {
+      "path": "bootstrap/ruleset-main.json",
+      "sha256": "94a8f8147d8dd5dd81ceb3338124a8633b00348b65ec3f5ab17efd3714621124"
+    },
+    {
+      "path": "cmd/council/main.go",
+      "sha256": "a149e5d6106defd0b5f7d0310f0e62bcd4a5b44430c727e3577be9dca165459f"
+    },
+    {
+      "path": "docs/ARCHITECTURE.md",
+      "sha256": "16b6c828380832e6a512cb077ec96785237baf0c4356dca06a43817cd687c6eb"
+    },
+    {
+      "path": "docs/BOOTSTRAP_TEST_EVIDENCE.md",
+      "sha256": "22c2bfe6d50b5df949cb849f792430adac3e1dc033f38942c5e53cead3b55a9a"
+    },
+    {
+      "path": "docs/PUBLISHING.md",
+      "sha256": "ba2b84d22950afeae5240ea2d53a788ce005cdf8b1c81c5ad1304318f5b7d5ec"
+    },
+    {
+      "path": "docs/REPOSITORY_POLICY.md",
+      "sha256": "604da6aabcf6d21bf21ff1311de688698531b800f9ee33eee69d2357b058220b"
+    },
+    {
+      "path": "docs/ROADMAP.md",
+      "sha256": "67df830e4d474ba82212725fb49a2e885b4ec3d49c235293059e0e3039b6bec3"
+    },
+    {
+      "path": "docs/SOURCES.md",
+      "sha256": "0daa1e7f3e917057123c97ae289fa3b3b83e497b45c4329079b66948e43a3388"
+    },
+    {
+      "path": "docs/adr/0001-controller-led-local-service.md",
+      "sha256": "f3a37c41b6ca231cdffd2c6612839f036fe45b48a612ed80b5072ce2fe809417"
+    },
+    {
+      "path": "docs/adr/0002-pr-only-main-and-mit-license.md",
+      "sha256": "396ccde27aa88f45ddeb3e6e510132fd2b8b16cf208b2666cbd7154b426fc62a"
+    },
+    {
+      "path": "go.mod",
+      "sha256": "fe586ec641e0a677a9873eeea46348086d71378fc67efa526def3ae7e31f3913"
+    },
+    {
+      "path": "internal/council/domain.go",
+      "sha256": "ac12981e35774223d2b4c8927cebf395cea28875cfb30d1847b96cbbcabe270e"
+    },
+    {
+      "path": "internal/council/domain_test.go",
+      "sha256": "5688dbf28326846ca8570c5dcfb0b61086b77c657fecaf1a26343088da65ed50"
+    },
+    {
+      "path": "scripts/publish.py",
+      "sha256": "d7d1e337eb7d5bc342bff5f601b0123ad5a0de365005d0662f8b94741db1258d"
+    },
+    {
+      "path": "scripts/tests/test_publish.py",
+      "sha256": "eccf8913e69207b8f17017c7b73b9cc0c48a8197854c08ea9ed345681dc61c64"
+    },
+    {
+      "path": "scripts/verify_seed.py",
+      "sha256": "865607b2d752de680d822093ee71c9864408641c841413fa403d5d6b2f6d0414"
+    }
+  ]
+}
