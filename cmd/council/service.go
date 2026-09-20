@@ -19,6 +19,10 @@ func defaultStateDir() string {
 	if dir := os.Getenv("COUNCIL_STATE_DIR"); dir != "" {
 		return dir
 	}
+	home, err := os.UserHomeDir()
+	if err == nil && home != "" {
+		return filepath.Join(home, ".agent-council")
+	}
 	return ".agent-council"
 }
 
@@ -212,8 +216,13 @@ func stopServiceCmd(args []string) error {
 			// Check if discovery files are gone
 			sockPath := filepath.Join(stateDir, "council.sock")
 			tokenPath := filepath.Join(stateDir, "auth.token")
-			if _, err := os.Stat(sockPath); os.IsNotExist(err) {
-				if _, err := os.Stat(tokenPath); os.IsNotExist(err) {
+			_, sockErr := os.Stat(sockPath)
+			_, tokenErr := os.Stat(tokenPath)
+			if os.IsNotExist(sockErr) && os.IsNotExist(tokenErr) {
+				// Verify process exit / lock release
+				lock, err := service.AcquireServiceLock(stateDir)
+				if err == nil {
+					_ = lock.Release()
 					return nil
 				}
 			}

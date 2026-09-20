@@ -60,6 +60,11 @@ func (s *ExecutionSupervisor) Run(ctx context.Context) {
 		return
 	}
 
+	attemptID := s.receipt.AttemptID
+	if attemptID == "" {
+		attemptID = "1"
+	}
+
 	ref := adapter.TurnRef{
 		SessionID: adapter.SessionID(s.sessionID),
 		TurnKey:   s.turnKey,
@@ -71,7 +76,11 @@ func (s *ExecutionSupervisor) Run(ctx context.Context) {
 			return
 		}
 		// If prompt cannot be retrieved from store, record failure outcome
-		_ = s.recordTerminalOutcomeWithRetry(ctx, council.TurnFailed, fmt.Sprintf("failed to read turn prompt: %v", err))
+		if err := s.recordTerminalOutcomeWithRetry(ctx, council.TurnFailed, fmt.Sprintf("failed to read turn prompt: %v", err)); err != nil {
+			if s.coordinator != nil {
+				s.coordinator.AddRecoveryBlocker()
+			}
+		}
 		return
 	}
 
@@ -85,24 +94,37 @@ func (s *ExecutionSupervisor) Run(ctx context.Context) {
 			if reason == "" && err != nil {
 				reason = err.Error()
 			}
-			_ = s.recordTerminalOutcomeWithRetry(ctx, council.TurnFailed, reason)
+			if err := s.recordTerminalOutcomeWithRetry(ctx, council.TurnFailed, reason); err != nil {
+				if s.coordinator != nil {
+					s.coordinator.AddRecoveryBlocker()
+				}
+			}
 			return
 		}
-		// DispatchUnknown or context error preserves reservation without fabricated completion
+		// DispatchUnknown or transport error: record uncertainty observation durably without fabricated completion
+		obsOpID := fmt.Sprintf("op-obs-%s-%s-%s", s.sessionID, s.turnKey, attemptID)
+		_, _ = s.store.RecordDispatchObservation(ctx, obsOpID, s.callerLease, s.sessionID, s.turnKey, "acceptance_unknown")
+		if s.coordinator != nil {
+			s.coordinator.AddRecoveryBlocker()
+		}
 		return
 	}
 
 	// Dispatch accepted: record observation
-	obsOpID := fmt.Sprintf("op-obs-acc-%s", s.turnKey)
+	obsOpID := fmt.Sprintf("op-obs-%s-%s-%s", s.sessionID, s.turnKey, attemptID)
 	_, _ = s.store.RecordDispatchObservation(ctx, obsOpID, s.callerLease, s.sessionID, s.turnKey, "receipt_acknowledged")
 
 	// Observe stream until completion
 	stream, err := s.adapter.Observe(ctx, ref)
 	if err == nil {
 		for ev := range stream.Events() {
+			if ev.Type == adapter.EventTerminal {
+				// Authoritative terminal event is emitted only after durable database commit
+				continue
+			}
 			if s.coordinator != nil {
 				evBytes, _ := json.Marshal(ev)
-				s.coordinator.BroadcastEvent(s.turnKey, SSEEvent{
+				s.coordinator.BroadcastEvent(ref, SSEEvent{
 					Event: "progress",
 					Data:  string(evBytes),
 				})
@@ -122,19 +144,38 @@ func (s *ExecutionSupervisor) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		_ = s.recordTerminalOutcomeWithRetry(ctx, council.TurnFailed, fmt.Sprintf("collect failed: %v", err))
+		// Transport or collection error must NOT record TurnFailed; preserve uncertainty
+		if s.coordinator != nil {
+			s.coordinator.AddRecoveryBlocker()
+		}
+		return
+	}
+
+	// Validate execution result ref matches requested turn ref
+	if turnResult.Ref.SessionID != ref.SessionID || turnResult.Ref.TurnKey != ref.TurnKey {
+		// Foreign execution result: quarantine and do not commit to this turn
+		if s.coordinator != nil {
+			s.coordinator.AddRecoveryBlocker()
+		}
 		return
 	}
 
 	err = s.recordTerminalOutcomeWithRetry(ctx, turnResult.Status, turnResult.Output)
-	if err == nil && s.coordinator != nil {
+	if err != nil {
+		if s.coordinator != nil {
+			s.coordinator.AddRecoveryBlocker()
+		}
+		return
+	}
+
+	if s.coordinator != nil {
 		termBytes, _ := json.Marshal(map[string]any{
 			"session_id": s.sessionID,
 			"turn_key":   s.turnKey,
 			"status":     turnResult.Status,
 			"result":     turnResult.Output,
 		})
-		s.coordinator.BroadcastEvent(s.turnKey, SSEEvent{
+		s.coordinator.BroadcastEvent(ref, SSEEvent{
 			Event: "terminal",
 			Data:  string(termBytes),
 		})
@@ -153,7 +194,11 @@ func (s *ExecutionSupervisor) recordTerminalOutcomeWithRetry(ctx context.Context
 	if expectedVer <= 0 {
 		expectedVer = s.initialExpectedVersion
 	}
-	opID := fmt.Sprintf("op-term-%s", s.turnKey)
+	attemptID := s.receipt.AttemptID
+	if attemptID == "" {
+		attemptID = "1"
+	}
+	opID := fmt.Sprintf("op-term-%s-%s-%s", s.sessionID, s.turnKey, attemptID)
 
 	dbCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

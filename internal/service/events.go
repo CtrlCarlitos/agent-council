@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/CtrlCarlitos/agent-council/internal/adapter"
 	"github.com/CtrlCarlitos/agent-council/internal/council"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
@@ -38,8 +39,13 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. Atomic Snapshot & Subscription Registration
+	ref := adapter.TurnRef{
+		SessionID: adapter.SessionID(sessionID),
+		TurnKey:   turnKey,
+	}
+
 	// Register subscriber first so no events emitted after snapshot are missed
-	subCh, unsub := s.coordinator.RegisterSubscriber(turnKey)
+	subCh, unsub := s.coordinator.RegisterSubscriber(ref)
 	defer unsub()
 
 	// Query authoritative current state from store
@@ -73,7 +79,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	// If already terminal, emit terminal event and cleanly close
-	if details.Status == council.TurnCompleted || details.Status == council.TurnFailed || details.Status == council.TurnCancelled {
+	if details.Status == council.TurnCompleted || details.Status == council.TurnFailed || details.Status == council.TurnCancelled || details.Status == council.TurnInterrupted {
 		termBytes, _ := json.Marshal(map[string]any{
 			"session_id": sessionID,
 			"turn_key":   turnKey,

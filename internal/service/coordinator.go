@@ -43,7 +43,7 @@ type Coordinator struct {
 	inFlightControl  int
 	recoveryBlockers int
 	activeTurns      map[adapter.TurnRef]context.CancelFunc
-	subscribers      map[string][]chan SSEEvent
+	subscribers      map[adapter.TurnRef][]chan SSEEvent
 }
 
 // NewCoordinator initializes a new coordinator in the running state.
@@ -54,15 +54,30 @@ func NewCoordinator() *Coordinator {
 		ctx:         ctx,
 		cancel:      cancel,
 		activeTurns: make(map[adapter.TurnRef]context.CancelFunc),
-		subscribers: make(map[string][]chan SSEEvent),
+		subscribers: make(map[adapter.TurnRef][]chan SSEEvent),
 	}
 }
 
-// SetState updates the lifecycle state of the coordinator under an admission lock.
+func stateRank(s ServiceState) int {
+	switch s {
+	case ServiceStateRunning:
+		return 0
+	case ServiceStateDraining:
+		return 1
+	case ServiceStateStopping:
+		return 2
+	default:
+		return 0
+	}
+}
+
+// SetState updates the lifecycle state monotonically under an admission lock.
 func (c *Coordinator) SetState(state ServiceState) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.state = state
+	if stateRank(state) > stateRank(c.state) {
+		c.state = state
+	}
 }
 
 // State returns the current lifecycle state.
@@ -188,6 +203,13 @@ func (c *Coordinator) TrackControl() (func(), error) {
 	}, nil
 }
 
+// AddRecoveryBlocker increments the count of outstanding unresolved recovery blockers.
+func (c *Coordinator) AddRecoveryBlocker() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.recoveryBlockers++
+}
+
 // SetRecoveryBlockers updates the count of outstanding unresolved recovery blockers.
 func (c *Coordinator) SetRecoveryBlockers(n int) {
 	c.mu.Lock()
@@ -268,28 +290,28 @@ func (c *Coordinator) LiveWorkerKeys() map[string]bool {
 	return keys
 }
 
-// RegisterSubscriber registers an event channel for a specific turn.
-func (c *Coordinator) RegisterSubscriber(turnKey string) (chan SSEEvent, func()) {
+// RegisterSubscriber registers an event channel for a specific turn ref.
+func (c *Coordinator) RegisterSubscriber(ref adapter.TurnRef) (chan SSEEvent, func()) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	ch := make(chan SSEEvent, 64)
-	c.subscribers[turnKey] = append(c.subscribers[turnKey], ch)
+	c.subscribers[ref] = append(c.subscribers[ref], ch)
 
 	var once sync.Once
 	unsub := func() {
 		once.Do(func() {
 			c.mu.Lock()
 			defer c.mu.Unlock()
-			subs := c.subscribers[turnKey]
+			subs := c.subscribers[ref]
 			for i, sub := range subs {
 				if sub == ch {
-					c.subscribers[turnKey] = append(subs[:i], subs[i+1:]...)
+					c.subscribers[ref] = append(subs[:i], subs[i+1:]...)
 					break
 				}
 			}
-			if len(c.subscribers[turnKey]) == 0 {
-				delete(c.subscribers, turnKey)
+			if len(c.subscribers[ref]) == 0 {
+				delete(c.subscribers, ref)
 			}
 		})
 	}
@@ -297,11 +319,11 @@ func (c *Coordinator) RegisterSubscriber(turnKey string) (chan SSEEvent, func())
 	return ch, unsub
 }
 
-// SubscriberCount returns the number of active observers for a specific turn.
-func (c *Coordinator) SubscriberCount(turnKey string) int {
+// SubscriberCount returns the number of active observers for a specific turn ref.
+func (c *Coordinator) SubscriberCount(ref adapter.TurnRef) int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return len(c.subscribers[turnKey])
+	return len(c.subscribers[ref])
 }
 
 // TotalSubscriberCount returns the total number of active observers across all turns.
@@ -315,13 +337,13 @@ func (c *Coordinator) TotalSubscriberCount() int {
 	return total
 }
 
-// BroadcastEvent sends an event to all subscribers registered for the turn.
+// BroadcastEvent sends an event to all subscribers registered for the turn ref.
 // Slow observers that fail to consume within buffer capacity are disconnected.
-func (c *Coordinator) BroadcastEvent(turnKey string, ev SSEEvent) {
+func (c *Coordinator) BroadcastEvent(ref adapter.TurnRef, ev SSEEvent) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	subs := c.subscribers[turnKey]
+	subs := c.subscribers[ref]
 	if len(subs) == 0 {
 		return
 	}
@@ -337,9 +359,9 @@ func (c *Coordinator) BroadcastEvent(turnKey string, ev SSEEvent) {
 		}
 	}
 	if len(remaining) == 0 {
-		delete(c.subscribers, turnKey)
+		delete(c.subscribers, ref)
 	} else {
-		c.subscribers[turnKey] = remaining
+		c.subscribers[ref] = remaining
 	}
 }
 
@@ -353,7 +375,7 @@ func (c *Coordinator) CloseAllSubscribers() {
 			close(ch)
 		}
 	}
-	c.subscribers = make(map[string][]chan SSEEvent)
+	c.subscribers = make(map[adapter.TurnRef][]chan SSEEvent)
 }
 
 // WaitWorkers blocks until all active workers have completed and released accounting.
@@ -374,7 +396,7 @@ func (c *Coordinator) CancelAll() {
 			close(ch)
 		}
 	}
-	c.subscribers = make(map[string][]chan SSEEvent)
+	c.subscribers = make(map[adapter.TurnRef][]chan SSEEvent)
 }
 
 // Close cancels all active worker contexts, closes observers, and joins workers.

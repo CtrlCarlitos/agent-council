@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/CtrlCarlitos/agent-council/internal/adapter"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/adaptertest"
 	"github.com/CtrlCarlitos/agent-council/internal/council"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
@@ -106,14 +107,15 @@ func TestEvents_SynchronizedSnapshotAndCleanDisconnect(t *testing.T) {
 	resp.Body.Close()
 
 	// Wait for cleanup
+	ref := adapter.TurnRef{SessionID: "sess-1", TurnKey: "t-1"}
 	for i := 0; i < 100; i++ {
-		if count := srv.Coordinator().SubscriberCount("t-1"); count == 0 {
+		if count := srv.Coordinator().SubscriberCount(ref); count == 0 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	// Verify subscriber is cleanly deregistered
-	if count := srv.Coordinator().SubscriberCount("t-1"); count != 0 {
+	if count := srv.Coordinator().SubscriberCount(ref); count != 0 {
 		t.Fatalf("expected 0 subscribers after disconnect, got %d", count)
 	}
 }
@@ -248,12 +250,13 @@ func TestEvents_SlowConsumerOverflow(t *testing.T) {
 	coord := NewCoordinator()
 	defer coord.Close()
 
-	ch, unsub := coord.RegisterSubscriber("t-overflow")
+	ref := adapter.TurnRef{SessionID: "sess-overflow", TurnKey: "t-overflow"}
+	ch, unsub := coord.RegisterSubscriber(ref)
 	defer unsub()
 
 	// Capacity is 64. Send 100 events to trigger slow consumer disconnection.
 	for i := 0; i < 100; i++ {
-		coord.BroadcastEvent("t-overflow", SSEEvent{
+		coord.BroadcastEvent(ref, SSEEvent{
 			Event: "progress",
 			Data:  `{"progress":"tick"}`,
 		})
@@ -265,7 +268,7 @@ func TestEvents_SlowConsumerOverflow(t *testing.T) {
 	}
 
 	// Subscriber should be unregistered from coordinator
-	if count := coord.SubscriberCount("t-overflow"); count != 0 {
+	if count := coord.SubscriberCount(ref); count != 0 {
 		t.Fatalf("expected 0 subscribers after overflow disconnection, got %d", count)
 	}
 
@@ -278,6 +281,41 @@ func TestEvents_SlowConsumerOverflow(t *testing.T) {
 	_, ok := <-ch
 	if ok {
 		t.Fatalf("expected subscriber channel to be closed on overflow")
+	}
+}
+
+func TestEvents_SessionScopedSubscriberIsolation(t *testing.T) {
+	coord := NewCoordinator()
+	defer coord.Close()
+
+	ref1 := adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-shared"}
+	ref2 := adapter.TurnRef{SessionID: "sess-2", TurnKey: "turn-shared"}
+
+	ch1, unsub1 := coord.RegisterSubscriber(ref1)
+	defer unsub1()
+
+	ch2, unsub2 := coord.RegisterSubscriber(ref2)
+	defer unsub2()
+
+	coord.BroadcastEvent(ref1, SSEEvent{
+		Event: "progress",
+		Data:  `{"for":"sess-1"}`,
+	})
+
+	select {
+	case ev := <-ch1:
+		if ev.Data != `{"for":"sess-1"}` {
+			t.Fatalf("unexpected data for sess-1: %s", ev.Data)
+		}
+	default:
+		t.Fatal("expected event for sess-1")
+	}
+
+	select {
+	case ev := <-ch2:
+		t.Fatalf("cross-session observation leak: sess-2 received event for sess-1: %+v", ev)
+	default:
+		// Expected: sess-2 receives nothing
 	}
 }
 

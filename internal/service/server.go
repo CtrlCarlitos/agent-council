@@ -159,12 +159,21 @@ func (s *Server) Start() error {
 	s.listener = l
 	s.running = true
 
-	// Initial diagnostic sync and recovery blocker tracking
+	// Initial state hydration and validation before accepting requests
 	if s.store != nil {
-		liveMap := s.coordinator.LiveWorkerKeys()
-		if counts, err := s.store.GetDiagnosticCounts(context.Background(), liveMap); err == nil {
-			s.coordinator.SetRecoveryBlockers(counts.RecoveryBlockers)
+		hydrateCtx, hydrateCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer hydrateCancel()
+		if _, err := s.store.HydrateState(hydrateCtx); err != nil {
+			_ = l.Close()
+			return fmt.Errorf("hydrate state failed: %w", err)
 		}
+		liveMap := s.coordinator.LiveWorkerKeys()
+		counts, err := s.store.GetDiagnosticCounts(hydrateCtx, liveMap)
+		if err != nil {
+			_ = l.Close()
+			return fmt.Errorf("initial diagnostic counts failed: %w", err)
+		}
+		s.coordinator.SetRecoveryBlockers(counts.RecoveryBlockers)
 	}
 
 	go func() {
@@ -201,11 +210,14 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	var reservedTurns, unresolvedTurns int
 	if s.store != nil {
 		liveMap := s.coordinator.LiveWorkerKeys()
-		if counts, err := s.store.GetDiagnosticCounts(r.Context(), liveMap); err == nil {
-			s.coordinator.SetRecoveryBlockers(counts.RecoveryBlockers)
-			reservedTurns = counts.ReservedTurns
-			unresolvedTurns = counts.UnresolvedTurns
+		counts, err := s.store.GetDiagnosticCounts(r.Context(), liveMap)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "storage_error", fmt.Sprintf("diagnostics query failed: %v", err), "")
+			return
 		}
+		s.coordinator.SetRecoveryBlockers(counts.RecoveryBlockers)
+		reservedTurns = counts.ReservedTurns
+		unresolvedTurns = counts.UnresolvedTurns
 	}
 
 	resp := ReadinessResponse{
@@ -233,12 +245,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	activeRuns := []string{}
 	if s.store != nil {
 		liveMap := s.coordinator.LiveWorkerKeys()
-		if counts, err := s.store.GetDiagnosticCounts(r.Context(), liveMap); err == nil {
-			s.coordinator.SetRecoveryBlockers(counts.RecoveryBlockers)
-			reservedTurns = counts.ReservedTurns
-			unresolvedTurns = counts.UnresolvedTurns
-			activeRuns = counts.ActiveRuns
+		counts, err := s.store.GetDiagnosticCounts(r.Context(), liveMap)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "storage_error", fmt.Sprintf("diagnostics query failed: %v", err), "")
+			return
 		}
+		s.coordinator.SetRecoveryBlockers(counts.RecoveryBlockers)
+		reservedTurns = counts.ReservedTurns
+		unresolvedTurns = counts.UnresolvedTurns
+		activeRuns = counts.ActiveRuns
 	}
 
 	resp := StatusResponse{

@@ -78,6 +78,16 @@ func (c *Client) Meta() service.DiscoveryMeta {
 	return c.meta
 }
 
+// Token returns the authentication bearer token for the service.
+func (c *Client) Token() string {
+	return c.token
+}
+
+// HTTPClient returns the underlying http.Client configured for the service transport.
+func (c *Client) HTTPClient() *http.Client {
+	return c.httpClient
+}
+
 func (c *Client) do(ctx context.Context, method, path string, body any, dst any) error {
 	var bodyReader io.Reader
 	if body != nil {

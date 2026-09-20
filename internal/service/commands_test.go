@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/CtrlCarlitos/agent-council/internal/adapter"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/adaptertest"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
@@ -60,7 +61,13 @@ func TestCommands_TurnReadCancelAndReconcile(t *testing.T) {
 		t.Fatalf("release turn: %v", err)
 	}
 
-	fakeAdapter := adaptertest.NewFakeAdapter("claude")
+	holdStart := make(chan struct{})
+	defer close(holdStart)
+	fakeAdapter := adaptertest.NewFake(adaptertest.ScriptedFaults{
+		HoldExecutionStart: holdStart,
+	})
+	fakeAdapter.SetDefaultContributor("claude")
+	_, _ = fakeAdapter.Dispatch(ctx, adapter.TurnRef{SessionID: "sess-1", TurnKey: "t-1"}, "Hello")
 	cfg := ServerConfig{
 		StateDir:   dir,
 		InstanceID: "inst-test-1",

@@ -224,7 +224,8 @@ func TestAcceptance_CrashRecovery_WithoutAccessibleNativeEvidence(t *testing.T) 
 	}
 
 	// Verify idle stop (drain=false) is rejected with 409 service_busy due to recoveryBlockers
-	stopReq, _ := http.NewRequestWithContext(ctx, "POST", "http://localhost/v1/service/stop", strings.NewReader(`{"drain":false}`))
+	stopBody := fmt.Sprintf(`{"instance_id":%q,"drain":false}`, cfg2.InstanceID)
+	stopReq, _ := http.NewRequestWithContext(ctx, "POST", "http://localhost/v1/service/stop", strings.NewReader(stopBody))
 	stopReq.Header.Set("Authorization", "Bearer "+cfg2.AuthToken)
 	stopReq.Header.Set("Content-Type", "application/json")
 	stopResp, err := client2.Do(stopReq)
@@ -412,6 +413,8 @@ func TestAcceptance_IdleStop_ReleaseRace(t *testing.T) {
 		if stopStatusCode != http.StatusAccepted {
 			t.Fatalf("expected stop to return 202 accepted when release was rejected, got %v", stopStatusCode)
 		}
+	} else {
+		t.Fatalf("unexpected release status code: %v (stop status: %v)", releaseStatusCode, stopStatusCode)
 	}
 }
 

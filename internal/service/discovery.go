@@ -29,6 +29,29 @@ func GenerateAuthToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+func writePrivateFile(path string, data []byte) error {
+	if fi, err := os.Lstat(path); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to write to symlink at %s", path)
+		}
+		_ = os.Remove(path)
+	}
+
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return fmt.Errorf("create private file %s: %w", path, err)
+	}
+	defer f.Close()
+
+	if err := f.Chmod(0600); err != nil {
+		return fmt.Errorf("chmod private file %s: %w", path, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		return fmt.Errorf("write private file %s: %w", path, err)
+	}
+	return f.Sync()
+}
+
 func PublishDiscovery(stateDir string, meta DiscoveryMeta, token string) error {
 	if stateDir == "" {
 		return errors.New("stateDir cannot be empty")
@@ -45,11 +68,11 @@ func PublishDiscovery(stateDir string, meta DiscoveryMeta, token string) error {
 		return fmt.Errorf("stateDir %s is not a directory", stateDir)
 	}
 
-	// Remove stale socket if present, ensuring it's not a directory or symlink
+	// Remove stale socket if present, ensuring it is strictly a socket
 	sockPath := filepath.Join(stateDir, "council.sock")
 	if fi, err := os.Lstat(sockPath); err == nil {
-		if fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("stale socket path %s is a directory or symlink", sockPath)
+		if fi.Mode().Type() != os.ModeSocket {
+			return fmt.Errorf("unexpected file at %s: expected socket, found mode %v", sockPath, fi.Mode())
 		}
 		if err := os.Remove(sockPath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove stale socket: %w", err)
@@ -59,13 +82,18 @@ func PublishDiscovery(stateDir string, meta DiscoveryMeta, token string) error {
 	// 1. Atomically write auth.token (mode 0600)
 	tokenPath := filepath.Join(stateDir, "auth.token")
 	tmpTokenPath := filepath.Join(stateDir, "auth.token.tmp")
-	if err := os.WriteFile(tmpTokenPath, []byte(token), 0600); err != nil {
+	if err := writePrivateFile(tmpTokenPath, []byte(token)); err != nil {
 		return fmt.Errorf("write auth.token.tmp: %w", err)
+	}
+	if fi, err := os.Lstat(tokenPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		_ = os.Remove(tmpTokenPath)
+		return fmt.Errorf("target token path %s is an unexpected symlink", tokenPath)
 	}
 	if err := os.Rename(tmpTokenPath, tokenPath); err != nil {
 		_ = os.Remove(tmpTokenPath)
 		return fmt.Errorf("rename auth.token: %w", err)
 	}
+	_ = os.Chmod(tokenPath, 0600)
 
 	// 2. Atomically write service.json (mode 0600) excluding token
 	metaJSON, err := json.MarshalIndent(meta, "", "  ")
@@ -74,13 +102,18 @@ func PublishDiscovery(stateDir string, meta DiscoveryMeta, token string) error {
 	}
 	metaPath := filepath.Join(stateDir, "service.json")
 	tmpMetaPath := filepath.Join(stateDir, "service.json.tmp")
-	if err := os.WriteFile(tmpMetaPath, metaJSON, 0600); err != nil {
+	if err := writePrivateFile(tmpMetaPath, metaJSON); err != nil {
 		return fmt.Errorf("write service.json.tmp: %w", err)
+	}
+	if fi, err := os.Lstat(metaPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		_ = os.Remove(tmpMetaPath)
+		return fmt.Errorf("target meta path %s is an unexpected symlink", metaPath)
 	}
 	if err := os.Rename(tmpMetaPath, metaPath); err != nil {
 		_ = os.Remove(tmpMetaPath)
 		return fmt.Errorf("rename service.json: %w", err)
 	}
+	_ = os.Chmod(metaPath, 0600)
 
 	return nil
 }

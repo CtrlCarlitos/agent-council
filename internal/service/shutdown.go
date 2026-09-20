@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -31,7 +32,12 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.InstanceID != "" && req.InstanceID != s.cfg.InstanceID {
+	if strings.TrimSpace(req.InstanceID) == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "instance_id is required", "")
+		return
+	}
+
+	if req.InstanceID != s.cfg.InstanceID {
 		writeError(w, http.StatusConflict, "instance_mismatch",
 			fmt.Sprintf("instance_id %q does not match current instance %q", req.InstanceID, s.cfg.InstanceID), "")
 		return
@@ -64,7 +70,8 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Drain == true: close release admission gate and drain active executions
+	// Drain == true: close release admission gate and drain active executions.
+	// Operator drain has no cancellation cutoff—only an OS signal imposes execution termination.
 	s.coordinator.SetState(ServiceStateDraining)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -78,14 +85,15 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		ticker := time.NewTicker(20 * time.Millisecond)
 		defer ticker.Stop()
 
-		timeout := time.After(30 * time.Second)
 		for {
 			select {
-			case <-timeout:
-				s.coordinator.CancelActiveWorkers()
-				_ = s.Teardown(5 * time.Second)
+			case <-s.shutdown:
 				return
 			case <-ticker.C:
+				liveMap := s.coordinator.LiveWorkerKeys()
+				if counts, err := s.store.GetDiagnosticCounts(context.Background(), liveMap); err == nil {
+					s.coordinator.SetRecoveryBlockers(counts.RecoveryBlockers)
+				}
 				if s.coordinator.IsShutdownEligible() {
 					_ = s.Teardown(5 * time.Second)
 					return

@@ -21,6 +21,15 @@ func startDetachedService(stateDir string) error {
 		return fmt.Errorf("resolve executable path: %w", err)
 	}
 
+	// Pre-check: reject if service is already running
+	if c, err := client.New(stateDir); err == nil {
+		checkCtx, checkCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer checkCancel()
+		if ready, err := c.GetReadiness(checkCtx); err == nil && ready.Status == "ready" {
+			return errors.New("service already running")
+		}
+	}
+
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", os.DevNull, err)
@@ -46,6 +55,12 @@ func startDetachedService(stateDir string) error {
 		return fmt.Errorf("start detached service: %w", err)
 	}
 
+	pid := cmd.Process.Pid
+	exited := make(chan error, 1)
+	go func() {
+		exited <- cmd.Wait()
+	}()
+
 	// Poll readiness until ready or timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -57,15 +72,19 @@ func startDetachedService(stateDir string) error {
 		select {
 		case <-ctx.Done():
 			return errors.New("timed out waiting for service readiness")
-		case <-ticker.C:
-			// Check if process has died
-			if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
-				return fmt.Errorf("detached service process exited prematurely: %w", err)
+		case err := <-exited:
+			if err != nil {
+				return fmt.Errorf("detached service process exited with error: %w", err)
 			}
-
+			return errors.New("detached service process exited prematurely")
+		case <-ticker.C:
 			c, err := client.New(stateDir)
 			if err != nil {
 				continue
+			}
+			if c.Meta().PID != pid {
+				// Another service instance already owns stateDir
+				return fmt.Errorf("service already running with PID %d", c.Meta().PID)
 			}
 			ready, err := c.GetReadiness(ctx)
 			if err == nil && ready.Status == "ready" {

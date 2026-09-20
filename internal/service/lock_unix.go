@@ -24,8 +24,14 @@ func AcquireServiceLock(stateDir string) (*ServiceLock, error) {
 	}
 
 	lockPath := filepath.Join(stateDir, "service.lock")
-	// Open file with O_RDWR|O_CREATE|O_CLOEXEC, mode 0600
-	fd, err := syscall.Open(lockPath, syscall.O_RDWR|syscall.O_CREAT|syscall.O_CLOEXEC, 0600)
+	if fi, err := os.Lstat(lockPath); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("service.lock %s is an unexpected symlink", lockPath)
+		}
+	}
+
+	// Open file with O_RDWR|O_CREATE|O_CLOEXEC|O_NOFOLLOW, mode 0600
+	fd, err := syscall.Open(lockPath, syscall.O_RDWR|syscall.O_CREAT|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("open service.lock: %w", err)
 	}
@@ -40,8 +46,11 @@ func AcquireServiceLock(stateDir string) (*ServiceLock, error) {
 		return nil, fmt.Errorf("flock service.lock: %w", err)
 	}
 
-	// Enforce 0600 mode on the file
-	_ = syscall.Fchmod(fd, 0600)
+	// Enforce 0600 mode on the file and propagate errors
+	if err := syscall.Fchmod(fd, 0600); err != nil {
+		_ = syscall.Close(fd)
+		return nil, fmt.Errorf("fchmod service.lock: %w", err)
+	}
 
 	file := os.NewFile(uintptr(fd), lockPath)
 	return &ServiceLock{

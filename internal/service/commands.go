@@ -178,14 +178,56 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		cancelCtx, cancelTimeout := context.WithTimeout(context.Background(), 5*time.Second)
 		outcome, err := s.adapter.Cancel(cancelCtx, turnRef)
 		cancelTimeout()
-		if err == nil {
+		if err != nil {
+			cancellationStatus = "unavailable"
+		} else {
 			switch outcome.Disposition {
 			case adapter.CancelConfirmed:
-				cancellationStatus = "confirmed"
+				if outcome.Ref == turnRef {
+					termOpID := fmt.Sprintf("%s:term", req.OpID)
+					reason := outcome.Reason
+					if reason == "" {
+						reason = "cancelled by operator"
+					}
+					bgCtx, bgCancel := context.WithTimeout(context.Background(), 3*time.Second)
+					defer bgCancel()
+
+					persisted := false
+					for retries := 0; retries < 5; retries++ {
+						ver, verErr := s.store.GetSessionVersion(bgCtx, sessionID)
+						if verErr != nil {
+							ver = receipt.CommittedVersion
+						}
+						termReceipt, termErr := s.store.RecordTerminalOutcome(bgCtx, termOpID, req.ControllerLease, sessionID, ver, turnKey, council.TurnCancelled, reason)
+						if termErr == nil {
+							receipt = termReceipt
+							persisted = true
+							break
+						}
+						if !errors.Is(termErr, storage.ErrStaleUpdate) {
+							break
+						}
+					}
+					if persisted {
+						cancellationStatus = "confirmed"
+					} else {
+						cancellationStatus = "unknown"
+					}
+				} else {
+					cancellationStatus = "unknown"
+				}
+			case adapter.CancelAlreadyTerminal:
+				cancellationStatus = "already_terminal"
+			case adapter.CancelRejected:
+				cancellationStatus = "rejected"
 			case adapter.CancelUnsupported:
 				cancellationStatus = "unsupported"
-			default:
+			case adapter.CancelRequested:
 				cancellationStatus = "requested"
+			case adapter.CancelUnknown:
+				cancellationStatus = "unknown"
+			default:
+				cancellationStatus = string(outcome.Disposition)
 			}
 		}
 	}
@@ -307,6 +349,10 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if found {
+		if committedReceipt.SessionID != sessionID || (committedReceipt.TurnKey != "" && committedReceipt.TurnKey != turnKey) || committedReceipt.CommandType != "reconcile_session" {
+			writeError(w, http.StatusConflict, "idempotency_conflict", "existing receipt targets different command, session, or turn", req.OpID)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(ReconcileResponse{
@@ -317,10 +363,27 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 2: Check or initiate recovery episode
+	// Step 2: Validate caller authority against runs.controller_lease and active turn before probes
+	if err := s.store.ValidateControllerLease(r.Context(), sessionID, req.ControllerLease); err != nil {
+		if errors.Is(err, storage.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "session_not_found", err.Error(), req.OpID)
+			return
+		}
+		if errors.Is(err, storage.ErrUnauthorizedOperation) {
+			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), req.OpID)
+		return
+	}
+
 	recState, err := s.store.GetSessionRecoveryState(r.Context(), sessionID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "get_session_failed", err.Error(), req.OpID)
+		return
+	}
+	if recState.ActiveKey != turnKey {
+		writeError(w, http.StatusBadRequest, "invalid_turn", fmt.Sprintf("session active turn is %q, not %q", recState.ActiveKey, turnKey), req.OpID)
 		return
 	}
 
@@ -345,9 +408,9 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "record_host_loss_failed", err.Error(), req.OpID)
 			return
 		}
-		_, _ = fmt.Sscanf(hlReceipt.Payload, "%d", &generation)
-		if generation == 0 {
-			generation = 1
+		if _, err := fmt.Sscanf(hlReceipt.Payload, "%d", &generation); err != nil || generation == 0 {
+			writeError(w, http.StatusInternalServerError, "invalid_recovery_gen", "failed to determine active recovery generation from host loss receipt", req.OpID)
+			return
 		}
 	}
 
@@ -373,8 +436,10 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 4: Persist reconciled outcome
-	recReceipt, err := s.store.ReconcileSession(r.Context(), stageReconcileID, req.ControllerLease, recoveryRef, outcome)
+	// Step 4: Persist reconciled outcome under bounded service context
+	persistCtx, persistCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer persistCancel()
+	recReceipt, err := s.store.ReconcileSession(persistCtx, stageReconcileID, req.ControllerLease, recoveryRef, outcome)
 	if err != nil {
 		if errors.Is(err, storage.ErrUnauthorizedOperation) {
 			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)

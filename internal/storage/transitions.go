@@ -1516,6 +1516,26 @@ func (s *Store) ValidateSessionRun(ctx context.Context, sessionID, runID string)
 	return nil
 }
 
+// ValidateControllerLease checks whether the caller lease matches the session's run controller lease.
+func (s *Store) ValidateControllerLease(ctx context.Context, sessionID, callerLease string) error {
+	var runLease string
+	err := s.readDB.QueryRowContext(ctx, `
+SELECT r.controller_lease
+FROM sessions s
+JOIN runs r ON s.run_id = r.run_id
+WHERE s.session_id = ?;`, sessionID).Scan(&runLease)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrSessionNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("validate controller lease: %w", err)
+	}
+	if runLease != callerLease {
+		return ErrUnauthorizedOperation
+	}
+	return nil
+}
+
 // GetDiagnosticCounts computes active runs, reserved turns, unresolved turns, and recovery blockers.
 func (s *Store) GetDiagnosticCounts(ctx context.Context, liveWorkerKeys map[string]bool) (DiagnosticCounts, error) {
 	var counts DiagnosticCounts
