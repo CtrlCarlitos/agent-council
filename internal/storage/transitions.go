@@ -1558,6 +1558,8 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runLease)
 }
 
 // GetDiagnosticCounts computes active runs, reserved turns, unresolved turns, and recovery blockers.
+// A turn in either nonterminal execution state ('running' or 'cancelling')
+// is a reservation; an unconfirmed cancellation is not completed work.
 func (s *Store) GetDiagnosticCounts(ctx context.Context, liveWorkerKeys map[string]bool) (DiagnosticCounts, error) {
 	var counts DiagnosticCounts
 	counts.ActiveRuns = make([]string, 0)
@@ -1570,36 +1572,42 @@ func (s *Store) GetDiagnosticCounts(ctx context.Context, liveWorkerKeys map[stri
 	defer rows.Close()
 	for rows.Next() {
 		var runID string
-		if err := rows.Scan(&runID); err == nil {
-			counts.ActiveRuns = append(counts.ActiveRuns, runID)
+		if err := rows.Scan(&runID); err != nil {
+			return counts, fmt.Errorf("scan active run: %w", err)
 		}
+		counts.ActiveRuns = append(counts.ActiveRuns, runID)
+	}
+	if err := rows.Err(); err != nil {
+		return counts, fmt.Errorf("iterate active runs: %w", err)
 	}
 
 	// 2. Reserved and Unresolved turns
-	turnRows, err := s.readDB.QueryContext(ctx, `SELECT session_id, turn_key, status FROM turns WHERE status = 'running';`)
+	turnRows, err := s.readDB.QueryContext(ctx, `SELECT session_id, turn_key, status FROM turns WHERE status IN ('running', 'cancelling');`)
 	if err != nil {
 		return counts, err
 	}
 	defer turnRows.Close()
 	for turnRows.Next() {
 		var sID, tKey, status string
-		if err := turnRows.Scan(&sID, &tKey, &status); err == nil {
-			counts.ReservedTurns++
-			mapKey := fmt.Sprintf("%s:%s", sID, tKey)
-			if liveWorkerKeys == nil || !liveWorkerKeys[mapKey] {
-				counts.UnresolvedTurns++
-			}
+		if err := turnRows.Scan(&sID, &tKey, &status); err != nil {
+			return counts, fmt.Errorf("scan reserved turn: %w", err)
 		}
+		counts.ReservedTurns++
+		mapKey := fmt.Sprintf("%s:%s", sID, tKey)
+		if liveWorkerKeys == nil || !liveWorkerKeys[mapKey] {
+			counts.UnresolvedTurns++
+		}
+	}
+	if err := turnRows.Err(); err != nil {
+		return counts, fmt.Errorf("iterate reserved turns: %w", err)
 	}
 
 	// 3. Recovery Blockers = Unresolved turns + sessions with visibility = 'host_lost'
 	var hostLostSessions int
-	err = s.readDB.QueryRowContext(ctx, `SELECT count(*) FROM sessions WHERE visibility = 'host_lost';`).Scan(&hostLostSessions)
-	if err == nil {
-		counts.RecoveryBlockers = counts.UnresolvedTurns + hostLostSessions
-	} else {
-		counts.RecoveryBlockers = counts.UnresolvedTurns
+	if err := s.readDB.QueryRowContext(ctx, `SELECT count(*) FROM sessions WHERE visibility = 'host_lost';`).Scan(&hostLostSessions); err != nil {
+		return counts, fmt.Errorf("count host-lost sessions: %w", err)
 	}
+	counts.RecoveryBlockers = counts.UnresolvedTurns + hostLostSessions
 
 	return counts, nil
 }

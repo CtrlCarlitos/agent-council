@@ -477,17 +477,13 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "harness_unavailable", "no saved native session binding for recovery", req.OpID)
 		return
 	}
+	sessionBinding, err := sessionBindingFromStorage(binding, contributor)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "harness_unavailable", err.Error(), req.OpID)
+		return
+	}
 	resumeCtx, resumeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	err = s.adapter.ResumeSession(resumeCtx, adapter.SessionBinding{
-		SessionID:       adapter.SessionID(binding.LogicalSessionID),
-		Contributor:     council.Contributor(contributor),
-		NativeSessionID: binding.NativeSessionID,
-		Config: adapter.SessionConfig{
-			WorkspaceRoot: binding.WorkspaceMode,
-			Model:         binding.Model,
-			Tooling:       parseToolingConfig(binding.ToolingConfig),
-		},
-	})
+	err = s.adapter.ResumeSession(resumeCtx, sessionBinding)
 	resumeCancel()
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "harness_unavailable", fmt.Sprintf("cannot attach to saved native session: %v", err), req.OpID)
@@ -555,17 +551,86 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// parseToolingConfig decodes the stored tooling configuration into the
-// adapter's tool list, tolerating an empty configuration.
-func parseToolingConfig(cfgJSON string) []string {
-	if strings.TrimSpace(cfgJSON) == "" {
-		return nil
+// ErrUnsupportedBindingConfig reports a persisted native-binding
+// configuration that cannot be reconstructed faithfully for resume.
+// Failing visibly is required: silently dropping configuration would
+// restore a different session than the one that was saved.
+var ErrUnsupportedBindingConfig = errors.New("unsupported native-binding configuration for resume")
+
+// sessionBindingFromStorage reconstructs the adapter session binding from
+// the persisted native binding and session contributor, preserving the
+// saved workspace root, model, tooling, and native identity.
+//
+// The persisted tooling configuration may be empty, a JSON array of tool
+// names, or a JSON object whose recognized session-config fields are
+// workspace_root, model, and tools/tooling (array of tool names). Profile
+// references (a bare identifier or a string/map tooling value) and other
+// shapes cannot be expanded without a profile registry and are rejected
+// with ErrUnsupportedBindingConfig. Remaining stored object keys (policy
+// metadata such as read_only or env_allowlist) are not part of the adapter
+// session configuration.
+func sessionBindingFromStorage(nb storage.NativeBinding, contributor string) (adapter.SessionBinding, error) {
+	binding := adapter.SessionBinding{
+		SessionID:       adapter.SessionID(nb.LogicalSessionID),
+		Contributor:     council.Contributor(contributor),
+		NativeSessionID: nb.NativeSessionID,
+		Config: adapter.SessionConfig{
+			Model: nb.Model,
+		},
 	}
+
+	trimmed := strings.TrimSpace(nb.ToolingConfig)
+	if trimmed == "" || trimmed == "{}" {
+		return binding, nil
+	}
+
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &obj); err == nil {
+		if raw, ok := obj["workspace_root"]; ok {
+			var root string
+			if err := json.Unmarshal(raw, &root); err != nil {
+				return adapter.SessionBinding{}, fmt.Errorf("%w: workspace_root must be a string", ErrUnsupportedBindingConfig)
+			}
+			binding.Config.WorkspaceRoot = root
+		}
+		if raw, ok := obj["model"]; ok {
+			var model string
+			if err := json.Unmarshal(raw, &model); err != nil {
+				return adapter.SessionBinding{}, fmt.Errorf("%w: model must be a string", ErrUnsupportedBindingConfig)
+			}
+			binding.Config.Model = model
+		}
+		toolsRaw, hasTools := obj["tools"]
+		if !hasTools {
+			toolsRaw, hasTools = obj["tooling"]
+		}
+		if hasTools {
+			tools, err := decodeToolList(toolsRaw)
+			if err != nil {
+				return adapter.SessionBinding{}, fmt.Errorf("%w: %v", ErrUnsupportedBindingConfig, err)
+			}
+			binding.Config.Tooling = tools
+		}
+		return binding, nil
+	}
+
+	// Legacy/alternate representation: a JSON array of tool names.
+	tools, err := decodeToolList([]byte(trimmed))
+	if err != nil {
+		return adapter.SessionBinding{}, fmt.Errorf("%w: %v", ErrUnsupportedBindingConfig, err)
+	}
+	binding.Config.Tooling = tools
+	return binding, nil
+}
+
+// decodeToolList decodes a JSON value into a tool-name list, rejecting
+// profile strings and maps that cannot be faithfully expanded.
+func decodeToolList(raw json.RawMessage) ([]string, error) {
 	var tools []string
-	if err := json.Unmarshal([]byte(cfgJSON), &tools); err != nil {
-		return nil
+	if err := json.Unmarshal(raw, &tools); err != nil {
+		return nil, errors.New("tooling must be an array of tool names for resume")
 	}
-	return tools
+	return tools, nil
 }
 
 func (s *Server) handleQueuePrompt(w http.ResponseWriter, r *http.Request) {

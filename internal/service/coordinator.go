@@ -122,6 +122,8 @@ func (c *Coordinator) LiveWorkers() int {
 // RegisterWorker admits and tracks a new execution worker under coordinator ownership.
 // The returned context is the worker's termination scope: it is cancelled only by
 // service-level termination, never by a cancellation request.
+// Registration changes the live set that diagnostics use to exclude live
+// turns from unresolved counts, so it advances the blocker epoch.
 func (c *Coordinator) RegisterWorker(ref adapter.TurnRef) (context.Context, func(), error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -134,6 +136,7 @@ func (c *Coordinator) RegisterWorker(ref adapter.TurnRef) (context.Context, func
 	c.activeTurns[ref] = workerCancel
 	c.liveWorkers++
 	c.tasks.Add(1)
+	c.blockerEpoch++
 
 	var once sync.Once
 	done := func() {
@@ -144,6 +147,10 @@ func (c *Coordinator) RegisterWorker(ref adapter.TurnRef) (context.Context, func
 			c.liveWorkers--
 			c.tasks.Done()
 			workerCancel()
+			// Retirement changes the live set: a diagnostic whose snapshot
+			// was taken while this worker was tracked must no longer apply,
+			// because its unresolved-count exclusion relied on the old set.
+			c.blockerEpoch++
 		})
 	}
 
@@ -223,8 +230,12 @@ func (c *Coordinator) AddRecoveryBlocker() {
 	c.blockerEpoch++
 }
 
-// BlockerEpoch returns the current blocker epoch. Callers must capture this
-// before starting a diagnostic read and pass it to ApplyDiagnosticBlockers.
+// BlockerEpoch returns the current diagnostic epoch, which versions every
+// input a diagnostic refresh depends on: blocker creation, worker
+// registration, and worker retirement (the live set determines which
+// running turns are excluded from unresolved counts). Callers must capture
+// this before starting a diagnostic read and pass it to
+// ApplyDiagnosticBlockers.
 func (c *Coordinator) BlockerEpoch() uint64 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -296,7 +307,9 @@ func (c *Coordinator) TryStopIdle() bool {
 	return false
 }
 
-// AdmitRelease admits a new release operation, incrementing pendingHandoffs under lock.
+// AdmitRelease admits a new release operation, incrementing pendingHandoffs
+// under lock. Accepted handoffs participate in the task WaitGroup until the
+// responsibility is transferred to a worker or the admission finishes.
 func (c *Coordinator) AdmitRelease() (func(), error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -304,12 +317,14 @@ func (c *Coordinator) AdmitRelease() (func(), error) {
 		return nil, ErrServiceStopping
 	}
 	c.pendingHandoffs++
+	c.tasks.Add(1)
 	var once sync.Once
 	done := func() {
 		once.Do(func() {
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			c.pendingHandoffs--
+			c.tasks.Done()
 		})
 	}
 	return done, nil

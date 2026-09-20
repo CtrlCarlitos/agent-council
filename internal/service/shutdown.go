@@ -175,7 +175,10 @@ func (s *Server) Teardown(timeout time.Duration) error {
 	s.coordinator.CloseAllSubscribers()
 
 	// 3. HTTP Server Shutdown bounded by the single final deadline; this
-	// waits for in-flight command handlers as well.
+	// waits for in-flight command handlers as well. A non-nil error means
+	// shutdown did not complete: handlers may still be active (for example
+	// one stalled before admission or performing untracked read work), and
+	// a completed task WaitGroup does not prove they exited.
 	s.httpServer.SetKeepAlivesEnabled(false)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -193,13 +196,18 @@ func (s *Server) Teardown(timeout time.Duration) error {
 		close(tasksDone)
 	}()
 
+	tasksJoined := false
 	select {
 	case <-tasksDone:
+		tasksJoined = true
 	case <-ctx.Done():
-		// Forced termination: a bounded return is not proof that tasks
-		// exited. Cancel them, remove discovery, and record the forced
-		// exit. Storage stays open and the lock stays held until the
-		// process boundary terminates everything.
+	}
+
+	if !tasksJoined || err != nil {
+		// Forced termination: a bounded return is not proof that all HTTP
+		// handlers or tasks exited. Cancel tracked work, remove discovery,
+		// and record the forced exit. Storage stays open and the lock stays
+		// held until the process boundary terminates everything.
 		s.coordinator.CancelAll()
 		forcedErr := fmt.Errorf("%w after %v (http shutdown: %v)", ErrForcedTeardown, timeout, err)
 		s.recordTeardownError(forcedErr)
