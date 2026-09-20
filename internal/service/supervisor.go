@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -15,6 +16,7 @@ import (
 type ExecutionSupervisor struct {
 	store                  *storage.Store
 	adapter                adapter.Adapter
+	coordinator            *Coordinator
 	runID                  string
 	sessionID              string
 	turnKey                string
@@ -28,6 +30,7 @@ type ExecutionSupervisor struct {
 func NewExecutionSupervisor(
 	store *storage.Store,
 	adp adapter.Adapter,
+	coordinator *Coordinator,
 	runID, sessionID, turnKey, callerLease string,
 	initialExpectedVersion int64,
 	receipt storage.ReleaseReceipt,
@@ -36,6 +39,7 @@ func NewExecutionSupervisor(
 	return &ExecutionSupervisor{
 		store:                  store,
 		adapter:                adp,
+		coordinator:            coordinator,
 		runID:                  runID,
 		sessionID:              sessionID,
 		turnKey:                turnKey,
@@ -84,8 +88,14 @@ func (s *ExecutionSupervisor) Run(ctx context.Context) {
 	// Observe stream until completion
 	stream, err := s.adapter.Observe(ctx, ref)
 	if err == nil {
-		for range stream.Events() {
-			// Drain events until stream is closed upon completion or error
+		for ev := range stream.Events() {
+			if s.coordinator != nil {
+				evBytes, _ := json.Marshal(ev)
+				s.coordinator.BroadcastEvent(s.turnKey, SSEEvent{
+					Event: "progress",
+					Data:  string(evBytes),
+				})
+			}
 		}
 	}
 
@@ -96,7 +106,19 @@ func (s *ExecutionSupervisor) Run(ctx context.Context) {
 		return
 	}
 
-	_ = s.recordTerminalOutcomeWithRetry(ctx, turnResult.Status, turnResult.Output)
+	err = s.recordTerminalOutcomeWithRetry(ctx, turnResult.Status, turnResult.Output)
+	if err == nil && s.coordinator != nil {
+		termBytes, _ := json.Marshal(map[string]any{
+			"session_id": s.sessionID,
+			"turn_key":   s.turnKey,
+			"status":     turnResult.Status,
+			"result":     turnResult.Output,
+		})
+		s.coordinator.BroadcastEvent(s.turnKey, SSEEvent{
+			Event: "terminal",
+			Data:  string(termBytes),
+		})
+	}
 }
 
 // recordTerminalOutcomeWithRetry persists the terminal outcome, resilient to concurrent

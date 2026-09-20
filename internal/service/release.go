@@ -151,6 +151,7 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	supervisor := NewExecutionSupervisor(
 		s.store,
 		s.adapter,
+		s.coordinator,
 		runID,
 		sessionID,
 		turnKey,

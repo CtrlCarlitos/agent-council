@@ -452,6 +452,7 @@ func TestSupervisor_VersionAdvanceResilience(t *testing.T) {
 	sup := NewExecutionSupervisor(
 		store,
 		fakeAdapter,
+		NewCoordinator(),
 		"run-res",
 		"sess-res",
 		"t-res",
