@@ -58,6 +58,7 @@ type ControllerRecord struct {
 	Connected     bool
 	AttachmentID  string
 	InstanceID    string // service instance owning the current episode
+	AttachmentRev uint64 // authoritative monotonic episode revision
 }
 
 // rowQueryer abstracts QueryRowContext over transactions and read pools so
@@ -251,6 +252,9 @@ func (s *Store) AdoptController(ctx context.Context, opID, runID, harness, contr
 	if strings.TrimSpace(newLeaseCandidate) == "" {
 		return ControllerGrantReceipt{}, errors.New("lease candidate is required")
 	}
+	if recovery != nil && strings.TrimSpace(recovery.Reason) == "" {
+		return ControllerGrantReceipt{}, errors.New("operator recovery requires an explicit reason")
+	}
 
 	// The fingerprint binds the command, run, target, and recovery intent —
 	// authorization inputs (bootstrap credential) and the secret candidate
@@ -369,10 +373,12 @@ func (s *Store) HandoffController(ctx context.Context, opID, runID, currentLease
 	return s.installGrant(ctx, tx.Tx(), opID, runID, harness, controllerRef, newLeaseCandidate, "handoff_controller", fingerprint, "controller_handed_off", "controller")
 }
 
-// RevokeController removes controller authority. With the current lease it
-// is controller self-revocation; with verified operator recovery it is a
-// lost-lease recovery revocation targeting the expected generation. Replay
-// is bound to this command, run, target generation, and recovery intent.
+// RevokeController removes controller authority. Self-revocation
+// (recovery == nil) classifies current controller authority and generation
+// before replay: a retired lease cannot replay its own successful
+// revocation. Operator recovery replays under its own verified privilege —
+// no controller lease is required — with the semantic target generation
+// bound into the operation identity.
 func (s *Store) RevokeController(ctx context.Context, opID, runID, controllerLease string, recovery *OperatorRecovery) (OperationReceipt, error) {
 	if strings.TrimSpace(opID) == "" {
 		return OperationReceipt{}, errors.New("empty operation id")
@@ -381,25 +387,37 @@ func (s *Store) RevokeController(ctx context.Context, opID, runID, controllerLea
 		return OperationReceipt{}, errors.New("operator recovery requires an explicit reason")
 	}
 
-	authMode := "controller"
-	if recovery != nil {
-		authMode = fmt.Sprintf("recovery:reason=%s", SanitizeText(recovery.Reason))
-	}
-
 	tx, err := s.BeginWrite(ctx)
 	if err != nil {
 		return OperationReceipt{}, err
 	}
 	defer tx.Rollback()
 
-	// Idempotent replay is bound to this exact command, run, and recovery
-	// intent; any other journal payload under this operation ID conflicts.
+	authMode := "controller"
+	targetGen := uint64(0)
+	fingerprintTarget := ""
+	if recovery != nil {
+		authMode = fmt.Sprintf("recovery:reason=%s", SanitizeText(recovery.Reason))
+		targetGen = recovery.ExpectedGeneration
+		fingerprintTarget = fmt.Sprintf("recovery-gen=%d", recovery.ExpectedGeneration)
+	} else {
+		// Self-revocation: current controller classification precedes replay.
+		gen, err := classifyRunController(ctx, tx.Tx(), runID, controllerLease)
+		if err != nil {
+			return OperationReceipt{}, err
+		}
+		targetGen = gen
+		fingerprintTarget = fmt.Sprintf("controller-gen=%d", gen)
+	}
+	fp := computeFingerprint("revoke_controller", runID, fingerprintTarget, authMode)
+
+	// Idempotent replay is bound to this exact command, run, target
+	// generation, and authorization mode.
 	var storedCmdType, storedFingerprint, payloadJSON string
 	err = tx.Tx().QueryRowContext(ctx, `SELECT command_type, command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;`, opID).
 		Scan(&storedCmdType, &storedFingerprint, &payloadJSON)
 	if err == nil {
-		expected := computeFingerprint("revoke_controller", runID, authMode)
-		if storedCmdType != "revoke_controller" || storedFingerprint != expected {
+		if storedCmdType != "revoke_controller" || storedFingerprint != fp {
 			return OperationReceipt{}, ErrIdempotencyConflict
 		}
 		var jp journalPayload
@@ -412,13 +430,12 @@ func (s *Store) RevokeController(ctx context.Context, opID, runID, controllerLea
 		return OperationReceipt{}, fmt.Errorf("query revocation operation: %w", err)
 	}
 
-	var targetGen uint64
-	switch {
-	case recovery != nil:
+	if recovery != nil {
+		// Operator recovery targets the grant at the expected generation —
+		// the legacy bootstrap (0) or the active adopted grant.
 		var gen uint64
-		var status string
-		err = tx.Tx().QueryRowContext(ctx, `SELECT generation, status FROM controller_leases
-			WHERE run_id = ? AND status IN ('legacy','active') ORDER BY generation DESC LIMIT 1;`, runID).Scan(&gen, &status)
+		err = tx.Tx().QueryRowContext(ctx, `SELECT generation FROM controller_leases
+			WHERE run_id = ? AND status IN ('legacy','active') ORDER BY generation DESC LIMIT 1;`, runID).Scan(&gen)
 		if err == sql.ErrNoRows {
 			return OperationReceipt{}, fmt.Errorf("no controller grant to revoke for run %s", runID)
 		}
@@ -428,15 +445,6 @@ func (s *Store) RevokeController(ctx context.Context, opID, runID, controllerLea
 		if recovery.ExpectedGeneration != gen {
 			return OperationReceipt{}, ErrGenerationMismatch
 		}
-		targetGen = gen
-	case strings.TrimSpace(controllerLease) != "":
-		gen, err := classifyRunController(ctx, tx.Tx(), runID, controllerLease)
-		if err != nil {
-			return OperationReceipt{}, err
-		}
-		targetGen = gen
-	default:
-		return OperationReceipt{}, ErrAdoptionRequired
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -465,8 +473,7 @@ func (s *Store) RevokeController(ctx context.Context, opID, runID, controllerLea
 		CreatedAt:        time.Now().UTC(),
 		Payload:          fmt.Sprintf("revoked:generation=%d:authorized_by=%s", targetGen, authMode),
 	}
-	if err := recordJournalEntry(tx.Tx(), opID, "revoke_controller",
-		computeFingerprint("revoke_controller", runID, authMode),
+	if err := recordJournalEntry(tx.Tx(), opID, "revoke_controller", fp,
 		runID, "", "", "controller_revoked", receipt, ""); err != nil {
 		return OperationReceipt{}, err
 	}
@@ -636,7 +643,7 @@ func (s *Store) ValidateRunControllerLease(ctx context.Context, runID, callerLea
 
 // GetControllerRecord returns the redacted run-scoped controller record.
 func (s *Store) GetControllerRecord(ctx context.Context, runID string) (ControllerRecord, error) {
-	rows, err := s.readDB.QueryContext(ctx, `SELECT generation, coalesce(harness,''), controller_ref, status, connected, coalesce(attachment_id,''), coalesce(instance_id,'')
+	rows, err := s.readDB.QueryContext(ctx, `SELECT generation, coalesce(harness,''), controller_ref, status, connected, coalesce(attachment_id,''), coalesce(instance_id,''), attachment_rev
 		FROM controller_leases WHERE run_id = ? ORDER BY generation DESC;`, runID)
 	if err != nil {
 		return ControllerRecord{}, fmt.Errorf("query controller leases: %w", err)
@@ -650,10 +657,10 @@ func (s *Store) GetControllerRecord(ctx context.Context, runID string) (Controll
 
 	rec := ControllerRecord{Status: "none"}
 	for rows.Next() {
-		var gen uint64
+		var gen, rev uint64
 		var harness, controllerRef, status, attachment, instance string
 		var connected int
-		if err := rows.Scan(&gen, &harness, &controllerRef, &status, &connected, &attachment, &instance); err != nil {
+		if err := rows.Scan(&gen, &harness, &controllerRef, &status, &connected, &attachment, &instance, &rev); err != nil {
 			return ControllerRecord{}, fmt.Errorf("scan controller lease: %w", err)
 		}
 		if err := rows.Err(); err != nil {
@@ -663,7 +670,7 @@ func (s *Store) GetControllerRecord(ctx context.Context, runID string) (Controll
 		case "active":
 			rec = ControllerRecord{
 				Generation: gen, Harness: harness, ControllerRef: controllerRef,
-				Status: "active", Adopted: adopted == 1, Connected: connected == 1, AttachmentID: attachment, InstanceID: instance,
+				Status: "active", Adopted: adopted == 1, Connected: connected == 1, AttachmentID: attachment, InstanceID: instance, AttachmentRev: rev,
 			}
 		case "legacy":
 			rec = ControllerRecord{Generation: gen, Status: "legacy", Adopted: false}

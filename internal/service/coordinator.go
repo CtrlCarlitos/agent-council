@@ -36,6 +36,7 @@ type attachmentState struct {
 	generation   uint64
 	attachmentID string
 	instanceID   string
+	revision     uint64
 }
 
 // Coordinator manages the release admission gate, live worker accounting,
@@ -441,20 +442,30 @@ func (c *Coordinator) CloseAllSubscribers() {
 }
 
 // MarkControllerAttached publishes an in-instance attachment record for a
-// run, generation, and episode. It is set only from validated connect
-// transitions in this instance, and never downgrades: a delayed handler
-// from an older generation cannot overwrite a newer controller's record.
-func (c *Coordinator) MarkControllerAttached(runID string, generation uint64, attachmentID, instanceID string) {
+// run, generation, and episode, ordered by the authoritative monotonic
+// attachment revision: a delayed publication of an older episode — of any
+// generation, including the same generation — cannot overwrite a newer
+// one. Identical episode replays are idempotent.
+func (c *Coordinator) MarkControllerAttached(runID string, generation uint64, attachmentID, instanceID string, revision uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if existing, ok := c.attachments[runID]; ok && existing.generation > generation {
-		return
+	if existing, ok := c.attachments[runID]; ok {
+		if existing.revision > revision {
+			return
+		}
+		if existing.revision == revision && existing.attachmentID != attachmentID {
+			return
+		}
+		if existing.generation > generation {
+			return
+		}
 	}
 	c.attachments[runID] = attachmentState{
 		runID:        runID,
 		generation:   generation,
 		attachmentID: attachmentID,
 		instanceID:   instanceID,
+		revision:     revision,
 	}
 }
 
@@ -484,6 +495,22 @@ func (c *Coordinator) InvalidateControllerAttachment(runID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.attachments, runID)
+}
+
+// InvalidateControllerAttachmentIf performs a compare-and-delete of the
+// exact local identity — generation, episode, and owning instance — so a
+// disconnect for one episode never clears a successor's record, and a
+// normal disconnect clears its own record without consulting durable
+// fields the committed transition already cleared.
+func (c *Coordinator) InvalidateControllerAttachmentIf(runID string, generation uint64, attachmentID, instanceID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if existing, ok := c.attachments[runID]; ok &&
+		existing.generation == generation &&
+		existing.attachmentID == attachmentID &&
+		existing.instanceID == instanceID {
+		delete(c.attachments, runID)
+	}
 }
 
 // WaitTasks blocks until every admitted unit of work (workers, accepted

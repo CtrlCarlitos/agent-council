@@ -164,7 +164,7 @@ func TestGate1Review204_DelayedConnectAfterHandoff(t *testing.T) {
 	gate1HTTPConnect(t, srv, "tok-h", "run-h", "lease-B", 2, "op-conn-b2")
 
 	// A delayed generation-1 connect publication attempts to overwrite.
-	srv.Coordinator().MarkControllerAttached("run-h", 1, "stale-episode", srv.InstanceID())
+	srv.Coordinator().MarkControllerAttached("run-h", 1, "stale-episode", srv.InstanceID(), 1)
 
 	// The gate consults the durable generation and exact episode: the stale
 	// mark cannot authorize A's decisions.
@@ -181,8 +181,10 @@ func TestGate1Review204_DelayedConnectAfterHandoff(t *testing.T) {
 	}
 }
 
-// The decision gate compares the exact durable attachment identity: a stale
-// local episode of the same generation does not authorize.
+// The decision gate compares the exact durable attachment identity, and a
+// same-generation stale publication cannot even enter the coordinator: the
+// revision-ordered publication refuses an equal-revision different-episode
+// write, so the legitimate episode remains the only local identity.
 func TestGate1Review204_GateComparesExactEpisode(t *testing.T) {
 	dir := testStateDir(t)
 	ctx := context.Background()
@@ -193,13 +195,33 @@ func TestGate1Review204_GateComparesExactEpisode(t *testing.T) {
 	}
 	adoptForTest(t, store, "run-e", "boot-A")
 
-	// Durable: episode B (via reconnect).
+	// Durable: the legitimate episode.
 	gate1HTTPConnect(t, srv, "tok-e", "run-e", "boot-A", 1, "op-conn-eb")
-	// Local: overwrite with a forged stale episode of the same generation.
-	srv.Coordinator().MarkControllerAttached("run-e", 1, "forged-episode", srv.InstanceID())
+	rec, err := store.GetControllerRecord(ctx, "run-e")
+	if err != nil || rec.AttachmentID == "" {
+		t.Fatalf("legitimate episode missing: %+v err=%v", rec, err)
+	}
 
-	if code := gate1Decision(t, srv, "tok-e", "run-e", "boot-A"); code != http.StatusConflict {
-		t.Fatalf("local/durable episode mismatch must fence decisions, got %d", code)
+	// A forged same-generation, same-revision, different-episode publication
+	// is refused by the revision ordering.
+	srv.Coordinator().MarkControllerAttached("run-e", 1, "forged-episode", srv.InstanceID(), rec.AttachmentRev)
+	if srv.Coordinator().ControllerAttachedEpisode("run-e", 1, "forged-episode") {
+		t.Fatal("stale same-revision publication must not replace the legitimate episode")
+	}
+	if !srv.Coordinator().ControllerAttachedEpisode("run-e", 1, rec.AttachmentID) {
+		t.Fatal("legitimate episode must remain published")
+	}
+
+	// A NEWER revision legitimately advances the episode (reconnect), and an
+	// older-revision delayed publication cannot overwrite it.
+	gate1HTTPConnect(t, srv, "tok-e", "run-e", "boot-A", 1, "op-conn-eb2")
+	rec2, err := store.GetControllerRecord(ctx, "run-e")
+	if err != nil || rec2.AttachmentRev <= rec.AttachmentRev {
+		t.Fatalf("reconnect must advance the revision: %+v vs %+v", rec2, rec)
+	}
+	srv.Coordinator().MarkControllerAttached("run-e", 1, rec.AttachmentID, srv.InstanceID(), rec.AttachmentRev)
+	if srv.Coordinator().ControllerAttachedEpisode("run-e", 1, rec2.AttachmentID) != true {
+		t.Fatal("delayed older-revision publication must not overwrite the newer episode")
 	}
 }
 
@@ -219,5 +241,43 @@ func gate1HTTPDisconnect(t *testing.T, srv *Server, store *storage.Store, authTo
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("disconnect: %d", resp.StatusCode)
+	}
+}
+
+// A normal disconnect clears its own local attachment (compare-and-delete),
+// and a replayed disconnect leaves a successor's record intact.
+func TestGate1Review453_DisconnectCleanupAndSuccessorPreservation(t *testing.T) {
+	dir := testStateDir(t)
+	ctx := context.Background()
+	srv, store, lock := gate1ServerFixture(t, dir, "inst-c", "tok-c")
+	defer func() { _ = srv.Close(); _ = store.Close(); _ = lock.Release() }()
+	if _, err := store.CreateRun(ctx, "op-run-c", "run-c", "b", "s", "p", "boot-A"); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	adoptForTest(t, store, "run-c", "boot-A")
+
+	// Episode A connects and disconnects normally.
+	gate1HTTPConnect(t, srv, "tok-c", "run-c", "boot-A", 1, "op-conn-ca")
+	recA, err := store.GetControllerRecord(ctx, "run-c")
+	if err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	gate1HTTPDisconnect(t, srv, store, "tok-c", "run-c", "boot-A", 1, "op-disc-ca", recA.AttachmentID)
+
+	// The local record was cleared by the ordinary disconnect: decisions are
+	// fenced by the restart gate rather than a stale local episode.
+	if code := gate1Decision(t, srv, "tok-c", "run-c", "boot-A"); code != http.StatusConflict {
+		t.Fatalf("decision after normal disconnect must be fenced, got %d", code)
+	}
+	durRec, _ := store.GetControllerRecord(ctx, "run-c")
+	if durRec.Connected {
+		t.Fatal("durable state must be disconnected")
+	}
+
+	// Episode B reconnects; replaying A's successful disconnect preserves B.
+	gate1HTTPConnect(t, srv, "tok-c", "run-c", "boot-A", 1, "op-conn-cb")
+	gate1HTTPDisconnect(t, srv, store, "tok-c", "run-c", "boot-A", 1, "op-disc-ca", recA.AttachmentID)
+	if code := gate1Decision(t, srv, "tok-c", "run-c", "boot-A"); code == http.StatusConflict {
+		t.Fatal("replayed stale disconnect must not clear the successor's attachment")
 	}
 }

@@ -620,7 +620,7 @@ func (s *Store) ReconcileSession(ctx context.Context, opID string, execRef Execu
 	}
 
 	sessID := string(ref.SessionID)
-	fp := computeFingerprint("reconcile_session", sessID, ref.TurnKey, fmt.Sprintf("%d", ref.Generation), string(outcome.Status), string(outcome.Observed), outcome.Result)
+	fp := computeFingerprint("reconcile_session", sessID, ref.TurnKey, execRef.AttemptID, fmt.Sprintf("%d", ref.Generation), string(outcome.Status), string(outcome.Observed), outcome.Result)
 
 	tx, err := s.BeginWrite(ctx)
 	if err != nil {
@@ -628,9 +628,14 @@ func (s *Store) ReconcileSession(ctx context.Context, opID string, execRef Execu
 	}
 	defer tx.Rollback()
 
-	// The original execution reference is validated against the persisted
-	// accepted execution inside the atomic transition: session, turn, and
-	// the exact attempt identity (AC-004 Gate 1 review finding 4).
+	// The execution and recovery references must identify the SAME
+	// execution before replay or mutation: one execution must never
+	// validate another's recovery (Gate 1 re-review finding 1). The bound
+	// target's original attempt is then validated inside this transition.
+	if execRef.SessionID != sessID || execRef.TurnKey != ref.TurnKey {
+		return OperationReceipt{}, fmt.Errorf("%w: execution reference (%s/%s) does not match recovery reference (%s/%s)",
+			ErrWrongExecutionAttempt, execRef.SessionID, execRef.TurnKey, sessID, ref.TurnKey)
+	}
 	if _, err := resolveExecutionRef(ctx, tx.Tx(), execRef); err != nil {
 		return OperationReceipt{}, err
 	}

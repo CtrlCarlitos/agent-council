@@ -326,7 +326,7 @@ func (s *Server) handleControllerConnect(w http.ResponseWriter, r *http.Request)
 		s.writeGrantError(w, err, req.OpID)
 		return
 	}
-	s.coordinator.MarkControllerAttached(runID, rec.Generation, connectReceipt.AttachmentID, s.cfg.InstanceID)
+	s.coordinator.MarkControllerAttached(runID, rec.Generation, connectReceipt.AttachmentID, s.cfg.InstanceID, connectReceipt.AttachmentRev)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

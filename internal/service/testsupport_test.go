@@ -35,5 +35,5 @@ func connectControllerForTest(t *testing.T, srv *Server, store *storage.Store, r
 	if err != nil {
 		t.Fatalf("fixture connect (run %s): %v", runID, err)
 	}
-	srv.Coordinator().MarkControllerAttached(runID, rec.Generation, receipt.AttachmentID, srv.InstanceID())
+	srv.Coordinator().MarkControllerAttached(runID, rec.Generation, receipt.AttachmentID, srv.InstanceID(), receipt.AttachmentRev)
 }

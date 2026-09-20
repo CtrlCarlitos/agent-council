@@ -73,7 +73,7 @@ func (s *Server) handleRunControllerConnect(w http.ResponseWriter, r *http.Reque
 	rec, err := s.store.GetControllerRecord(r.Context(), runID)
 	if err == nil && rec.Adopted && rec.Connected && rec.Generation == req.ExpectedGeneration &&
 		rec.AttachmentID == receipt.AttachmentID && rec.InstanceID == s.cfg.InstanceID {
-		s.coordinator.MarkControllerAttached(runID, req.ExpectedGeneration, receipt.AttachmentID, s.cfg.InstanceID)
+		s.coordinator.MarkControllerAttached(runID, req.ExpectedGeneration, receipt.AttachmentID, s.cfg.InstanceID, rec.AttachmentRev)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -113,14 +113,13 @@ func (s *Server) handleRunControllerDisconnect(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Local invalidation follows the durable transition and its exact
-	// episode: a replayed disconnect for an already-ended episode must not
-	// clear a successor's in-instance record.
+	// Local invalidation is a compare-and-delete of the exact local
+	// identity: the disconnect clears its own episode without consulting
+	// durable fields the committed transition already cleared, and a
+	// replayed disconnect for an already-ended episode leaves a successor's
+	// record untouched.
 	if episode, ok := strings.CutPrefix(receipt.Payload, "disconnected:attachment="); ok {
-		rec, rerr := s.store.GetControllerRecord(r.Context(), runID)
-		if rerr == nil && rec.AttachmentID == episode && !rec.Connected {
-			s.coordinator.InvalidateControllerAttachment(runID)
-		}
+		s.coordinator.InvalidateControllerAttachmentIf(runID, req.ExpectedGeneration, episode, s.cfg.InstanceID)
 	}
 
 	w.Header().Set("Content-Type", "application/json")

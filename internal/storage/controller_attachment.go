@@ -21,6 +21,11 @@ import (
 type ConnectReceipt struct {
 	OperationReceipt
 	AttachmentID string
+	// AttachmentRev is the authoritative monotonic revision of this
+	// episode within the run: same-generation episodes are ordered by it,
+	// so a delayed publication of an older episode cannot overwrite a newer
+	// one.
+	AttachmentRev uint64
 }
 
 func newAttachmentID() (string, error) {
@@ -86,11 +91,8 @@ func (s *Store) ConnectRunController(ctx context.Context, opID, runID, lease str
 		}
 		var jp journalPayload
 		if err := json.Unmarshal([]byte(payloadJSON), &jp); err == nil && jp.Receipt.OpID != "" {
-			attachment := ""
-			if len(jp.Receipt.Payload) > len("attachment=") && strings.HasPrefix(jp.Receipt.Payload, "attachment=") {
-				attachment = strings.TrimPrefix(jp.Receipt.Payload, "attachment=")
-			}
-			return ConnectReceipt{OperationReceipt: jp.Receipt, AttachmentID: attachment}, nil
+			attachment, rev := parseAttachmentPayload(jp.Receipt.Payload)
+			return ConnectReceipt{OperationReceipt: jp.Receipt, AttachmentID: attachment, AttachmentRev: rev}, nil
 		}
 		return ConnectReceipt{}, ErrIdempotencyConflict
 	}
@@ -105,9 +107,14 @@ func (s *Store) ConnectRunController(ctx context.Context, opID, runID, lease str
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := tx.Tx().ExecContext(ctx, `UPDATE controller_leases
-		SET connected = 1, attachment_id = ?, instance_id = ?, updated_at = ?
+		SET connected = 1, attachment_id = ?, instance_id = ?, attachment_rev = attachment_rev + 1, updated_at = ?
 		WHERE run_id = ? AND generation = ? AND status = 'active';`, attachmentID, instanceID, now, runID, gen); err != nil {
 		return ConnectReceipt{}, fmt.Errorf("establish attachment: %w", err)
+	}
+	var rev uint64
+	if err := tx.Tx().QueryRowContext(ctx, `SELECT attachment_rev FROM controller_leases
+		WHERE run_id = ? AND generation = ? AND status = 'active';`, runID, gen).Scan(&rev); err != nil {
+		return ConnectReceipt{}, fmt.Errorf("read attachment revision: %w", err)
 	}
 	if err := projectSessionConnection(ctx, tx.Tx(), runID, "connected"); err != nil {
 		return ConnectReceipt{}, err
@@ -119,9 +126,10 @@ func (s *Store) ConnectRunController(ctx context.Context, opID, runID, lease str
 			CommandType:      "connect_run_controller",
 			CommittedVersion: int64(gen),
 			CreatedAt:        time.Now().UTC(),
-			Payload:          "attachment=" + attachmentID,
+			Payload:          fmt.Sprintf("attachment=%s:rev=%d", attachmentID, rev),
 		},
-		AttachmentID: attachmentID,
+		AttachmentID:  attachmentID,
+		AttachmentRev: rev,
 	}
 	if err := recordJournalEntry(tx.Tx(), opID, "connect_run_controller", fingerprint, runID, "", "", "controller_connected", receipt.OperationReceipt, ""); err != nil {
 		return ConnectReceipt{}, err
@@ -130,6 +138,15 @@ func (s *Store) ConnectRunController(ctx context.Context, opID, runID, lease str
 		return ConnectReceipt{}, err
 	}
 	return receipt, nil
+}
+
+func parseAttachmentPayload(payload string) (string, uint64) {
+	attachment, rest, _ := strings.Cut(strings.TrimPrefix(payload, "attachment="), ":rev=")
+	rev := uint64(0)
+	if rest != "" {
+		fmt.Sscanf(rest, "%d", &rev)
+	}
+	return attachment, rev
 }
 
 // DisconnectRunController ends the current attachment episode. A delayed
