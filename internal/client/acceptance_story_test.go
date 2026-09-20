@@ -95,10 +95,17 @@ func runPrimaryStory(t *testing.T, harnessA, harnessB string) {
 		t.Fatal("first release must be a new dispatch")
 	}
 
-	// The turn is durably accepted.
+	// The turn is durably dispatched (the fixture adapter may complete it
+	// faster than this check runs; the attempt identity proves A's release).
 	d, err := store1.GetTurnDetails(ctx, "sess-ps", "t-work")
-	if err != nil || d.Status != council.TurnRunning {
-		t.Fatalf("work turn must be running: %+v err=%v", d, err)
+	if err != nil {
+		t.Fatalf("work turn must exist: %v", err)
+	}
+	if d.Status != council.TurnRunning && !isTerminalStatus(d.Status) {
+		t.Fatalf("work turn must be dispatched, got %v", d.Status)
+	}
+	if d.AttemptID == "" {
+		t.Fatal("dispatched turn must carry its attempt identity")
 	}
 
 	// A disconnects explicitly; authorized work continues and completes.
