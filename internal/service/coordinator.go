@@ -442,22 +442,27 @@ func (c *Coordinator) CloseAllSubscribers() {
 }
 
 // MarkControllerAttached publishes an in-instance attachment record for a
-// run, generation, and episode, ordered by the authoritative monotonic
-// attachment revision: a delayed publication of an older episode — of any
-// generation, including the same generation — cannot overwrite a newer
-// one. Identical episode replays are idempotent.
+// run, generation, and episode. Attachment revisions are generation-scoped
+// (each grant row counts its own episodes), so generation is compared
+// first: a newer controller generation always replaces an older one —
+// including when its first episode's revision restarts at 1 — while within
+// the same generation the newer episode revision wins and an older
+// generation can never overwrite a successor regardless of revision
+// numbers. Identical episode replays are idempotent.
 func (c *Coordinator) MarkControllerAttached(runID string, generation uint64, attachmentID, instanceID string, revision uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if existing, ok := c.attachments[runID]; ok {
-		if existing.revision > revision {
-			return
-		}
-		if existing.revision == revision && existing.attachmentID != attachmentID {
-			return
-		}
 		if existing.generation > generation {
 			return
+		}
+		if existing.generation == generation {
+			if existing.revision > revision {
+				return
+			}
+			if existing.revision == revision && existing.attachmentID != attachmentID {
+				return
+			}
 		}
 	}
 	c.attachments[runID] = attachmentState{

@@ -21,10 +21,10 @@ import (
 type ConnectReceipt struct {
 	OperationReceipt
 	AttachmentID string
-	// AttachmentRev is the authoritative monotonic revision of this
-	// episode within the run: same-generation episodes are ordered by it,
-	// so a delayed publication of an older episode cannot overwrite a newer
-	// one.
+	// AttachmentRev is the authoritative generation-scoped attachment
+	// revision: episodes are ordered by it within one controller
+	// generation, so a delayed publication of an older episode cannot
+	// overwrite a newer one. It does not order across generations.
 	AttachmentRev uint64
 }
 

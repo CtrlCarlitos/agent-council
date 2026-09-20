@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS controller_leases (
     granted_by_op_id TEXT NOT NULL,
     attachment_id TEXT,
     instance_id TEXT,
-    attachment_rev INTEGER NOT NULL DEFAULT 0,
+    attachment_rev INTEGER NOT NULL DEFAULT 0, -- generation-scoped episode revision
     connected INTEGER NOT NULL DEFAULT 0 CHECK (connected IN (0, 1)),
     attached_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
