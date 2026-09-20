@@ -182,8 +182,10 @@ func parseAndVerifyIcaclsOutput(targetPath string, outStr string) error {
 		if line == "" {
 			continue
 		}
-		// Skip standard icacls summary lines
-		if strings.HasPrefix(line, "Successfully processed") || strings.HasPrefix(line, "Failed processing") {
+		// Verify*Permissions inspects one object. Only this complete successful
+		// summary is ignorable; a pathname or principal can share its prefix.
+		// Unsupported/malformed output and permission entries must be parsed below.
+		if line == "Successfully processed 1 files; Failed processing 0 files" {
 			continue
 		}
 
