@@ -133,6 +133,13 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	doneControl, err := s.coordinator.TrackControl()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "service_stopping", "service is stopping", req.OpID)
+		return
+	}
+	defer doneControl()
+
 	stageOpID := fmt.Sprintf("%s:req", req.OpID)
 	receipt, err := s.store.RequestCancel(r.Context(), stageOpID, req.ControllerLease, sessionID, req.ExpectedVersion, turnKey)
 	if err != nil {
@@ -247,6 +254,13 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "op_id and controller_lease are required", req.OpID)
 		return
 	}
+
+	doneControl, err := s.coordinator.TrackControl()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "service_stopping", "service is stopping", req.OpID)
+		return
+	}
+	defer doneControl()
 
 	stageReconcileID := fmt.Sprintf("%s:reconcile", req.OpID)
 	stageHostLossID := fmt.Sprintf("%s:host_loss", req.OpID)

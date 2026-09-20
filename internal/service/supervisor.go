@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
 	"github.com/CtrlCarlitos/agent-council/internal/council"
@@ -124,18 +125,26 @@ func (s *ExecutionSupervisor) Run(ctx context.Context) {
 // recordTerminalOutcomeWithRetry persists the terminal outcome, resilient to concurrent
 // session row_version advances.
 func (s *ExecutionSupervisor) recordTerminalOutcomeWithRetry(ctx context.Context, status council.TurnStatus, rawResult string) error {
+	if s.coordinator != nil {
+		doneCommit := s.coordinator.TrackCommit()
+		defer doneCommit()
+	}
+
 	expectedVer := s.receipt.CommittedVersion
 	if expectedVer <= 0 {
 		expectedVer = s.initialExpectedVersion
 	}
 	opID := fmt.Sprintf("op-term-%s", s.turnKey)
 
+	dbCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
 	for retries := 0; retries < 10; retries++ {
-		latestVer, err := s.store.GetSessionVersion(ctx, s.sessionID)
+		latestVer, err := s.store.GetSessionVersion(dbCtx, s.sessionID)
 		if err == nil && latestVer > 0 {
 			expectedVer = latestVer
 		}
-		_, err = s.store.RecordTerminalOutcome(ctx, opID, s.callerLease, s.sessionID, expectedVer, s.turnKey, status, rawResult)
+		_, err = s.store.RecordTerminalOutcome(dbCtx, opID, s.callerLease, s.sessionID, expectedVer, s.turnKey, status, rawResult)
 		if errors.Is(err, storage.ErrStaleUpdate) {
 			continue
 		}

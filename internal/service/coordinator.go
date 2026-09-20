@@ -31,14 +31,18 @@ type SSEEvent struct {
 // Coordinator manages the release admission gate, live worker accounting,
 // service-owned execution lifetimes, and SSE event fanout.
 type Coordinator struct {
-	mu          sync.RWMutex
-	state       ServiceState
-	ctx         context.Context
-	cancel      context.CancelFunc
-	workers     sync.WaitGroup
-	liveWorkers int
-	activeTurns map[adapter.TurnRef]context.CancelFunc
-	subscribers map[string][]chan SSEEvent
+	mu               sync.RWMutex
+	state            ServiceState
+	ctx              context.Context
+	cancel           context.CancelFunc
+	workers          sync.WaitGroup
+	liveWorkers      int
+	pendingHandoffs  int
+	pendingCommits   int
+	inFlightControl  int
+	recoveryBlockers int
+	activeTurns      map[adapter.TurnRef]context.CancelFunc
+	subscribers      map[string][]chan SSEEvent
 }
 
 // NewCoordinator initializes a new coordinator in the running state.
@@ -124,6 +128,94 @@ func (c *Coordinator) CancelWorker(ref adapter.TurnRef) bool {
 		return true
 	}
 	return false
+}
+
+// CancelActiveWorkers cancels the execution contexts of all active turn workers.
+func (c *Coordinator) CancelActiveWorkers() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, cancel := range c.activeTurns {
+		cancel()
+	}
+}
+
+// TrackHandoff registers an accepted release handoff until worker registration.
+func (c *Coordinator) TrackHandoff() func() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pendingHandoffs++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.pendingHandoffs--
+		})
+	}
+}
+
+// TrackCommit registers a pending terminal outcome database commit.
+func (c *Coordinator) TrackCommit() func() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pendingCommits++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.pendingCommits--
+		})
+	}
+}
+
+// TrackControl registers an in-flight control operation (cancellation or reconciliation).
+func (c *Coordinator) TrackControl() (func(), error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state == ServiceStateStopping {
+		return nil, ErrServiceStopping
+	}
+	c.inFlightControl++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.inFlightControl--
+		})
+	}, nil
+}
+
+// SetRecoveryBlockers updates the count of outstanding unresolved recovery blockers.
+func (c *Coordinator) SetRecoveryBlockers(n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.recoveryBlockers = n
+}
+
+// ShutdownCounters returns a snapshot of the five shutdown eligibility counters.
+func (c *Coordinator) ShutdownCounters() map[string]int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return map[string]int{
+		"pending_handoffs":  c.pendingHandoffs,
+		"live_workers":      c.liveWorkers,
+		"pending_commits":   c.pendingCommits,
+		"in_flight_control": c.inFlightControl,
+		"recovery_blockers": c.recoveryBlockers,
+	}
+}
+
+// IsShutdownEligible reports whether all five shutdown counters are zero.
+func (c *Coordinator) IsShutdownEligible() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.pendingHandoffs == 0 &&
+		c.liveWorkers == 0 &&
+		c.pendingCommits == 0 &&
+		c.inFlightControl == 0 &&
+		c.recoveryBlockers == 0
 }
 
 // RegisterSubscriber registers an event channel for a specific turn.

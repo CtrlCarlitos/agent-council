@@ -109,6 +109,7 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 	mux.HandleFunc("POST /v1/runs/{run_id}/sessions/{session_id}/prompts/{turn_key}/discard", srv.handleDiscardPrompt)
 	mux.HandleFunc("POST /v1/runs/{run_id}/decisions", srv.handleRecordDecision)
 	mux.HandleFunc("GET /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/events", srv.handleEvents)
+	mux.HandleFunc("POST /v1/service/stop", srv.handleStop)
 
 	handler := authMiddleware(cfg.AuthToken, mux)
 
@@ -164,25 +165,7 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.running {
-		return nil
-	}
-	s.running = false
-
-	s.coordinator.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	err := s.httpServer.Shutdown(ctx)
-	if s.listener != nil {
-		_ = s.listener.Close()
-	}
-	_ = s.lock.CleanupDiscovery()
-	return err
+	return s.Teardown(5 * time.Second)
 }
 
 func (s *Server) WaitForShutdown(ctx context.Context) error {
@@ -195,8 +178,16 @@ func (s *Server) WaitForShutdown(ctx context.Context) error {
 }
 
 func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
+	if s.coordinator.State() == ServiceStateStopping {
+		writeError(w, http.StatusServiceUnavailable, "service_stopping", "service is stopping", "")
+		return
+	}
+	statusStr := "ready"
+	if s.coordinator.State() == ServiceStateDraining {
+		statusStr = "draining"
+	}
 	resp := ReadinessResponse{
-		Status:          "ready",
+		Status:          statusStr,
 		InstanceID:      s.cfg.InstanceID,
 		ProtocolVersion: 1,
 		StateDir:        s.cfg.StateDir,
@@ -209,10 +200,16 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	statusStr := "ready"
+	if s.coordinator.State() == ServiceStateDraining {
+		statusStr = "draining"
+	} else if s.coordinator.State() == ServiceStateStopping {
+		statusStr = "stopping"
+	}
 	resp := StatusResponse{
 		InstanceID:      s.cfg.InstanceID,
 		PID:             os.Getpid(),
-		Status:          "ready",
+		Status:          statusStr,
 		StartedAt:       s.startedAt,
 		ActiveRuns:      []string{},
 		LiveWorkers:     s.coordinator.LiveWorkers(),

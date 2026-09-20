@@ -138,11 +138,13 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ReleaseDispositionNew: register worker under detached coordinator context
+	doneHandoff := s.coordinator.TrackHandoff()
 	ref := adapter.TurnRef{
 		SessionID: adapter.SessionID(sessionID),
 		TurnKey:   turnKey,
 	}
 	workerCtx, done, err := s.coordinator.RegisterWorker(ref)
+	doneHandoff()
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "service_stopping", err.Error(), req.OpID)
 		return
