@@ -120,7 +120,7 @@ Controller commands follow a strict contract mapping:
 
 | Operation | Route | Method | Required Concurrency & Correlation Inputs |
 |---|---|---|---|
-| Connect Controller | `/v1/runs/{run_id}/controller/connect` | POST | `op_id`, `controller_lease`, `expected_version` |
+| Connect Controller | `/v1/runs/{run_id}/sessions/{session_id}/controller/connect` | POST | `op_id`, `controller_lease`, `expected_version` (session-scoped version check) |
 | Queue Prompt | `/v1/runs/{run_id}/sessions/{session_id}/prompts/queue` | POST | `op_id`, `controller_lease`, `expected_version`, `prompt`, `turn_key` |
 | Replace Prompt | `/v1/runs/{run_id}/sessions/{session_id}/prompts/{turn_key}/replace` | POST | `op_id`, `controller_lease`, `expected_version`, `prompt` |
 | Discard Prompt | `/v1/runs/{run_id}/sessions/{session_id}/prompts/{turn_key}/discard` | POST | `op_id`, `controller_lease`, `expected_version` |
@@ -130,7 +130,7 @@ Controller commands follow a strict contract mapping:
 | Cancel Request | `/v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/cancel` | POST | `op_id`, `controller_lease`, `expected_version`, `reason` |
 | Reconcile | `/v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/reconcile` | POST | `op_id`, `controller_lease` (validates against current durable turn state & recovery generation) |
 
-- **Controller Reattachment**: Explicitly performed via `/v1/runs/{run_id}/controller/connect`. Readiness probes, status queries, and SSE subscriptions **never** implicitly renew leases or reattach controllers.
+- **Controller Reattachment**: Explicitly performed via `/v1/runs/{run_id}/sessions/{session_id}/controller/connect` targeting a specific session and validating against that session's version. Readiness probes, status queries, and SSE subscriptions **never** implicitly renew leases or reattach controllers.
 
 ---
 
@@ -204,17 +204,17 @@ Releases an approved queued prompt to execution.
   }
   ```
 - **Storage Release Contract & Disposition**:
-  1. **Pre-flight Availability Check**: If the required native harness adapter or saved session binding is unavailable, rejects immediately (`503 Service Unavailable`, `error.code: "harness_unavailable"`) without releasing the turn or consuming the prompt.
-  2. **Admission Coordination**: Under the admission lock, if the service is `draining` or `stopping`:
-     - Validates authentication, command fingerprint, and resource scope.
-     - If `op_id` is an already-committed release, retrieves and returns the existing receipt (`200 OK`, `replayed: true`).
-     - If newly requested, rejects with `503 Service Unavailable` (`error.code: "service_draining"`).
-  3. **Atomic Execution Hand-off**:
-     - `storage.Store.ReleaseTurn(...)` returns both the immutable `ReleaseReceipt` and a distinct disposition:
+  1. **Authentication & Scope Validation**: Validates Bearer token, controller lease, and resource scope.
+  2. **Idempotent Retry Resolution**: Resolves whether `op_id` corresponds to an already-committed release operation for this turn. If found, returns the existing receipt immediately (`200 OK`, `replayed: true`) without checking harness availability or admission draining state.
+  3. **Admission Coordination & Pre-flight Availability Check (New Releases Only)**:
+     - Under the admission lock, if the service is `draining` or `stopping`, rejects new release requests with `503 Service Unavailable` (`error.code: "service_draining"`).
+     - Verifies that the required native harness adapter and saved session binding are available; if not, rejects immediately with `503 Service Unavailable` (`error.code: "harness_unavailable"`) without releasing the turn or consuming the prompt.
+  4. **Atomic Execution Hand-off**:
+     - `storage.Store.ReleaseTurn(...)` transaction returns both the immutable `ReleaseReceipt` and a distinct disposition:
        - `ReleaseDispositionNew`: Newly committed reservation. The coordinator registers execution responsibility and dispatches the worker outside the DB transaction. Returns `202 Accepted` with receipt and authoritative turn URL.
-       - `ReleaseDispositionReplayed`: Idempotent replay of an existing operation. **Does not dispatch a worker**. Returns `200 OK` with `replayed: true`.
+       - `ReleaseDispositionReplayed`: Idempotent replay of an existing operation (e.g. concurrent race resolved by database transaction). **Does not dispatch a worker**. Returns `200 OK` with `replayed: true`.
      - Registration does not depend on writing the HTTP response; if the client disconnects immediately after commit, the coordinator still owns the execution.
-  4. **Context Detachment**: The worker executes under a **service-owned turn context**. It does **not** inherit `r.Context()`. Disconnecting the HTTP request has zero effect on the worker.
+  5. **Context Detachment**: The worker executes under a **service-owned turn context**. It does **not** inherit `r.Context()`. Disconnecting the HTTP request has zero effect on the worker.
 
 #### `GET /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}`
 Retrieves authoritative durable state for a turn, session, and receipts. Used by Client B upon reconnection.
@@ -396,9 +396,9 @@ When the service starts up against a state directory containing pre-existing rec
 
 ### Task 6: Shutdown Coordinator & Signal Handling
 - Implement `POST /v1/service/stop` (`drain: false` with atomic idle check; `drain: true` with admission closure).
-- Implement OS signal handler (`SIGTERM`/`SIGINT`) initiating bounded drain grace period (15s).
+- Implement OS signal handler (`SIGTERM`/`SIGINT`) initiating bounded drain grace period (15s); grace expiry starts bounded termination handling.
 - Implement strict teardown sequence: quiesce command admission -> close SSE -> HTTP shutdown -> join tasks -> close store -> delete runtime files -> release lock last.
-- Implement forced termination path if grace period or teardown deadline expires.
+- Implement forced termination path if orderly quiescence cannot be reached within the final teardown deadline (retaining lock until process termination).
 
 ### Task 7: Detached Background Launcher & CLI Command Suite
 - Update `cmd/council`:

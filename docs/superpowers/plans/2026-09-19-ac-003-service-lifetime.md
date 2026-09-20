@@ -1,6 +1,6 @@
 # AC-003 Service Lifetime & Local Control Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans (Native inline TDD with 1 implementation owner and 2 internal verification gates). Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Run the Council Go service independently of CLI/MCP client connection lifetime over an authenticated local control boundary, ensuring client disconnection never terminates authorized work and service restart honestly preserves execution uncertainty without fabricating completion or redispatching unprompted.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** Go 1.25.0, SQLite (modernc.org/sqlite v1.59.0 via database/sql), `net/http`, `syscall.Flock`, `crypto/rand`.
 
-**Spec:** [`docs/superpowers/specs/2026-09-19-ac-003-service-lifetime-design.md`](file:///home/carlitos/projects/CtrlCarlitos/agent-council/docs/superpowers/specs/2026-09-19-ac-003-service-lifetime-design.md)
+**Spec:** [`../specs/2026-09-19-ac-003-service-lifetime-design.md`](file:///home/carlitos/projects/CtrlCarlitos/agent-council/docs/superpowers/specs/2026-09-19-ac-003-service-lifetime-design.md)
 
 ## Global Constraints
 
@@ -20,6 +20,10 @@
 - Client disconnect never terminates accepted workers or blocks persistence.
 - Restart detects unfinished work without inventing completion or redispatching unprompted.
 - No "fake" adapter registered in production registry (use test-only assembly).
+
+## Verification Gates
+- **Gate 1 (after Tasks 1–3)**: Verify ownership exclusivity, authenticated startup, transaction-derived release disposition, adapter injection, and single-dispatch evidence. Full test pass with `CGO_ENABLED=0 go test ./...` and `CGO_ENABLED=1 go test -race -count=3 ./...`.
+- **Gate 2 (after Tasks 4–6)**: Verify composite-command retries, durable outcome recording, race-free observation, and bounded shutdown against adversarial cases before CLI and final subprocess integration. Full test pass with `CGO_ENABLED=0 go test ./...` and `CGO_ENABLED=1 go test -race -count=3 ./...`.
 
 ## Review Focus
 
@@ -34,9 +38,13 @@
 ### Task 1: Storage Bridge, Exclusivity Locking, and Discovery Metadata
 
 **Files:**
+- Modify: `internal/storage/types.go`
 - Modify: `internal/storage/transitions.go`
 - Modify: `internal/storage/session_store.go`
+- Create: `internal/storage/release_disposition_test.go`
 - Create: `internal/service/lock.go`
+- Create: `internal/service/lock_unix.go`
+- Create: `internal/service/lock_windows.go`
 - Create: `internal/service/discovery.go`
 - Test: `internal/service/lock_test.go`
 - Test: `internal/service/discovery_test.go`
@@ -48,10 +56,108 @@
   - `storage.ReleaseResult`: `{ Receipt ReleaseReceipt, Disposition ReleaseDisposition }`
   - `service.AcquireServiceLock(stateDir string) (*ServiceLock, error)`
   - `service.ServiceLock.Release() error`
+  - `service.ServiceLock.CleanupDiscovery() error` (owner-bound receiver)
   - `service.PublishDiscovery(stateDir string, meta DiscoveryMeta, token string) error`
-  - `service.CleanupDiscovery(stateDir string) error`
 
-- [ ] **Step 1: Write failing tests for ReleaseDisposition and ServiceLock**
+- [ ] **Step 1: Write failing tests for storage ReleaseDisposition, ServiceLock, and Discovery**
+
+Create `internal/storage/release_disposition_test.go`:
+```go
+package storage_test
+
+import (
+	"context"
+	"path/filepath"
+	"testing"
+
+	"github.com/CtrlCarlitos/agent-council/internal/storage"
+)
+
+func TestStorage_ReleaseDisposition_NewReplayedConflict(t *testing.T) {
+	dir := t.TempDir()
+	store, err := storage.Open(storage.StoreOptions{StateDir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	_, err = store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile-1", "lease-1")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	sessRec, err := store.CreateSession(ctx, storage.SessionRecord{
+		RunID:           "run-1",
+		SessionID:       "sess-1",
+		ContributorID:   "claude",
+		ControllerLease: "lease-1",
+		ExpectedVersion: 1,
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	qRec, err := store.QueuePrompt(ctx, storage.PendingPrompt{
+		RunID:           "run-1",
+		SessionID:       "sess-1",
+		TurnKey:         "t-1",
+		Prompt:          "Hello",
+		ControllerLease: "lease-1",
+		ExpectedVersion: sessRec.Receipt.CommittedVersion,
+	})
+	if err != nil {
+		t.Fatalf("queue prompt: %v", err)
+	}
+
+	// 1. First release: returns ReleaseDispositionNew
+	res1, err := store.ReleaseTurn(ctx, "op-rel-1", "run-1", "sess-1", "t-1", "lease-1", qRec.Receipt.CommittedVersion)
+	if err != nil {
+		t.Fatalf("first release failed: %v", err)
+	}
+	if res1.Disposition != storage.ReleaseDispositionNew {
+		t.Fatalf("expected ReleaseDispositionNew, got %v", res1.Disposition)
+	}
+	if res1.Receipt.TurnKey != "t-1" {
+		t.Fatalf("unexpected turn key in receipt: %s", res1.Receipt.TurnKey)
+	}
+
+	// 2. Idempotent replay: same op_id and parameters returns ReleaseDispositionReplayed with identical receipt
+	res2, err := store.ReleaseTurn(ctx, "op-rel-1", "run-1", "sess-1", "t-1", "lease-1", qRec.Receipt.CommittedVersion)
+	if err != nil {
+		t.Fatalf("replay release failed: %v", err)
+	}
+	if res2.Disposition != storage.ReleaseDispositionReplayed {
+		t.Fatalf("expected ReleaseDispositionReplayed, got %v", res2.Disposition)
+	}
+	if res2.Receipt != res1.Receipt {
+		t.Fatalf("expected identical receipt, got %+v vs %+v", res2.Receipt, res1.Receipt)
+	}
+
+	// 3. Conflicting op_id: same op_id with different turn_key or parameters fails
+	_, err = store.ReleaseTurn(ctx, "op-rel-1", "run-1", "sess-1", "t-other", "lease-1", qRec.Receipt.CommittedVersion)
+	if err == nil {
+		t.Fatal("expected error on conflicting release replay, got nil")
+	}
+
+	// 4. Replay after store reopen: preserve ReleaseDispositionReplayed and receipt
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	store2, err := storage.Open(storage.StoreOptions{StateDir: dir})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer store2.Close()
+
+	res3, err := store2.ReleaseTurn(ctx, "op-rel-1", "run-1", "sess-1", "t-1", "lease-1", qRec.Receipt.CommittedVersion)
+	if err != nil {
+		t.Fatalf("replay after reopen failed: %v", err)
+	}
+	if res3.Disposition != storage.ReleaseDispositionReplayed || res3.Receipt != res1.Receipt {
+		t.Fatalf("expected replayed receipt matching original after reopen, got %+v", res3)
+	}
+}
+```
 
 Create `internal/service/lock_test.go`:
 ```go
@@ -100,6 +206,7 @@ Create `internal/service/discovery_test.go`:
 package service
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -107,6 +214,12 @@ import (
 
 func TestDiscovery_SeparationAndPermissions(t *testing.T) {
 	dir := t.TempDir()
+	lock, err := AcquireServiceLock(dir)
+	if err != nil {
+		t.Fatalf("acquire lock: %v", err)
+	}
+	defer lock.Release()
+
 	meta := DiscoveryMeta{
 		ProtocolVersion: 1,
 		InstanceID:      "inst-test-1",
@@ -124,7 +237,10 @@ func TestDiscovery_SeparationAndPermissions(t *testing.T) {
 	// Check auth.token exists with mode 0600
 	tokenPath := filepath.Join(dir, "auth.token")
 	info, err := os.Stat(tokenPath)
-	if err != nil || info.Mode().Perm() != 0600 {
+	if err != nil {
+		t.Fatalf("stat auth.token: %v", err)
+	}
+	if info.Mode().Perm() != 0600 {
 		t.Fatalf("auth.token permissions not 0600: %v", info.Mode().Perm())
 	}
 
@@ -134,24 +250,67 @@ func TestDiscovery_SeparationAndPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read service.json: %v", err)
 	}
-	if string(metaBytes) == "" || bytesContains(metaBytes, []byte(token)) {
+	if len(metaBytes) == 0 || bytes.Contains(metaBytes, []byte(token)) {
 		t.Fatal("service.json must not leak auth.token")
 	}
 
-	// Cleanup removes service.json, auth.token, council.sock
-	if err := CleanupDiscovery(dir); err != nil {
+	// Owner-bound cleanup removes service.json, auth.token, council.sock
+	if err := lock.CleanupDiscovery(); err != nil {
 		t.Fatalf("cleanup discovery failed: %v", err)
 	}
 	if fileExists(tokenPath) || fileExists(metaPath) {
 		t.Fatal("expected discovery and token files to be unlinked")
 	}
 }
+
+func TestDiscovery_FailedStartAndSuccessorSafety(t *testing.T) {
+	dir := t.TempDir()
+	winnerLock, err := AcquireServiceLock(dir)
+	if err != nil {
+		t.Fatalf("winner lock failed: %v", err)
+	}
+	defer winnerLock.Release()
+
+	meta := DiscoveryMeta{
+		ProtocolVersion: 1,
+		InstanceID:      "winner-1",
+		PID:             os.Getpid(),
+		Transport:       "unix",
+		Endpoint:        filepath.Join(dir, "council.sock"),
+		StateDir:        dir,
+	}
+	token := "winner-token"
+	if err := PublishDiscovery(dir, meta, token); err != nil {
+		t.Fatalf("winner publish failed: %v", err)
+	}
+
+	// Loser attempts to acquire lock and fails
+	loserLock, err := AcquireServiceLock(dir)
+	if err != ErrServiceAlreadyRunning {
+		t.Fatalf("expected ErrServiceAlreadyRunning, got %v", err)
+	}
+	if loserLock != nil {
+		t.Fatal("loser lock must be nil")
+	}
+
+	// Unowned / unheld lock cannot remove winner's files
+	var nilLock *ServiceLock
+	if err := nilLock.CleanupDiscovery(); err == nil {
+		t.Fatal("unowned cleanup must return error")
+	}
+
+	// Winner's discovery files remain intact
+	metaPath := filepath.Join(dir, "service.json")
+	if !fileExists(metaPath) {
+		t.Fatal("winner's service.json must remain intact after loser failure")
+	}
+}
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run tests to verify they fail**
 
-Run: `go test -v ./internal/service`
-Expected: FAIL (compilation error, types not implemented).
+Run: `go test -v ./internal/storage -run TestStorage_ReleaseDisposition` and `go test -v ./internal/service`
+Expected: FAIL (types and methods not implemented).
 
 - [ ] **Step 3: Implement ReleaseDisposition in storage and ServiceLock/Discovery in service**
 
@@ -170,14 +329,31 @@ type ReleaseResult struct {
 	Disposition ReleaseDisposition
 }
 ```
-Update `ReleaseTurn` to return `(ReleaseResult, error)` (or `ReleaseTurnResult`), checking if the receipt was retrieved from idempotent lookup (`ReleaseDispositionReplayed`) versus newly inserted (`ReleaseDispositionNew`).
+Update `ReleaseTurn` to return `(ReleaseResult, error)`, distinguishing when the receipt was retrieved via idempotent journal lookup (`ReleaseDispositionReplayed`) versus a newly committed transition (`ReleaseDispositionNew`). Update any existing callers in `session_store.go` and tests to receive `ReleaseResult`.
 
-Create `internal/service/lock.go` implementing `flock(LOCK_EX|LOCK_NB)` with `FD_CLOEXEC` on Unix.
-Create `internal/service/discovery.go` implementing token generation, atomic JSON writing, path validation, and cleanup.
+Create `internal/service/lock.go`:
+- Define `ServiceLock` struct holding file handle and stateDir.
+- Define `ErrServiceAlreadyRunning = errors.New("service already running in this state directory")`
+- Define `ErrUnsupportedPlatform = errors.New("service lifetime management is not supported on this platform")`
+- Define `lock.CleanupDiscovery() error` (removes `service.json`, `auth.token`, `council.sock` only if `lock.IsHeld()`).
+
+Create `internal/service/lock_unix.go` (`//go:build !windows`):
+- Implement `AcquireServiceLock(stateDir string) (*ServiceLock, error)` using `syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB)` with `FD_CLOEXEC`.
+- Implement `Release() error`: closes fd and marks unheld, leaving `service.lock` on disk.
+
+Create `internal/service/lock_windows.go` (`//go:build windows`):
+- Implement `AcquireServiceLock(stateDir string) (*ServiceLock, error)` returning `nil, ErrUnsupportedPlatform`.
+
+Create `internal/service/discovery.go`:
+- Implement `PublishDiscovery(stateDir string, meta DiscoveryMeta, token string) error`:
+  - Validates `0700` state directory.
+  - Atomically writes `auth.token` (mode `0600`) with 32 cryptographically random bytes formatted as hex.
+  - Atomically writes `service.json` (mode `0600`) excluding `auth.token`.
+  - Removes stale socket if one exists (validating it is a socket, not a dir or symlink).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `go test -v ./internal/service ./internal/storage`
+Run: `go test -v ./internal/storage -run TestStorage_ReleaseDisposition` and `go test -v ./internal/service`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -200,10 +376,13 @@ git commit -m "feat(service): implement storage release disposition, exclusivity
 **Interfaces:**
 - Consumes: `storage.Store`, `ServiceLock`, `DiscoveryMeta`
 - Produces:
+  - `service.ServerConfig`: `{ StateDir string, InstanceID string, AuthToken string }`
   - `service.NewServer(store *storage.Store, lock *ServiceLock, cfg ServerConfig) (*Server, error)`
   - `service.Server.Start() error`
   - `service.Server.Close() error`
   - Endpoints: `GET /v1/readiness`, `GET /v1/status`
+- **Resource Ownership**:
+  The foreground runner or launcher acquires `ServiceLock` and opens `storage.Store`. `NewServer` receives these resources and configuration. `Server` owns the HTTP listener, request routing, and coordinator lifecycle. `Server.Close()` cleanly shuts down the HTTP server and coordinator. The caller/runner closes `storage.Store` and releases `ServiceLock` upon process exit.
 
 - [ ] **Step 1: Write failing tests for HTTP server, Bearer auth, readiness, and status**
 
@@ -214,20 +393,46 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
+	"path/filepath"
 	"testing"
+
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
+func newTestClient(socketPath string) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
+}
+
 func TestServer_ReadinessAndStatus(t *testing.T) {
 	dir := t.TempDir()
+	lock, err := AcquireServiceLock(dir)
+	if err != nil {
+		t.Fatalf("acquire lock: %v", err)
+	}
+	defer lock.Release()
+
 	store, err := storage.Open(storage.StoreOptions{StateDir: dir})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
 	defer store.Close()
 
-	srv, err := NewServer(store, dir)
+	cfg := ServerConfig{
+		StateDir:   dir,
+		InstanceID: "inst-test-1",
+		AuthToken:  "test-auth-token-secret-1234567890",
+	}
+
+	srv, err := NewServer(store, lock, cfg)
 	if err != nil {
 		t.Fatalf("new server: %v", err)
 	}
@@ -236,42 +441,61 @@ func TestServer_ReadinessAndStatus(t *testing.T) {
 	}
 	defer srv.Close()
 
-	client := srv.Client()
+	client := newTestClient(srv.SocketPath())
 
 	// 1. Unauthenticated request must return 401 with WWW-Authenticate
-	resp, err := client.Get("/v1/readiness")
-	if err != nil || resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %v, err: %v", resp.StatusCode, err)
+	resp, err := client.Get("http://localhost/v1/readiness")
+	if err != nil {
+		t.Fatalf("unauthenticated GET failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %v", resp.StatusCode)
 	}
 	if resp.Header.Get("WWW-Authenticate") != "Bearer" {
 		t.Fatalf("missing WWW-Authenticate header")
 	}
 
 	// 2. Authenticated readiness request must return 200 ready
-	req, _ := http.NewRequest("GET", "/v1/readiness", nil)
-	req.Header.Set("Authorization", "Bearer "+srv.AuthToken())
-	resp, err = client.Do(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 OK, got: %v", resp.StatusCode)
+	req, err := http.NewRequestWithContext(context.Background(), "GET", "http://localhost/v1/readiness", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.AuthToken)
+	respReady, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("readiness request failed: %v", err)
+	}
+	defer respReady.Body.Close()
+	if respReady.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got: %v", respReady.StatusCode)
 	}
 
 	var r ReadinessResponse
-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+	if err := json.NewDecoder(respReady.Body).Decode(&r); err != nil {
 		t.Fatalf("decode readiness: %v", err)
 	}
-	if r.Status != "ready" || r.InstanceID != srv.InstanceID() {
+	if r.Status != "ready" || r.InstanceID != cfg.InstanceID {
 		t.Fatalf("unexpected readiness response: %+v", r)
 	}
 
 	// 3. Authenticated status request returns diagnostics
-	req, _ = http.NewRequest("GET", "/v1/status", nil)
-	req.Header.Set("Authorization", "Bearer "+srv.AuthToken())
-	resp, err = client.Do(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 OK, got: %v", resp.StatusCode)
+	reqStatus, err := http.NewRequestWithContext(context.Background(), "GET", "http://localhost/v1/status", nil)
+	if err != nil {
+		t.Fatalf("create status req: %v", err)
 	}
+	reqStatus.Header.Set("Authorization", "Bearer "+cfg.AuthToken)
+	respStatus, err := client.Do(reqStatus)
+	if err != nil {
+		t.Fatalf("status request failed: %v", err)
+	}
+	defer respStatus.Body.Close()
+	if respStatus.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got: %v", respStatus.StatusCode)
+	}
+
 	var s StatusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+	if err := json.NewDecoder(respStatus.Body).Decode(&s); err != nil {
 		t.Fatalf("decode status: %v", err)
 	}
 	if s.Status != "ready" || s.LiveWorkers != 0 {
@@ -319,16 +543,18 @@ git commit -m "feat(service): implement HTTP service core, auth middleware, and 
 **Files:**
 - Create: `internal/service/coordinator.go`
 - Create: `internal/service/release.go`
+- Create: `internal/service/supervisor.go`
 - Test: `internal/service/release_test.go`
 
 **Interfaces:**
-- Consumes: `storage.Store`, `adapter.Adapter`
+- Consumes: `storage.Store`, `ServiceLock`, `adapter.Adapter`
 - Produces:
   - `service.Coordinator` (manages admission gate, live workers, execution contexts)
+  - `service.ExecutionSupervisor` (owns worker dispatch, observation, collection, outcome commit, and version advance resilience)
   - `POST /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/release`
-  - Worker execution decoupling: worker runs under `service.Context`, not `r.Context()`.
+  - Worker execution decoupling: worker runs under detached `coordinator.Context()`, not `r.Context()`.
 
-- [ ] **Step 1: Write failing test for release hand-off, retry safety, and draining admission**
+- [ ] **Step 1: Write failing test for release hand-off, retry safety, draining admission, and adapter dispatch counting**
 
 Create `internal/service/release_test.go`:
 ```go
@@ -340,74 +566,185 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+
+	"github.com/CtrlCarlitos/agent-council/internal/adapter/adaptertest"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
 func TestRelease_IdempotentRetryAndDraining(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := storage.Open(storage.StoreOptions{StateDir: dir})
+	lock, err := AcquireServiceLock(dir)
+	if err != nil {
+		t.Fatalf("acquire lock: %v", err)
+	}
+	defer lock.Release()
+
+	store, err := storage.Open(storage.StoreOptions{StateDir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
 	defer store.Close()
 
 	ctx := context.Background()
-	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile-1", "lease-1")
-	_, _ = store.CreateSession(ctx, "op-sess-1", "run-1", "sess-1", "claude", "lease-1", 1)
-	_, _ = store.QueuePrompt(ctx, "op-q-1", "run-1", "sess-1", "t-1", "Hello", "lease-1", 1)
+	_, err = store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile-1", "lease-1")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	sessRec, err := store.CreateSession(ctx, storage.SessionRecord{
+		RunID:           "run-1",
+		SessionID:       "sess-1",
+		ContributorID:   "claude",
+		ControllerLease: "lease-1",
+		ExpectedVersion: 1,
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
 
-	srv, _ := NewServer(store, dir)
-	_ = srv.Start()
+	qRec1, err := store.QueuePrompt(ctx, storage.PendingPrompt{
+		RunID:           "run-1",
+		SessionID:       "sess-1",
+		TurnKey:         "t-1",
+		Prompt:          "Hello",
+		ControllerLease: "lease-1",
+		ExpectedVersion: sessRec.Receipt.CommittedVersion,
+	})
+	if err != nil {
+		t.Fatalf("queue prompt t-1: %v", err)
+	}
+
+	// Authentically queue a sibling turn t-2 for later drain testing
+	qRec2, err := store.QueuePrompt(ctx, storage.PendingPrompt{
+		RunID:           "run-1",
+		SessionID:       "sess-1",
+		TurnKey:         "t-2",
+		Prompt:          "Followup",
+		ControllerLease: "lease-1",
+		ExpectedVersion: qRec1.Receipt.CommittedVersion,
+	})
+	if err != nil {
+		t.Fatalf("queue prompt t-2: %v", err)
+	}
+
+	// Create test adapter assembly
+	fakeAdapter := adaptertest.NewFakeAdapter("claude")
+
+	cfg := ServerConfig{
+		StateDir:   dir,
+		InstanceID: "inst-test-1",
+		AuthToken:  "test-auth-token-12345",
+	}
+
+	srv, err := NewServerWithAdapter(store, lock, cfg, fakeAdapter)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
 	defer srv.Close()
 
-	client := srv.Client()
+	client := newTestClient(srv.SocketPath())
 	releaseBody := ReleaseRequest{
 		InstanceID:      srv.InstanceID(),
 		OpID:            "op-rel-1",
 		ControllerLease: "lease-1",
-		ExpectedVersion: 1,
+		ExpectedVersion: qRec2.Receipt.CommittedVersion,
 	}
-	bodyBytes, _ := json.Marshal(releaseBody)
+	bodyBytes, err := json.Marshal(releaseBody)
+	if err != nil {
+		t.Fatalf("marshal release req: %v", err)
+	}
 
 	// 1. Initial release succeeds with 202 Accepted
-	req, _ := http.NewRequest("POST", "/v1/runs/run-1/sessions/sess-1/turns/t-1/release", bytes.NewReader(bodyBytes))
-	req.Header.Set("Authorization", "Bearer "+srv.AuthToken())
+	req, err := http.NewRequestWithContext(ctx, "POST", "http://localhost/v1/runs/run-1/sessions/sess-1/turns/t-1/release", bytes.NewReader(bodyBytes))
+	if err != nil {
+		t.Fatalf("create req: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.AuthToken)
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
-	if err != nil || resp.StatusCode != http.StatusAccepted {
+	if err != nil {
+		t.Fatalf("release request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("expected 202 Accepted, got %v", resp.StatusCode)
 	}
 
+	// Assert adapter dispatch count is exactly 1
+	if count := fakeAdapter.DispatchCount("sess-1"); count != 1 {
+		t.Fatalf("expected 1 dispatch for initial release, got %d", count)
+	}
+
 	// 2. Retry with same op_id succeeds with 200 OK and replayed: true
-	req2, _ := http.NewRequest("POST", "/v1/runs/run-1/sessions/sess-1/turns/t-1/release", bytes.NewReader(bodyBytes))
-	req2.Header.Set("Authorization", "Bearer "+srv.AuthToken())
+	req2, err := http.NewRequestWithContext(ctx, "POST", "http://localhost/v1/runs/run-1/sessions/sess-1/turns/t-1/release", bytes.NewReader(bodyBytes))
+	if err != nil {
+		t.Fatalf("create req2: %v", err)
+	}
+	req2.Header.Set("Authorization", "Bearer "+cfg.AuthToken)
+	req2.Header.Set("Content-Type", "application/json")
 	resp2, err := client.Do(req2)
-	if err != nil || resp2.StatusCode != http.StatusOK {
+	if err != nil {
+		t.Fatalf("retry release request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK on replay, got %v", resp2.StatusCode)
 	}
 	var relResp ReleaseResponse
-	_ = json.NewDecoder(resp2.Body).Decode(&relResp)
+	if err := json.NewDecoder(resp2.Body).Decode(&relResp); err != nil {
+		t.Fatalf("decode replay response: %v", err)
+	}
 	if !relResp.Replayed {
 		t.Fatal("expected replayed == true on idempotent release retry")
+	}
+
+	// Assert adapter dispatch count remains exactly 1 (no second worker dispatched)
+	if count := fakeAdapter.DispatchCount("sess-1"); count != 1 {
+		t.Fatalf("expected dispatch count to remain 1 after replay, got %d", count)
 	}
 
 	// 3. Enter draining mode: new release is rejected with 503, but previous op_id retry still succeeds
 	srv.Coordinator().SetState(ServiceStateDraining)
 
-	// New release rejected with 503
-	newReleaseBody, _ := json.Marshal(ReleaseRequest{
+	// New release of sibling prompt t-2 rejected with 503
+	newReleaseBody, err := json.Marshal(ReleaseRequest{
 		InstanceID:      srv.InstanceID(),
 		OpID:            "op-rel-2",
 		ControllerLease: "lease-1",
-		ExpectedVersion: 1,
+		ExpectedVersion: qRec2.Receipt.CommittedVersion,
 	})
-	reqNew, _ := http.NewRequest("POST", "/v1/runs/run-1/sessions/sess-1/turns/t-2/release", bytes.NewReader(newReleaseBody))
-	reqNew.Header.Set("Authorization", "Bearer "+srv.AuthToken())
-	respNew, _ := client.Do(reqNew)
+	if err != nil {
+		t.Fatalf("marshal new release body: %v", err)
+	}
+	reqNew, err := http.NewRequestWithContext(ctx, "POST", "http://localhost/v1/runs/run-1/sessions/sess-1/turns/t-2/release", bytes.NewReader(newReleaseBody))
+	if err != nil {
+		t.Fatalf("create reqNew: %v", err)
+	}
+	reqNew.Header.Set("Authorization", "Bearer "+cfg.AuthToken)
+	reqNew.Header.Set("Content-Type", "application/json")
+	respNew, err := client.Do(reqNew)
+	if err != nil {
+		t.Fatalf("new release during drain failed: %v", err)
+	}
+	defer respNew.Body.Close()
 	if respNew.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 while draining, got %v", respNew.StatusCode)
 	}
 
-	// Retry of op-rel-1 still returns 200 OK
-	reqRetry, _ := http.NewRequest("POST", "/v1/runs/run-1/sessions/sess-1/turns/t-1/release", bytes.NewReader(bodyBytes))
-	reqRetry.Header.Set("Authorization", "Bearer "+srv.AuthToken())
-	respRetry, _ := client.Do(reqRetry)
+	// Retry of op-rel-1 still returns 200 OK without checking adapter availability or drain state
+	reqRetry, err := http.NewRequestWithContext(ctx, "POST", "http://localhost/v1/runs/run-1/sessions/sess-1/turns/t-1/release", bytes.NewReader(bodyBytes))
+	if err != nil {
+		t.Fatalf("create reqRetry: %v", err)
+	}
+	reqRetry.Header.Set("Authorization", "Bearer "+cfg.AuthToken)
+	reqRetry.Header.Set("Content-Type", "application/json")
+	respRetry, err := client.Do(reqRetry)
+	if err != nil {
+		t.Fatalf("retry during drain failed: %v", err)
+	}
+	defer respRetry.Body.Close()
 	if respRetry.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK on retry during drain, got %v", respRetry.StatusCode)
 	}
@@ -419,18 +756,34 @@ func TestRelease_IdempotentRetryAndDraining(t *testing.T) {
 Run: `go test -v -run TestRelease_IdempotentRetryAndDraining ./internal/service`
 Expected: FAIL.
 
-- [ ] **Step 3: Implement Coordinator and Release Handler**
+- [ ] **Step 3: Implement Coordinator, Release Handler, and Execution Supervisor**
 
 Implement `internal/service/coordinator.go`:
 - Track lifecycle states: `ServiceStateRunning`, `ServiceStateDraining`, `ServiceStateStopping`.
 - Admission lock for checking and transitioning state.
-- Register live workers and execution contexts detached from `r.Context()`.
+- Live worker accounting with wait groups and tracking maps.
+- Detached execution context for workers tied to coordinator lifetime, not `r.Context()`.
+
+Implement `internal/service/supervisor.go`:
+- Service-owned execution supervisor pipeline:
+  1. Retains original release receipt and attempt identity throughout.
+  2. Dispatches worker via `adapter.Dispatch(turnCtx, ...)`.
+  3. Handles disposition: `DispatchAccepted`, `DispatchUnknown`, or `DispatchRejected`.
+  4. Observes events and collects authoritative outcome from `adapter.Collect(...)`.
+  5. Persists terminal outcome via `store.RecordTerminalOutcome`.
+     - **Session Version Resilience**: If session version advanced during execution (e.g., concurrent prompt queue or decision), supervisor re-queries latest session version and retries outcome recording deterministically without changing execution identity.
+  6. Releases coordinator worker accounting only after the terminal outcome is durably committed to SQLite.
 
 Implement `internal/service/release.go`:
-- Pre-flight adapter availability check (rejects `503` if adapter unavailable).
-- Draining check: allows retries of known `op_id`s, blocks new releases with `503`.
-- Calls `store.ReleaseTurn` and dispatches worker goroutine **only** if `Disposition == ReleaseDispositionNew`.
-- Returns `202 Accepted` for new release, `200 OK` (`replayed: true`) for retries.
+- Enforces strict release ordering:
+  1. Authenticate Bearer token and validate resource scope.
+  2. **Idempotent Retry Resolution**: Checks if `op_id` already matches a committed release operation for this turn. If found, returns existing receipt immediately (`200 OK`, `replayed: true`) without checking harness availability or admission draining state.
+  3. **New Release Checks**:
+     - Under admission lock, rejects if `draining` or `stopping` (`503 Service Unavailable`, `error.code: "service_draining"`).
+     - Verifies required harness adapter is available; if unavailable, rejects (`503 Service Unavailable`, `error.code: "harness_unavailable"`).
+  4. Calls `store.ReleaseTurn(...)` to commit reservation in SQLite:
+     - `ReleaseDispositionNew`: Coordinator registers worker execution and launches `supervisor.Run(workerCtx)` in a detached goroutine. Returns `202 Accepted`.
+     - `ReleaseDispositionReplayed`: Returns `200 OK` with `replayed: true` (does not dispatch worker).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -457,7 +810,7 @@ git commit -m "feat(service): implement release admission gate and retry-safe di
 - Consumes: `storage.Store`, `adapter.Adapter`, `service.Coordinator`
 - Produces:
   - `GET /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}`
-  - `POST /v1/runs/{run_id}/controller/connect`
+  - `POST /v1/runs/{run_id}/sessions/{session_id}/controller/connect` (session-scoped controller reattachment)
   - `POST /v1/runs/{run_id}/sessions/{session_id}/prompts/queue`
   - `POST /v1/runs/{run_id}/sessions/{session_id}/prompts/{turn_key}/replace`
   - `POST /v1/runs/{run_id}/sessions/{session_id}/prompts/{turn_key}/discard`
@@ -465,7 +818,7 @@ git commit -m "feat(service): implement release admission gate and retry-safe di
   - `POST /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/cancel`
   - `POST /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/reconcile`
 
-- [ ] **Step 1: Write failing test for turn read, cancel, and reconcile**
+- [ ] **Step 1: Write failing test for turn read, cancellation of active turn, and composite reconciliation**
 
 Create `internal/service/commands_test.go`:
 ```go
@@ -477,69 +830,178 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+
+	"github.com/CtrlCarlitos/agent-council/internal/adapter/adaptertest"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
-func TestCommands_TurnReadAndCancellation(t *testing.T) {
+func TestCommands_TurnReadCancelAndReconcile(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := storage.Open(storage.StoreOptions{StateDir: dir})
+	lock, err := AcquireServiceLock(dir)
+	if err != nil {
+		t.Fatalf("acquire lock: %v", err)
+	}
+	defer lock.Release()
+
+	store, err := storage.Open(storage.StoreOptions{StateDir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
 	defer store.Close()
 
 	ctx := context.Background()
-	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile-1", "lease-1")
-	_, _ = store.CreateSession(ctx, "op-sess-1", "run-1", "sess-1", "claude", "lease-1", 1)
-	_, _ = store.QueuePrompt(ctx, "op-q-1", "run-1", "sess-1", "t-1", "Hello", "lease-1", 1)
+	_, err = store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile-1", "lease-1")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	sessRec, err := store.CreateSession(ctx, storage.SessionRecord{
+		RunID:           "run-1",
+		SessionID:       "sess-1",
+		ContributorID:   "claude",
+		ControllerLease: "lease-1",
+		ExpectedVersion: 1,
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
 
-	srv, _ := NewServer(store, dir)
-	_ = srv.Start()
+	qRec, err := store.QueuePrompt(ctx, storage.PendingPrompt{
+		RunID:           "run-1",
+		SessionID:       "sess-1",
+		TurnKey:         "t-1",
+		Prompt:          "Hello",
+		ControllerLease: "lease-1",
+		ExpectedVersion: sessRec.Receipt.CommittedVersion,
+	})
+	if err != nil {
+		t.Fatalf("queue prompt: %v", err)
+	}
+
+	// Release turn first so it is running (cancellation requires an active running turn)
+	relRes, err := store.ReleaseTurn(ctx, "op-rel-1", "run-1", "sess-1", "t-1", "lease-1", qRec.Receipt.CommittedVersion)
+	if err != nil {
+		t.Fatalf("release turn: %v", err)
+	}
+
+	fakeAdapter := adaptertest.NewFakeAdapter("claude")
+	cfg := ServerConfig{
+		StateDir:   dir,
+		InstanceID: "inst-test-1",
+		AuthToken:  "test-token-456",
+	}
+
+	srv, err := NewServerWithAdapter(store, lock, cfg, fakeAdapter)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
 	defer srv.Close()
 
-	client := srv.Client()
+	client := newTestClient(srv.SocketPath())
 
 	// 1. Authoritative Turn Read: GET turn returns full details
-	req, _ := http.NewRequest("GET", "/v1/runs/run-1/sessions/sess-1/turns/t-1", nil)
-	req.Header.Set("Authorization", "Bearer "+srv.AuthToken())
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://localhost/v1/runs/run-1/sessions/sess-1/turns/t-1", nil)
+	if err != nil {
+		t.Fatalf("create read req: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.AuthToken)
 	resp, err := client.Do(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
+	if err != nil {
+		t.Fatalf("turn read request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK on turn read, got %v", resp.StatusCode)
 	}
 
-	// 2. Cancellation Request
-	cancelBody, _ := json.Marshal(CancelRequest{
+	// 2. Cancellation Request against active running turn
+	cancelBody, err := json.Marshal(CancelRequest{
 		OpID:            "op-cancel-1",
 		ControllerLease: "lease-1",
-		ExpectedVersion: 1,
+		ExpectedVersion: relRes.Receipt.CommittedVersion,
 		Reason:          "user requested",
 	})
-	reqCancel, _ := http.NewRequest("POST", "/v1/runs/run-1/sessions/sess-1/turns/t-1/cancel", bytes.NewReader(cancelBody))
-	reqCancel.Header.Set("Authorization", "Bearer "+srv.AuthToken())
+	if err != nil {
+		t.Fatalf("marshal cancel body: %v", err)
+	}
+	reqCancel, err := http.NewRequestWithContext(ctx, "POST", "http://localhost/v1/runs/run-1/sessions/sess-1/turns/t-1/cancel", bytes.NewReader(cancelBody))
+	if err != nil {
+		t.Fatalf("create cancel req: %v", err)
+	}
+	reqCancel.Header.Set("Authorization", "Bearer "+cfg.AuthToken)
+	reqCancel.Header.Set("Content-Type", "application/json")
 	respCancel, err := client.Do(reqCancel)
-	if err != nil || respCancel.StatusCode != http.StatusOK {
+	if err != nil {
+		t.Fatalf("cancel request: %v", err)
+	}
+	defer respCancel.Body.Close()
+	if respCancel.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK on cancel request, got %v", respCancel.StatusCode)
 	}
 	var cResp CancelResponse
-	_ = json.NewDecoder(respCancel.Body).Decode(&cResp)
+	if err := json.NewDecoder(respCancel.Body).Decode(&cResp); err != nil {
+		t.Fatalf("decode cancel resp: %v", err)
+	}
 	if cResp.CancellationStatus != "requested" && cResp.CancellationStatus != "confirmed" {
 		t.Fatalf("unexpected cancellation status: %s", cResp.CancellationStatus)
+	}
+
+	// 3. Controller Reattachment: session-scoped connect validates version
+	connectBody, err := json.Marshal(ControllerConnectRequest{
+		OpID:            "op-conn-1",
+		ControllerLease: "lease-1",
+		ExpectedVersion: cResp.Receipt.CommittedVersion,
+	})
+	if err != nil {
+		t.Fatalf("marshal connect body: %v", err)
+	}
+	reqConn, err := http.NewRequestWithContext(ctx, "POST", "http://localhost/v1/runs/run-1/sessions/sess-1/controller/connect", bytes.NewReader(connectBody))
+	if err != nil {
+		t.Fatalf("create conn req: %v", err)
+	}
+	reqConn.Header.Set("Authorization", "Bearer "+cfg.AuthToken)
+	reqConn.Header.Set("Content-Type", "application/json")
+	respConn, err := client.Do(reqConn)
+	if err != nil {
+		t.Fatalf("connect req: %v", err)
+	}
+	defer respConn.Body.Close()
+	if respConn.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK on connect, got %v", respConn.StatusCode)
 	}
 }
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `go test -v -run TestCommands_TurnReadAndCancellation ./internal/service`
+Run: `go test -v -run TestCommands_TurnReadCancelAndReconcile ./internal/service`
 Expected: FAIL.
 
-- [ ] **Step 3: Implement Command Handlers and Authoritative Turn Read**
+- [ ] **Step 3: Implement Command Handlers, Authoritative Turn Read, and Composite-Operation Recovery**
 
 Implement `internal/service/turns.go`:
-- Handles `GET /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}`: returns serialized turn, dispatch intent, receipts, and terminal outcome.
+- Handles `GET /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}`: returns serialized turn record, dispatch intent, receipts, and terminal outcome.
 
 Implement `internal/service/commands.go`:
 - Handles prompt queueing, replacement, discarding, and decisions via `store`.
-- Handles `POST /v1/runs/{run_id}/controller/connect`.
-- Handles `POST .../cancel`: validates lease and version, calls `store.RequestCancel(..., op_id+":req", ...)`, invokes adapter Cancel on an independent control context, records outcome if confirmed.
-- Handles `POST .../reconcile`: checks if recovery episode is open; if not, calls `store.RecordHostLoss(..., op_id+":host_loss", ...)`. Then invokes adapter `Reconcile` and records outcome.
+- Handles `POST /v1/runs/{run_id}/sessions/{session_id}/controller/connect`: session-scoped reattachment validating target session's `expected_version`.
+- Stable composite operation ID derivation:
+  - Host loss stage: `fmt.Sprintf("%s:host_loss", req.OpID)`
+  - Reconcile stage: `fmt.Sprintf("%s:reconcile", req.OpID)`
+  - Cancel stage: `fmt.Sprintf("%s:req", req.OpID)`
+- Multi-stage retry control flow for `/cancel`:
+  - Validates lease and version against running turn.
+  - Calls `store.RequestCancel(..., stageOpID, ...)`. If already committed, returns existing receipt.
+  - Signals adapter Cancel under bounded control context.
+  - Returns `CancelResponse{ Receipt: origReceipt, CancellationStatus: status }`.
+- Multi-stage retry control flow for `/reconcile`:
+  - **Check Completed Stage First**: If `%s:reconcile` stage already committed in SQLite, retrieve and return the committed receipt immediately without opening another episode or calling adapter.
+  - **Episode Initiation**: If no recovery episode is currently open, calls `store.RecordHostLoss(..., stageHostLossID, ...)` to allocate an episode and obtain a monotonic recovery generation. If `%s:host_loss` was already committed, reuse that existing episode generation.
+  - Invokes `adapter.Reconcile(ctx, ref, gen)`.
+  - Authoritatively records outcome via `store.ReconcileSession(..., stageReconcileID, ...)` and returns committed receipt.
+  - Idempotency conflicts: if same `op_id` is supplied with differing target or command parameters, return `409 Conflict`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -565,9 +1027,9 @@ git commit -m "feat(service): implement command routing, recovery episodes, and 
 - Consumes: `service.Coordinator`, `storage.Store`
 - Produces:
   - `GET /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/events`
-  - SSE framing: `id: <seq>\nevent: <name>\ndata: <json>\n\n`
+  - SSE framing: `event: <name>\ndata: <json>\n\n` (omitting resumable `id:` lines for AC-003)
 
-- [ ] **Step 1: Write failing test for SSE snapshot on connect and client disconnection**
+- [ ] **Step 1: Write failing tests for atomic SSE snapshot synchronization, clean disconnect, and slow-consumer write deadlines**
 
 Create `internal/service/events_test.go`:
 ```go
@@ -579,58 +1041,138 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/CtrlCarlitos/agent-council/internal/adapter/adaptertest"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
-func TestEvents_SnapshotAndCleanDisconnect(t *testing.T) {
+func TestEvents_SynchronizedSnapshotAndCleanDisconnect(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := storage.Open(storage.StoreOptions{StateDir: dir})
+	lock, err := AcquireServiceLock(dir)
+	if err != nil {
+		t.Fatalf("acquire lock: %v", err)
+	}
+	defer lock.Release()
+
+	store, err := storage.Open(storage.StoreOptions{StateDir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
 	defer store.Close()
 
 	ctx := context.Background()
-	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile-1", "lease-1")
-	_, _ = store.CreateSession(ctx, "op-sess-1", "run-1", "sess-1", "claude", "lease-1", 1)
-	_, _ = store.QueuePrompt(ctx, "op-q-1", "run-1", "sess-1", "t-1", "Hello", "lease-1", 1)
+	_, err = store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile-1", "lease-1")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	sessRec, err := store.CreateSession(ctx, storage.SessionRecord{
+		RunID:           "run-1",
+		SessionID:       "sess-1",
+		ContributorID:   "claude",
+		ControllerLease: "lease-1",
+		ExpectedVersion: 1,
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	qRec, err := store.QueuePrompt(ctx, storage.PendingPrompt{
+		RunID:           "run-1",
+		SessionID:       "sess-1",
+		TurnKey:         "t-1",
+		Prompt:          "Hello",
+		ControllerLease: "lease-1",
+		ExpectedVersion: sessRec.Receipt.CommittedVersion,
+	})
+	if err != nil {
+		t.Fatalf("queue prompt: %v", err)
+	}
 
-	srv, _ := NewServer(store, dir)
-	_ = srv.Start()
+	// Release turn
+	_, err = store.ReleaseTurn(ctx, "op-rel-1", "run-1", "sess-1", "t-1", "lease-1", qRec.Receipt.CommittedVersion)
+	if err != nil {
+		t.Fatalf("release turn: %v", err)
+	}
+
+	fakeAdapter := adaptertest.NewFakeAdapter("claude")
+	cfg := ServerConfig{
+		StateDir:   dir,
+		InstanceID: "inst-test-1",
+		AuthToken:  "test-token-789",
+	}
+
+	srv, err := NewServerWithAdapter(store, lock, cfg, fakeAdapter)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
 	defer srv.Close()
 
-	client := srv.Client()
+	client := newTestClient(srv.SocketPath())
 
-	req, _ := http.NewRequest("GET", "/v1/runs/run-1/sessions/sess-1/turns/t-1/events", nil)
-	req.Header.Set("Authorization", "Bearer "+srv.AuthToken())
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://localhost/v1/runs/run-1/sessions/sess-1/turns/t-1/events", nil)
+	if err != nil {
+		t.Fatalf("create sse req: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.AuthToken)
 	req.Header.Set("Accept", "text/event-stream")
 
 	resp, err := client.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 OK SSE stream, got %v", resp.StatusCode)
+		t.Fatalf("expected 200 OK SSE stream, got %v, err: %v", resp.StatusCode, err)
 	}
 
 	reader := bufio.NewReader(resp.Body)
-	line, err := reader.ReadString('\n')
-	if err != nil || !strings.HasPrefix(line, "id:") {
-		t.Fatalf("expected id line, got: %q, err: %v", line, err)
+	// First event must be the initial state snapshot event
+	line1, err := reader.ReadString('\n')
+	if err != nil || !strings.HasPrefix(line1, "event:") {
+		t.Fatalf("expected event: prefix, got: %q, err: %v", line1, err)
+	}
+	line2, err := reader.ReadString('\n')
+	if err != nil || !strings.HasPrefix(line2, "data:") {
+		t.Fatalf("expected data: prefix, got: %q, err: %v", line2, err)
 	}
 
-	// Close client connection immediately; verify server doesn't panic or leak
+	// Close client connection immediately; verify server doesn't panic or leak,
+	// and verify worker execution completes and commits terminal outcome to SQLite
 	resp.Body.Close()
+
+	// Wait for worker completion
+	select {
+	case <-time.After(200 * time.Millisecond):
+	}
+	// Verify subscriber is cleanly deregistered
+	if count := srv.Coordinator().SubscriberCount("t-1"); count != 0 {
+		t.Fatalf("expected 0 subscribers after disconnect, got %d", count)
+	}
 }
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `go test -v -run TestEvents_SnapshotAndCleanDisconnect ./internal/service`
+Run: `go test -v -run TestEvents_SynchronizedSnapshotAndCleanDisconnect ./internal/service`
 Expected: FAIL.
 
-- [ ] **Step 3: Implement SSE Endpoint**
+- [ ] **Step 3: Implement Synchronized SSE Endpoint and Coordinator Event Broadcasting**
 
 Implement `internal/service/events.go`:
 - Sets headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `Connection: keep-alive`.
-- Flushes initial snapshot of turn state. If turn is already terminal, emit terminal event and return immediately.
-- Subscribes to coordinator's event channel for that turn with bounded buffer (64).
-- Listens on `r.Context().Done()`: when client disconnects, unregisters subscriber and exits without affecting execution.
-- Emits terminal events only after SQLite transaction commit.
+- **Atomic Snapshot and Subscription Registration**:
+  - Under coordinator synchronization, registers the subscriber channel AND retrieves the initial state snapshot of the turn.
+  - Network writes occur *outside* the synchronization lock.
+  - If the turn is already terminal, emits the terminal event and cleanly closes the stream immediately without waiting on the subscriber channel.
+- **Event Framing**:
+  - Formats events as `event: <name>\ndata: <json>\n\n` (no resumable `id:` line for AC-003).
+- **Bounded Buffers & Write Timeouts**:
+  - Subscriber channels have bounded capacity (64 events).
+  - Writing to an SSE subscriber is bounded by a write deadline (e.g. 500ms). Slow or stalled consumers are dropped without blocking execution or database commits.
+- **Disconnect Handling**:
+  - Listens on `r.Context().Done()`: when the client disconnects, unregisters the subscriber channel and terminates the handler goroutine cleanly.
+  - Detached workers continue execution unaffected.
+- **Commit-Before-Delivery**:
+  - Terminal events (completion, failure, cancellation) are broadcast to SSE observers only after the database transaction in `RecordTerminalOutcome` or `ReconcileSession` has committed.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -653,13 +1195,22 @@ git commit -m "feat(service): implement SSE live observation with snapshot-on-co
 - Test: `internal/service/shutdown_test.go`
 
 **Interfaces:**
-- Consumes: `service.Coordinator`, `service.Server`, `storage.Store`
+- Consumes: `service.Coordinator`, `service.Server`, `storage.Store`, `service.ServiceLock`
 - Produces:
   - `POST /v1/service/stop`
   - OS Signal listener (`SIGTERM`, `SIGINT`)
-  - Bounded graceful drain (15s) and teardown (5s) deadlines
+  - Three distinct timeout boundaries:
+    1. CLI wait timeout (`--timeout`, evaluated client-side)
+    2. Signal drain grace period (default 15s, service-side)
+    3. Final teardown deadline (default 5s, service-side)
+  - Complete shutdown eligibility verification:
+    1. Accepted-but-not-started release handoffs == 0
+    2. Active live worker executions == 0
+    3. Pending terminal outcome database commits == 0
+    4. Admitted in-flight cancellation or reconciliation jobs == 0
+    5. Outstanding unresolved recovery blockers == 0
 
-- [ ] **Step 1: Write failing test for idle stop, drain stop, and signal grace**
+- [ ] **Step 1: Write failing tests for idle stop, draining stop, blocked commits, and signal grace expiry**
 
 Create `internal/service/shutdown_test.go`:
 ```go
@@ -667,49 +1218,98 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
+
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
 func TestShutdown_IdleAndDrainingContracts(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := storage.Open(storage.StoreOptions{StateDir: dir})
+	lock, err := AcquireServiceLock(dir)
+	if err != nil {
+		t.Fatalf("acquire lock: %v", err)
+	}
+	defer lock.Release()
+
+	store, err := storage.Open(storage.StoreOptions{StateDir: dir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
 	defer store.Close()
 
-	srv, _ := NewServer(store, dir)
-	_ = srv.Start()
+	cfg := ServerConfig{
+		StateDir:   dir,
+		InstanceID: "inst-test-1",
+		AuthToken:  "test-token-shutdown",
+	}
+
+	srv, err := NewServer(store, lock, cfg)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
 	defer srv.Close()
 
-	client := srv.Client()
+	client := newTestClient(srv.SocketPath())
 
 	// 1. Instance mismatch returns 409 instance_mismatch
-	badBody, _ := json.Marshal(StopRequest{InstanceID: "wrong-id", Drain: false})
-	req, _ := http.NewRequest("POST", "/v1/service/stop", bytes.NewReader(badBody))
-	req.Header.Set("Authorization", "Bearer "+srv.AuthToken())
-	resp, _ := client.Do(req)
+	badBody, err := json.Marshal(StopRequest{InstanceID: "wrong-id", Drain: false})
+	if err != nil {
+		t.Fatalf("marshal bad stop body: %v", err)
+	}
+	req, err := http.NewRequestWithContext(context.Background(), "POST", "http://localhost/v1/service/stop", bytes.NewReader(badBody))
+	if err != nil {
+		t.Fatalf("create req: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.AuthToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("mismatch stop req failed: %v", err)
+	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("expected 409 instance mismatch, got %v", resp.StatusCode)
 	}
 
-	// 2. Idle stop on empty service returns 202 Accepted and stops
-	stopBody, _ := json.Marshal(StopRequest{InstanceID: srv.InstanceID(), Drain: false})
-	reqStop, _ := http.NewRequest("POST", "/v1/service/stop", bytes.NewReader(stopBody))
-	reqStop.Header.Set("Authorization", "Bearer "+srv.AuthToken())
+	// 2. Idle stop on empty service returns 202 Accepted and reaches quiescence
+	stopBody, err := json.Marshal(StopRequest{InstanceID: cfg.InstanceID, Drain: false})
+	if err != nil {
+		t.Fatalf("marshal stop body: %v", err)
+	}
+	reqStop, err := http.NewRequestWithContext(context.Background(), "POST", "http://localhost/v1/service/stop", bytes.NewReader(stopBody))
+	if err != nil {
+		t.Fatalf("create reqStop: %v", err)
+	}
+	reqStop.Header.Set("Authorization", "Bearer "+cfg.AuthToken)
+	reqStop.Header.Set("Content-Type", "application/json")
 	respStop, err := client.Do(reqStop)
-	if err != nil || respStop.StatusCode != http.StatusAccepted {
+	if err != nil {
+		t.Fatalf("stop request failed: %v", err)
+	}
+	defer respStop.Body.Close()
+	if respStop.StatusCode != http.StatusAccepted {
 		t.Fatalf("expected 202 Accepted on idle stop, got %v", respStop.StatusCode)
 	}
 
-	// Wait for server shutdown
-	srv.Wait()
+	// Bounded wait for server shutdown
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := srv.WaitForShutdown(shutdownCtx); err != nil {
+		t.Fatalf("server did not shut down within timeout: %v", err)
+	}
 
-	// Verify discovery files unlinked and lock file remains
+	// Verify discovery files unlinked and lock file remains on disk
 	if fileExists(srv.SocketPath()) || fileExists(srv.TokenPath()) {
 		t.Fatal("runtime socket and token must be unlinked on clean shutdown")
 	}
-	if !fileExists(srv.LockPath()) {
+	if !fileExists(lock.Path()) {
 		t.Fatal("service.lock must remain on disk after shutdown")
 	}
 }
@@ -720,23 +1320,32 @@ func TestShutdown_IdleAndDrainingContracts(t *testing.T) {
 Run: `go test -v -run TestShutdown_IdleAndDrainingContracts ./internal/service`
 Expected: FAIL.
 
-- [ ] **Step 3: Implement Shutdown Coordinator and Stop Handler**
+- [ ] **Step 3: Implement Shutdown Coordinator and Orderly Teardown Sequence**
 
 Implement `internal/service/shutdown.go`:
-- Handles `POST /v1/service/stop`.
-- Validates `instance_id`.
-- If `drain: false`: checks `live_workers > 0` or unresolved blockers; if busy returns `409 service_busy`. If idle, atomically sets `stopping` and initiates teardown.
-- If `drain: true`: sets `draining`, closes release admission gate, returns `202 Accepted`.
-- Manages OS signal listeners (`SIGTERM`, `SIGINT`): initiates bounded drain (15s grace).
-- Teardown sequence:
-  1. Reject new mutations and subscriptions.
-  2. Terminate active SSE streams.
-  3. `http.Server.Shutdown(ctx)` (5s deadline).
-  4. Join remaining tasks.
+- Complete shutdown eligibility checking under coordinator admission lock:
+  1. Accepted-but-not-started handoffs == 0
+  2. Active executions (`live_workers`) == 0
+  3. Pending terminal commits == 0
+  4. Admitted control jobs == 0
+  5. Outstanding unresolved recovery blockers == 0
+- Handles `POST /v1/service/stop`:
+  - Validates `instance_id`. Mismatch returns `409 instance_mismatch`.
+  - If `drain: false`: verifies complete shutdown eligibility. If any counter > 0, returns `409 service_busy`. If idle, sets `stopping` and triggers teardown.
+  - If `drain: true`: sets `draining`, closes release admission gate, returns `202 Accepted`.
+- Manages OS signal listeners (`SIGTERM`, `SIGINT`):
+  - Transitions to `draining` with a 15-second signal grace countdown.
+  - **Grace Expiry Rule**: When the 15s grace expires before executions complete, initiates bounded termination handling (requests worker cancellation, persists confirmed outcomes, leaves unconfirmed as unresolved in SQLite).
+- **Strict Teardown Sequence**:
+  1. Close command admission gate (rejecting new releases, mutations, and subscriptions).
+  2. Quiesce or terminate SSE streams.
+  3. `http.Server.Shutdown(ctx)` bounded by the 5-second final teardown deadline.
+  4. Join service-owned execution and persistence tasks.
   5. Close `storage.Store`.
-  6. Unlink `service.json`, `auth.token`, `council.sock`.
-  7. Release `service.lock` handle last.
-- If teardown deadline expires, execute forced exit without releasing lock prematurely.
+  6. Call `lock.CleanupDiscovery()` to unlink `service.json`, `auth.token`, `council.sock`.
+  7. Release `ServiceLock` handle **last** upon exit (never deleted from disk).
+- **Forced Termination Boundary**:
+  - If orderly quiescence cannot be established within the 5-second final teardown deadline, triggers forced exit without fabricating completion and **without releasing `service.lock` early**.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -757,6 +1366,8 @@ git commit -m "feat(service): implement shutdown coordinator, signal handling, a
 **Files:**
 - Modify: `cmd/council/main.go`
 - Create: `cmd/council/service.go`
+- Create: `cmd/council/service_unix.go`
+- Create: `cmd/council/service_windows.go`
 - Create: `internal/client/client.go`
 - Test: `cmd/council/service_test.go`
 
@@ -768,7 +1379,7 @@ git commit -m "feat(service): implement shutdown coordinator, signal handling, a
   - `council service status [--state-dir <path>]`
   - `council service stop [--state-dir <path>] [--drain] [--timeout <duration>]`
 
-- [ ] **Step 1: Write failing tests for CLI subcommands and detached launcher**
+- [ ] **Step 1: Write failing tests for CLI subcommands, detached launcher, and status decoding**
 
 Create `cmd/council/service_test.go`:
 ```go
@@ -776,6 +1387,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os/exec"
 	"path/filepath"
 	"testing"
@@ -786,28 +1398,64 @@ func TestCLI_ServiceStartStatusStopLifecycle(t *testing.T) {
 	dir := t.TempDir()
 	bin := buildTestBinary(t)
 
-	// 1. council service start launches background service
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	// 1. council service start launches detached background service
+	ctxStart, cancelStart := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelStart()
 
-	cmdStart := exec.CommandContext(ctx, bin, "service", "start", "--state-dir", dir)
+	cmdStart := exec.CommandContext(ctxStart, bin, "service", "start", "--state-dir", dir)
 	out, err := cmdStart.CombinedOutput()
 	if err != nil {
 		t.Fatalf("council service start failed: %v, out: %s", err, string(out))
 	}
 
-	// 2. council service status reports ready
-	cmdStatus := exec.Command(bin, "service", "status", "--state-dir", dir)
-	out, err = cmdStatus.CombinedOutput()
+	// Always ensure cleanup on test exit
+	defer func() {
+		ctxClean, cancelClean := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelClean()
+		_ = exec.CommandContext(ctxClean, bin, "service", "stop", "--state-dir", dir, "--timeout", "3s").Run()
+	}()
+
+	// 2. council service status reports ready and decodes expected diagnostics
+	ctxStatus, cancelStatus := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelStatus()
+	cmdStatus := exec.CommandContext(ctxStatus, bin, "service", "status", "--state-dir", dir)
+	outStatus, err := cmdStatus.CombinedOutput()
 	if err != nil {
-		t.Fatalf("council service status failed: %v, out: %s", err, string(out))
+		t.Fatalf("council service status failed: %v, out: %s", err, string(outStatus))
 	}
 
-	// 3. council service stop stops the background service
-	cmdStop := exec.Command(bin, "service", "stop", "--state-dir", dir, "--timeout", "5s")
-	out, err = cmdStop.CombinedOutput()
+	// Verify status output contains required diagnostic fields
+	var statusDiag struct {
+		Status      string `json:"status"`
+		InstanceID  string `json:"instance_id"`
+		StateDir    string `json:"state_dir"`
+		LiveWorkers int    `json:"live_workers"`
+	}
+	if err := json.Unmarshal(outStatus, &statusDiag); err != nil {
+		t.Fatalf("failed to decode JSON status: %v, raw: %s", err, string(outStatus))
+	}
+	if statusDiag.Status != "ready" || statusDiag.StateDir != dir || statusDiag.LiveWorkers != 0 {
+		t.Fatalf("unexpected status output: %+v", statusDiag)
+	}
+
+	// 3. council service stop stops the background service and cleans up
+	ctxStop, cancelStop := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelStop()
+	cmdStop := exec.CommandContext(ctxStop, bin, "service", "stop", "--state-dir", dir, "--timeout", "5s")
+	outStop, err := cmdStop.CombinedOutput()
 	if err != nil {
-		t.Fatalf("council service stop failed: %v, out: %s", err, string(out))
+		t.Fatalf("council service stop failed: %v, out: %s", err, string(outStop))
+	}
+
+	// Verify runtime discovery and socket are deleted, while service.lock remains on disk
+	sockPath := filepath.Join(dir, "council.sock")
+	tokenPath := filepath.Join(dir, "auth.token")
+	lockPath := filepath.Join(dir, "service.lock")
+	if fileExists(sockPath) || fileExists(tokenPath) {
+		t.Fatal("runtime socket and token must be unlinked after CLI stop")
+	}
+	if !fileExists(lockPath) {
+		t.Fatal("service.lock must remain on disk after CLI stop")
 	}
 }
 ```
@@ -817,19 +1465,26 @@ func TestCLI_ServiceStartStatusStopLifecycle(t *testing.T) {
 Run: `go test -v ./cmd/council`
 Expected: FAIL.
 
-- [ ] **Step 3: Implement CLI Subcommands and Client**
+- [ ] **Step 3: Implement CLI Subcommands and Client with Context-Aware Dialing**
 
 Implement `internal/client/client.go`:
-- Discovers `service.json` and `auth.token`.
-- Configures HTTP client with custom UDS dialer (`net.Dial("unix", socketPath)`).
-- Issues authenticated requests and handles JSON error envelopes.
+- Reads `service.json` and `auth.token`.
+- Custom UDS transport using `net.Dialer.DialContext` so socket connection respects operation deadlines.
+- Dispatches authenticated requests with Bearer token header.
+- Unmarshals standard JSON error envelopes.
 
-Implement `cmd/council/service.go` and update `cmd/council/main.go`:
-- `service run`: starts foreground server.
-- `service start`: executes `service run` with `setsid` and `DevNull` stdio; polls `GET /v1/readiness` with timeout; verifies matching instance, protocol version, and state dir.
-- `service status`: reads discovery and calls `GET /v1/status`.
-- `service stop`: calls `POST /v1/service/stop` with `--drain` flag and waits up to `--timeout`.
-- Native Windows: returns explicit unsupported-platform error.
+Implement `cmd/council/service.go`:
+- Common flags: `--state-dir` (defaults to current dir or env).
+- `service run`: acquires lock, starts HTTP server, blocks until signal or stop.
+- `service status`: reads status from client and prints formatted JSON.
+- `service stop`: sends stop request (`--drain`, `--timeout`).
+
+Implement `cmd/council/service_unix.go` (`//go:build !windows`):
+- `startDetachedService`: launches `service run` with `syscall.SysProcAttr{Setsid: true}` and redirects stdio to `os.DevNull`.
+- Polls `GET /v1/readiness` using context-aware client until ready or early child termination.
+
+Implement `cmd/council/service_windows.go` (`//go:build windows`):
+- `startDetachedService`: returns explicit unsupported-platform error `ErrUnsupportedPlatform`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -855,14 +1510,15 @@ git commit -m "feat(cli): implement detached background launcher and service com
 - Consumes: full `internal/service`, `internal/client`, `internal/adapter/adaptertest`
 - Produces: Comprehensive acceptance evidence covering all spec scenarios.
 
-- [ ] **Step 1: Write acceptance tests for two-client disconnect, crash recovery, and startup races**
+- [ ] **Step 1: Write acceptance tests using deterministic gates and boundary scenarios**
 
 Create `internal/service/acceptance_test.go`:
-1. `TestAcceptance_TwoClientDisconnect`:
+1. `TestAcceptance_TwoClientDisconnect_Deterministic`:
    - Independent service process running.
-   - Client A releases a turn through fake adapter with simulated execution delay.
-   - Client A process terminates immediately after release.
-   - Worker completes execution and commits terminal outcome to SQLite.
+   - Use deterministic gate (channel latch in test adapter) rather than simulated delay.
+   - Client A releases a turn through adapter; releases succeeds with 202 Accepted.
+   - Client A process terminates immediately while work is held at the latch.
+   - Release the latch: worker completes execution and durably commits terminal outcome to SQLite.
    - Client B connects, queries `GET /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}`, and verifies completed result.
    - A queued follow-up prompt remains queued and unexecuted.
 2. `TestAcceptance_CrashRecovery_WithoutAccessibleNativeEvidence`:
@@ -873,22 +1529,27 @@ Create `internal/service/acceptance_test.go`:
    - Turn is not redispatched.
 3. `TestAcceptance_RestartWithIndependentlyRetainedEvidence`:
    - External helper process retains test execution evidence independent of service memory.
-   - Restarted service calls `reconcile`: allocates recovery episode via `RecordHostLoss`, attaches to original binding, probes independent evidence, and authoritatively resolves.
-4. `TestAcceptance_ConcurrentStartupRace`:
+   - Restarted service calls `reconcile`: allocates recovery episode via `RecordHostLoss` if not open, attaches to original binding, probes independent evidence, and authoritatively resolves.
+4. `TestAcceptance_ReconcileRetry_LostCompositeResponse`:
+   - Service performs reconciliation, commits outcome, but client response is lost.
+   - Client retries with same `op_id`: service returns committed receipt without opening fresh host-loss episodes or re-probing adapter.
+5. `TestAcceptance_IdleStop_ReleaseRace`:
+   - Stop request races with release acceptance: under admission lock, release is either rejected (503) or admitted and tracked before stopping.
+6. `TestAcceptance_ConcurrentStartupRace`:
    - Two concurrent `service start` invocations against the same state directory.
    - Exactly one owner succeeds; loser fails with `already running` and leaves winner's files untouched.
-5. `TestAcceptance_ReleaseRetryDuringDrain`:
+7. `TestAcceptance_ReleaseRetryDuringDrain`:
    - Service enters `draining`.
    - Matching retry of already-committed release returns 200 OK without additional dispatch.
-6. `TestAcceptance_SignalGraceExpiry`:
-   - Signal grace expires while worker is active; service preserves unresolved outcome in SQLite without early lock release.
+8. `TestAcceptance_SignalGraceExpiry_PreservesUnresolved`:
+   - Signal grace expires while worker is active; service preserves unresolved outcome in SQLite without early lock release or fabricated completion.
 
-- [ ] **Step 2: Run tests to verify execution**
+- [ ] **Step 2: Run acceptance tests to verify execution**
 
 Run: `go test -race -count=1 -timeout=120s -v -run TestAcceptance_ ./internal/service`
 Expected: PASS.
 
-- [ ] **Step 3: Run full local repository verification**
+- [ ] **Step 3: Run full repository verification**
 
 ```bash
 CGO_ENABLED=0 go test ./...
