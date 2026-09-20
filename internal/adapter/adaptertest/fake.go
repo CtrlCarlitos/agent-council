@@ -46,6 +46,7 @@ type FakeAdapter struct {
 	results       map[adapter.TurnRef]adapter.TurnResult
 	retiredTurns  map[adapter.TurnRef]bool
 	activeStreams map[adapter.TurnRef][]*adapter.BufferedStream
+	eventHistory  map[adapter.TurnRef][]adapter.Event
 	workerCancels map[adapter.TurnRef]chan struct{}
 	workersWg     sync.WaitGroup
 	watchersWg    sync.WaitGroup
@@ -61,6 +62,7 @@ func NewFake(faults ScriptedFaults) *FakeAdapter {
 		results:       make(map[adapter.TurnRef]adapter.TurnResult),
 		retiredTurns:  make(map[adapter.TurnRef]bool),
 		activeStreams: make(map[adapter.TurnRef][]*adapter.BufferedStream),
+		eventHistory:  make(map[adapter.TurnRef][]adapter.Event),
 		workerCancels: make(map[adapter.TurnRef]chan struct{}),
 	}
 }
@@ -442,8 +444,13 @@ func (f *FakeAdapter) runWorker(ref adapter.TurnRef, prompt string, cancelCh <-c
 	}
 }
 
+const maxTurnEventHistory = 128
+
 func (f *FakeAdapter) broadcastEvent(ref adapter.TurnRef, ev adapter.Event) {
 	f.mu.Lock()
+	if len(f.eventHistory[ref]) < maxTurnEventHistory {
+		f.eventHistory[ref] = append(f.eventHistory[ref], ev)
+	}
 	streams := append([]*adapter.BufferedStream(nil), f.activeStreams[ref]...)
 	f.mu.Unlock()
 
@@ -495,7 +502,7 @@ func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter
 	stream := adapter.NewBufferedStream(ref, 64)
 
 	if f.faults.DropStreamEarly {
-		_ = stream.Send(adapter.Event{
+		_ = stream.SendOrOverflow(adapter.Event{
 			Ref:       ref,
 			Type:      adapter.EventProgress,
 			Status:    council.TurnRunning,
@@ -511,26 +518,41 @@ func (f *FakeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter
 
 	res, resExists := f.results[ref]
 	if resExists && (res.Status == council.TurnCompleted || res.Status == council.TurnCancelled) {
-		_ = stream.Send(adapter.Event{
+		for _, pastEv := range f.eventHistory[ref] {
+			if err := stream.SendOrOverflow(pastEv); err != nil {
+				return stream, nil
+			}
+		}
+		termEv := adapter.Event{
 			Ref:       ref,
 			Type:      adapter.EventTerminal,
 			Status:    res.Status,
 			Payload:   res.Output,
 			Timestamp: time.Now(),
 			Usage:     res.Usage,
-		})
-		_ = stream.CloseWithErr(nil)
+		}
+		if err := stream.SendOrOverflow(termEv); err == nil {
+			_ = stream.CloseWithErr(nil)
+		}
 		return stream, nil
 	}
 
 	// Send initial progress synchronously into the stream buffer before subscription
-	_ = stream.Send(adapter.Event{
+	if err := stream.SendOrOverflow(adapter.Event{
 		Ref:       ref,
 		Type:      adapter.EventProgress,
 		Status:    council.TurnRunning,
 		Payload:   "observing",
 		Timestamp: time.Now(),
-	})
+	}); err != nil {
+		return stream, nil
+	}
+
+	for _, pastEv := range f.eventHistory[ref] {
+		if err := stream.SendOrOverflow(pastEv); err != nil {
+			break
+		}
+	}
 
 	f.activeStreams[ref] = append(f.activeStreams[ref], stream)
 
