@@ -35,8 +35,11 @@ func TestWindows_ServiceCommandsUnsupported(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected %v to fail on Windows, output: %s", tc.args, string(out))
 			}
+			if _, ok := err.(*exec.ExitError); !ok {
+				t.Fatalf("%v did not execute: %v (out: %s)", tc.args, err, string(out))
+			}
 			if !strings.Contains(strings.ToLower(string(out)), strings.ToLower(tc.wantMsg)) {
-				t.Fatalf("expected error mentioning %q, got: %s", tc.wantMsg, string(out))
+				t.Fatalf("expected error mentioning %q, got (err %v): %s", tc.wantMsg, err, string(out))
 			}
 		})
 	}
