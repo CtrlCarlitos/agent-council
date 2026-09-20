@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/CtrlCarlitos/agent-council/internal/service"
+	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
 // Client interacts with an active local Council service instance.
@@ -164,6 +165,46 @@ func (c *Client) StopService(ctx context.Context, instanceID string, drain bool)
 	}
 	var resp service.StopResponse
 	if err := c.do(ctx, http.MethodPost, "/v1/service/stop", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// ReleaseTurn calls POST /v1/runs/run-1-style release for a session turn.
+// The session and turn identify the target; runID correlates the session.
+func (c *Client) ReleaseTurn(ctx context.Context, runID, sessionID, turnKey, opID, controllerLease string, expectedVersion int64) (*service.ReleaseResponse, error) {
+	req := service.ReleaseRequest{
+		OpID:            opID,
+		ControllerLease: controllerLease,
+		ExpectedVersion: expectedVersion,
+	}
+	var resp service.ReleaseResponse
+	path := fmt.Sprintf("/v1/runs/%s/sessions/%s/turns/%s/release", runID, sessionID, turnKey)
+	if err := c.do(ctx, http.MethodPost, path, req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// GetTurnDetails retrieves the authoritative turn state.
+func (c *Client) GetTurnDetails(ctx context.Context, runID, sessionID, turnKey string) (*storage.TurnDetails, error) {
+	var resp storage.TurnDetails
+	path := fmt.Sprintf("/v1/runs/%s/sessions/%s/turns/%s", runID, sessionID, turnKey)
+	if err := c.do(ctx, http.MethodGet, path, nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// ReconcileTurn requests reconciliation of an uncertain turn.
+func (c *Client) ReconcileTurn(ctx context.Context, runID, sessionID, turnKey, opID, controllerLease string) (*service.ReconcileResponse, error) {
+	req := service.ReconcileRequest{
+		OpID:            opID,
+		ControllerLease: controllerLease,
+	}
+	var resp service.ReconcileResponse
+	path := fmt.Sprintf("/v1/runs/%s/sessions/%s/turns/%s/reconcile", runID, sessionID, turnKey)
+	if err := c.do(ctx, http.MethodPost, path, req, &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil
