@@ -251,8 +251,14 @@ func TestShutdown_DrainingWaitsForWorkerCompletion(t *testing.T) {
 		t.Fatalf("server did not shut down after draining: %v", err)
 	}
 
-	// Verify turn reached terminal outcome in database
-	details, err := store.GetTurnDetails(context.Background(), "sess-1", "t-drain")
+	// Verify turn reached terminal outcome in database by reopening durable store
+	verifyStore, err := storage.Open(storage.StoreOptions{StateDir: dir})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer verifyStore.Close()
+
+	details, err := verifyStore.GetTurnDetails(context.Background(), "sess-1", "t-drain")
 	if err != nil {
 		t.Fatalf("get turn details: %v", err)
 	}

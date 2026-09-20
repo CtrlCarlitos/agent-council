@@ -36,6 +36,7 @@ type StatusResponse struct {
 	InstanceID      string    `json:"instance_id"`
 	PID             int       `json:"pid"`
 	Status          string    `json:"status"`
+	StateDir        string    `json:"state_dir"`
 	StartedAt       time.Time `json:"started_at"`
 	ActiveRuns      []string  `json:"active_runs"`
 	LiveWorkers     int       `json:"live_workers"`
@@ -55,9 +56,10 @@ type Server struct {
 	tokenPath   string
 	startedAt   time.Time
 
-	mu       sync.Mutex
-	running  bool
-	shutdown chan struct{}
+	mu           sync.Mutex
+	running      bool
+	shutdown     chan struct{}
+	teardownOnce sync.Once
 }
 
 func NewServer(store *storage.Store, lock *ServiceLock, cfg ServerConfig) (*Server, error) {
@@ -158,7 +160,7 @@ func (s *Server) Start() error {
 
 	go func() {
 		_ = s.httpServer.Serve(l)
-		close(s.shutdown)
+		_ = s.Teardown(5 * time.Second)
 	}()
 
 	return nil
@@ -210,6 +212,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		InstanceID:      s.cfg.InstanceID,
 		PID:             os.Getpid(),
 		Status:          statusStr,
+		StateDir:        s.cfg.StateDir,
 		StartedAt:       s.startedAt,
 		ActiveRuns:      []string{},
 		LiveWorkers:     s.coordinator.LiveWorkers(),

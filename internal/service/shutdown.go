@@ -45,6 +45,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 
 		s.coordinator.SetState(ServiceStateStopping)
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Connection", "close")
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(StopResponse{
 			InstanceID: s.cfg.InstanceID,
@@ -53,6 +54,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		})
 
 		go func() {
+			time.Sleep(20 * time.Millisecond)
 			_ = s.Teardown(5 * time.Second)
 		}()
 		return
@@ -94,10 +96,15 @@ func (s *Server) Teardown(timeout time.Duration) error {
 	s.mu.Lock()
 	if !s.running {
 		s.mu.Unlock()
+		<-s.shutdown
 		return nil
 	}
 	s.running = false
 	s.mu.Unlock()
+
+	defer s.teardownOnce.Do(func() {
+		close(s.shutdown)
+	})
 
 	// 1. Close command admission gate
 	s.coordinator.SetState(ServiceStateStopping)
@@ -106,6 +113,7 @@ func (s *Server) Teardown(timeout time.Duration) error {
 	s.coordinator.CloseAllSubscribers()
 
 	// 3. HTTP Server Shutdown bounded by timeout
+	s.httpServer.SetKeepAlivesEnabled(false)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
