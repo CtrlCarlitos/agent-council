@@ -12,8 +12,18 @@ import (
 //go:embed schema.sql
 var schemaSQL string
 
+// schema.sql is the frozen released v1 schema; schemaV2DDL is the immutable
+// v2 migration body. Fresh databases apply v1 then v2 sequentially — there
+// is no separate "latest schema" path that could diverge from upgrading.
+const currentSchemaVersion = 2
+
 func schemaChecksum() string {
 	sum := sha256.Sum256([]byte(schemaSQL))
+	return fmt.Sprintf("%x", sum)
+}
+
+func schemaV2Checksum() string {
+	sum := sha256.Sum256([]byte(schemaV2DDL + backfillControllerLeaseProvenance))
 	return fmt.Sprintf("%x", sum)
 }
 
@@ -67,40 +77,64 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 		currentVer = int(maxVer.Int64)
 	}
 
-	expectedChecksum := schemaChecksum()
-
-	if currentVer > 1 {
+	if currentVer > currentSchemaVersion {
 		return ErrUnsupportedSchemaVersion
 	}
 
-	if currentVer == 1 {
-		// Verify checksum
+	if currentVer >= 1 {
+		// Verify the frozen v1 checksum before any upgrade step.
 		var recordedChecksum string
 		err := tx.Tx().QueryRow("SELECT checksum FROM schema_migrations WHERE version = 1;").Scan(&recordedChecksum)
 		if err != nil {
 			return fmt.Errorf("read recorded checksum: %w", err)
 		}
-		if recordedChecksum != expectedChecksum {
+		if recordedChecksum != schemaChecksum() {
 			return ErrMigrationChecksumMismatch
 		}
-		return nil // Clean no-op, rollback read
+	} else {
+		// currentVer == 0: apply the frozen v1 schema sequentially.
+		if _, err := tx.Tx().Exec(schemaSQL); err != nil {
+			return fmt.Errorf("execute schema v1: %w", err)
+		}
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		_, err = tx.Tx().Exec(`
+INSERT INTO schema_migrations (version, name, checksum, applied_at)
+VALUES (1, 'initial_schema', ?, ?);`, schemaChecksum(), now)
+		if err != nil {
+			return fmt.Errorf("record migration v1: %w", err)
+		}
 	}
 
-	// currentVer == 0: apply schema v1
-	if _, err := tx.Tx().Exec(schemaSQL); err != nil {
-		return fmt.Errorf("execute schema v1: %w", err)
+	if currentVer >= 2 {
+		// Verify the v2 checksum and stop: fully migrated.
+		var recordedV2Checksum string
+		err := tx.Tx().QueryRow("SELECT checksum FROM schema_migrations WHERE version = 2;").Scan(&recordedV2Checksum)
+		if err != nil {
+			return fmt.Errorf("read recorded v2 checksum: %w", err)
+		}
+		if recordedV2Checksum != schemaV2Checksum() {
+			return ErrMigrationChecksumMismatch
+		}
+		return nil
 	}
 
+	// Apply v2: schema additions plus legacy provenance backfill, atomically.
+	if _, err := tx.Tx().Exec(schemaV2DDL); err != nil {
+		return fmt.Errorf("execute schema v2: %w", err)
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.Tx().Exec(backfillControllerLeaseProvenance, now, now); err != nil {
+		return fmt.Errorf("backfill controller lease provenance: %w", err)
+	}
 	_, err = tx.Tx().Exec(`
 INSERT INTO schema_migrations (version, name, checksum, applied_at)
-VALUES (1, 'initial_schema', ?, ?);`, expectedChecksum, now)
+VALUES (2, 'controller_leases_provenance', ?, ?);`, schemaV2Checksum(), now)
 	if err != nil {
-		return fmt.Errorf("record migration v1: %w", err)
+		return fmt.Errorf("record migration v2: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit migration v1: %w", err)
+		return fmt.Errorf("commit migration: %w", err)
 	}
 	return nil
 }
