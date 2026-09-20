@@ -83,8 +83,16 @@ func startDetachedService(stateDir string) error {
 				continue
 			}
 			if c.Meta().PID != pid {
-				// Another service instance already owns stateDir
-				return fmt.Errorf("service already running with PID %d", c.Meta().PID)
+				// Another discovery claims stateDir. Only a genuinely
+				// ready other instance wins: stale discovery from a dead
+				// predecessor must not abort this startup.
+				checkCtx, checkCancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+				other, otherErr := c.GetReadiness(checkCtx)
+				checkCancel()
+				if otherErr == nil && other != nil && other.Status == "ready" {
+					return fmt.Errorf("service already running with PID %d", c.Meta().PID)
+				}
+				continue
 			}
 			ready, err := c.GetReadiness(ctx)
 			if err == nil && ready.Status == "ready" {

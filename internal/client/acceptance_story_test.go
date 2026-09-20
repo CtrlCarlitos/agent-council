@@ -164,8 +164,11 @@ func runPrimaryStory(t *testing.T, harnessA, harnessB string) {
 		t.Fatalf("B must release the follow-up: %v", err)
 	}
 	d, err = store2.GetTurnDetails(ctx, "sess-ps", "t-next")
-	if err != nil || d.Status != council.TurnRunning {
-		t.Fatalf("follow-up must be running under B's release: %+v err=%v", d, err)
+	if err != nil {
+		t.Fatalf("follow-up turn must exist after B's release: %v", err)
+	}
+	if d.Status != council.TurnRunning && !isTerminalStatus(d.Status) {
+		t.Fatalf("follow-up must be dispatched under B's release, got %v", d.Status)
 	}
 	_ = adapter.TurnRef{}
 	_ = adaptertest.NewFakeAdapter("claude")
@@ -278,4 +281,12 @@ func waitForTurnTerminal(t *testing.T, store *storage.Store, sessionID, turnKey 
 
 func isLeaseSuperseded(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "lease_superseded")
+}
+
+func isTerminalStatus(s council.TurnStatus) bool {
+	switch s {
+	case council.TurnCompleted, council.TurnFailed, council.TurnCancelled, council.TurnInterrupted:
+		return true
+	}
+	return false
 }

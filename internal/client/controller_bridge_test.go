@@ -6,9 +6,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -60,11 +60,11 @@ func (f *adminBridgeFixture) post(t *testing.T, path, body string) (int, string)
 }
 
 func TestAC004_RestrictedBridgePositiveAndEscalation(t *testing.T) {
-	dir := t.TempDir()
-	if len(dir) > 80 {
-		// Keep the unix socket path bounded on long-temp-dir systems.
-		dir = "/tmp/ac-br-" + fmt.Sprint(time.Now().UnixNano())
+	dir, dirErr := os.MkdirTemp("/tmp", "ac-br-")
+	if dirErr != nil {
+		t.Fatalf("state dir: %v", dirErr)
 	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	lock, err := service.AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("lock: %v", err)
