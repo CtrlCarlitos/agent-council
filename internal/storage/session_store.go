@@ -127,6 +127,16 @@ VALUES (?, ?, ?, ?, ?, 'active', ?, ?);`, runID, briefDigest, sourceDigest, prof
 		return OperationReceipt{}, fmt.Errorf("insert run: %w", err)
 	}
 
+	// The supplied lease is recorded as generation-0 provenance only —
+	// never an adopted controller grant (AC-004).
+	_, err = tx.Tx().ExecContext(ctx, `INSERT INTO controller_leases
+		(run_id, generation, harness, controller_ref, lease, status, granted_by_op_id, attached_at, updated_at)
+		VALUES (?, 0, NULL, 'create-run-provenance', ?, 'legacy', ?, ?, ?);`,
+		runID, controllerLease, opID, now, now)
+	if err != nil {
+		return OperationReceipt{}, fmt.Errorf("insert run provenance: %w", err)
+	}
+
 	receipt := OperationReceipt{
 		OpID:             opID,
 		CommandType:      "create_run",
