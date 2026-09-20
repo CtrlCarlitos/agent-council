@@ -84,6 +84,7 @@ func TestCommands_TurnReadCancelAndReconcile(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+	connectControllerForTest(t, srv, store, "run-1", "lease-1")
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())
@@ -211,6 +212,7 @@ func TestCommands_PromptLifecycleAndDecisions(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+	connectControllerForTest(t, srv, store, "run-cmd", "lease-cmd")
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())
@@ -384,6 +386,7 @@ func TestCommands_CompositeReconciliation(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+	connectControllerForTest(t, srv, store, "run-rec", "lease-rec")
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())

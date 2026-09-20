@@ -355,6 +355,15 @@ func TestSubprocess_CrashRecovery_IndependentLedger(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client: %v", err)
 	}
+	// Reattach the adopted controller to the restarted instance before
+	// the recovery decision (restart gate).
+	connCtx, connCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if _, err := c.ConnectRunController(connCtx, "run-2", "op-conn-crash", "lease-1", 1); err != nil {
+		connCancel()
+		t.Fatalf("reattach after restart: %v", err)
+	}
+	connCancel()
+
 	recCtx, recCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer recCancel()
 	if _, err := c.ReconcileTurn(recCtx, "run-2", "sess-1", "turn-crash", "op-rec-crash", "lease-1"); err != nil {

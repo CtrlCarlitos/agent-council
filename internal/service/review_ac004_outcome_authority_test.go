@@ -117,12 +117,19 @@ func runMidFlightRotation(t *testing.T, revoke bool) {
 		if _, err := h.store.AdoptController(ctx, "op-adopt-after", "run-1", "agy", "controller-C", "", &storage.OperatorRecovery{Reason: "rotation", ExpectedGeneration: 1}, "lease-C"); err != nil {
 			t.Fatalf("adopt after revoke: %v", err)
 		}
+		if _, err := h.store.ConnectRunController(ctx, "op-conn-C3", "run-1", "lease-C", 2); err != nil {
+			t.Fatalf("controller C connect: %v", err)
+		}
 		nextVer, _ := h.store.GetSessionVersion(ctx, "sess-1")
 		if _, err := h.store.ReleaseTurn(ctx, "op-rel-next", "lease-C", "sess-1", nextVer, "turn-next"); err != nil {
 			t.Fatalf("newly adopted controller must release the follow-up: %v", err)
 		}
 	} else {
-		// Only B's explicit release starts the follow-up.
+		// Only B's explicit release starts the follow-up (B connects first:
+		// handoff deliberately grants no connection state).
+		if _, err := h.store.ConnectRunController(ctx, "op-conn-B3", "run-1", "lease-B", 2); err != nil {
+			t.Fatalf("controller B connect: %v", err)
+		}
 		nextVer, _ := h.store.GetSessionVersion(ctx, "sess-1")
 		if _, err := h.store.ReleaseTurn(ctx, "op-rel-next", "lease-B", "sess-1", nextVer, "turn-next"); err != nil {
 			t.Fatalf("controller B must release the follow-up: %v", err)

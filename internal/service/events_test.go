@@ -78,6 +78,7 @@ func TestEvents_SynchronizedSnapshotAndCleanDisconnect(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+	connectControllerForTest(t, srv, store, "run-1", "lease-1")
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())
@@ -189,6 +190,7 @@ func TestEvents_TerminalSnapshotOnConnect(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+	connectControllerForTest(t, srv, store, "run-1", "lease-1")
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())
@@ -378,6 +380,7 @@ func TestEvents_LiveObservationStreaming(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+	connectControllerForTest(t, srv, store, "run-1", "lease-1")
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())

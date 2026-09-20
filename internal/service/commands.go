@@ -149,6 +149,11 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	}
 	defer doneControl()
 
+	// New decisions require the current controller attached to this instance.
+	if !s.requireConnectedController(w, r, runID, sessionID, req.ControllerLease, req.OpID) {
+		return
+	}
+
 	stageOpID := fmt.Sprintf("%s:req", req.OpID)
 	receipt, err := s.store.RequestCancel(r.Context(), stageOpID, req.ControllerLease, sessionID, req.ExpectedVersion, turnKey)
 	if err != nil {
@@ -288,8 +293,8 @@ func (s *Server) handleControllerConnect(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if req.OpID == "" || req.ControllerLease == "" || req.ExpectedVersion <= 0 {
-		writeError(w, http.StatusBadRequest, "invalid_request", "op_id, controller_lease, and expected_version (>0) are required", req.OpID)
+	if req.OpID == "" || req.ControllerLease == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "op_id and controller_lease are required", req.OpID)
 		return
 	}
 
@@ -300,29 +305,31 @@ func (s *Server) handleControllerConnect(w http.ResponseWriter, r *http.Request)
 	}
 	defer doneControl()
 
-	receipt, err := s.store.SetControllerConnection(r.Context(), req.OpID, req.ControllerLease, sessionID, req.ExpectedVersion, council.ControllerConnected)
+	// Compatibility delegation (AC-004 §7): the session route establishes
+	// the run-scoped attachment episode; session controller_status columns
+	// are projections.
+	rec, err := s.store.GetControllerRecord(r.Context(), runID)
 	if err != nil {
-		if errors.Is(err, storage.ErrStaleUpdate) {
-			writeError(w, http.StatusConflict, "stale_version", err.Error(), req.OpID)
-			return
-		}
-		if errors.Is(err, storage.ErrUnauthorizedOperation) {
-			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
-			return
-		}
-		if writeControllerAuthError(w, err, req.OpID) {
-			return
-		}
-		writeError(w, http.StatusBadRequest, "connect_failed", err.Error(), req.OpID)
+		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), req.OpID)
 		return
 	}
+	if !rec.Adopted {
+		writeError(w, http.StatusConflict, "adoption_required", "run has no adopted controller", req.OpID)
+		return
+	}
+	connectReceipt, err := s.store.ConnectRunController(r.Context(), req.OpID, runID, req.ControllerLease, rec.Generation)
+	if err != nil {
+		s.writeGrantError(w, err, req.OpID)
+		return
+	}
+	s.coordinator.MarkControllerAttached(runID, rec.Generation, connectReceipt.AttachmentID, s.cfg.InstanceID)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(ControllerConnectResponse{
 		InstanceID: s.cfg.InstanceID,
 		OpID:       req.OpID,
-		Receipt:    receipt,
+		Receipt:    connectReceipt.OperationReceipt,
 	})
 }
 
@@ -362,6 +369,11 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer doneControl()
+
+	// New decisions require the current controller attached to this instance.
+	if !s.requireConnectedController(w, r, runID, sessionID, req.ControllerLease, req.OpID) {
+		return
+	}
 
 	stageReconcileID := fmt.Sprintf("%s:reconcile", req.OpID)
 	stageHostLossID := fmt.Sprintf("%s:host_loss", req.OpID)
@@ -698,6 +710,11 @@ func (s *Server) handleQueuePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 	defer doneControl()
 
+	// New decisions require the current controller attached to this instance.
+	if !s.requireConnectedController(w, r, runID, sessionID, req.ControllerLease, req.OpID) {
+		return
+	}
+
 	receipt, err := s.store.QueuePrompt(r.Context(), req.OpID, req.ControllerLease, sessionID, req.ExpectedVersion, storage.PendingPrompt{
 		SessionID: sessionID,
 		TurnKey:   req.TurnKey,
@@ -759,6 +776,11 @@ func (s *Server) handleReplacePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer doneControl()
+
+	// New decisions require the current controller attached to this instance.
+	if !s.requireConnectedController(w, r, runID, sessionID, req.ControllerLease, req.OpID) {
+		return
+	}
 
 	receipt, err := s.store.ReplacePendingPrompt(r.Context(), req.OpID, req.ControllerLease, sessionID, req.ExpectedVersion, storage.PendingPrompt{
 		SessionID: sessionID,
@@ -822,6 +844,11 @@ func (s *Server) handleDiscardPrompt(w http.ResponseWriter, r *http.Request) {
 	}
 	defer doneControl()
 
+	// New decisions require the current controller attached to this instance.
+	if !s.requireConnectedController(w, r, runID, sessionID, req.ControllerLease, req.OpID) {
+		return
+	}
+
 	receipt, err := s.store.DiscardPendingPrompt(r.Context(), req.OpID, req.ControllerLease, sessionID, req.ExpectedVersion, turnKey)
 	if err != nil {
 		if errors.Is(err, storage.ErrStaleUpdate) {
@@ -872,6 +899,11 @@ func (s *Server) handleRecordDecision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer doneControl()
+
+	// New decisions require the current controller attached to this instance.
+	if !s.requireConnectedController(w, r, runID, "", req.ControllerLease, req.OpID) {
+		return
+	}
 
 	receipt, err := s.store.RecordDecision(r.Context(), req.OpID, req.ControllerLease, runID, req.ArtifactID, req.Revision, req.DecisionPayload)
 	if err != nil {

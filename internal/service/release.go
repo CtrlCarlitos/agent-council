@@ -108,6 +108,11 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	}
 	defer doneAdmission()
 
+	// New decisions require the current controller attached to this instance.
+	if !s.requireConnectedController(w, r, runID, sessionID, req.ControllerLease, req.OpID) {
+		return
+	}
+
 	// Verify required harness adapter is available.
 	if s.adapter == nil {
 		writeError(w, http.StatusServiceUnavailable, "harness_unavailable", "harness adapter is unavailable", req.OpID)

@@ -333,6 +333,7 @@ func TestReviewPR29_ReconcilePostTerminalRetainedContext(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+	connectControllerForTest(t, srv, store, "run-pt", "lease-pt")
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())
@@ -495,6 +496,7 @@ func TestReviewPR29_ForcedTeardownSurfacesError(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+	connectControllerForTest(t, srv, store, "run-ft", "lease-ft")
 
 	relBody := fmt.Sprintf(`{"op_id":"op-rel-ft","controller_lease":"lease-ft","expected_version":%d}`, sessRec.CommittedVersion+1)
 	req, _ := http.NewRequestWithContext(ctx, "POST", "http://localhost/v1/runs/run-ft/sessions/sess-ft/turns/turn-ft/release", strings.NewReader(relBody))

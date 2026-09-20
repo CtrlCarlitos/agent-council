@@ -181,6 +181,7 @@ func TestAcceptance_CrashRecovery_WithoutAccessibleNativeEvidence(t *testing.T) 
 	if err := srv2.Start(); err != nil {
 		t.Fatalf("start server 2: %v", err)
 	}
+	connectControllerForTest(t, srv2, store2, "run-1", "lease-1")
 	defer srv2.Close()
 
 	client2 := newTestClient(srv2.SocketPath())
@@ -336,6 +337,7 @@ func TestAcceptance_RestartWithIndependentlyRetainedEvidence(t *testing.T) {
 	if err := srv2.Start(); err != nil {
 		t.Fatalf("start server 2: %v", err)
 	}
+	connectControllerForTest(t, srv2, store2, "run-1", "lease-1")
 	defer srv2.Close()
 
 	client2 := newTestClient(srv2.SocketPath())

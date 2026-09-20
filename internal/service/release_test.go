@@ -83,6 +83,7 @@ func TestRelease_IdempotentRetryAndDraining(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+	connectControllerForTest(t, srv, store, "run-1", "lease-1")
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())
@@ -253,6 +254,7 @@ func TestRelease_HarnessUnavailable(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+	connectControllerForTest(t, srv, store, "run-harn", "lease-harn")
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())
@@ -345,6 +347,7 @@ func TestRelease_ClientDisconnectDoesNotCancelWorker(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+	connectControllerForTest(t, srv, store, "run-disc", "lease-disc")
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())

@@ -29,6 +29,15 @@ type SSEEvent struct {
 	Data  string `json:"data"`
 }
 
+// attachmentState identifies an in-instance controller attachment by run,
+// generation, episode, and owning service instance (AC-004 §7).
+type attachmentState struct {
+	runID        string
+	generation   uint64
+	attachmentID string
+	instanceID   string
+}
+
 // Coordinator manages the release admission gate, live worker accounting,
 // service-owned execution lifetimes, and SSE event fanout.
 //
@@ -57,6 +66,7 @@ type Coordinator struct {
 	blockerEpoch     uint64
 	activeTurns      map[adapter.TurnRef]context.CancelFunc
 	subscribers      map[adapter.TurnRef][]chan SSEEvent
+	attachments      map[string]attachmentState
 }
 
 // NewCoordinator initializes a new coordinator in the running state.
@@ -68,6 +78,7 @@ func NewCoordinator() *Coordinator {
 		cancel:      cancel,
 		activeTurns: make(map[adapter.TurnRef]context.CancelFunc),
 		subscribers: make(map[adapter.TurnRef][]chan SSEEvent),
+		attachments: make(map[string]attachmentState),
 	}
 }
 
@@ -427,6 +438,38 @@ func (c *Coordinator) CloseAllSubscribers() {
 		}
 	}
 	c.subscribers = make(map[adapter.TurnRef][]chan SSEEvent)
+}
+
+// MarkControllerAttached publishes an in-instance attachment record for a
+// run and generation. It is set only from validated connect transitions in
+// this instance: a persisted connected flag, or a replayed old connect
+// operation, never establishes a live attachment on a fresh instance.
+func (c *Coordinator) MarkControllerAttached(runID string, generation uint64, attachmentID, instanceID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.attachments[runID] = attachmentState{
+		runID:        runID,
+		generation:   generation,
+		attachmentID: attachmentID,
+		instanceID:   instanceID,
+	}
+}
+
+// ControllerAttached reports whether the given generation of a run's
+// controller attached in this service instance.
+func (c *Coordinator) ControllerAttached(runID string, generation uint64) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	att, ok := c.attachments[runID]
+	return ok && att.generation == generation && att.instanceID != ""
+}
+
+// InvalidateControllerAttachment clears the in-instance attachment record
+// (used when authority transitions arrive through this instance).
+func (c *Coordinator) InvalidateControllerAttachment(runID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.attachments, runID)
 }
 
 // WaitTasks blocks until every admitted unit of work (workers, accepted

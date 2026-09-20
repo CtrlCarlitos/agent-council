@@ -170,6 +170,22 @@ func (c *Client) StopService(ctx context.Context, instanceID string, drain bool)
 	return &resp, nil
 }
 
+// ConnectRunController attaches the run's current controller to this
+// service instance, establishing a new attachment episode.
+func (c *Client) ConnectRunController(ctx context.Context, runID, opID, controllerLease string, expectedGeneration uint64) (*service.ControllerConnectRunResponse, error) {
+	req := service.ControllerConnectRunRequest{
+		OpID:               opID,
+		ControllerLease:    controllerLease,
+		ExpectedGeneration: expectedGeneration,
+	}
+	var resp service.ControllerConnectRunResponse
+	path := fmt.Sprintf("/v1/runs/%s/controller/connect", runID)
+	if err := c.do(ctx, http.MethodPost, path, req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // ReleaseTurn calls POST /v1/runs/run-1-style release for a session turn.
 // The session and turn identify the target; runID correlates the session.
 func (c *Client) ReleaseTurn(ctx context.Context, runID, sessionID, turnKey, opID, controllerLease string, expectedVersion int64) (*service.ReleaseResponse, error) {

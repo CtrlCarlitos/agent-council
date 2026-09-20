@@ -44,6 +44,7 @@ func TestShutdown_IdleAndDrainingContracts(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())
@@ -131,6 +132,7 @@ func TestShutdown_BusyRejectionWithoutDrain(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())
@@ -215,6 +217,7 @@ func TestShutdown_DrainingWaitsForWorkerCompletion(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+	connectControllerForTest(t, srv, store, "run-1", "lease-1")
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())
@@ -297,6 +300,7 @@ func TestShutdown_ForcedTeardownOnDeadline(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+
 	defer srv.Close()
 
 	// Register a worker that hangs until cancelled

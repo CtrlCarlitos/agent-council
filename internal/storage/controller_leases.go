@@ -309,10 +309,15 @@ func (s *Store) HandoffController(ctx context.Context, opID, runID, currentLease
 		return ControllerGrantReceipt{}, ErrGenerationMismatch
 	}
 
-	// The old generation is retired by the new installation.
+	// The old generation is retired by the new installation; its
+	// attachment is invalidated and session projections updated
+	// transactionally (the new controller never inherits connected flags).
 	if _, err := tx.Tx().ExecContext(ctx, `UPDATE controller_leases SET status = 'superseded', connected = 0, attachment_id = NULL, updated_at = ?
 		WHERE run_id = ? AND status = 'active';`, time.Now().UTC().Format(time.RFC3339Nano), runID); err != nil {
 		return ControllerGrantReceipt{}, fmt.Errorf("supersede previous grant: %w", err)
+	}
+	if err := projectSessionConnection(ctx, tx.Tx(), runID, "disconnected"); err != nil {
+		return ControllerGrantReceipt{}, err
 	}
 
 	return s.installGrant(ctx, tx.Tx(), opID, runID, harness, controllerRef, newLeaseCandidate, "handoff_controller", fingerprint, "controller_handed_off")
@@ -380,6 +385,11 @@ func (s *Store) RevokeController(ctx context.Context, opID, runID, controllerLea
 	if _, err := tx.Tx().ExecContext(ctx, `UPDATE controller_leases SET status = 'revoked', connected = 0, attachment_id = NULL, updated_at = ?
 		WHERE run_id = ? AND generation = ?;`, now, runID, targetGen); err != nil {
 		return OperationReceipt{}, fmt.Errorf("revoke grant: %w", err)
+	}
+	// The revoked controller's attachment is invalidated and session
+	// projections updated transactionally.
+	if err := projectSessionConnection(ctx, tx.Tx(), runID, "disconnected"); err != nil {
+		return OperationReceipt{}, err
 	}
 	if _, err := tx.Tx().ExecContext(ctx, `UPDATE runs SET controller_lease = '', updated_at = ? WHERE run_id = ?;`, now, runID); err != nil {
 		return OperationReceipt{}, fmt.Errorf("clear run lease: %w", err)
@@ -555,6 +565,13 @@ func (s *Store) installGrant(ctx context.Context, tx *sql.Tx, opID, runID, harne
 		return ControllerGrantReceipt{}, err
 	}
 	return receipt, nil
+}
+
+// ValidateRunControllerLease classifies a presented credential directly
+// against a run (controller class).
+func (s *Store) ValidateRunControllerLease(ctx context.Context, runID, callerLease string) error {
+	_, err := classifyCredential(ctx, s.readDB, runID, callerLease, true)
+	return err
 }
 
 // GetControllerRecord returns the redacted run-scoped controller record.
