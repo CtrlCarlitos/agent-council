@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/CtrlCarlitos/agent-council/internal/client"
@@ -55,6 +56,7 @@ func runServiceCmd(args []string) error {
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return fmt.Errorf("mkdir state-dir: %w", err)
 	}
+	_ = os.Chmod(stateDir, 0700)
 
 	lock, err := service.AcquireServiceLock(stateDir)
 	if err != nil {
@@ -126,6 +128,10 @@ func startServiceCmd(args []string) error {
 }
 
 func statusServiceCmd(args []string) error {
+	if runtime.GOOS == "windows" {
+		return fmt.Errorf("council service status is unsupported on windows: %w", service.ErrUnsupportedPlatform)
+	}
+
 	fs := flag.NewFlagSet("service status", flag.ContinueOnError)
 	stateDirFlag := fs.String("state-dir", defaultStateDir(), "path to state directory")
 	if err := fs.Parse(args); err != nil {
@@ -160,6 +166,10 @@ func statusServiceCmd(args []string) error {
 }
 
 func stopServiceCmd(args []string) error {
+	if runtime.GOOS == "windows" {
+		return fmt.Errorf("council service stop is unsupported on windows: %w", service.ErrUnsupportedPlatform)
+	}
+
 	fs := flag.NewFlagSet("service stop", flag.ContinueOnError)
 	stateDirFlag := fs.String("state-dir", defaultStateDir(), "path to state directory")
 	drainFlag := fs.Bool("drain", false, "drain active turns before stopping")

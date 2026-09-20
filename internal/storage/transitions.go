@@ -1499,3 +1499,66 @@ VALUES (?, ?, ?, ?, ?, ?, ?);`, opID, runID, artifactID, revision, digest, sanit
 	}
 	return receipt, nil
 }
+
+// ValidateSessionRun checks whether the given session belongs to the specified run.
+func (s *Store) ValidateSessionRun(ctx context.Context, sessionID, runID string) error {
+	var actualRunID string
+	err := s.readDB.QueryRowContext(ctx, "SELECT run_id FROM sessions WHERE session_id = ?;", sessionID).Scan(&actualRunID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrSessionNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("validate session run: %w", err)
+	}
+	if actualRunID != runID {
+		return ErrRunSessionMismatch
+	}
+	return nil
+}
+
+// GetDiagnosticCounts computes active runs, reserved turns, unresolved turns, and recovery blockers.
+func (s *Store) GetDiagnosticCounts(ctx context.Context, liveWorkerKeys map[string]bool) (DiagnosticCounts, error) {
+	var counts DiagnosticCounts
+	counts.ActiveRuns = make([]string, 0)
+
+	// 1. Active runs
+	rows, err := s.readDB.QueryContext(ctx, `SELECT run_id FROM runs WHERE lifecycle = 'active';`)
+	if err != nil {
+		return counts, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var runID string
+		if err := rows.Scan(&runID); err == nil {
+			counts.ActiveRuns = append(counts.ActiveRuns, runID)
+		}
+	}
+
+	// 2. Reserved and Unresolved turns
+	turnRows, err := s.readDB.QueryContext(ctx, `SELECT session_id, turn_key, status FROM turns WHERE status = 'running';`)
+	if err != nil {
+		return counts, err
+	}
+	defer turnRows.Close()
+	for turnRows.Next() {
+		var sID, tKey, status string
+		if err := turnRows.Scan(&sID, &tKey, &status); err == nil {
+			counts.ReservedTurns++
+			mapKey := fmt.Sprintf("%s:%s", sID, tKey)
+			if liveWorkerKeys == nil || !liveWorkerKeys[mapKey] {
+				counts.UnresolvedTurns++
+			}
+		}
+	}
+
+	// 3. Recovery Blockers = Unresolved turns + sessions with visibility = 'host_lost'
+	var hostLostSessions int
+	err = s.readDB.QueryRowContext(ctx, `SELECT count(*) FROM sessions WHERE visibility = 'host_lost';`).Scan(&hostLostSessions)
+	if err == nil {
+		counts.RecoveryBlockers = counts.UnresolvedTurns + hostLostSessions
+	} else {
+		counts.RecoveryBlockers = counts.UnresolvedTurns
+	}
+
+	return counts, nil
+}

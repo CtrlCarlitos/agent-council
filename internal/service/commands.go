@@ -123,8 +123,17 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req CancelRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeStrictJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error(), "")
+		return
+	}
+
+	if err := s.store.ValidateSessionRun(r.Context(), sessionID, runID); err != nil {
+		if errors.Is(err, storage.ErrSessionNotFound) || errors.Is(err, storage.ErrRunSessionMismatch) {
+			writeError(w, http.StatusNotFound, "session_not_found", err.Error(), req.OpID)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), req.OpID)
 		return
 	}
 
@@ -201,8 +210,17 @@ func (s *Server) handleControllerConnect(w http.ResponseWriter, r *http.Request)
 	}
 
 	var req ControllerConnectRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeStrictJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error(), "")
+		return
+	}
+
+	if err := s.store.ValidateSessionRun(r.Context(), sessionID, runID); err != nil {
+		if errors.Is(err, storage.ErrSessionNotFound) || errors.Is(err, storage.ErrRunSessionMismatch) {
+			writeError(w, http.StatusNotFound, "session_not_found", err.Error(), req.OpID)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), req.OpID)
 		return
 	}
 
@@ -245,8 +263,17 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req ReconcileRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeStrictJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error(), "")
+		return
+	}
+
+	if err := s.store.ValidateSessionRun(r.Context(), sessionID, runID); err != nil {
+		if errors.Is(err, storage.ErrSessionNotFound) || errors.Is(err, storage.ErrRunSessionMismatch) {
+			writeError(w, http.StatusNotFound, "session_not_found", err.Error(), req.OpID)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), req.OpID)
 		return
 	}
 
@@ -380,8 +407,17 @@ func (s *Server) handleQueuePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req QueuePromptRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeStrictJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error(), "")
+		return
+	}
+
+	if err := s.store.ValidateSessionRun(r.Context(), sessionID, runID); err != nil {
+		if errors.Is(err, storage.ErrSessionNotFound) || errors.Is(err, storage.ErrRunSessionMismatch) {
+			writeError(w, http.StatusNotFound, "session_not_found", err.Error(), req.OpID)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), req.OpID)
 		return
 	}
 
@@ -423,8 +459,17 @@ func (s *Server) handleReplacePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req ReplacePromptRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeStrictJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error(), "")
+		return
+	}
+
+	if err := s.store.ValidateSessionRun(r.Context(), sessionID, runID); err != nil {
+		if errors.Is(err, storage.ErrSessionNotFound) || errors.Is(err, storage.ErrRunSessionMismatch) {
+			writeError(w, http.StatusNotFound, "session_not_found", err.Error(), req.OpID)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), req.OpID)
 		return
 	}
 
@@ -466,8 +511,17 @@ func (s *Server) handleDiscardPrompt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req DiscardPromptRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeStrictJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error(), "")
+		return
+	}
+
+	if err := s.store.ValidateSessionRun(r.Context(), sessionID, runID); err != nil {
+		if errors.Is(err, storage.ErrSessionNotFound) || errors.Is(err, storage.ErrRunSessionMismatch) {
+			writeError(w, http.StatusNotFound, "session_not_found", err.Error(), req.OpID)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), req.OpID)
 		return
 	}
 
@@ -502,7 +556,7 @@ func (s *Server) handleRecordDecision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req RecordDecisionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeStrictJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error(), "")
 		return
 	}

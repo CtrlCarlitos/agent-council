@@ -26,7 +26,7 @@ type StopResponse struct {
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	var req StopRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeStrictJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error(), "")
 		return
 	}
@@ -38,12 +38,16 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !req.Drain {
-		if !s.coordinator.IsShutdownEligible() {
+		liveMap := s.coordinator.LiveWorkerKeys()
+		if counts, err := s.store.GetDiagnosticCounts(r.Context(), liveMap); err == nil {
+			s.coordinator.SetRecoveryBlockers(counts.RecoveryBlockers)
+		}
+
+		if !s.coordinator.TryStopIdle() {
 			writeError(w, http.StatusConflict, "service_busy", "service has active executions or pending operations", "")
 			return
 		}
 
-		s.coordinator.SetState(ServiceStateStopping)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Connection", "close")
 		w.WriteHeader(http.StatusAccepted)
@@ -132,7 +136,9 @@ func (s *Server) Teardown(timeout time.Duration) error {
 	select {
 	case <-workerDone:
 	case <-ctx.Done():
-		s.coordinator.Close()
+		s.coordinator.CancelAll()
+		_ = s.lock.CleanupDiscovery()
+		return ctx.Err()
 	}
 
 	// 5. Close storage store
@@ -149,22 +155,21 @@ func (s *Server) Teardown(timeout time.Duration) error {
 
 // StartSignalHandler installs OS signal listeners for SIGINT and SIGTERM.
 func (s *Server) StartSignalHandler() {
-	sigCh := make(chan os.Signal, 1)
+	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
+		defer signal.Stop(sigCh)
 		select {
 		case <-s.shutdown:
-			signal.Stop(sigCh)
 			return
 		case <-sigCh:
-			signal.Stop(sigCh)
-			s.handleSignalGrace()
+			s.handleSignalGrace(sigCh)
 		}
 	}()
 }
 
-func (s *Server) handleSignalGrace() {
+func (s *Server) handleSignalGrace(sigCh <-chan os.Signal) {
 	s.coordinator.SetState(ServiceStateDraining)
 
 	graceTimer := time.NewTimer(15 * time.Second)
@@ -175,7 +180,14 @@ func (s *Server) handleSignalGrace() {
 
 	for {
 		select {
+		case <-sigCh:
+			// Repeated signals retain original deadline; ignore
+			continue
 		case <-ticker.C:
+			liveMap := s.coordinator.LiveWorkerKeys()
+			if counts, err := s.store.GetDiagnosticCounts(context.Background(), liveMap); err == nil {
+				s.coordinator.SetRecoveryBlockers(counts.RecoveryBlockers)
+			}
 			if s.coordinator.IsShutdownEligible() {
 				_ = s.Teardown(5 * time.Second)
 				return

@@ -27,6 +27,8 @@ var (
 	ErrTurnAlreadyExists          = errors.New("turn identifier already exists")
 	ErrSymlinkForbidden           = errors.New("symlink state directory not permitted")
 	ErrConflictingTerminalOutcome = errors.New("conflicting terminal outcome on already-terminal turn")
+	ErrSessionNotFound            = errors.New("session not found")
+	ErrRunSessionMismatch         = errors.New("session does not belong to run")
 )
 
 type QueryRower interface {
@@ -75,4 +77,11 @@ const (
 type ReleaseResult struct {
 	Receipt     ReleaseReceipt
 	Disposition ReleaseDisposition
+}
+
+type DiagnosticCounts struct {
+	ActiveRuns       []string
+	ReservedTurns    int
+	UnresolvedTurns  int
+	RecoveryBlockers int
 }

@@ -2,8 +2,11 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
+
+	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
 func (s *Server) handleGetTurn(w http.ResponseWriter, r *http.Request) {
@@ -13,6 +16,15 @@ func (s *Server) handleGetTurn(w http.ResponseWriter, r *http.Request) {
 
 	if runID == "" || sessionID == "" || turnKey == "" {
 		writeError(w, http.StatusBadRequest, "invalid_path", "run_id, session_id, and turn_key are required", "")
+		return
+	}
+
+	if err := s.store.ValidateSessionRun(r.Context(), sessionID, runID); err != nil {
+		if errors.Is(err, storage.ErrSessionNotFound) || errors.Is(err, storage.ErrRunSessionMismatch) {
+			writeError(w, http.StatusNotFound, "session_not_found", err.Error(), "")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), "")
 		return
 	}
 

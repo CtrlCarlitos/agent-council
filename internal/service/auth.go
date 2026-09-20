@@ -1,6 +1,7 @@
 package service
 
 import (
+	"crypto/subtle"
 	"net/http"
 	"strings"
 )
@@ -15,7 +16,7 @@ func authMiddleware(token string, next http.Handler) http.Handler {
 		}
 
 		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || parts[0] != "Bearer" || parts[1] != token {
+		if len(parts) != 2 || parts[0] != "Bearer" || subtle.ConstantTimeCompare([]byte(parts[1]), []byte(token)) != 1 {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeError(w, http.StatusUnauthorized, "unauthorized", "invalid authorization token", "")
 			return

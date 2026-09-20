@@ -206,6 +206,33 @@ func TestAcceptance_CrashRecovery_WithoutAccessibleNativeEvidence(t *testing.T) 
 	if fakeAdp2.DispatchCount("sess-1") != 0 {
 		t.Fatalf("turn must not be automatically redispatched upon restart")
 	}
+
+	// Verify /v1/status reports live_workers: 0, reserved_turns: 1, unresolved_turns: 1
+	statusReq, _ := http.NewRequestWithContext(ctx, "GET", "http://localhost/v1/status", nil)
+	statusReq.Header.Set("Authorization", "Bearer "+cfg2.AuthToken)
+	statusResp, err := client2.Do(statusReq)
+	if err != nil || statusResp.StatusCode != http.StatusOK {
+		t.Fatalf("status request failed: %v", err)
+	}
+	defer statusResp.Body.Close()
+	var stResp StatusResponse
+	if err := json.NewDecoder(statusResp.Body).Decode(&stResp); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if stResp.LiveWorkers != 0 || stResp.ReservedTurns != 1 || stResp.UnresolvedTurns != 1 {
+		t.Fatalf("expected live_workers=0, reserved_turns=1, unresolved_turns=1, got %+v", stResp)
+	}
+
+	// Verify idle stop (drain=false) is rejected with 409 service_busy due to recoveryBlockers
+	stopReq, _ := http.NewRequestWithContext(ctx, "POST", "http://localhost/v1/service/stop", strings.NewReader(`{"drain":false}`))
+	stopReq.Header.Set("Authorization", "Bearer "+cfg2.AuthToken)
+	stopReq.Header.Set("Content-Type", "application/json")
+	stopResp, err := client2.Do(stopReq)
+	if err != nil || stopResp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on idle stop with unresolved recovery blockers, got %v", stopResp.StatusCode)
+	}
+	stopResp.Body.Close()
+
 	_ = relResult
 }
 

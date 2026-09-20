@@ -69,6 +69,7 @@ func startDetachedService(stateDir string) error {
 			}
 			ready, err := c.GetReadiness(ctx)
 			if err == nil && ready.Status == "ready" {
+				_ = cmd.Process.Release()
 				return nil
 			}
 		}

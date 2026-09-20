@@ -155,8 +155,17 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("listen unix %s: %w", s.socketPath, err)
 	}
+	_ = os.Chmod(s.socketPath, 0600)
 	s.listener = l
 	s.running = true
+
+	// Initial diagnostic sync and recovery blocker tracking
+	if s.store != nil {
+		liveMap := s.coordinator.LiveWorkerKeys()
+		if counts, err := s.store.GetDiagnosticCounts(context.Background(), liveMap); err == nil {
+			s.coordinator.SetRecoveryBlockers(counts.RecoveryBlockers)
+		}
+	}
 
 	go func() {
 		_ = s.httpServer.Serve(l)
@@ -180,22 +189,33 @@ func (s *Server) WaitForShutdown(ctx context.Context) error {
 }
 
 func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
-	if s.coordinator.State() == ServiceStateStopping {
-		writeError(w, http.StatusServiceUnavailable, "service_stopping", "service is stopping", "")
+	if s.coordinator.IsDrainingOrStopping() {
+		code := "service_draining"
+		if s.coordinator.State() == ServiceStateStopping {
+			code = "service_stopping"
+		}
+		writeError(w, http.StatusServiceUnavailable, code, "service is not ready to accept new work", "")
 		return
 	}
-	statusStr := "ready"
-	if s.coordinator.State() == ServiceStateDraining {
-		statusStr = "draining"
+
+	var reservedTurns, unresolvedTurns int
+	if s.store != nil {
+		liveMap := s.coordinator.LiveWorkerKeys()
+		if counts, err := s.store.GetDiagnosticCounts(r.Context(), liveMap); err == nil {
+			s.coordinator.SetRecoveryBlockers(counts.RecoveryBlockers)
+			reservedTurns = counts.ReservedTurns
+			unresolvedTurns = counts.UnresolvedTurns
+		}
 	}
+
 	resp := ReadinessResponse{
-		Status:          statusStr,
+		Status:          "ready",
 		InstanceID:      s.cfg.InstanceID,
 		ProtocolVersion: 1,
 		StateDir:        s.cfg.StateDir,
 		LiveWorkers:     s.coordinator.LiveWorkers(),
-		ReservedTurns:   0,
-		UnresolvedTurns: 0,
+		ReservedTurns:   reservedTurns,
+		UnresolvedTurns: unresolvedTurns,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -208,16 +228,29 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	} else if s.coordinator.State() == ServiceStateStopping {
 		statusStr = "stopping"
 	}
+
+	var reservedTurns, unresolvedTurns int
+	activeRuns := []string{}
+	if s.store != nil {
+		liveMap := s.coordinator.LiveWorkerKeys()
+		if counts, err := s.store.GetDiagnosticCounts(r.Context(), liveMap); err == nil {
+			s.coordinator.SetRecoveryBlockers(counts.RecoveryBlockers)
+			reservedTurns = counts.ReservedTurns
+			unresolvedTurns = counts.UnresolvedTurns
+			activeRuns = counts.ActiveRuns
+		}
+	}
+
 	resp := StatusResponse{
 		InstanceID:      s.cfg.InstanceID,
 		PID:             os.Getpid(),
 		Status:          statusStr,
 		StateDir:        s.cfg.StateDir,
 		StartedAt:       s.startedAt,
-		ActiveRuns:      []string{},
+		ActiveRuns:      activeRuns,
 		LiveWorkers:     s.coordinator.LiveWorkers(),
-		ReservedTurns:   0,
-		UnresolvedTurns: 0,
+		ReservedTurns:   reservedTurns,
+		UnresolvedTurns: unresolvedTurns,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)

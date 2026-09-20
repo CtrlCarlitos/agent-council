@@ -251,7 +251,7 @@ func TestEvents_SlowConsumerOverflow(t *testing.T) {
 	ch, unsub := coord.RegisterSubscriber("t-overflow")
 	defer unsub()
 
-	// Capacity is 64. Send 100 events.
+	// Capacity is 64. Send 100 events to trigger slow consumer disconnection.
 	for i := 0; i < 100; i++ {
 		coord.BroadcastEvent("t-overflow", SSEEvent{
 			Event: "progress",
@@ -259,15 +259,25 @@ func TestEvents_SlowConsumerOverflow(t *testing.T) {
 		})
 	}
 
-	// Channel buffer should be full (64 items) without deadlock
+	// Channel buffer should have 64 items and then be closed
 	if len(ch) != 64 {
 		t.Fatalf("expected buffer length 64, got %d", len(ch))
 	}
 
-	// Read one event to verify it works
-	ev := <-ch
-	if ev.Event != "progress" {
-		t.Fatalf("expected event progress, got %s", ev.Event)
+	// Subscriber should be unregistered from coordinator
+	if count := coord.SubscriberCount("t-overflow"); count != 0 {
+		t.Fatalf("expected 0 subscribers after overflow disconnection, got %d", count)
+	}
+
+	// Drain 64 items
+	for i := 0; i < 64; i++ {
+		<-ch
+	}
+
+	// Next read should immediately see channel closed
+	_, ok := <-ch
+	if ok {
+		t.Fatalf("expected subscriber channel to be closed on overflow")
 	}
 }
 

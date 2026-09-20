@@ -2,6 +2,8 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 )
 
@@ -25,4 +27,18 @@ func writeError(w http.ResponseWriter, status int, code, message, opID string) {
 			OpID:    opID,
 		},
 	})
+}
+
+func decodeStrictJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return errors.New("unexpected extra data after JSON payload")
+	}
+	return nil
 }

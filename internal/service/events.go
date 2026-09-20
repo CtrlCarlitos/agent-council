@@ -2,11 +2,14 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/CtrlCarlitos/agent-council/internal/council"
+	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -16,6 +19,15 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	if runID == "" || sessionID == "" || turnKey == "" {
 		writeError(w, http.StatusBadRequest, "invalid_path", "run_id, session_id, and turn_key are required", "")
+		return
+	}
+
+	if err := s.store.ValidateSessionRun(r.Context(), sessionID, runID); err != nil {
+		if errors.Is(err, storage.ErrSessionNotFound) || errors.Is(err, storage.ErrRunSessionMismatch) {
+			writeError(w, http.StatusNotFound, "session_not_found", err.Error(), "")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), "")
 		return
 	}
 
@@ -47,6 +59,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Now().Add(5 * time.Second))
+
 	// Emit initial state snapshot event
 	snapBytes, _ := json.Marshal(map[string]any{
 		"session_id": sessionID,
@@ -65,6 +80,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			"status":     details.Status,
 			"result":     details.Result,
 		})
+		_ = rc.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		fmt.Fprintf(w, "event: terminal\ndata: %s\n\n", string(termBytes))
 		flusher.Flush()
 		return
@@ -81,6 +97,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
+			_ = rc.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Event, ev.Data)
 			flusher.Flush()
 			if ev.Event == "terminal" {

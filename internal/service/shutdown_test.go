@@ -333,3 +333,37 @@ func TestShutdown_ForcedTeardownOnDeadline(t *testing.T) {
 		t.Fatal("service.lock must remain on disk after forced teardown")
 	}
 }
+
+func TestShutdown_TeardownReturnsWithinDeadlineEvenIfWorkerNeverCallsDone(t *testing.T) {
+	dir := t.TempDir()
+	lock, _ := AcquireServiceLock(dir)
+	defer lock.Release()
+	store, _ := storage.Open(storage.StoreOptions{StateDir: dir})
+	defer store.Close()
+
+	srv, _ := NewServer(store, lock, ServerConfig{
+		StateDir:   dir,
+		InstanceID: "inst-hung-worker",
+		AuthToken:  "token-hung",
+	})
+	_ = srv.Start()
+	defer srv.Close()
+
+	// Register a worker that NEVER calls workerDone (hung worker / uncooperative process)
+	_, _, err := srv.Coordinator().RegisterWorker(adapter.TurnRef{SessionID: "sess-1", TurnKey: "t-hung-forever"})
+	if err != nil {
+		t.Fatalf("register worker: %v", err)
+	}
+
+	start := time.Now()
+	// Teardown with 50ms deadline
+	err = srv.Teardown(50 * time.Millisecond)
+	elapsed := time.Since(start)
+
+	if elapsed > 1*time.Second {
+		t.Fatalf("teardown blocked waiting on hung worker: elapsed %v", elapsed)
+	}
+	if err == nil {
+		t.Fatalf("expected context deadline error, got nil")
+	}
+}

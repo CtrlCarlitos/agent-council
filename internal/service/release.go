@@ -39,8 +39,17 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req ReleaseRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeStrictJSON(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error(), "")
+		return
+	}
+
+	if err := s.store.ValidateSessionRun(r.Context(), sessionID, runID); err != nil {
+		if errors.Is(err, storage.ErrSessionNotFound) || errors.Is(err, storage.ErrRunSessionMismatch) {
+			writeError(w, http.StatusNotFound, "session_not_found", err.Error(), req.OpID)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), req.OpID)
 		return
 	}
 
@@ -92,10 +101,12 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 
 	// 2. Admission Coordination & Pre-flight Availability Check (New Releases Only):
 	// Under admission lock, if the service is draining or stopping, reject.
-	if s.coordinator.IsDrainingOrStopping() {
+	doneAdmission, err := s.coordinator.AdmitRelease()
+	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "service_draining", "service is draining new work", req.OpID)
 		return
 	}
+	defer doneAdmission()
 
 	// Verify required harness adapter is available.
 	if s.adapter == nil {
@@ -138,13 +149,11 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ReleaseDispositionNew: register worker under detached coordinator context
-	doneHandoff := s.coordinator.TrackHandoff()
 	ref := adapter.TurnRef{
 		SessionID: adapter.SessionID(sessionID),
 		TurnKey:   turnKey,
 	}
 	workerCtx, done, err := s.coordinator.RegisterWorker(ref)
-	doneHandoff()
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "service_stopping", err.Error(), req.OpID)
 		return

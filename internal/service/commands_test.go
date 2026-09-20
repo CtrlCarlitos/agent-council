@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/adaptertest"
@@ -397,5 +399,95 @@ func TestCommands_CompositeReconciliation(t *testing.T) {
 	}
 	if retryResp.Receipt.CommittedVersion != recResp.Receipt.CommittedVersion {
 		t.Fatalf("expected identical committed version on replay: got %d vs %d", retryResp.Receipt.CommittedVersion, recResp.Receipt.CommittedVersion)
+	}
+}
+
+func TestCommands_StrictJSONRejectsExtraFields(t *testing.T) {
+	dir := t.TempDir()
+	lock, _ := AcquireServiceLock(dir)
+	defer lock.Release()
+	store, _ := storage.Open(storage.StoreOptions{StateDir: dir})
+	defer store.Close()
+
+	ctx := context.Background()
+	_, _ = store.CreateRun(ctx, "op-run-strict", "run-strict-1", "brief", "spec", "profile", "lease-strict")
+	sessRec, _ := store.CreateSession(ctx, "op-sess-strict", "lease-strict", storage.SessionRecord{
+		ID:                  "sess-strict-1",
+		RunID:               "run-strict-1",
+		Contributor:         "claude",
+		Role:                "reviewer",
+		IsActiveContributor: true,
+		State:               "parked",
+		Visibility:          "reachable",
+	})
+
+	srv, _ := NewServer(store, lock, ServerConfig{
+		StateDir:   dir,
+		InstanceID: "inst-strict-test",
+		AuthToken:  "token-strict",
+	})
+	_ = srv.Start()
+	defer srv.Close()
+
+	client := newTestClient(srv.SocketPath())
+
+	// Sending extra unknown field "unknown_extra_field"
+	badBody := fmt.Sprintf(`{"op_id":"op-q-strict","controller_lease":"lease-strict","expected_version":%d,"turn_key":"t-1","prompt":"hello","unknown_extra_field":123}`, sessRec.CommittedVersion)
+	req, _ := http.NewRequestWithContext(ctx, "POST", "http://localhost/v1/runs/run-strict-1/sessions/sess-strict-1/prompts/queue", strings.NewReader(badBody))
+	req.Header.Set("Authorization", "Bearer token-strict")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for extra JSON fields, got %d", resp.StatusCode)
+	}
+}
+
+func TestCommands_RunSessionCorrelation(t *testing.T) {
+	dir := t.TempDir()
+	lock, _ := AcquireServiceLock(dir)
+	defer lock.Release()
+	store, _ := storage.Open(storage.StoreOptions{StateDir: dir})
+	defer store.Close()
+
+	ctx := context.Background()
+	_, _ = store.CreateRun(ctx, "op-run-corr", "run-corr-1", "brief", "spec", "profile", "lease-corr")
+	sessRec, _ := store.CreateSession(ctx, "op-sess-corr", "lease-corr", storage.SessionRecord{
+		ID:                  "sess-corr-1",
+		RunID:               "run-corr-1",
+		Contributor:         "claude",
+		Role:                "reviewer",
+		IsActiveContributor: true,
+		State:               "parked",
+		Visibility:          "reachable",
+	})
+
+	srv, _ := NewServer(store, lock, ServerConfig{
+		StateDir:   dir,
+		InstanceID: "inst-corr-test",
+		AuthToken:  "token-corr",
+	})
+	_ = srv.Start()
+	defer srv.Close()
+
+	client := newTestClient(srv.SocketPath())
+
+	// Send request with mismatched run ID "wrong-run-id"
+	body := fmt.Sprintf(`{"op_id":"op-q-corr","controller_lease":"lease-corr","expected_version":%d,"turn_key":"t-1","prompt":"hello"}`, sessRec.CommittedVersion)
+	req, _ := http.NewRequestWithContext(ctx, "POST", "http://localhost/v1/runs/wrong-run-id/sessions/sess-corr-1/prompts/queue", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer token-corr")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found for mismatched run ID, got %d", resp.StatusCode)
 	}
 }

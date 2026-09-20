@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
@@ -218,6 +219,55 @@ func (c *Coordinator) IsShutdownEligible() bool {
 		c.recoveryBlockers == 0
 }
 
+// TryStopIdle checks if all five shutdown counters are zero under lock and transitions
+// the coordinator to ServiceStateStopping atomically.
+func (c *Coordinator) TryStopIdle() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state != ServiceStateRunning {
+		return false
+	}
+	if c.pendingHandoffs == 0 &&
+		c.liveWorkers == 0 &&
+		c.pendingCommits == 0 &&
+		c.inFlightControl == 0 &&
+		c.recoveryBlockers == 0 {
+		c.state = ServiceStateStopping
+		return true
+	}
+	return false
+}
+
+// AdmitRelease admits a new release operation, incrementing pendingHandoffs under lock.
+func (c *Coordinator) AdmitRelease() (func(), error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state == ServiceStateDraining || c.state == ServiceStateStopping {
+		return nil, ErrServiceStopping
+	}
+	c.pendingHandoffs++
+	var once sync.Once
+	done := func() {
+		once.Do(func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.pendingHandoffs--
+		})
+	}
+	return done, nil
+}
+
+// LiveWorkerKeys returns a set of "session_id:turn_key" strings for all currently tracked live workers.
+func (c *Coordinator) LiveWorkerKeys() map[string]bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make(map[string]bool, len(c.activeTurns))
+	for ref := range c.activeTurns {
+		keys[fmt.Sprintf("%s:%s", ref.SessionID, ref.TurnKey)] = true
+	}
+	return keys
+}
+
 // RegisterSubscriber registers an event channel for a specific turn.
 func (c *Coordinator) RegisterSubscriber(turnKey string) (chan SSEEvent, func()) {
 	c.mu.Lock()
@@ -266,16 +316,30 @@ func (c *Coordinator) TotalSubscriberCount() int {
 }
 
 // BroadcastEvent sends an event to all subscribers registered for the turn.
+// Slow observers that fail to consume within buffer capacity are disconnected.
 func (c *Coordinator) BroadcastEvent(turnKey string, ev SSEEvent) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	for _, ch := range c.subscribers[turnKey] {
+	subs := c.subscribers[turnKey]
+	if len(subs) == 0 {
+		return
+	}
+
+	remaining := make([]chan SSEEvent, 0, len(subs))
+	for _, ch := range subs {
 		select {
 		case ch <- ev:
+			remaining = append(remaining, ch)
 		default:
-			// slow consumer overflow: drop event to avoid blocking coordinator/workers
+			// slow consumer overflow: disconnect observer
+			close(ch)
 		}
+	}
+	if len(remaining) == 0 {
+		delete(c.subscribers, turnKey)
+	} else {
+		c.subscribers[turnKey] = remaining
 	}
 }
 
@@ -297,10 +361,11 @@ func (c *Coordinator) WaitWorkers() {
 	c.workers.Wait()
 }
 
-// Close cancels all active worker contexts, closes observers, and joins workers.
-func (c *Coordinator) Close() {
+// CancelAll cancels all active worker contexts and closes observers without joining workers.
+func (c *Coordinator) CancelAll() {
 	c.cancel()
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	for _, cancel := range c.activeTurns {
 		cancel()
 	}
@@ -310,6 +375,10 @@ func (c *Coordinator) Close() {
 		}
 	}
 	c.subscribers = make(map[string][]chan SSEEvent)
-	c.mu.Unlock()
+}
+
+// Close cancels all active worker contexts, closes observers, and joins workers.
+func (c *Coordinator) Close() {
+	c.CancelAll()
 	c.workers.Wait()
 }
