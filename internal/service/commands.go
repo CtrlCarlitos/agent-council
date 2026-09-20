@@ -563,12 +563,17 @@ var ErrUnsupportedBindingConfig = errors.New("unsupported native-binding configu
 //
 // The persisted tooling configuration may be empty, a JSON array of tool
 // names, or a JSON object whose recognized session-config fields are
-// workspace_root, model, and tools/tooling (array of tool names). Profile
+// workspace_root, model, and exactly one of tools/tooling (an array of tool
+// names; both aliases present is ambiguous and rejected). Profile
 // references (a bare identifier or a string/map tooling value) and other
 // shapes cannot be expanded without a profile registry and are rejected
-// with ErrUnsupportedBindingConfig. Remaining stored object keys (policy
-// metadata such as read_only or env_allowlist) are not part of the adapter
-// session configuration.
+// with ErrUnsupportedBindingConfig.
+//
+// Resume reconstructs the supported adapter binding fields only. It does
+// not, by itself, establish enforcement of stored read_only,
+// env_allowlist, or other policy metadata: those keys are outside
+// adapter.SessionConfig and require an explicit enforcement owner when
+// native integrations use them.
 func sessionBindingFromStorage(nb storage.NativeBinding, contributor string) (adapter.SessionBinding, error) {
 	binding := adapter.SessionBinding{
 		SessionID:       adapter.SessionID(nb.LogicalSessionID),
@@ -600,9 +605,16 @@ func sessionBindingFromStorage(nb storage.NativeBinding, contributor string) (ad
 			}
 			binding.Config.Model = model
 		}
+		// Exactly one tooling representation per object: accepting both
+		// would let an unsupported profile reference or a conflicting
+		// list disappear behind the other alias.
 		toolsRaw, hasTools := obj["tools"]
-		if !hasTools {
-			toolsRaw, hasTools = obj["tooling"]
+		if _, hasTooling := obj["tooling"]; hasTooling {
+			if hasTools {
+				return adapter.SessionBinding{}, fmt.Errorf("%w: specify exactly one of tools or tooling", ErrUnsupportedBindingConfig)
+			}
+			toolsRaw = obj["tooling"]
+			hasTools = true
 		}
 		if hasTools {
 			tools, err := decodeToolList(toolsRaw)
