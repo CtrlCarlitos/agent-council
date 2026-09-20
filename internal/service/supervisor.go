@@ -56,6 +56,10 @@ func NewExecutionSupervisor(
 func (s *ExecutionSupervisor) Run(ctx context.Context) {
 	defer s.done()
 
+	if ctx.Err() != nil {
+		return
+	}
+
 	ref := adapter.TurnRef{
 		SessionID: adapter.SessionID(s.sessionID),
 		TurnKey:   s.turnKey,
@@ -63,6 +67,9 @@ func (s *ExecutionSupervisor) Run(ctx context.Context) {
 
 	prompt, err := s.store.GetTurnPrompt(ctx, s.sessionID, s.turnKey)
 	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		// If prompt cannot be retrieved from store, record failure outcome
 		_ = s.recordTerminalOutcomeWithRetry(ctx, council.TurnFailed, fmt.Sprintf("failed to read turn prompt: %v", err))
 		return
@@ -70,6 +77,9 @@ func (s *ExecutionSupervisor) Run(ctx context.Context) {
 
 	outcome, err := s.adapter.Dispatch(ctx, ref, prompt)
 	if err != nil || outcome.Status != adapter.DispatchAccepted {
+		if ctx.Err() != nil {
+			return
+		}
 		if outcome.Status == adapter.DispatchRejected {
 			reason := outcome.Reason
 			if reason == "" && err != nil {
@@ -84,7 +94,7 @@ func (s *ExecutionSupervisor) Run(ctx context.Context) {
 
 	// Dispatch accepted: record observation
 	obsOpID := fmt.Sprintf("op-obs-acc-%s", s.turnKey)
-	_, _ = s.store.RecordDispatchObservation(ctx, obsOpID, s.callerLease, s.sessionID, s.turnKey, "dispatch_accepted")
+	_, _ = s.store.RecordDispatchObservation(ctx, obsOpID, s.callerLease, s.sessionID, s.turnKey, "receipt_acknowledged")
 
 	// Observe stream until completion
 	stream, err := s.adapter.Observe(ctx, ref)
@@ -100,9 +110,18 @@ func (s *ExecutionSupervisor) Run(ctx context.Context) {
 		}
 	}
 
+	// If worker context was cancelled (grace expiry or forced exit),
+	// do not fabricate terminal failure; preserve unconfirmed outcome as unresolved.
+	if ctx.Err() != nil {
+		return
+	}
+
 	// Collect authoritative outcome
 	turnResult, err := s.adapter.Collect(ctx, ref)
 	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		_ = s.recordTerminalOutcomeWithRetry(ctx, council.TurnFailed, fmt.Sprintf("collect failed: %v", err))
 		return
 	}

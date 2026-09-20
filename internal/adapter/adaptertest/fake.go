@@ -75,6 +75,13 @@ func NewFakeAdapter(contributor council.Contributor) *FakeAdapter {
 	return f
 }
 
+// SetDefaultContributor sets the default contributor for auto-session binding.
+func (f *FakeAdapter) SetDefaultContributor(contributor council.Contributor) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.defaultContributor = contributor
+}
+
 // TurnState returns an independent snapshot of what the fake received, accepted, and started.
 func (f *FakeAdapter) TurnState(ref adapter.TurnRef) DispatchState {
 	f.mu.Lock()
@@ -105,6 +112,18 @@ func (f *FakeAdapter) ExecutionStatus(ref adapter.TurnRef) council.TurnStatus {
 		return res.Status
 	}
 	return ""
+}
+
+// SetExecutionResult sets the execution outcome directly within the fake.
+func (f *FakeAdapter) SetExecutionResult(ref adapter.TurnRef, res adapter.TurnResult) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.results[ref] = res
+	f.dispatches[ref] = &DispatchState{
+		Received: true,
+		Accepted: true,
+		Started:  true,
+	}
 }
 
 // DispatchCount returns the number of dispatches recorded for the given session.
