@@ -170,6 +170,15 @@ func (c *Client) StopService(ctx context.Context, instanceID string, drain bool)
 	return &resp, nil
 }
 
+// GetControllerRecord reads the redacted run-scoped controller record.
+func (c *Client) GetControllerRecord(ctx context.Context, runID string) (*service.ControllerRecordResponse, error) {
+	var resp service.ControllerRecordResponse
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/v1/runs/%s/controller", runID), nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // ConnectRunController attaches the run's current controller to this
 // service instance, establishing a new attachment episode.
 func (c *Client) ConnectRunController(ctx context.Context, runID, opID, controllerLease string, expectedGeneration uint64) (*service.ControllerConnectRunResponse, error) {
