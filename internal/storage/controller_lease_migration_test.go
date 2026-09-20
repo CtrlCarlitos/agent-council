@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -15,6 +16,23 @@ import (
 // generation-0 provenance (never an alternate controller), and complete
 // preservation of pending prompts, turns, attempt identities, native
 // bindings, and journal evidence.
+
+// releasedV1SchemaChecksum is the sha256 of the released v1 schema.sql at
+// the AC-003 closeout commit (b325bb1). The frozen v1 input must match this
+// digest forever; if a future edit changes schema.sql together with
+// schemaChecksum(), this anchor still fails.
+const releasedV1SchemaChecksum = "950560bcea3eb7e76a13d600d51a948614f11acff089a5b6a62dae47170aa356"
+
+func TestAC004_Migration_FrozenV1InputMatchesReleasedAnchor(t *testing.T) {
+	sum := sha256.Sum256([]byte(schemaSQL))
+	got := fmt.Sprintf("%x", sum)
+	if got != releasedV1SchemaChecksum {
+		t.Fatalf("frozen v1 schema input diverged from the released b325bb1 schema: %s", got)
+	}
+	if schemaChecksum() != releasedV1SchemaChecksum {
+		t.Fatal("schemaChecksum() must equal the released v1 anchor")
+	}
+}
 
 // applyFrozenV1 creates a verified v1 database: the released v1 schema
 // applied directly plus the version-1 migration row exactly as v1 code
@@ -36,9 +54,56 @@ func applyFrozenV1(t *testing.T, dir string) *sql.DB {
 	return db
 }
 
-// seedV1GoldenData writes a deterministic v1 dataset with raw SQL:
-// queued prompt (never released), running turn with attempt identity and
-// acknowledged intent, cancelling turn, native binding, and journal evidence.
+// v1GoldenSnapshot captures complete pre-migration records for comparison.
+type v1GoldenSnapshot struct {
+	run             []string
+	sessions        []string
+	pendingPrompts  []string
+	turns           []string
+	dispatchIntents []string
+	nativeBindings  []string
+	journalEntries  []string
+}
+
+// snapshotV1 reads complete rows (projected to the v1 columns only) so the
+// post-migration comparison allows exactly the v2 additions.
+func snapshotV1(t *testing.T, db *sql.DB) v1GoldenSnapshot {
+	t.Helper()
+	grab := func(query string) []string {
+		rows, err := db.Query(query)
+		if err != nil {
+			t.Fatalf("snapshot query (%q): %v", firstLine(query), err)
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var line string
+			if err := rows.Scan(&line); err != nil {
+				t.Fatalf("snapshot scan (%q): %v", firstLine(query), err)
+			}
+			out = append(out, line)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("snapshot iterate (%q): %v", firstLine(query), err)
+		}
+		return out
+	}
+	return v1GoldenSnapshot{
+		run:             grab(`SELECT run_id || '|' || brief_digest || '|' || source_digest || '|' || profile_digest || '|' || controller_lease || '|' || lifecycle || '|' || created_at || '|' || updated_at FROM runs ORDER BY run_id;`),
+		sessions:        grab(`SELECT session_id || '|' || run_id || '|' || contributor || '|' || is_active_contributor || '|' || state || '|' || lifecycle || '|' || controller_status || '|' || visibility || '|' || coalesce(active_key,'') || '|' || coalesce(recovery_context,'') || '|' || recovery_gen || '|' || active_recovery_gen || '|' || row_version FROM sessions ORDER BY session_id;`),
+		pendingPrompts:  grab(`SELECT session_id || '|' || turn_key || '|' || prompt || '|' || queued_at FROM pending_prompts ORDER BY session_id, turn_key;`),
+		turns:           grab(`SELECT session_id || '|' || turn_key || '|' || prompt || '|' || status || '|' || result || '|' || attempt_id || '|' || created_at || '|' || coalesce(completed_at,'') FROM turns ORDER BY session_id, turn_key;`),
+		dispatchIntents: grab(`SELECT session_id || '|' || turn_key || '|' || attempt_id || '|' || phase || '|' || recorded_at || '|' || updated_at FROM dispatch_intents ORDER BY session_id, turn_key;`),
+		nativeBindings:  grab(`SELECT session_id || '|' || native_session_id || '|' || harness || '|' || model || '|' || workspace_mode || '|' || config_json FROM native_bindings ORDER BY session_id;`),
+		journalEntries:  grab(`SELECT op_id || '|' || command_type || '|' || command_fingerprint || '|' || run_id || '|' || coalesce(session_id,'') || '|' || coalesce(turn_key,'') || '|' || event_kind || '|' || payload_json FROM journal_entries ORDER BY op_id;`),
+	}
+}
+
+// seedV1GoldenData writes a deterministic v1 dataset with raw SQL: a queued
+// follow-up prompt (never released), a running turn with attempt identity
+// and acknowledged intent, a cancelling turn in a separate valid session,
+// completed historical work, a native binding with nonempty configuration,
+// and journal evidence with a complete receipt payload.
 func seedV1GoldenData(t *testing.T, db *sql.DB) {
 	t.Helper()
 	now := "2026-09-20T00:00:00Z"
@@ -48,14 +113,25 @@ func seedV1GoldenData(t *testing.T, db *sql.DB) {
 		`INSERT INTO sessions (session_id, run_id, contributor, is_active_contributor, state, lifecycle, controller_status, visibility, recovery_gen, active_recovery_gen, row_version, created_at, updated_at)
 		 VALUES ('sess-v1', 'run-v1', 'claude', 1, 'running', 'active', 'connected', 'reachable', 0, 0, 3, '` + now + `', '` + now + `');`,
 		`UPDATE sessions SET active_key = 'turn-run' WHERE session_id = 'sess-v1';`,
+		`INSERT INTO sessions (session_id, run_id, contributor, is_active_contributor, state, lifecycle, controller_status, visibility, recovery_gen, active_recovery_gen, row_version, created_at, updated_at)
+		 VALUES ('sess-v1b', 'run-v1', 'codex', 0, 'running', 'active', 'connected', 'reachable', 0, 0, 2, '` + now + `', '` + now + `');`,
+		`UPDATE sessions SET active_key = 'turn-cxl' WHERE session_id = 'sess-v1b';`,
 		`INSERT INTO pending_prompts (session_id, turn_key, prompt, queued_at)
 		 VALUES ('sess-v1', 'turn-queued', 'follow-up work', '` + now + `');`,
 		`INSERT INTO turns (session_id, turn_key, prompt, status, result, attempt_id, created_at)
 		 VALUES ('sess-v1', 'turn-run', 'accepted work', 'running', '', 'attempt-original-1', '` + now + `');`,
 		`INSERT INTO dispatch_intents (session_id, turn_key, attempt_id, phase, recorded_at, updated_at)
 		 VALUES ('sess-v1', 'turn-run', 'attempt-original-1', 'receipt_acknowledged', '` + now + `', '` + now + `');`,
+		`INSERT INTO turns (session_id, turn_key, prompt, status, result, attempt_id, created_at)
+		 VALUES ('sess-v1b', 'turn-cxl', 'cancelling work', 'cancelling', '', 'attempt-original-2', '` + now + `');`,
+		`INSERT INTO dispatch_intents (session_id, turn_key, attempt_id, phase, recorded_at, updated_at)
+		 VALUES ('sess-v1b', 'turn-cxl', 'attempt-original-2', 'receipt_acknowledged', '` + now + `', '` + now + `');`,
+		`INSERT INTO turns (session_id, turn_key, prompt, status, result, attempt_id, created_at, completed_at)
+		 VALUES ('sess-v1b', 'turn-done', 'finished work', 'completed', 'historical result', 'attempt-original-3', '` + now + `', '` + now + `');`,
+		`INSERT INTO dispatch_intents (session_id, turn_key, attempt_id, phase, recorded_at, updated_at)
+		 VALUES ('sess-v1b', 'turn-done', 'attempt-original-3', 'resolved', '` + now + `', '` + now + `');`,
 		`INSERT INTO native_bindings (session_id, native_session_id, harness, model, workspace_mode, config_json, created_at, updated_at)
-		 VALUES ('sess-v1', 'native-sess-v1', 'claude', '', '', '', '` + now + `', '` + now + `');`,
+		 VALUES ('sess-v1', 'native-sess-v1', 'claude', 'model-x', 'branch', '{"workspace_root":"/work/repo","model":"model-x","tools":["git","go"]}', '` + now + `', '` + now + `');`,
 		`INSERT INTO journal_entries (op_id, command_type, command_fingerprint, run_id, session_id, turn_key, event_kind, payload_json, created_at)
 		 VALUES ('op-v1-release', 'release_turn', 'fp1', 'run-v1', 'sess-v1', 'turn-run', 'turn_released',
 		 '{"caller_lease":"legacy-secret-1","receipt":{"op_id":"op-v1-release","command_type":"release_turn","session_id":"sess-v1","turn_key":"turn-run","committed_version":3,"created_at":"2026-09-20T00:00:00Z","payload":"attempt-original-1"}}', '` + now + `');`,
@@ -82,6 +158,7 @@ func TestAC004_Migration_UpgradesVerifiedV1Database(t *testing.T) {
 	dir := t.TempDir()
 	db := applyFrozenV1(t, dir)
 	seedV1GoldenData(t, db)
+	before := snapshotV1(t, db)
 	if err := db.Close(); err != nil {
 		t.Fatalf("close v1 fixture: %v", err)
 	}
@@ -124,8 +201,8 @@ func TestAC004_Migration_UpgradesVerifiedV1Database(t *testing.T) {
 		t.Fatalf("migrated run must remain unadopted, got controller_adopted=%d", adopted)
 	}
 
-	// Accepted intent keeps its original attempt identity and is stamped
-	// with issuing generation 0.
+	// Accepted intents keep their original attempt identities and are
+	// stamped with issuing generation 0.
 	var attemptID string
 	var issuingGen int
 	if err := store.readDB.QueryRow(`SELECT attempt_id, issuing_controller_generation FROM dispatch_intents
@@ -139,7 +216,38 @@ func TestAC004_Migration_UpgradesVerifiedV1Database(t *testing.T) {
 		t.Fatalf("expected issuing_controller_generation 0 for migrated accepted attempt, got %d", issuingGen)
 	}
 
-	// Preservation: pending prompts, turns, bindings, journal evidence.
+	// Complete preservation: every pre-existing record is byte-identical
+	// (projected to v1 columns). Journal payloads and references are
+	// compared directly here; retrieval authorization is a separate
+	// assertion and must not depend on the legacy credential.
+	after := v1GoldenSnapshot{
+		run:             queryLines(t, store.readDB, `SELECT run_id || '|' || brief_digest || '|' || source_digest || '|' || profile_digest || '|' || controller_lease || '|' || lifecycle || '|' || created_at || '|' || updated_at FROM runs ORDER BY run_id;`),
+		sessions:        queryLines(t, store.readDB, `SELECT session_id || '|' || run_id || '|' || contributor || '|' || is_active_contributor || '|' || state || '|' || lifecycle || '|' || controller_status || '|' || visibility || '|' || coalesce(active_key,'') || '|' || coalesce(recovery_context,'') || '|' || recovery_gen || '|' || active_recovery_gen || '|' || row_version FROM sessions ORDER BY session_id;`),
+		pendingPrompts:  queryLines(t, store.readDB, `SELECT session_id || '|' || turn_key || '|' || prompt || '|' || queued_at FROM pending_prompts ORDER BY session_id, turn_key;`),
+		turns:           queryLines(t, store.readDB, `SELECT session_id || '|' || turn_key || '|' || prompt || '|' || status || '|' || result || '|' || attempt_id || '|' || created_at || '|' || coalesce(completed_at,'') FROM turns ORDER BY session_id, turn_key;`),
+		dispatchIntents: queryLines(t, store.readDB, `SELECT session_id || '|' || turn_key || '|' || attempt_id || '|' || phase || '|' || recorded_at || '|' || updated_at FROM dispatch_intents ORDER BY session_id, turn_key;`),
+		nativeBindings:  queryLines(t, store.readDB, `SELECT session_id || '|' || native_session_id || '|' || harness || '|' || model || '|' || workspace_mode || '|' || config_json FROM native_bindings ORDER BY session_id;`),
+		journalEntries:  queryLines(t, store.readDB, `SELECT op_id || '|' || command_type || '|' || command_fingerprint || '|' || run_id || '|' || coalesce(session_id,'') || '|' || coalesce(turn_key,'') || '|' || event_kind || '|' || payload_json FROM journal_entries ORDER BY op_id;`),
+	}
+	if before.run == nil || after.run == nil {
+		t.Fatal("snapshot comparison requires non-nil captures")
+	}
+	for name, pair := range map[string][2][]string{
+		"runs":             {before.run, after.run},
+		"sessions":         {before.sessions, after.sessions},
+		"pending_prompts":  {before.pendingPrompts, after.pendingPrompts},
+		"turns":            {before.turns, after.turns},
+		"dispatch_intents": {before.dispatchIntents, after.dispatchIntents},
+		"native_bindings":  {before.nativeBindings, after.nativeBindings},
+		"journal_entries":  {before.journalEntries, after.journalEntries},
+	} {
+		if strings.Join(pair[0], "\n") != strings.Join(pair[1], "\n") {
+			t.Fatalf("%s altered by migration:\nbefore:\n%s\nafter:\n%s", name,
+				strings.Join(pair[0], "\n"), strings.Join(pair[1], "\n"))
+		}
+	}
+
+	// No automatic execution: the queued follow-up was never released.
 	hydrated, err := store.HydrateState(context.Background())
 	if err != nil {
 		t.Fatalf("hydrate: %v", err)
@@ -151,22 +259,30 @@ func TestAC004_Migration_UpgradesVerifiedV1Database(t *testing.T) {
 	if _, queued := sess.PendingPrompts["turn-queued"]; !queued {
 		t.Fatalf("queued follow-up prompt lost: %+v", sess.PendingPrompts)
 	}
-	turnRun, ok := sess.Turns["turn-run"]
-	if !ok || turnRun.Status != "running" {
-		t.Fatalf("running turn lost or altered: %+v", sess.Turns)
-	}
-	if sess.NativeBinding == nil || sess.NativeBinding.NativeSessionID != "native-sess-v1" {
-		t.Fatalf("native binding lost: %+v", sess.NativeBinding)
-	}
-	journalReceipt, found, err := store.FindOperationReceipt(context.Background(), "op-v1-release", "legacy-secret-1")
-	if err != nil || !found || journalReceipt == nil {
-		t.Fatalf("journal evidence lost: found=%v err=%v", found, err)
-	}
-
-	// No automatic execution: the queued follow-up was never released.
 	if _, hasTurn := sess.Turns["turn-queued"]; hasTurn {
 		t.Fatal("queued prompt must not be released by migration")
 	}
+}
+
+func queryLines(t *testing.T, db *sql.DB, query string) []string {
+	t.Helper()
+	rows, err := db.Query(query)
+	if err != nil {
+		t.Fatalf("query (%q): %v", firstLine(query), err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatalf("scan (%q): %v", firstLine(query), err)
+		}
+		out = append(out, line)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate (%q): %v", firstLine(query), err)
+	}
+	return out
 }
 
 // A fresh database applies v1 then v2 sequentially and carries no
@@ -217,8 +333,12 @@ func TestAC004_Migration_RepeatOpenIdempotent(t *testing.T) {
 	}
 	defer store.Close()
 	var provCount, migrationCount int
-	_ = store.readDB.QueryRow(`SELECT count(*) FROM controller_leases WHERE run_id = 'run-v1';`).Scan(&provCount)
-	_ = store.readDB.QueryRow(`SELECT count(*) FROM schema_migrations;`).Scan(&migrationCount)
+	if err := store.readDB.QueryRow(`SELECT count(*) FROM controller_leases WHERE run_id = 'run-v1';`).Scan(&provCount); err != nil {
+		t.Fatalf("count provenance: %v", err)
+	}
+	if err := store.readDB.QueryRow(`SELECT count(*) FROM schema_migrations;`).Scan(&migrationCount); err != nil {
+		t.Fatalf("count migrations: %v", err)
+	}
 	if provCount != 1 || migrationCount != 2 {
 		t.Fatalf("repeat-open duplicated state: provenance=%d migrations=%d", provCount, migrationCount)
 	}
@@ -263,6 +383,77 @@ func TestAC004_Migration_ConcurrentInitialization(t *testing.T) {
 	}
 }
 
+// Rollback evidence (injected failure, not abrupt process termination):
+// a deterministic failure after v2 DDL and backfill have been staged but
+// before commit leaves no partial v2 schema, backfill, or migration record,
+// and a subsequent open completes the upgrade.
+func TestAC004_Migration_RollbackAfterV2Begins(t *testing.T) {
+	dir := t.TempDir()
+	db := applyFrozenV1(t, dir)
+	seedV1GoldenData(t, db)
+	_ = db.Close()
+
+	_, err := func() (s *Store, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				s, err = nil, fmt.Errorf("hook panic: %v", r)
+			}
+		}()
+		return Open(StoreOptions{
+			StateDir: dir,
+			TestHookBeforeCommit: func(boundary string) {
+				if boundary == "pre_commit_migration_v2" {
+					panic("injected failure after v2 staged")
+				}
+			},
+		})
+	}()
+	if err == nil {
+		t.Fatal("expected the injected migration failure to surface")
+	}
+
+	// No partial v2 state survived the rollback.
+	verify, err := sql.Open("sqlite", buildDSN(dir+"/state.db", "immediate"))
+	if err != nil {
+		t.Fatalf("reopen raw: %v", err)
+	}
+	defer verify.Close()
+	assertNoPartialV2(t, verify)
+
+	// A subsequent clean open completes the upgrade.
+	store, err := Open(StoreOptions{StateDir: dir})
+	if err != nil {
+		t.Fatalf("complete upgrade after rollback: %v", err)
+	}
+	defer store.Close()
+	ver, err := store.CurrentSchemaVersion()
+	if err != nil || ver != 2 {
+		t.Fatalf("expected completed upgrade to v2, got %d err=%v", ver, err)
+	}
+}
+
+func assertNoPartialV2(t *testing.T, db *sql.DB) {
+	t.Helper()
+	var v2Tables int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='controller_leases';`).Scan(&v2Tables); err != nil {
+		t.Fatalf("inspect v2 tables: %v", err)
+	}
+	if v2Tables != 0 {
+		t.Fatal("partial v2 schema survived a rolled-back migration")
+	}
+	var provRows int
+	if err := db.QueryRow(`SELECT count(*) FROM controller_leases;`).Scan(&provRows); err == nil && provRows > 0 {
+		t.Fatalf("provenance backfill survived a rolled-back migration: %d rows", provRows)
+	}
+	var v2Record int
+	if err := db.QueryRow(`SELECT count(*) FROM schema_migrations WHERE version = 2;`).Scan(&v2Record); err != nil {
+		t.Fatalf("inspect migration records: %v", err)
+	}
+	if v2Record != 0 {
+		t.Fatal("v2 migration record survived a rolled-back migration")
+	}
+}
+
 // A checksum mismatch on the recorded v1 migration rejects the upgrade
 // without applying v2 or partially modifying the database.
 func TestAC004_Migration_ChecksumMismatchRejected(t *testing.T) {
@@ -284,11 +475,7 @@ func TestAC004_Migration_ChecksumMismatchRejected(t *testing.T) {
 		t.Fatalf("reopen raw: %v", err)
 	}
 	defer verify.Close()
-	var v2Tables int
-	_ = verify.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='controller_leases';`).Scan(&v2Tables)
-	if v2Tables != 0 {
-		t.Fatal("v2 objects must not exist after checksum mismatch rejection")
-	}
+	assertNoPartialV2(t, verify)
 }
 
 // Databases from a newer schema version are refused.

@@ -126,6 +126,13 @@ VALUES (1, 'initial_schema', ?, ?);`, schemaChecksum(), now)
 	if _, err := tx.Tx().Exec(backfillControllerLeaseProvenance, now, now); err != nil {
 		return fmt.Errorf("backfill controller lease provenance: %w", err)
 	}
+
+	// Test hook: deterministic interruption point after v2 changes have been
+	// staged but before commit (rollback evidence).
+	if s.testHookBeforeCommit != nil {
+		s.testHookBeforeCommit("pre_commit_migration_v2")
+	}
+
 	_, err = tx.Tx().Exec(`
 INSERT INTO schema_migrations (version, name, checksum, applied_at)
 VALUES (2, 'controller_leases_provenance', ?, ?);`, schemaV2Checksum(), now)
