@@ -1,6 +1,6 @@
 # AC-003: Service Lifetime, Local IPC, and Process Decoupling Design
 
-- **Status**: Proposed
+- **Status**: Proposed (Amended)
 - **Date**: 2026-09-19
 - **Issue**: [#3 (AC-003)](https://github.com/CtrlCarlitos/agent-council/issues/3)
 - **Dependencies**: AC-001 (Session & Turn Contracts), AC-002 (Durable State & Recovery)
@@ -12,7 +12,7 @@
 
 Closing a terminal window, dropping an SSH session, or disconnecting a client tool (CLI, IDE, or future MCP bridge) currently risks killing the job owner process and terminating in-flight contributor executions.
 
-The Agent Council service must run **independently of client connection lifetime**. 
+The Agent Council service must run **independently of client connection lifetime**.
 
 ### Core Principles
 1. **Client Disconnect is Not Cancellation**: Terminating or disconnecting a client process (CLI or MCP) closes that client's connection only. Accepted turn executions belong to the service and run to completion within their authorized budget and limits.
@@ -23,7 +23,7 @@ The Agent Council service must run **independently of client connection lifetime
 
 ---
 
-## 2. Process Architecture & Exclusivity
+## 2. Process Architecture, Exclusivity & Platform Boundaries
 
 ### 2.1 Process Models
 - **Foreground Core (`council service run`)**:
@@ -33,14 +33,23 @@ The Agent Council service must run **independently of client connection lifetime
 - **Detached Launcher (`council service start`)**:
   - Launches `council service run` as an independent, detached operating system process.
   - Linux/WSL: executes via `os/exec` with a fresh session (`SysProcAttr.Setsid = true`) and redirects standard streams (`os.DevNull` or configured log sinks). The launcher does not tie child process lifetime to its own context.
-  - Monitors the child process for early exit and polls authenticated readiness (`GET /v1/readiness`) up to a bounded startup timeout.
-  - Returns success only after verified readiness. If the child exits early or the deadline expires, reports sanitized diagnostic failure without claiming success or relaunching.
+  - Distinguishes two startup timeout outcomes:
+    1. Known early child exit: captures process exit code and stderr diagnostics, reporting immediate startup failure.
+    2. Readiness deadline expiration while child may remain alive: reports startup outcome unknown without claiming failure-to-start or automatically relaunching a competing owner.
   - Native Windows: returns an explicit unsupported-platform error until native Windows named-pipe IPC and process detachment are implemented and verified.
 - **Client Commands (`council service status`, `council service stop`, council turn operations)**:
   - Ephemeral client utilities that read discovery metadata (`service.json`) and credentials (`auth.token`), communicate over local IPC, and exit.
   - Ordinary client commands **never** implicitly spawn a background service.
 
-### 2.2 Exclusivity & State Directory Locking
+### 2.2 Platform Scope & Native Windows Boundary
+- **Linux/WSL (Initial Target)**: Full support using standard-library `net.Listen("unix", ...)` and `syscall.Flock`.
+- **Native Windows (Explicitly Unsupported Initially)**:
+  - Service commands (`run`, `start`, `status`, `stop`) return clear unsupported-platform errors.
+  - No silent fallback to localhost TCP or unauthenticated transports.
+  - Windows support requires implementing named pipes with explicit security descriptors via `github.com/Microsoft/go-winio` and `LockFileEx` exclusivity in a dedicated, verified task.
+  - Cross-platform compilation of the repository is preserved via build tags (`//go:build !windows`).
+
+### 2.3 Exclusivity & State Directory Locking
 Exclusivity is anchored by an operating-system-held lock on `service.lock` in the root of the state directory:
 1. `service.lock` is created with mode `0600` inside the `0700` state directory.
 2. The service process acquires an exclusive, non-blocking lock:
@@ -50,12 +59,17 @@ Exclusivity is anchored by an operating-system-held lock on `service.lock` in th
 4. **Lock Invariant**: `service.lock` is **never unlinked or deleted** during normal cleanup. Unlinking an open file on Unix leaves the inode active while giving subsequent processes a new inode to lock, breaking exclusivity. The lock handle is closed and released last upon exit.
 5. A stale PID or timestamp in discovery files never authorizes breaking an active OS lock.
 
-### 2.3 Runtime Discovery & Credential Separation
+### 2.4 Runtime Discovery & Credential Separation
 To prevent credential leakage during diagnostic collection, metadata and secret tokens are strictly separated:
 
 1. **`service.lock`**:
    - Empty or minimal header file; authority is the OS flock, not the file content.
-2. **`service.json` (Mode `0600`)**:
+2. **`auth.token` (Mode `0600`)**:
+   - Generated freshly on every service start using 32 bytes from `crypto/rand` encoded as hex.
+   - Written as a complete protected file before `service.json` is published.
+   - Cached in-memory by the service; never reread from disk during serving.
+   - Never printed in `service status`, logs, diagnostics, or model prompts.
+3. **`service.json` (Mode `0600`)**:
    - Published only after successful startup, storage hydration, listener binding, and credential creation.
    - Non-secret discovery payload:
      ```json
@@ -65,54 +79,62 @@ To prevent credential leakage during diagnostic collection, metadata and secret 
        "pid": 12345,
        "transport": "unix",
        "endpoint": "/path/to/state/council.sock",
+       "state_dir": "/path/to/state",
        "started_at": "2026-09-19T20:00:00Z"
      }
      ```
-3. **`auth.token` (Mode `0600`)**:
-   - Generated freshly on every service start using 32 bytes from `crypto/rand` encoded as hex.
-   - Written as a complete file before `service.json` is published.
-   - Cached in-memory by the service; never reread from disk during serving.
-   - Never printed in `service status`, logs, diagnostics, or model prompts.
 4. **`council.sock` (Mode `0600`)**:
    - UNIX domain socket located in the `0700` state directory.
    - Before binding, the service validates that the endpoint path matches expectations and unlinks only a stale socket file belonging to this runtime location. An unexpected directory, regular file, or symlink is a fatal error.
+5. **Startup Failure & Loser Cleanliness**:
+   - A losing startup process (failing to acquire `service.lock`) touches none of the winner's files (`service.json`, `auth.token`, `council.sock`).
+   - If an owning startup fails mid-initialization (e.g. storage error, listener error), it unwinds only the runtime resources it created, closes storage, and releases `service.lock`.
 
 ---
 
-## 3. Communication Protocol & HTTP API
+## 3. Communication Protocol, Endpoints & Contracts
 
-The local control interface uses standard HTTP/1.1 with JSON requests/responses for commands and Server-Sent Events (SSE) for live observation.
+The local control interface uses HTTP/1.1 with JSON requests/responses for commands and Server-Sent Events (SSE) for live observation.
 
-### 3.1 Authentication & Authorization
-- **Service Authentication**: Every incoming HTTP request must include `Authorization: Bearer <auth.token>`. Mismatches return `401 Unauthorized` with `WWW-Authenticate: Bearer`.
+### 3.1 Authentication, Decoding & Error Envelopes
+- **Service Authentication**: Every incoming HTTP request must include `Authorization: Bearer <auth.token>`. Mismatches return `401 Unauthorized` with `WWW-Authenticate: Bearer`. The token is a trusted local operator capability.
 - **Council Authorization**: Mutations additionally require valid controller credentials (`controller_lease`), expected version tags (`expected_version`), and resource correlation. Mismatches return `403 Forbidden` or `409 Conflict`.
-- **Request Bounding**: All request bodies are wrapped with `http.MaxBytesReader` (max 10MB) to protect against memory exhaustion.
-
-### 3.2 Error Envelope
-All error responses adhere to a uniform structure:
-```json
-{
-  "error": {
-    "code": "stale_version",
-    "message": "The session version has advanced; refresh state before retrying.",
-    "op_id": "op-release-123"
+- **Request Bounding & Strict Decoding**:
+  - Request bodies: wrapped with `http.MaxBytesReader` (max 10MB).
+  - Request headers: bounded by `http.Server.MaxHeaderBytes` (1MB).
+  - Strict JSON: `json.Decoder.DisallowUnknownFields()`, followed by verifying EOF (rejecting trailing data).
+- **Error Envelope**:
+  All errors return a uniform structure with sanitized diagnostics (no raw SQL, internal paths, or tokens):
+  ```json
+  {
+    "error": {
+      "code": "stale_version",
+      "message": "The session version has advanced; refresh state before retrying.",
+      "op_id": "op-release-123"
+    }
   }
-}
-```
+  ```
 
-Standard Status Code Mapping:
-- `400 Bad Request`: Malformed JSON, missing required fields, invalid identifiers.
-- `401 Unauthorized`: Missing or invalid Bearer token.
-- `403 Forbidden`: Insufficient controller authority or invalid controller lease.
-- `404 Not Found`: Target run, session, turn, or prompt does not exist in scope.
-- `409 Conflict`: Idempotency conflict, stale version, instance mismatch, or service busy.
-- `413 Request Entity Too Large`: Payload exceeds body limit.
-- `415 Unsupported Media Type`: Non-JSON content type where JSON is expected.
-- `503 Service Unavailable`: New release requested while service is draining or stopping.
+### 3.2 Command Concurrency & Correlation Inputs
+Controller commands follow a strict contract mapping:
+
+| Operation | Route | Method | Required Concurrency & Correlation Inputs |
+|---|---|---|---|
+| Connect Controller | `/v1/runs/{run_id}/controller/connect` | POST | `op_id`, `controller_lease`, `expected_version` |
+| Queue Prompt | `/v1/runs/{run_id}/sessions/{session_id}/prompts/queue` | POST | `op_id`, `controller_lease`, `expected_version`, `prompt`, `turn_key` |
+| Replace Prompt | `/v1/runs/{run_id}/sessions/{session_id}/prompts/{turn_key}/replace` | POST | `op_id`, `controller_lease`, `expected_version`, `prompt` |
+| Discard Prompt | `/v1/runs/{run_id}/sessions/{session_id}/prompts/{turn_key}/discard` | POST | `op_id`, `controller_lease`, `expected_version` |
+| Record Decision | `/v1/runs/{run_id}/decisions` | POST | `op_id`, `controller_lease`, `artifact_id`, `revision`, `decision_payload` |
+| Release Turn | `/v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/release` | POST | `op_id`, `controller_lease`, `expected_version` |
+| Read Turn State | `/v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}` | GET | Read-only; queries turn, intent, receipts, and execution status |
+| Cancel Request | `/v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/cancel` | POST | `op_id`, `controller_lease`, `expected_version`, `reason` |
+| Reconcile | `/v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/reconcile` | POST | `op_id`, `controller_lease` (validates against current durable turn state & recovery generation) |
+
+- **Controller Reattachment**: Explicitly performed via `/v1/runs/{run_id}/controller/connect`. Readiness probes, status queries, and SSE subscriptions **never** implicitly renew leases or reattach controllers.
 
 ---
 
-### 3.3 Endpoints
+### 3.3 Endpoints Specification
 
 #### `GET /v1/readiness`
 Verifies that the service is operational.
@@ -130,7 +152,8 @@ Verifies that the service is operational.
   }
   ```
 - **Rules**:
-  - Returns `200 OK` when storage is initialized, hydration succeeded, recovery restrictions are in place, and control endpoints can respond. Unresolved turns from previous runs do not block readiness.
+  - The launcher validates that `instance_id`, `protocol_version`, and `state_dir` match expectations.
+  - Returns `200 OK` when storage is initialized, hydration succeeded, recovery restrictions are installed, and control endpoints can respond. Unresolved turns from previous runs do not block readiness.
   - Returns `503 Service Unavailable` when the service is `draining` or `stopping`.
 
 #### `GET /v1/status`
@@ -154,21 +177,15 @@ Returns high-level status of the council and service diagnostics.
 #### `POST /v1/service/stop`
 Requests controlled shutdown of the service instance.
 - **Headers**: `Authorization: Bearer <token>`
-- **Request Body**:
-  ```json
-  {
-    "instance_id": "550e8400-e29b-41d4-a716-446655440000",
-    "drain": false
-  }
-  ```
+- **Request Body**: `{"instance_id": "<uuid>", "drain": false | true}` (CLI wait `--timeout` is client-side).
 - **Semantics**:
-  - `instance_id` must match the current running instance; mismatches return `409 Conflict` (`error.code: "instance_mismatch"`).
+  - `instance_id` must match current running instance; mismatches return `409 Conflict` (`error.code: "instance_mismatch"`).
   - **Idle Stop (`drain: false`)**:
     - Under the admission lock, checks if `live_workers > 0`, in-flight commits exist, or unresolved recovery blockers exist.
     - If busy: returns `409 Conflict` (`error.code: "service_busy"`) without modifying service state.
     - If idle: atomically transitions to `stopping`, closes admission, returns `202 Accepted`, and signals asynchronous teardown.
   - **Draining Stop (`drain: true`)**:
-    - Atomically closes the admission gate for new releases.
+    - Atomically closes admission for new turn releases.
     - Returns `202 Accepted` (`status: "draining"`).
     - Status, inspection, cancellation, and reconciliation endpoints remain operational.
     - Active executions finish and commit outcomes before final teardown.
@@ -186,16 +203,18 @@ Releases an approved queued prompt to execution.
     "expected_version": 4
   }
   ```
-- **Execution Hand-off & Retry Rules**:
-  1. If service is in `draining` or `stopping` mode, check if `op_id` is an already-committed release:
-     - If newly requested: return `503 Service Unavailable` (`error.code: "service_draining"`).
-     - If matching retry: return the existing receipt (`200 OK`, `replayed: true`).
-  2. Coordinate with release admission gate under lock.
-  3. Invoke `storage.Store.ReleaseTurn(...)`:
-     - Newly committed: returns receipt, registers execution responsibility with service lifecycle coordinator, and dispatches the worker outside the DB transaction. Returns `202 Accepted` with receipt and turn URL.
-     - Idempotent replay: returns existing receipt. **Does not dispatch another worker**. Returns `200 OK` with `replayed: true`.
-     - Idempotency conflict: returns `409 Conflict`.
-  4. **Context Detachment**: The worker goroutine executes under a **service-owned turn context**. It does **not** inherit `r.Context()`. Disconnecting the HTTP request has zero effect on the worker.
+- **Storage Release Contract & Disposition**:
+  1. **Pre-flight Availability Check**: If the required native harness adapter or saved session binding is unavailable, rejects immediately (`503 Service Unavailable`, `error.code: "harness_unavailable"`) without releasing the turn or consuming the prompt.
+  2. **Admission Coordination**: Under the admission lock, if the service is `draining` or `stopping`:
+     - Validates authentication, command fingerprint, and resource scope.
+     - If `op_id` is an already-committed release, retrieves and returns the existing receipt (`200 OK`, `replayed: true`).
+     - If newly requested, rejects with `503 Service Unavailable` (`error.code: "service_draining"`).
+  3. **Atomic Execution Hand-off**:
+     - `storage.Store.ReleaseTurn(...)` returns both the immutable `ReleaseReceipt` and a distinct disposition:
+       - `ReleaseDispositionNew`: Newly committed reservation. The coordinator registers execution responsibility and dispatches the worker outside the DB transaction. Returns `202 Accepted` with receipt and authoritative turn URL.
+       - `ReleaseDispositionReplayed`: Idempotent replay of an existing operation. **Does not dispatch a worker**. Returns `200 OK` with `replayed: true`.
+     - Registration does not depend on writing the HTTP response; if the client disconnects immediately after commit, the coordinator still owns the execution.
+  4. **Context Detachment**: The worker executes under a **service-owned turn context**. It does **not** inherit `r.Context()`. Disconnecting the HTTP request has zero effect on the worker.
 
 #### `GET /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}`
 Retrieves authoritative durable state for a turn, session, and receipts. Used by Client B upon reconnection.
@@ -206,33 +225,66 @@ Retrieves authoritative durable state for a turn, session, and receipts. Used by
 Streams live observation events for an active turn.
 - **Headers**: `Authorization: Bearer <token>`, `Accept: text/event-stream`
 - **Stream Rules**:
-  - Snapshot on connect: the service reads current authoritative turn status and emits an initial snapshot event. If the turn is already terminal, it emits the terminal event and cleanly closes the stream.
+  - Best-effort live progress; no durable replay promise. Unsupported `Last-Event-ID` requests are reset/rejected.
+  - Synchronized snapshot on connect: the service reads current authoritative turn status and registers the subscriber. If the turn is already terminal (or finishes between snapshot and subscription), it emits the terminal snapshot event immediately and cleanly closes the stream.
   - Bounded buffers: observer channel has bounded capacity (64 events) with write timeouts. Slow observers are disconnected without blocking workers or database commits.
   - Client disconnect: closing the SSE connection terminates the handler cleanly. Workers continue unaffected.
-  - Terminal event ordering: a terminal event claiming completion or failure is emitted to SSE **only after** the corresponding storage transaction has committed.
+  - **Commit-Before-Delivery**: A terminal event claiming completion, cancellation, or failure is emitted to SSE **only after** the corresponding storage transaction has committed.
 
 #### `POST /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/cancel`
 Requests cancellation of an active turn.
 - **Headers**: `Authorization: Bearer <token>`
-- **Request Body**: `{"op_id": "...", "controller_lease": "...", "reason": "..."}`
+- **Request Body**:
+  ```json
+  {
+    "op_id": "op-cancel-123",
+    "controller_lease": "lease-abc",
+    "expected_version": 4,
+    "reason": "operator requested cancel"
+  }
+  ```
 - **Semantics**:
-  - Invokes `storage.Store.RequestCancel(...)` to record the intent.
-  - Signals worker context cancellation and invokes adapter `Cancel`.
-  - Returns `200 OK` with receipt indicating whether cancellation was confirmed, requested, or uncertain. A cancellation request is **not** confirmation of termination.
+  - Validates controller lease and expected version.
+  - Invokes `storage.Store.RequestCancel(...)` using internal stage ID `<op_id>:req` to record the intent.
+  - Signals worker context cancellation and invokes adapter `Cancel` using an independently bounded control context. Cancellation of execution does not disable observation or persistence.
+  - Returns `200 OK` containing both `receipt` (original committed request acceptance) and `cancellation_status` (latest verified status: `requested`, `confirmed`, `unsupported`, or `uncertain`). A cancellation request is **not** confirmation of termination.
 
 #### `POST /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/reconcile`
 Requests reconciliation of an uncertain or interrupted turn.
 - **Headers**: `Authorization: Bearer <token>`
-- **Request Body**: `{"op_id": "...", "controller_lease": "..."}`
-- **Semantics**:
-  - The client requests reconciliation; it cannot manufacture adapter observations.
-  - If no host-loss episode is open, the service durably opens one via `storage.Store.RecordHostLoss(...)` to obtain a fresh generation.
+- **Request Body**:
+  ```json
+  {
+    "op_id": "op-reconcile-123",
+    "controller_lease": "lease-abc"
+  }
+  ```
+- **Composite Command Convention**:
+  - Public operation ID `op_id` links multi-stage durable records.
+  - If no recovery episode is open, the service durably opens one via `storage.Store.RecordHostLoss(..., op_id+":host_loss", ...)` to obtain a fresh monotonic generation.
   - Invokes adapter `Reconcile` using the original recovery reference and generation.
-  - Authoritatively records the reconciled outcome in storage and returns the receipt.
+  - Authoritatively records the reconciled outcome via `storage.Store.ReconcileSession(..., op_id+":reconcile", ...)` and returns the committed receipt.
+  - Reconnection retry with the same `op_id` returns the committed result without opening fresh episodes.
 
 ---
 
-## 4. Lifecycle Coordination, Draining, and Shutdown
+### 3.4 Adapter Lifecycle & Outcome Mapping
+
+| Adapter Result | Required Service Treatment |
+|---|---|
+| Dispatch accepted (`DispatchAccepted`) | Record acknowledgement intent; retain reservation; supervise outcome collection |
+| Dispatch acceptance unknown (`DispatchUnknown`) | Record uncertainty intent; do not retry dispatch; retain reservation |
+| Dispatch definitively rejected (`DispatchRejected`) | Record non-execution resolution without manufacturing a successful run; release reservation cleanly |
+| Observation ends or errors | End/recover observation stream; do not infer task termination |
+| Authoritative terminal outcome obtained | Persist to SQLite via `RecordTerminalOutcome` before announcing durable completion |
+| Result persistence fails | Retain unresolved persistence responsibility; do not report successful drain |
+
+- **Native Session Binding**: Explicit recovery loads the saved logical/native binding and approved configuration, invoking the adapter's supported resume/recovery mechanism against the original execution. It **never** calls `CreateSession` as a silent substitute for a missing session.
+- **Post-Terminal Recovery Blockers**: A parked contributor with an outstanding reachability episode (`visibility == host_lost`) remains a recovery and shutdown blocker, even though its turn is already terminal.
+
+---
+
+## 4. Lifecycle Coordination, Draining, and Teardown Synchronization
 
 ### 4.1 Lifecycle States
 ```
@@ -246,28 +298,36 @@ Requests reconciliation of an uncertain or interrupted turn.
 
 - **RUNNING**: Normal operations. Release admission gate is open.
 - **DRAINING**: Admission gate closed to new releases. Active executions continue. Mutation endpoints (cancel, reconcile) and inspection stay open. Existing receipts remain retrievable.
-- **STOPPING**: Final teardown. All command admission closed. Existing SSE connections terminated. Storage closed. Runtime files deleted. Lock released last.
+- **STOPPING**: Final teardown. All command admission closed. Existing SSE connections terminated. Storage closed. Runtime files deleted. Lock released last. Read-only inspection or receipt retrieval may finish while HTTP remains available, but clients are not promised availability after listener shutdown begins.
 
 ### 4.2 Three Timeout Domains
 1. **CLI Wait Timeout (`--timeout`)**:
    - Evaluated strictly on the client side.
-   - If the CLI wait timeout expires while draining, the client reports `still draining (active: N)` or unknown status. The service continues draining unaffected.
+   - If the CLI wait timeout expires while draining, the client reports `still draining (active: N)` or unknown status. The accepted service drain operation continues unaffected.
 2. **Signal Drain Grace Period (Default: 15s)**:
    - Evaluated by the service upon receiving `SIGTERM` or `SIGINT`.
-   - Starts a bounded countdown for accepted work to finish naturally. Repeated signals do not reset the grace period.
-   - If the grace period expires before executions complete: the service initiates bounded termination, requesting cancellation where supported, capturing confirmed outcomes, and preserving unconfirmed outcomes as unresolved.
-3. **Teardown Deadline (Default: 5s)**:
+   - Starts a bounded countdown for accepted work to finish naturally. Repeated signals retain the original deadline.
+   - If the grace period expires before executions complete: the service initiates bounded termination handling, requesting cancellation where supported, capturing confirmed outcomes, and preserving unconfirmed outcomes as unresolved.
+3. **Final Teardown Deadline (Default: 5s)**:
    - Evaluated during final teardown in `STOPPING`.
-   - Bounded context for HTTP `Shutdown()`, observer termination, and task joining.
-   - If quiescence cannot be established within the teardown deadline, the service exits through a forced-exit path without fabricating completion or releasing `service.lock` prematurely.
+   - Limits the time to wait for HTTP `Shutdown()`, observer termination, and joining active tasks.
+   - If orderly quiescence cannot be established within the teardown deadline, the service exits through a forced-exit path without fabricating completion and **without releasing `service.lock` prematurely** while old tasks may still mutate state.
 
-### 4.3 Orderly Teardown Sequence
+### 4.3 Shutdown Eligibility Definition
+The coordinator considers the service eligible for final teardown only when all of the following reach zero:
+1. Accepted-but-not-started release handoffs.
+2. Active live worker executions.
+3. Pending terminal outcome database commits.
+4. Admitted in-flight cancellation or reconciliation jobs.
+5. Outstanding unresolved recovery blockers (including post-terminal reachability episodes).
+
+### 4.4 Orderly Teardown Sequence
 1. Close release admission gate.
-2. Allow accepted executions and their outcome commits to finish (or signal grace to expire).
-3. Transition to `STOPPING`: reject all new incoming HTTP requests and mutations.
+2. Drain accepted executions and their outcome commits (or signal grace expires).
+3. Transition to `STOPPING`: reject all new incoming HTTP requests, mutations, and subscriptions.
 4. Close existing SSE observation subscriptions.
 5. Invoke `http.Server.Shutdown(ctx)` with bounded deadline to wait for in-flight handlers.
-6. Join all service-owned persistence and observation tasks to reach total quiescence.
+6. Join all service-owned execution, persistence, and observation tasks to reach total quiescence.
 7. Close `storage.Store`.
 8. Unlink `service.json`, `auth.token`, and `council.sock`.
 9. Close file descriptor and release `service.lock` **last** (file remains on disk).
@@ -301,55 +361,60 @@ When the service starts up against a state directory containing pre-existing rec
 - Implement `internal/service/lock.go`: `flock(LOCK_EX|LOCK_NB)` with `FD_CLOEXEC`, stable file retention, and clean release.
 - Implement `internal/service/discovery.go`: atomic writing of `service.json` (mode `0600`) and random 32-byte `auth.token` (mode `0600`).
 - Implement stale socket cleanup: check path, verify not a directory/symlink, unlink only stale socket file.
-- Verify loser startup cannot alter winner's runtime files.
+- Implement failed-start cleanup and verify loser startup cannot alter winner's runtime files.
 
 ### Task 2: HTTP Service Core, Auth Middleware, and Diagnostic Endpoints
 - Implement `internal/service/server.go`: `net/http` server bound to UDS `council.sock`.
 - Implement Bearer token authentication middleware with `WWW-Authenticate` challenge.
-- Implement standard error envelope and `http.MaxBytesReader` request bounding.
+- Implement standard error envelope, `http.MaxBytesReader` (10MB), and header limits (1MB).
 - Implement `GET /v1/readiness` and `GET /v1/status` distinguishing `live_workers`, `reserved_turns`, and `unresolved_turns`.
 
 ### Task 3: Release Admission Gate & Retry-Safe Dispatch Coordinator
+- Extend `storage.Store.ReleaseTurn` to return `ReleaseResult{Receipt: receipt, Disposition: ReleaseDisposition}`.
 - Implement `internal/service/coordinator.go`: admission gate state machine (`running`, `draining`, `stopping`).
 - Implement `POST /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/release`:
+  - Pre-flight check: reject if adapter or native binding is unavailable.
   - Draining check: reject new releases (`503`), permit matching retries.
-  - Distinguish newly committed vs replayed storage receipts.
-  - Newly committed: register active execution, dispatch worker in detached service context.
-  - Replayed: return existing receipt with `replayed: true` (200 OK) without dispatching.
+  - Distinguish newly committed vs replayed storage receipts:
+    - Newly committed: register execution, dispatch worker in detached service context.
+    - Replayed: return existing receipt with `replayed: true` (200 OK) without dispatching.
 
 ### Task 4: Command Routing, Recovery Episodes, and Authoritative Read
 - Implement `GET /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}` (authoritative read used by reconnecting clients).
+- Implement `POST /v1/runs/{run_id}/controller/connect` for explicit controller connection.
 - Implement prompt queue commands (`/queue`, `/replace`, `/discard`) and `/decisions`.
-- Implement `POST .../cancel`: record request, call adapter Cancel, record confirmed/uncertain outcome.
+- Implement `POST .../cancel`: record request, call adapter Cancel with independent context, record confirmed/uncertain outcome.
 - Implement `POST .../reconcile`: allocate recovery episode via `RecordHostLoss` if needed, call adapter Reconcile, persist outcome.
 - Validate controller lease, `expected_version`, and reference correlation across all mutations.
 
 ### Task 5: Server-Sent Events (SSE) Live Observation
 - Implement `GET /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/events`.
-- Synchronize observer registration and initial state snapshot: emit terminal event immediately if already finished.
+- Synchronize observer registration and initial state snapshot: emit terminal event immediately if already finished (no hanging).
 - Bounded event buffers (64 capacity), write timeouts, explicit disconnection on slow consumption.
 - Emit durable terminal events only after SQLite transaction commit.
 - Client disconnect does not cancel workers.
 
 ### Task 6: Shutdown Coordinator & Signal Handling
 - Implement `POST /v1/service/stop` (`drain: false` with atomic idle check; `drain: true` with admission closure).
-- Implement OS signal handler (`SIGTERM`/`SIGINT`) initiating bounded drain grace period.
+- Implement OS signal handler (`SIGTERM`/`SIGINT`) initiating bounded drain grace period (15s).
 - Implement strict teardown sequence: quiesce command admission -> close SSE -> HTTP shutdown -> join tasks -> close store -> delete runtime files -> release lock last.
 - Implement forced termination path if grace period or teardown deadline expires.
 
 ### Task 7: Detached Background Launcher & CLI Command Suite
 - Update `cmd/council`:
   - `council service run`: runs foreground core.
-  - `council service start`: launches detached process via `setsid` on Linux/WSL, redirects stdio, polls `GET /v1/readiness` until ready or error.
+  - `council service start`: launches detached process via `setsid` on Linux/WSL, redirects stdio, polls `GET /v1/readiness` until ready or error (distinguishes early child exit from timeout).
   - `council service status`: reads discovery and displays authenticated status.
   - `council service stop [--drain]`: authenticated stop request with CLI `--timeout` wait.
-- Explicit unsupported error on native Windows for background launcher.
+- Explicit unsupported error on native Windows for all service commands.
 
 ### Task 8: End-to-End Integration & Concurrency Acceptance Suite
-- Test 1: Independent client lifetime (Client A releases turn and terminates; service completes work and commits result; Client B connects, reads result; queued prompt remains queued).
-- Test 2: Crash and restart recovery (kill -9 during execution; restart preserves unresolved reservation without redispatch; explicit reconcile probes and resolves).
-- Test 3: Concurrent startup race (two `service start` attempts; exactly one owner; loser leaves winner intact).
-- Test 4: Release retry safety (duplicate release during drain returns receipt without dispatch).
-- Test 5: Idle stop vs release race (atomic rejection or tracking).
-- Test 6: Signal grace expiry and forced exit preservation.
-- Test 7: Test-only assembly with fake adapter (no fake adapter in production registry).
+- **Acceptance Evidence Partitioning**:
+  - Test 1: Independent client lifetime (Client A releases turn and terminates; service completes work and commits result; Client B connects, reads result; queued prompt remains queued).
+  - Test 2: Crash and restart recovery without accessible native evidence (kill -9 during execution; restart preserves unresolved reservation without redispatch).
+  - Test 3: Restart with independently retained test-harness evidence (explicit recovery attaches to original binding and resolves from independently retained evidence via test helper process).
+  - Test 4: Concurrent startup race (two `service start` attempts; exactly one owner; loser leaves winner intact).
+  - Test 5: Release retry safety (duplicate release during drain returns receipt without dispatch).
+  - Test 6: Idle stop vs release race (atomic rejection or tracking).
+  - Test 7: Signal grace expiry and forced exit preservation without early lock release.
+  - Test 8: Test-only assembly with fake adapter (no fake adapter in production registry).
