@@ -292,6 +292,121 @@ func (s *Store) GetTurnPrompt(ctx context.Context, sessionID, turnKey string) (s
 	return prompt, nil
 }
 
+// FindOperationReceipt checks if opID exists in journal_entries and validates callerLease if non-empty.
+func (s *Store) FindOperationReceipt(ctx context.Context, opID string, callerLease string) (*OperationReceipt, bool, error) {
+	var storedCmdType, storedFingerprint, payloadJSON string
+	err := s.readDB.QueryRowContext(ctx, "SELECT command_type, command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;", opID).Scan(&storedCmdType, &storedFingerprint, &payloadJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var jp journalPayload
+	if err := json.Unmarshal([]byte(payloadJSON), &jp); err == nil && jp.Receipt.OpID != "" {
+		if callerLease != "" && jp.CallerLease != callerLease {
+			return nil, false, ErrUnauthorizedOperation
+		}
+		return &jp.Receipt, true, nil
+	}
+	return nil, false, nil
+}
+
+// SessionRecoveryState holds reachability and recovery status for a session.
+type SessionRecoveryState struct {
+	Visibility        string
+	ActiveRecoveryGen uint64
+	RowVersion        int64
+	State             string
+	ActiveKey         string
+}
+
+// GetSessionRecoveryState reads current visibility and recovery generation.
+func (s *Store) GetSessionRecoveryState(ctx context.Context, sessionID string) (SessionRecoveryState, error) {
+	var st SessionRecoveryState
+	var activeKey sql.NullString
+	err := s.readDB.QueryRowContext(ctx, "SELECT visibility, active_recovery_gen, row_version, state, active_key FROM sessions WHERE session_id = ?;", sessionID).Scan(&st.Visibility, &st.ActiveRecoveryGen, &st.RowVersion, &st.State, &activeKey)
+	if err != nil {
+		return SessionRecoveryState{}, err
+	}
+	if activeKey.Valid {
+		st.ActiveKey = activeKey.String
+	}
+	return st, nil
+}
+
+// TurnDetails provides full authoritative status and state for a turn.
+type TurnDetails struct {
+	SessionID      string                 `json:"session_id"`
+	TurnKey        string                 `json:"turn_key"`
+	Prompt         string                 `json:"prompt"`
+	Status         council.TurnStatus     `json:"status"`
+	Result         string                 `json:"result"`
+	AttemptID      string                 `json:"attempt_id"`
+	CreatedAt      time.Time              `json:"created_at"`
+	CompletedAt    *time.Time             `json:"completed_at,omitempty"`
+	DispatchIntent *DispatchIntentDetails `json:"dispatch_intent,omitempty"`
+}
+
+// DispatchIntentDetails captures intent tracking for an attempt.
+type DispatchIntentDetails struct {
+	SessionID  string    `json:"session_id"`
+	TurnKey    string    `json:"turn_key"`
+	AttemptID  string    `json:"attempt_id"`
+	Phase      string    `json:"phase"`
+	RecordedAt time.Time `json:"recorded_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// GetTurnDetails returns authoritative turn state including dispatch intent.
+func (s *Store) GetTurnDetails(ctx context.Context, sessionID, turnKey string) (*TurnDetails, error) {
+	var td TurnDetails
+	var completedAt sql.NullString
+	var createdAtStr string
+	err := s.readDB.QueryRowContext(ctx, `
+SELECT session_id, turn_key, prompt, status, result, attempt_id, created_at, completed_at
+FROM turns
+WHERE session_id = ? AND turn_key = ?;`, sessionID, turnKey).Scan(&td.SessionID, &td.TurnKey, &td.Prompt, &td.Status, &td.Result, &td.AttemptID, &createdAtStr, &completedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query turn: %w", err)
+	}
+
+	if t, err := time.Parse(time.RFC3339Nano, createdAtStr); err == nil {
+		td.CreatedAt = t
+	} else if t, err := time.Parse(time.RFC3339, createdAtStr); err == nil {
+		td.CreatedAt = t
+	}
+
+	if completedAt.Valid && completedAt.String != "" {
+		if t, err := time.Parse(time.RFC3339Nano, completedAt.String); err == nil {
+			td.CompletedAt = &t
+		} else if t, err := time.Parse(time.RFC3339, completedAt.String); err == nil {
+			td.CompletedAt = &t
+		}
+	}
+
+	var di DispatchIntentDetails
+	var diRecStr, diUpdStr string
+	err = s.readDB.QueryRowContext(ctx, `
+SELECT session_id, turn_key, attempt_id, phase, recorded_at, updated_at
+FROM dispatch_intents
+WHERE session_id = ? AND turn_key = ?;`, sessionID, turnKey).Scan(&di.SessionID, &di.TurnKey, &di.AttemptID, &di.Phase, &diRecStr, &diUpdStr)
+	if err == nil {
+		if t, err := time.Parse(time.RFC3339Nano, diRecStr); err == nil {
+			di.RecordedAt = t
+		}
+		if t, err := time.Parse(time.RFC3339Nano, diUpdStr); err == nil {
+			di.UpdatedAt = t
+		}
+		td.DispatchIntent = &di
+	}
+
+	return &td, nil
+}
+
 func (s *Store) ReleaseTurn(ctx context.Context, opID string, callerLease string, sessionID string, expectedVersion int64, turnKey string) (ReleaseResult, error) {
 	if expectedVersion <= 0 {
 		return ReleaseResult{}, ErrInvalidExpectedVersion
