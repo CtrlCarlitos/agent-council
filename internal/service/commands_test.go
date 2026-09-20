@@ -1,3 +1,5 @@
+//go:build unix
+
 package service
 
 import (
@@ -15,7 +17,7 @@ import (
 )
 
 func TestCommands_TurnReadCancelAndReconcile(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, err := AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("acquire lock: %v", err)
@@ -132,11 +134,17 @@ func TestCommands_TurnReadCancelAndReconcile(t *testing.T) {
 		t.Fatalf("unexpected cancellation status: %s", cResp.CancellationStatus)
 	}
 
-	// 3. Controller Reattachment: session-scoped connect validates version
+	// 3. Controller Reattachment: session-scoped connect validates version.
+	// The cancel response preserves the request acceptance receipt, so the
+	// client refreshes the authoritative version before reconnecting.
+	connectVersion, err := store.GetSessionVersion(ctx, "sess-1")
+	if err != nil {
+		t.Fatalf("get session version: %v", err)
+	}
 	connectBody, err := json.Marshal(ControllerConnectRequest{
 		OpID:            "op-conn-1",
 		ControllerLease: "lease-1",
-		ExpectedVersion: cResp.Receipt.CommittedVersion,
+		ExpectedVersion: connectVersion,
 	})
 	if err != nil {
 		t.Fatalf("marshal connect body: %v", err)
@@ -158,7 +166,7 @@ func TestCommands_TurnReadCancelAndReconcile(t *testing.T) {
 }
 
 func TestCommands_PromptLifecycleAndDecisions(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, err := AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("acquire lock: %v", err)
@@ -299,7 +307,7 @@ func TestCommands_PromptLifecycleAndDecisions(t *testing.T) {
 }
 
 func TestCommands_CompositeReconciliation(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, err := AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("acquire lock: %v", err)
@@ -330,7 +338,17 @@ func TestCommands_CompositeReconciliation(t *testing.T) {
 		t.Fatalf("create session: %v", err)
 	}
 
-	qRec, err := store.QueuePrompt(ctx, "op-q-rec", "lease-rec", "sess-rec", sessRec.CommittedVersion, storage.PendingPrompt{
+	// Explicit recovery attaches to the saved native binding.
+	bindRec, err := store.SetNativeBinding(ctx, "op-bind-rec", "lease-rec", "sess-rec", sessRec.CommittedVersion, storage.NativeBinding{
+		LogicalSessionID: "sess-rec",
+		NativeSessionID:  "native-sess-rec",
+		Harness:          "claude",
+	})
+	if err != nil {
+		t.Fatalf("set native binding: %v", err)
+	}
+
+	qRec, err := store.QueuePrompt(ctx, "op-q-rec", "lease-rec", "sess-rec", bindRec.CommittedVersion, storage.PendingPrompt{
 		SessionID: "sess-rec",
 		TurnKey:   "t-rec",
 		Prompt:    "Prompt for reconcile test",
@@ -345,6 +363,12 @@ func TestCommands_CompositeReconciliation(t *testing.T) {
 	}
 
 	fakeAdapter := adaptertest.NewFakeAdapter("claude")
+	if _, err := fakeAdapter.CreateSession(ctx, adapter.CreateSessionRequest{
+		SessionID:   adapter.SessionID("sess-rec"),
+		Contributor: "claude",
+	}); err != nil {
+		t.Fatalf("create adapter session: %v", err)
+	}
 	cfg := ServerConfig{
 		StateDir:   dir,
 		InstanceID: "inst-rec",
@@ -410,7 +434,7 @@ func TestCommands_CompositeReconciliation(t *testing.T) {
 }
 
 func TestCommands_StrictJSONRejectsExtraFields(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, _ := AcquireServiceLock(dir)
 	defer lock.Release()
 	store, _ := storage.Open(storage.StoreOptions{StateDir: dir})
@@ -455,7 +479,7 @@ func TestCommands_StrictJSONRejectsExtraFields(t *testing.T) {
 }
 
 func TestCommands_RunSessionCorrelation(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, _ := AcquireServiceLock(dir)
 	defer lock.Release()
 	store, _ := storage.Open(storage.StoreOptions{StateDir: dir})

@@ -112,7 +112,14 @@ func runServiceCmd(args []string) error {
 	defer srv.Close()
 
 	srv.StartSignalHandler()
-	_ = srv.WaitForShutdown(context.Background())
+	if err := srv.WaitForShutdown(context.Background()); err != nil {
+		// Forced termination: leftover tasks may still be mutating storage,
+		// so deferred cleanup must not run. The process boundary is the only
+		// safe terminator; the lock file stays on disk and its handle is
+		// released by process exit.
+		fmt.Fprintf(os.Stderr, "council service: %v\n", err)
+		os.Exit(1)
+	}
 	return nil
 }
 

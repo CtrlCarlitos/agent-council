@@ -1,3 +1,5 @@
+//go:build unix
+
 package service
 
 import (
@@ -110,7 +112,7 @@ func TestAcceptance_TwoClientDisconnect_Deterministic(t *testing.T) {
 // 2. Crash Recovery Without Accessible Native Evidence: Turn reservation preserved as unresolved,
 // no automatic redispatch.
 func TestAcceptance_CrashRecovery_WithoutAccessibleNativeEvidence(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 
 	// 1. Initial service instance releases turn and simulates crash
 	lock1, err := AcquireServiceLock(dir)
@@ -240,14 +242,22 @@ func TestAcceptance_CrashRecovery_WithoutAccessibleNativeEvidence(t *testing.T) 
 // 3. Restart With Independently Retained Evidence: Reconcile allocates recovery episode,
 // probes independent evidence, and resolves turn.
 func TestAcceptance_RestartWithIndependentlyRetainedEvidence(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 
 	// Initial store setup
-	lock1, _ := AcquireServiceLock(dir)
-	store1, _ := storage.Open(storage.StoreOptions{StateDir: dir})
+	lock1, err := AcquireServiceLock(dir)
+	if err != nil {
+		t.Fatalf("acquire lock 1: %v", err)
+	}
+	store1, err := storage.Open(storage.StoreOptions{StateDir: dir})
+	if err != nil {
+		t.Fatalf("open store 1: %v", err)
+	}
 	ctx := context.Background()
-	_, _ = store1.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile", "lease-1")
-	sessRec, _ := store1.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
+	if _, err := store1.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile", "lease-1"); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	sessRec, err := store1.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID:                  "sess-1",
 		RunID:               "run-1",
 		Contributor:         "claude",
@@ -256,23 +266,57 @@ func TestAcceptance_RestartWithIndependentlyRetainedEvidence(t *testing.T) {
 		State:               "parked",
 		Visibility:          "reachable",
 	})
-	qRec, _ := store1.QueuePrompt(ctx, "op-q-1", "lease-1", "sess-1", sessRec.CommittedVersion, storage.PendingPrompt{
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	// The saved native binding is the attach point for explicit recovery.
+	bindRec, err := store1.SetNativeBinding(ctx, "op-bind-1", "lease-1", "sess-1", sessRec.CommittedVersion, storage.NativeBinding{
+		LogicalSessionID: "sess-1",
+		NativeSessionID:  "native-sess-1",
+		Harness:          "claude",
+	})
+	if err != nil {
+		t.Fatalf("set native binding: %v", err)
+	}
+	qRec, err := store1.QueuePrompt(ctx, "op-q-1", "lease-1", "sess-1", bindRec.CommittedVersion, storage.PendingPrompt{
 		SessionID: "sess-1",
 		TurnKey:   "turn-evid",
 		Prompt:    "work before crash",
 	})
-	_, _ = store1.ReleaseTurn(ctx, "op-rel-1", "lease-1", "sess-1", qRec.CommittedVersion, "turn-evid")
-	_ = store1.Close()
-	_ = lock1.Release()
+	if err != nil {
+		t.Fatalf("queue prompt: %v", err)
+	}
+	if _, err := store1.ReleaseTurn(ctx, "op-rel-1", "lease-1", "sess-1", qRec.CommittedVersion, "turn-evid"); err != nil {
+		t.Fatalf("release turn: %v", err)
+	}
+	if err := store1.Close(); err != nil {
+		t.Fatalf("close store 1: %v", err)
+	}
+	if err := lock1.Release(); err != nil {
+		t.Fatalf("release lock 1: %v", err)
+	}
 
 	// Restart service
-	lock2, _ := AcquireServiceLock(dir)
+	lock2, err := AcquireServiceLock(dir)
+	if err != nil {
+		t.Fatalf("acquire lock 2: %v", err)
+	}
 	defer lock2.Release()
-	store2, _ := storage.Open(storage.StoreOptions{StateDir: dir})
+	store2, err := storage.Open(storage.StoreOptions{StateDir: dir})
+	if err != nil {
+		t.Fatalf("open store 2: %v", err)
+	}
 	defer store2.Close()
 
-	// Adapter simulates independently retained evidence
+	// Adapter simulates independently retained evidence. The native session
+	// matching the saved binding exists at the harness side.
 	fakeAdp2 := adaptertest.NewFakeAdapter("claude")
+	if _, err := fakeAdp2.CreateSession(ctx, adapter.CreateSessionRequest{
+		SessionID:   adapter.SessionID("sess-1"),
+		Contributor: "claude",
+	}); err != nil {
+		t.Fatalf("create adapter session: %v", err)
+	}
 	fakeAdp2.SetExecutionResult(adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-evid"}, adapter.TurnResult{
 		Status: council.TurnCompleted,
 		Output: "authoritative output from independent evidence",
@@ -283,8 +327,13 @@ func TestAcceptance_RestartWithIndependentlyRetainedEvidence(t *testing.T) {
 		InstanceID: "inst-restart-3",
 		AuthToken:  "token-restart-3",
 	}
-	srv2, _ := NewServerWithAdapter(store2, lock2, cfg2, fakeAdp2)
-	_ = srv2.Start()
+	srv2, err := NewServerWithAdapter(store2, lock2, cfg2, fakeAdp2)
+	if err != nil {
+		t.Fatalf("new server 2: %v", err)
+	}
+	if err := srv2.Start(); err != nil {
+		t.Fatalf("start server 2: %v", err)
+	}
 	defer srv2.Close()
 
 	client2 := newTestClient(srv2.SocketPath())
@@ -318,7 +367,24 @@ func TestAcceptance_ReconcileRetry_LostCompositeResponse(t *testing.T) {
 	ctx := context.Background()
 
 	ver, _ := h.createSessionAndTurn(ctx, "run-1", "sess-1", "turn-retry", "prompt")
-	_, err := h.store.ReleaseTurn(ctx, "op-rel-retry", "lease-1", "sess-1", ver, "turn-retry")
+
+	// Explicit recovery attaches to the saved native binding.
+	bindRec, err := h.store.SetNativeBinding(ctx, "op-bind-retry", "lease-1", "sess-1", ver, storage.NativeBinding{
+		LogicalSessionID: "sess-1",
+		NativeSessionID:  "native-sess-1",
+		Harness:          "claude",
+	})
+	if err != nil {
+		t.Fatalf("set native binding: %v", err)
+	}
+	if _, err := h.adapter.CreateSession(ctx, adapter.CreateSessionRequest{
+		SessionID:   adapter.SessionID("sess-1"),
+		Contributor: "claude",
+	}); err != nil {
+		t.Fatalf("create adapter session: %v", err)
+	}
+
+	_, err = h.store.ReleaseTurn(ctx, "op-rel-retry", "lease-1", "sess-1", bindRec.CommittedVersion, "turn-retry")
 	if err != nil {
 		t.Fatalf("release turn: %v", err)
 	}
@@ -420,7 +486,7 @@ func TestAcceptance_IdleStop_ReleaseRace(t *testing.T) {
 
 // 6. Concurrent Startup Race: Exactly one owner succeeds; loser fails with already running.
 func TestAcceptance_ConcurrentStartupRace(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 
 	var wg sync.WaitGroup
 	wg.Add(2)

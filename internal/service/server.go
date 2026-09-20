@@ -60,6 +60,7 @@ type Server struct {
 	running      bool
 	shutdown     chan struct{}
 	teardownOnce sync.Once
+	teardownErr  error
 }
 
 func NewServer(store *storage.Store, lock *ServiceLock, cfg ServerConfig) (*Server, error) {
@@ -188,10 +189,16 @@ func (s *Server) Close() error {
 	return s.Teardown(5 * time.Second)
 }
 
+// WaitForShutdown blocks until teardown has completed. It returns the
+// recorded teardown outcome: nil for orderly completion and a wrapped
+// ErrForcedTeardown when the final deadline expired, so a timed-out teardown
+// is never reported as orderly success.
 func (s *Server) WaitForShutdown(ctx context.Context) error {
 	select {
 	case <-s.shutdown:
-		return nil
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.teardownErr
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -209,13 +216,14 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 
 	var reservedTurns, unresolvedTurns int
 	if s.store != nil {
+		epoch := s.coordinator.BlockerEpoch()
 		liveMap := s.coordinator.LiveWorkerKeys()
 		counts, err := s.store.GetDiagnosticCounts(r.Context(), liveMap)
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, "storage_error", fmt.Sprintf("diagnostics query failed: %v", err), "")
 			return
 		}
-		s.coordinator.SetRecoveryBlockers(counts.RecoveryBlockers)
+		s.coordinator.ApplyDiagnosticBlockers(counts.RecoveryBlockers, epoch)
 		reservedTurns = counts.ReservedTurns
 		unresolvedTurns = counts.UnresolvedTurns
 	}
@@ -244,13 +252,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	var reservedTurns, unresolvedTurns int
 	activeRuns := []string{}
 	if s.store != nil {
+		epoch := s.coordinator.BlockerEpoch()
 		liveMap := s.coordinator.LiveWorkerKeys()
 		counts, err := s.store.GetDiagnosticCounts(r.Context(), liveMap)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "storage_error", fmt.Sprintf("diagnostics query failed: %v", err), "")
 			return
 		}
-		s.coordinator.SetRecoveryBlockers(counts.RecoveryBlockers)
+		s.coordinator.ApplyDiagnosticBlockers(counts.RecoveryBlockers, epoch)
 		reservedTurns = counts.ReservedTurns
 		unresolvedTurns = counts.UnresolvedTurns
 		activeRuns = counts.ActiveRuns

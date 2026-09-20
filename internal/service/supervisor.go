@@ -114,7 +114,10 @@ func (s *ExecutionSupervisor) Run(ctx context.Context) {
 	obsOpID := fmt.Sprintf("op-obs-%s-%s-%s", s.sessionID, s.turnKey, attemptID)
 	_, _ = s.store.RecordDispatchObservation(ctx, obsOpID, s.callerLease, s.sessionID, s.turnKey, "receipt_acknowledged")
 
-	// Observe stream until completion
+	// Observe stream until completion. The worker context is the termination
+	// scope only; a cancellation request does not cancel it, so observation,
+	// collection, and persistence stay alive while the native execution may
+	// still be running (cancel requested, unsupported, rejected, or unknown).
 	stream, err := s.adapter.Observe(ctx, ref)
 	if err == nil {
 		for ev := range stream.Events() {
@@ -132,14 +135,18 @@ func (s *ExecutionSupervisor) Run(ctx context.Context) {
 		}
 	}
 
-	// If worker context was cancelled (grace expiry or forced exit),
-	// do not fabricate terminal failure; preserve unconfirmed outcome as unresolved.
+	// If the service is terminating (grace expiry or forced exit), do not
+	// fabricate terminal failure; preserve the unconfirmed outcome as
+	// unresolved. This is the only ctx-cancelled exit path.
 	if ctx.Err() != nil {
 		return
 	}
 
-	// Collect authoritative outcome
-	turnResult, err := s.adapter.Collect(ctx, ref)
+	// Collect the authoritative outcome. Collect may report a pending result
+	// while the native execution is still finishing (for example after a
+	// cancellation request that the adapter could not confirm), so poll until
+	// a terminal result is verified or the service terminates.
+	turnResult, err := s.collectUntilTerminal(ctx, ref)
 	if err != nil {
 		if ctx.Err() != nil {
 			return
@@ -162,6 +169,12 @@ func (s *ExecutionSupervisor) Run(ctx context.Context) {
 
 	err = s.recordTerminalOutcomeWithRetry(ctx, turnResult.Status, turnResult.Output)
 	if err != nil {
+		// A command-driven path (confirmed cancellation, reconciliation) may
+		// have committed the terminal outcome concurrently. Durable terminal
+		// state means the outcome was recorded authoritatively: not a blocker.
+		if s.turnAlreadyCommittedTerminal() {
+			return
+		}
 		if s.coordinator != nil {
 			s.coordinator.AddRecoveryBlocker()
 		}
@@ -215,4 +228,48 @@ func (s *ExecutionSupervisor) recordTerminalOutcomeWithRetry(ctx context.Context
 		return err
 	}
 	return errors.New("exhausted version retries recording terminal outcome")
+}
+
+// collectUntilTerminal polls the adapter until it verifies a terminal result
+// or the termination scope ctx is cancelled. A pending result (execution
+// still finishing) is not an error.
+func (s *ExecutionSupervisor) collectUntilTerminal(ctx context.Context, ref adapter.TurnRef) (adapter.TurnResult, error) {
+	for {
+		if ctx.Err() != nil {
+			return adapter.TurnResult{}, ctx.Err()
+		}
+		res, err := s.adapter.Collect(ctx, ref)
+		if err != nil {
+			return adapter.TurnResult{}, err
+		}
+		if isTerminalTurnStatus(res.Status) && res.ResultStatus != adapter.ResultPending {
+			return res, nil
+		}
+		select {
+		case <-ctx.Done():
+			return adapter.TurnResult{}, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+// turnAlreadyCommittedTerminal reports whether the turn already has a
+// durable terminal outcome recorded by another authoritative path.
+func (s *ExecutionSupervisor) turnAlreadyCommittedTerminal() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	details, err := s.store.GetTurnDetails(ctx, s.sessionID, s.turnKey)
+	if err != nil || details == nil {
+		return false
+	}
+	return isTerminalTurnStatus(details.Status)
+}
+
+func isTerminalTurnStatus(status council.TurnStatus) bool {
+	switch status {
+	case council.TurnCompleted, council.TurnFailed, council.TurnCancelled, council.TurnInterrupted:
+		return true
+	default:
+		return false
+	}
 }

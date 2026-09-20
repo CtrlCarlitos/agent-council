@@ -316,6 +316,7 @@ func (s *Store) FindOperationReceipt(ctx context.Context, opID string, callerLea
 type SessionRecoveryState struct {
 	Visibility        string
 	ActiveRecoveryGen uint64
+	RecoveryContext   string
 	RowVersion        int64
 	State             string
 	ActiveKey         string
@@ -325,7 +326,7 @@ type SessionRecoveryState struct {
 func (s *Store) GetSessionRecoveryState(ctx context.Context, sessionID string) (SessionRecoveryState, error) {
 	var st SessionRecoveryState
 	var activeKey sql.NullString
-	err := s.readDB.QueryRowContext(ctx, "SELECT visibility, active_recovery_gen, row_version, state, active_key FROM sessions WHERE session_id = ?;", sessionID).Scan(&st.Visibility, &st.ActiveRecoveryGen, &st.RowVersion, &st.State, &activeKey)
+	err := s.readDB.QueryRowContext(ctx, "SELECT visibility, active_recovery_gen, row_version, state, active_key, coalesce(recovery_context, '') FROM sessions WHERE session_id = ?;", sessionID).Scan(&st.Visibility, &st.ActiveRecoveryGen, &st.RowVersion, &st.State, &activeKey, &st.RecoveryContext)
 	if err != nil {
 		return SessionRecoveryState{}, err
 	}
@@ -333,6 +334,26 @@ func (s *Store) GetSessionRecoveryState(ctx context.Context, sessionID string) (
 		st.ActiveKey = activeKey.String
 	}
 	return st, nil
+}
+
+// GetSessionNativeBinding returns the saved native binding for a session
+// together with the session's contributor identity, for explicit recovery
+// attach. found is false when no binding has been saved.
+func (s *Store) GetSessionNativeBinding(ctx context.Context, sessionID string) (NativeBinding, string, bool, error) {
+	var b NativeBinding
+	var contributor string
+	err := s.readDB.QueryRowContext(ctx, `
+SELECT b.session_id, b.native_session_id, b.harness, b.model, b.workspace_mode, b.config_json, s.contributor
+FROM native_bindings b
+JOIN sessions s ON s.session_id = b.session_id
+WHERE b.session_id = ?;`, sessionID).Scan(&b.LogicalSessionID, &b.NativeSessionID, &b.Harness, &b.Model, &b.WorkspaceMode, &b.ToolingConfig, &contributor)
+	if err == sql.ErrNoRows {
+		return NativeBinding{}, "", false, nil
+	}
+	if err != nil {
+		return NativeBinding{}, "", false, err
+	}
+	return b, contributor, true, nil
 }
 
 // TurnDetails provides full authoritative status and state for a turn.

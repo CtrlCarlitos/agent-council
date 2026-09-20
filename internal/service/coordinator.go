@@ -31,17 +31,30 @@ type SSEEvent struct {
 
 // Coordinator manages the release admission gate, live worker accounting,
 // service-owned execution lifetimes, and SSE event fanout.
+//
+// Invariants:
+//   - A cancellation request never cancels a worker context. Only service
+//     termination (signal grace expiry, forced teardown, root cancellation)
+//     cancels worker execution contexts; a cancel request is an adapter-level
+//     signal and the supervisor keeps observing, collecting, and persisting.
+//   - Every admitted unit of work (worker, handoff, commit, control
+//     operation) is accounted in one task WaitGroup so teardown can join all
+//     predecessor activity.
+//   - Recovery blocker counts are reconciled against a versioned snapshot:
+//     a diagnostic refresh observed before an AddRecoveryBlocker obligation
+//     materialized can never erase that obligation.
 type Coordinator struct {
 	mu               sync.RWMutex
 	state            ServiceState
 	ctx              context.Context
 	cancel           context.CancelFunc
-	workers          sync.WaitGroup
+	tasks            sync.WaitGroup
 	liveWorkers      int
 	pendingHandoffs  int
 	pendingCommits   int
 	inFlightControl  int
 	recoveryBlockers int
+	blockerEpoch     uint64
 	activeTurns      map[adapter.TurnRef]context.CancelFunc
 	subscribers      map[adapter.TurnRef][]chan SSEEvent
 }
@@ -107,6 +120,8 @@ func (c *Coordinator) LiveWorkers() int {
 }
 
 // RegisterWorker admits and tracks a new execution worker under coordinator ownership.
+// The returned context is the worker's termination scope: it is cancelled only by
+// service-level termination, never by a cancellation request.
 func (c *Coordinator) RegisterWorker(ref adapter.TurnRef) (context.Context, func(), error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -118,7 +133,7 @@ func (c *Coordinator) RegisterWorker(ref adapter.TurnRef) (context.Context, func
 	workerCtx, workerCancel := context.WithCancel(c.ctx)
 	c.activeTurns[ref] = workerCancel
 	c.liveWorkers++
-	c.workers.Add(1)
+	c.tasks.Add(1)
 
 	var once sync.Once
 	done := func() {
@@ -127,23 +142,12 @@ func (c *Coordinator) RegisterWorker(ref adapter.TurnRef) (context.Context, func
 			defer c.mu.Unlock()
 			delete(c.activeTurns, ref)
 			c.liveWorkers--
-			c.workers.Done()
+			c.tasks.Done()
 			workerCancel()
 		})
 	}
 
 	return workerCtx, done, nil
-}
-
-// CancelWorker cancels the execution context of a specific active turn worker.
-func (c *Coordinator) CancelWorker(ref adapter.TurnRef) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if cancel, ok := c.activeTurns[ref]; ok {
-		cancel()
-		return true
-	}
-	return false
 }
 
 // CancelActiveWorkers cancels the execution contexts of all active turn workers.
@@ -158,14 +162,16 @@ func (c *Coordinator) CancelActiveWorkers() {
 // TrackHandoff registers an accepted release handoff until worker registration.
 func (c *Coordinator) TrackHandoff() func() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.pendingHandoffs++
+	c.tasks.Add(1)
+	c.mu.Unlock()
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			c.pendingHandoffs--
+			c.tasks.Done()
 		})
 	}
 }
@@ -173,14 +179,16 @@ func (c *Coordinator) TrackHandoff() func() {
 // TrackCommit registers a pending terminal outcome database commit.
 func (c *Coordinator) TrackCommit() func() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.pendingCommits++
+	c.tasks.Add(1)
+	c.mu.Unlock()
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			c.pendingCommits--
+			c.tasks.Done()
 		})
 	}
 }
@@ -193,24 +201,52 @@ func (c *Coordinator) TrackControl() (func(), error) {
 		return nil, ErrServiceStopping
 	}
 	c.inFlightControl++
+	c.tasks.Add(1)
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			c.inFlightControl--
+			c.tasks.Done()
 		})
 	}, nil
 }
 
-// AddRecoveryBlocker increments the count of outstanding unresolved recovery blockers.
+// AddRecoveryBlocker records a new outstanding persistence or uncertainty
+// obligation and advances the blocker epoch so that any diagnostic snapshot
+// taken before this obligation cannot overwrite it.
 func (c *Coordinator) AddRecoveryBlocker() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.recoveryBlockers++
+	c.blockerEpoch++
 }
 
-// SetRecoveryBlockers updates the count of outstanding unresolved recovery blockers.
+// BlockerEpoch returns the current blocker epoch. Callers must capture this
+// before starting a diagnostic read and pass it to ApplyDiagnosticBlockers.
+func (c *Coordinator) BlockerEpoch() uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.blockerEpoch
+}
+
+// ApplyDiagnosticBlockers reconciles the recovery blocker count from a fresh
+// diagnostic read. The read is applied only when no AddRecoveryBlocker
+// obligation materialized after the snapshot was taken (epoch unchanged);
+// otherwise the refresh is skipped and the next refresh reconciles.
+func (c *Coordinator) ApplyDiagnosticBlockers(n int, epoch uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if epoch != c.blockerEpoch {
+		return false
+	}
+	c.recoveryBlockers = n
+	return true
+}
+
+// SetRecoveryBlockers installs the initial blocker count from startup
+// hydration. It must not be used once any worker or command handler can run.
 func (c *Coordinator) SetRecoveryBlockers(n int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -378,9 +414,16 @@ func (c *Coordinator) CloseAllSubscribers() {
 	c.subscribers = make(map[adapter.TurnRef][]chan SSEEvent)
 }
 
+// WaitTasks blocks until every admitted unit of work (workers, accepted
+// handoffs, pending commits, in-flight control operations) has completed.
+func (c *Coordinator) WaitTasks() {
+	c.tasks.Wait()
+}
+
 // WaitWorkers blocks until all active workers have completed and released accounting.
+// Superseded by WaitTasks; retained for existing callers.
 func (c *Coordinator) WaitWorkers() {
-	c.workers.Wait()
+	c.tasks.Wait()
 }
 
 // CancelAll cancels all active worker contexts and closes observers without joining workers.
@@ -399,8 +442,8 @@ func (c *Coordinator) CancelAll() {
 	c.subscribers = make(map[adapter.TurnRef][]chan SSEEvent)
 }
 
-// Close cancels all active worker contexts, closes observers, and joins workers.
+// Close cancels all active worker contexts, closes observers, and joins all tasks.
 func (c *Coordinator) Close() {
 	c.CancelAll()
-	c.workers.Wait()
+	c.tasks.Wait()
 }

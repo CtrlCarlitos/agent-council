@@ -169,10 +169,11 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		TurnKey:   turnKey,
 	}
 
-	// Signal coordinator worker context cancellation
-	s.coordinator.CancelWorker(turnRef)
-
-	// Call adapter Cancel under independent timeout
+	// Request cancellation through the adapter under an independent timeout.
+	// The supervisor's observation, collection, and persistence
+	// responsibilities stay alive independently of this request: a request,
+	// unsupported, rejected, or unknown outcome is not termination, and the
+	// native execution may still be running.
 	cancellationStatus := "requested"
 	if s.adapter != nil {
 		cancelCtx, cancelTimeout := context.WithTimeout(context.Background(), 5*time.Second)
@@ -198,18 +199,45 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 						if verErr != nil {
 							ver = receipt.CommittedVersion
 						}
-						termReceipt, termErr := s.store.RecordTerminalOutcome(bgCtx, termOpID, req.ControllerLease, sessionID, ver, turnKey, council.TurnCancelled, reason)
+						_, termErr := s.store.RecordTerminalOutcome(bgCtx, termOpID, req.ControllerLease, sessionID, ver, turnKey, council.TurnCancelled, reason)
 						if termErr == nil {
-							receipt = termReceipt
 							persisted = true
+							break
+						}
+						if errors.Is(termErr, storage.ErrConflictingTerminalOutcome) {
+							// Another authoritative committer (the
+							// supervisor collecting the cancelled result)
+							// recorded this outcome first.
 							break
 						}
 						if !errors.Is(termErr, storage.ErrStaleUpdate) {
 							break
 						}
 					}
+					// Resolve against durable state: the cancellation is
+					// confirmed only when the turn is durably cancelled.
+					if details, derr := s.store.GetTurnDetails(bgCtx, sessionID, turnKey); derr == nil && details != nil && details.Status == council.TurnCancelled {
+						if !persisted {
+							persisted = true
+						}
+						reason = details.Result
+					}
 					if persisted {
 						cancellationStatus = "confirmed"
+						// Notify existing SSE subscribers after the
+						// authoritative command-driven terminal commit; the
+						// supervisor's stream cannot be relied upon for this
+						// notification.
+						termBytes, _ := json.Marshal(map[string]any{
+							"session_id": sessionID,
+							"turn_key":   turnKey,
+							"status":     council.TurnCancelled,
+							"result":     reason,
+						})
+						s.coordinator.BroadcastEvent(turnRef, SSEEvent{
+							Event: "terminal",
+							Data:  string(termBytes),
+						})
 					} else {
 						cancellationStatus = "unknown"
 					}
@@ -232,6 +260,9 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The response preserves the original committed request acceptance
+	// receipt; the evolving cancellation status is reported separately and a
+	// confirmed terminal commit is queryable on the turn resource.
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(CancelResponse{
@@ -270,6 +301,13 @@ func (s *Server) handleControllerConnect(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "invalid_request", "op_id, controller_lease, and expected_version (>0) are required", req.OpID)
 		return
 	}
+
+	doneControl, err := s.coordinator.TrackControl()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "service_stopping", "service is stopping", req.OpID)
+		return
+	}
+	defer doneControl()
 
 	receipt, err := s.store.SetControllerConnection(r.Context(), req.OpID, req.ControllerLease, sessionID, req.ExpectedVersion, council.ControllerConnected)
 	if err != nil {
@@ -382,7 +420,17 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "get_session_failed", err.Error(), req.OpID)
 		return
 	}
-	if recState.ActiveKey != turnKey {
+	// Authorize against the active execution OR the exact retained
+	// post-terminal recovery reference. A turn whose terminal outcome was
+	// recorded while host visibility was lost has an empty active key; its
+	// recovery_context and active_recovery_gen retain the unresolved episode
+	// that must be reconciled.
+	activeMatch := recState.ActiveKey == turnKey
+	retainedMatch := recState.ActiveKey == "" &&
+		recState.Visibility == "host_lost" &&
+		recState.RecoveryContext == turnKey &&
+		recState.ActiveRecoveryGen > 0
+	if !activeMatch && !retainedMatch {
 		writeError(w, http.StatusBadRequest, "invalid_turn", fmt.Sprintf("session active turn is %q, not %q", recState.ActiveKey, turnKey), req.OpID)
 		return
 	}
@@ -414,9 +462,35 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Step 3: Probe adapter Reconcile
+	// Step 3: Load the saved native-session binding and attach to the
+	// original execution. Recovery must never substitute a fresh session.
 	if s.adapter == nil {
 		writeError(w, http.StatusServiceUnavailable, "harness_unavailable", "harness adapter unavailable", req.OpID)
+		return
+	}
+	binding, contributor, found, err := s.store.GetSessionNativeBinding(r.Context(), sessionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "get_binding_failed", err.Error(), req.OpID)
+		return
+	}
+	if !found {
+		writeError(w, http.StatusServiceUnavailable, "harness_unavailable", "no saved native session binding for recovery", req.OpID)
+		return
+	}
+	resumeCtx, resumeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	err = s.adapter.ResumeSession(resumeCtx, adapter.SessionBinding{
+		SessionID:       adapter.SessionID(binding.LogicalSessionID),
+		Contributor:     council.Contributor(contributor),
+		NativeSessionID: binding.NativeSessionID,
+		Config: adapter.SessionConfig{
+			WorkspaceRoot: binding.WorkspaceMode,
+			Model:         binding.Model,
+			Tooling:       parseToolingConfig(binding.ToolingConfig),
+		},
+	})
+	resumeCancel()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "harness_unavailable", fmt.Sprintf("cannot attach to saved native session: %v", err), req.OpID)
 		return
 	}
 
@@ -453,6 +527,25 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Step 5: Notify terminal subscribers after any authoritative
+	// command-driven terminal commit, not only supervisor-driven completion.
+	if details, derr := s.store.GetTurnDetails(r.Context(), sessionID, turnKey); derr == nil && details != nil &&
+		(details.Status == council.TurnCompleted || details.Status == council.TurnFailed || details.Status == council.TurnCancelled || details.Status == council.TurnInterrupted) {
+		termBytes, _ := json.Marshal(map[string]any{
+			"session_id": sessionID,
+			"turn_key":   turnKey,
+			"status":     details.Status,
+			"result":     details.Result,
+		})
+		s.coordinator.BroadcastEvent(adapter.TurnRef{
+			SessionID: adapter.SessionID(sessionID),
+			TurnKey:   turnKey,
+		}, SSEEvent{
+			Event: "terminal",
+			Data:  string(termBytes),
+		})
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(ReconcileResponse{
@@ -460,6 +553,19 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		OpID:       req.OpID,
 		Receipt:    recReceipt,
 	})
+}
+
+// parseToolingConfig decodes the stored tooling configuration into the
+// adapter's tool list, tolerating an empty configuration.
+func parseToolingConfig(cfgJSON string) []string {
+	if strings.TrimSpace(cfgJSON) == "" {
+		return nil
+	}
+	var tools []string
+	if err := json.Unmarshal([]byte(cfgJSON), &tools); err != nil {
+		return nil
+	}
+	return tools
 }
 
 func (s *Server) handleQueuePrompt(w http.ResponseWriter, r *http.Request) {
@@ -485,6 +591,13 @@ func (s *Server) handleQueuePrompt(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), req.OpID)
 		return
 	}
+
+	doneControl, err := s.coordinator.TrackControl()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "service_stopping", "service is stopping", req.OpID)
+		return
+	}
+	defer doneControl()
 
 	receipt, err := s.store.QueuePrompt(r.Context(), req.OpID, req.ControllerLease, sessionID, req.ExpectedVersion, storage.PendingPrompt{
 		SessionID: sessionID,
@@ -538,6 +651,13 @@ func (s *Server) handleReplacePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	doneControl, err := s.coordinator.TrackControl()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "service_stopping", "service is stopping", req.OpID)
+		return
+	}
+	defer doneControl()
+
 	receipt, err := s.store.ReplacePendingPrompt(r.Context(), req.OpID, req.ControllerLease, sessionID, req.ExpectedVersion, storage.PendingPrompt{
 		SessionID: sessionID,
 		TurnKey:   turnKey,
@@ -590,6 +710,13 @@ func (s *Server) handleDiscardPrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	doneControl, err := s.coordinator.TrackControl()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "service_stopping", "service is stopping", req.OpID)
+		return
+	}
+	defer doneControl()
+
 	receipt, err := s.store.DiscardPendingPrompt(r.Context(), req.OpID, req.ControllerLease, sessionID, req.ExpectedVersion, turnKey)
 	if err != nil {
 		if errors.Is(err, storage.ErrStaleUpdate) {
@@ -625,6 +752,18 @@ func (s *Server) handleRecordDecision(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error(), "")
 		return
 	}
+
+	if req.OpID == "" || req.ControllerLease == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "op_id and controller_lease are required", req.OpID)
+		return
+	}
+
+	doneControl, err := s.coordinator.TrackControl()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "service_stopping", "service is stopping", req.OpID)
+		return
+	}
+	defer doneControl()
 
 	receipt, err := s.store.RecordDecision(r.Context(), req.OpID, req.ControllerLease, runID, req.ArtifactID, req.Revision, req.DecisionPayload)
 	if err != nil {
