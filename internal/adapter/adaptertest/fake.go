@@ -38,18 +38,19 @@ type ScriptedFaults struct {
 // FakeAdapter implements adapter.Adapter with deterministic script controls for testing.
 // It must never be registered or imported in production code.
 type FakeAdapter struct {
-	mu            sync.Mutex
-	faults        ScriptedFaults
-	sessions      map[adapter.SessionID]adapter.SessionBinding
-	dispatches    map[adapter.TurnRef]*DispatchState
-	prompts       map[adapter.TurnRef]string
-	results       map[adapter.TurnRef]adapter.TurnResult
-	retiredTurns  map[adapter.TurnRef]bool
-	activeStreams map[adapter.TurnRef][]*adapter.BufferedStream
-	eventHistory  map[adapter.TurnRef][]adapter.Event
-	workerCancels map[adapter.TurnRef]chan struct{}
-	workersWg     sync.WaitGroup
-	watchersWg    sync.WaitGroup
+	mu                 sync.Mutex
+	faults             ScriptedFaults
+	defaultContributor council.Contributor
+	sessions           map[adapter.SessionID]adapter.SessionBinding
+	dispatches         map[adapter.TurnRef]*DispatchState
+	prompts            map[adapter.TurnRef]string
+	results            map[adapter.TurnRef]adapter.TurnResult
+	retiredTurns       map[adapter.TurnRef]bool
+	activeStreams      map[adapter.TurnRef][]*adapter.BufferedStream
+	eventHistory       map[adapter.TurnRef][]adapter.Event
+	workerCancels      map[adapter.TurnRef]chan struct{}
+	workersWg          sync.WaitGroup
+	watchersWg         sync.WaitGroup
 }
 
 // NewFake constructs a FakeAdapter configured with the provided scripted faults.
@@ -65,6 +66,13 @@ func NewFake(faults ScriptedFaults) *FakeAdapter {
 		eventHistory:  make(map[adapter.TurnRef][]adapter.Event),
 		workerCancels: make(map[adapter.TurnRef]chan struct{}),
 	}
+}
+
+// NewFakeAdapter constructs a FakeAdapter for test assemblies with a default contributor.
+func NewFakeAdapter(contributor council.Contributor) *FakeAdapter {
+	f := NewFake(ScriptedFaults{})
+	f.defaultContributor = contributor
+	return f
 }
 
 // TurnState returns an independent snapshot of what the fake received, accepted, and started.
@@ -97,6 +105,19 @@ func (f *FakeAdapter) ExecutionStatus(ref adapter.TurnRef) council.TurnStatus {
 		return res.Status
 	}
 	return ""
+}
+
+// DispatchCount returns the number of dispatches recorded for the given session.
+func (f *FakeAdapter) DispatchCount(sessionID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	count := 0
+	for ref := range f.dispatches {
+		if string(ref.SessionID) == sessionID {
+			count++
+		}
+	}
+	return count
 }
 
 // ActiveStreamCount returns the number of active subscriptions registered for a turn.
@@ -261,9 +282,17 @@ func (f *FakeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt 
 	f.mu.Lock()
 	// Verify session exists
 	if _, exists := f.sessions[ref.SessionID]; !exists {
-		f.dispatches[ref] = &DispatchState{Received: true, Accepted: false, Started: false}
-		f.mu.Unlock()
-		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: "session not found"}, errors.New("session not found")
+		if f.defaultContributor != "" {
+			f.sessions[ref.SessionID] = adapter.SessionBinding{
+				SessionID:       ref.SessionID,
+				Contributor:     f.defaultContributor,
+				NativeSessionID: fmt.Sprintf("native-%s", ref.SessionID),
+			}
+		} else {
+			f.dispatches[ref] = &DispatchState{Received: true, Accepted: false, Started: false}
+			f.mu.Unlock()
+			return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: "session not found"}, errors.New("session not found")
+		}
 	}
 
 	// Verify turn identifier has not been retired

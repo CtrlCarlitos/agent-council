@@ -245,6 +245,53 @@ UPDATE sessions SET row_version = ?, updated_at = ? WHERE session_id = ?;`, newV
 	return receipt, nil
 }
 
+// FindCommittedRelease checks if opID has already been committed as a release_turn operation.
+func (s *Store) FindCommittedRelease(ctx context.Context, opID string, callerLease string, sessionID string, turnKey string) (*ReleaseReceipt, bool, error) {
+	fp := computeFingerprint("release_turn", sessionID, turnKey)
+	var storedCmdType, storedFingerprint, payloadJSON string
+	err := s.readDB.QueryRowContext(ctx, "SELECT command_type, command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;", opID).Scan(&storedCmdType, &storedFingerprint, &payloadJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var jp releaseJournalPayload
+	if err := json.Unmarshal([]byte(payloadJSON), &jp); err == nil && jp.Receipt.TurnKey != "" {
+		if jp.Receipt.OperationReceipt.TurnKey == "" {
+			jp.Receipt.OperationReceipt.TurnKey = jp.Receipt.TurnKey
+		}
+		if jp.CallerLease != callerLease {
+			return nil, false, ErrUnauthorizedOperation
+		}
+		if storedCmdType != "release_turn" || storedFingerprint != fp {
+			return nil, false, ErrIdempotencyConflict
+		}
+		return &jp.Receipt, true, nil
+	}
+	return nil, false, nil
+}
+
+// GetSessionVersion returns the current row_version of the given session.
+func (s *Store) GetSessionVersion(ctx context.Context, sessionID string) (int64, error) {
+	var version int64
+	err := s.readDB.QueryRowContext(ctx, "SELECT row_version FROM sessions WHERE session_id = ?;", sessionID).Scan(&version)
+	if err != nil {
+		return 0, err
+	}
+	return version, nil
+}
+
+// GetTurnPrompt returns the prompt text of the given turn.
+func (s *Store) GetTurnPrompt(ctx context.Context, sessionID, turnKey string) (string, error) {
+	var prompt string
+	err := s.readDB.QueryRowContext(ctx, "SELECT prompt FROM turns WHERE session_id = ? AND turn_key = ?;", sessionID, turnKey).Scan(&prompt)
+	if err != nil {
+		return "", err
+	}
+	return prompt, nil
+}
+
 func (s *Store) ReleaseTurn(ctx context.Context, opID string, callerLease string, sessionID string, expectedVersion int64, turnKey string) (ReleaseResult, error) {
 	if expectedVersion <= 0 {
 		return ReleaseResult{}, ErrInvalidExpectedVersion

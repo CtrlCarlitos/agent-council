@@ -1,0 +1,123 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/CtrlCarlitos/agent-council/internal/adapter"
+	"github.com/CtrlCarlitos/agent-council/internal/council"
+	"github.com/CtrlCarlitos/agent-council/internal/storage"
+)
+
+// ExecutionSupervisor supervises an individual turn's dispatch, observation,
+// outcome collection, and terminal persistence under service ownership.
+type ExecutionSupervisor struct {
+	store                  *storage.Store
+	adapter                adapter.Adapter
+	runID                  string
+	sessionID              string
+	turnKey                string
+	callerLease            string
+	initialExpectedVersion int64
+	receipt                storage.ReleaseReceipt
+	done                   func()
+}
+
+// NewExecutionSupervisor constructs a supervisor instance for an admitted turn execution.
+func NewExecutionSupervisor(
+	store *storage.Store,
+	adp adapter.Adapter,
+	runID, sessionID, turnKey, callerLease string,
+	initialExpectedVersion int64,
+	receipt storage.ReleaseReceipt,
+	done func(),
+) *ExecutionSupervisor {
+	return &ExecutionSupervisor{
+		store:                  store,
+		adapter:                adp,
+		runID:                  runID,
+		sessionID:              sessionID,
+		turnKey:                turnKey,
+		callerLease:            callerLease,
+		initialExpectedVersion: initialExpectedVersion,
+		receipt:                receipt,
+		done:                   done,
+	}
+}
+
+// Run executes the supervisor pipeline to completion under the provided worker context.
+// It decrements coordinator worker accounting only after the terminal outcome is committed.
+func (s *ExecutionSupervisor) Run(ctx context.Context) {
+	defer s.done()
+
+	ref := adapter.TurnRef{
+		SessionID: adapter.SessionID(s.sessionID),
+		TurnKey:   s.turnKey,
+	}
+
+	prompt, err := s.store.GetTurnPrompt(ctx, s.sessionID, s.turnKey)
+	if err != nil {
+		// If prompt cannot be retrieved from store, record failure outcome
+		_ = s.recordTerminalOutcomeWithRetry(ctx, council.TurnFailed, fmt.Sprintf("failed to read turn prompt: %v", err))
+		return
+	}
+
+	outcome, err := s.adapter.Dispatch(ctx, ref, prompt)
+	if err != nil || outcome.Status != adapter.DispatchAccepted {
+		if outcome.Status == adapter.DispatchRejected {
+			reason := outcome.Reason
+			if reason == "" && err != nil {
+				reason = err.Error()
+			}
+			_ = s.recordTerminalOutcomeWithRetry(ctx, council.TurnFailed, reason)
+			return
+		}
+		// DispatchUnknown or context error preserves reservation without fabricated completion
+		return
+	}
+
+	// Dispatch accepted: record observation
+	obsOpID := fmt.Sprintf("op-obs-acc-%s", s.turnKey)
+	_, _ = s.store.RecordDispatchObservation(ctx, obsOpID, s.callerLease, s.sessionID, s.turnKey, "dispatch_accepted")
+
+	// Observe stream until completion
+	stream, err := s.adapter.Observe(ctx, ref)
+	if err == nil {
+		for range stream.Events() {
+			// Drain events until stream is closed upon completion or error
+		}
+	}
+
+	// Collect authoritative outcome
+	turnResult, err := s.adapter.Collect(ctx, ref)
+	if err != nil {
+		_ = s.recordTerminalOutcomeWithRetry(ctx, council.TurnFailed, fmt.Sprintf("collect failed: %v", err))
+		return
+	}
+
+	_ = s.recordTerminalOutcomeWithRetry(ctx, turnResult.Status, turnResult.Output)
+}
+
+// recordTerminalOutcomeWithRetry persists the terminal outcome, resilient to concurrent
+// session row_version advances.
+func (s *ExecutionSupervisor) recordTerminalOutcomeWithRetry(ctx context.Context, status council.TurnStatus, rawResult string) error {
+	expectedVer := s.receipt.CommittedVersion
+	if expectedVer <= 0 {
+		expectedVer = s.initialExpectedVersion
+	}
+	opID := fmt.Sprintf("op-term-%s", s.turnKey)
+
+	for retries := 0; retries < 10; retries++ {
+		latestVer, err := s.store.GetSessionVersion(ctx, s.sessionID)
+		if err == nil && latestVer > 0 {
+			expectedVer = latestVer
+		}
+		_, err = s.store.RecordTerminalOutcome(ctx, opID, s.callerLease, s.sessionID, expectedVer, s.turnKey, status, rawResult)
+		if errors.Is(err, storage.ErrStaleUpdate) {
+			continue
+		}
+		return err
+	}
+	return errors.New("exhausted version retries recording terminal outcome")
+}

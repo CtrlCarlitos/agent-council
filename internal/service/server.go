@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/CtrlCarlitos/agent-council/internal/adapter"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
@@ -43,14 +44,16 @@ type StatusResponse struct {
 }
 
 type Server struct {
-	store      *storage.Store
-	lock       *ServiceLock
-	cfg        ServerConfig
-	listener   net.Listener
-	httpServer *http.Server
-	socketPath string
-	tokenPath  string
-	startedAt  time.Time
+	store       *storage.Store
+	lock        *ServiceLock
+	cfg         ServerConfig
+	coordinator *Coordinator
+	adapter     adapter.Adapter
+	listener    net.Listener
+	httpServer  *http.Server
+	socketPath  string
+	tokenPath   string
+	startedAt   time.Time
 
 	mu       sync.Mutex
 	running  bool
@@ -58,6 +61,10 @@ type Server struct {
 }
 
 func NewServer(store *storage.Store, lock *ServiceLock, cfg ServerConfig) (*Server, error) {
+	return NewServerWithAdapter(store, lock, cfg, nil)
+}
+
+func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerConfig, adp adapter.Adapter) (*Server, error) {
 	if store == nil {
 		return nil, errors.New("store cannot be nil")
 	}
@@ -78,18 +85,21 @@ func NewServer(store *storage.Store, lock *ServiceLock, cfg ServerConfig) (*Serv
 	tokenPath := filepath.Join(cfg.StateDir, "auth.token")
 
 	srv := &Server{
-		store:      store,
-		lock:       lock,
-		cfg:        cfg,
-		socketPath: socketPath,
-		tokenPath:  tokenPath,
-		startedAt:  time.Now().UTC(),
-		shutdown:   make(chan struct{}),
+		store:       store,
+		lock:        lock,
+		cfg:         cfg,
+		coordinator: NewCoordinator(),
+		adapter:     adp,
+		socketPath:  socketPath,
+		tokenPath:   tokenPath,
+		startedAt:   time.Now().UTC(),
+		shutdown:    make(chan struct{}),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/readiness", srv.handleReadiness)
 	mux.HandleFunc("GET /v1/status", srv.handleStatus)
+	mux.HandleFunc("POST /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/release", srv.handleRelease)
 
 	handler := authMiddleware(cfg.AuthToken, mux)
 
@@ -115,6 +125,10 @@ func (s *Server) TokenPath() string {
 
 func (s *Server) LockPath() string {
 	return s.lock.Path()
+}
+
+func (s *Server) Coordinator() *Coordinator {
+	return s.coordinator
 }
 
 func (s *Server) Start() error {
@@ -149,6 +163,8 @@ func (s *Server) Close() error {
 	}
 	s.running = false
 
+	s.coordinator.Close()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -175,7 +191,7 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 		InstanceID:      s.cfg.InstanceID,
 		ProtocolVersion: 1,
 		StateDir:        s.cfg.StateDir,
-		LiveWorkers:     0,
+		LiveWorkers:     s.coordinator.LiveWorkers(),
 		ReservedTurns:   0,
 		UnresolvedTurns: 0,
 	}
@@ -190,7 +206,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Status:          "ready",
 		StartedAt:       s.startedAt,
 		ActiveRuns:      []string{},
-		LiveWorkers:     0,
+		LiveWorkers:     s.coordinator.LiveWorkers(),
 		ReservedTurns:   0,
 		UnresolvedTurns: 0,
 	}
