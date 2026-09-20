@@ -459,7 +459,8 @@ func (s *Store) ReleaseTurn(ctx context.Context, opID string, callerLease string
 	defer tx.Rollback()
 
 	// Current controller authority precedes idempotent replay (AC-004).
-	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, true); err != nil {
+	issuingGeneration, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, true)
+	if err != nil {
 		return ReleaseResult{}, err
 	}
 
@@ -544,10 +545,11 @@ VALUES (?, ?, ?, 'running', '', ?, ?);`, sessionID, turnKey, sanitizedPrompt, at
 		return ReleaseResult{}, fmt.Errorf("insert turn: %w", err)
 	}
 
-	// Insert into dispatch_intents
+	// Insert into dispatch_intents, stamped with the issuing controller
+	// generation that authorized this execution (AC-004 §6).
 	_, err = tx.Tx().ExecContext(ctx, `
-INSERT INTO dispatch_intents (session_id, turn_key, attempt_id, phase, recorded_at, updated_at)
-VALUES (?, ?, ?, 'intent_recorded', ?, ?);`, sessionID, turnKey, attemptID, now, now)
+INSERT INTO dispatch_intents (session_id, turn_key, attempt_id, phase, issuing_controller_generation, recorded_at, updated_at)
+VALUES (?, ?, ?, 'intent_recorded', ?, ?, ?);`, sessionID, turnKey, attemptID, issuingGeneration, now, now)
 	if err != nil {
 		return ReleaseResult{}, fmt.Errorf("insert dispatch intent: %w", err)
 	}
@@ -621,11 +623,6 @@ func (s *Store) ReconcileSession(ctx context.Context, opID string, callerLease s
 	}
 	defer tx.Rollback()
 
-	// Current controller authority precedes idempotent replay (AC-004).
-	if _, err := authorizeSessionController(ctx, tx.Tx(), sessID, callerLease, true); err != nil {
-		return OperationReceipt{}, err
-	}
-
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "reconcile_session", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
@@ -645,7 +642,14 @@ WHERE s.session_id = ?;`, sessID).Scan(&runID, &runLease, &currentVer, &state, &
 		return OperationReceipt{}, fmt.Errorf("query session for reconcile: %w", err)
 	}
 
-	_ = runLease // authority classified before replay
+	// Two-boundary form (AC-004 §6): the controller authorized this
+	// recovery operation at initiation (service boundary classifies
+	// authority before the probe); this commit records the verified
+	// observation under the captured execution and recovery references —
+	// an authorized probe stays persistable even if controller authority
+	// rotates while it is in flight. The active recovery generation below
+	// remains the episode-scoped validity check.
+	_ = runLease
 	if visibility != "host_lost" {
 		return OperationReceipt{}, errors.New("session host is not lost")
 	}

@@ -160,6 +160,9 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
 			return
 		}
+		if writeControllerAuthError(w, err, req.OpID) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "cancel_failed", err.Error(), req.OpID)
 		return
 	}
@@ -193,26 +196,14 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 					bgCtx, bgCancel := context.WithTimeout(context.Background(), 3*time.Second)
 					defer bgCancel()
 
+					// The evidence write uses the accepted execution's
+					// identity (AC-004 §6) — it must not depend on the
+					// requesting controller's lease remaining current.
+					execRef := s.executionRefForTurn(bgCtx, sessionID, turnKey)
 					persisted := false
-					for retries := 0; retries < 5; retries++ {
-						ver, verErr := s.store.GetSessionVersion(bgCtx, sessionID)
-						if verErr != nil {
-							ver = receipt.CommittedVersion
-						}
-						_, termErr := s.store.RecordTerminalOutcome(bgCtx, termOpID, req.ControllerLease, sessionID, ver, turnKey, council.TurnCancelled, reason)
-						if termErr == nil {
-							persisted = true
-							break
-						}
-						if errors.Is(termErr, storage.ErrConflictingTerminalOutcome) {
-							// Another authoritative committer (the
-							// supervisor collecting the cancelled result)
-							// recorded this outcome first.
-							break
-						}
-						if !errors.Is(termErr, storage.ErrStaleUpdate) {
-							break
-						}
+					if execRef != nil {
+						_, termErr := s.store.RecordObservedExecutionOutcome(bgCtx, termOpID, *execRef, council.TurnCancelled, reason)
+						persisted = termErr == nil
 					}
 					// Resolve against durable state: the cancellation is
 					// confirmed only when the turn is durably cancelled.
@@ -317,6 +308,9 @@ func (s *Server) handleControllerConnect(w http.ResponseWriter, r *http.Request)
 		}
 		if errors.Is(err, storage.ErrUnauthorizedOperation) {
 			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
+			return
+		}
+		if writeControllerAuthError(w, err, req.OpID) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "connect_failed", err.Error(), req.OpID)
@@ -585,6 +579,23 @@ var ErrUnsupportedBindingConfig = errors.New("unsupported native-binding configu
 // env_allowlist, or other policy metadata: those keys are outside
 // adapter.SessionConfig and require an explicit enforcement owner when
 // native integrations use them.
+// executionRefForTurn resolves the persisted execution reference (session,
+// turn, attempt) for a nonterminal turn, or nil when none is recorded.
+func (s *Server) executionRefForTurn(ctx context.Context, sessionID, turnKey string) *storage.ExecutionRef {
+	details, err := s.store.GetTurnDetails(ctx, sessionID, turnKey)
+	if err != nil || details == nil || details.DispatchIntent == nil {
+		return nil
+	}
+	if details.DispatchIntent.AttemptID == "" {
+		return nil
+	}
+	return &storage.ExecutionRef{
+		SessionID: sessionID,
+		TurnKey:   turnKey,
+		AttemptID: details.DispatchIntent.AttemptID,
+	}
+}
+
 func sessionBindingFromStorage(nb storage.NativeBinding, contributor string) (adapter.SessionBinding, error) {
 	binding := adapter.SessionBinding{
 		SessionID:       adapter.SessionID(nb.LogicalSessionID),
@@ -701,6 +712,9 @@ func (s *Server) handleQueuePrompt(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
 			return
 		}
+		if writeControllerAuthError(w, err, req.OpID) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "queue_failed", err.Error(), req.OpID)
 		return
 	}
@@ -760,6 +774,9 @@ func (s *Server) handleReplacePrompt(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
 			return
 		}
+		if writeControllerAuthError(w, err, req.OpID) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "replace_failed", err.Error(), req.OpID)
 		return
 	}
@@ -815,6 +832,9 @@ func (s *Server) handleDiscardPrompt(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
 			return
 		}
+		if writeControllerAuthError(w, err, req.OpID) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "discard_failed", err.Error(), req.OpID)
 		return
 	}
@@ -861,6 +881,9 @@ func (s *Server) handleRecordDecision(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, storage.ErrArtifactNotFound) {
 			writeError(w, http.StatusNotFound, "artifact_not_found", err.Error(), req.OpID)
+			return
+		}
+		if writeControllerAuthError(w, err, req.OpID) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "decision_failed", err.Error(), req.OpID)

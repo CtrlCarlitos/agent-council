@@ -129,6 +129,9 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "prompt_not_queued", err.Error(), req.OpID)
 			return
 		}
+		if writeControllerAuthError(w, err, req.OpID) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "release_failed", err.Error(), req.OpID)
 		return
 	}

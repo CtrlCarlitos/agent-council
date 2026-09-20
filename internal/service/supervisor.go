@@ -65,6 +65,12 @@ func (s *ExecutionSupervisor) Run(ctx context.Context) {
 		attemptID = "1"
 	}
 
+	execRef := storage.ExecutionRef{
+		SessionID: s.sessionID,
+		TurnKey:   s.turnKey,
+		AttemptID: attemptID,
+	}
+
 	ref := adapter.TurnRef{
 		SessionID: adapter.SessionID(s.sessionID),
 		TurnKey:   s.turnKey,
@@ -103,16 +109,17 @@ func (s *ExecutionSupervisor) Run(ctx context.Context) {
 		}
 		// DispatchUnknown or transport error: record uncertainty observation durably without fabricated completion
 		obsOpID := fmt.Sprintf("op-obs-%s-%s-%s", s.sessionID, s.turnKey, attemptID)
-		_, _ = s.store.RecordDispatchObservation(ctx, obsOpID, s.callerLease, s.sessionID, s.turnKey, "acceptance_unknown")
+		_, _ = s.store.RecordObservedDispatchAcknowledgement(ctx, obsOpID, execRef, "acceptance_unknown")
 		if s.coordinator != nil {
 			s.coordinator.AddRecoveryBlocker()
 		}
 		return
 	}
 
-	// Dispatch accepted: record observation
+	// Dispatch accepted: record observation under the execution reference —
+	// the acknowledgement never depends on the issuing controller's lease.
 	obsOpID := fmt.Sprintf("op-obs-%s-%s-%s", s.sessionID, s.turnKey, attemptID)
-	_, _ = s.store.RecordDispatchObservation(ctx, obsOpID, s.callerLease, s.sessionID, s.turnKey, "receipt_acknowledged")
+	_, _ = s.store.RecordObservedDispatchAcknowledgement(ctx, obsOpID, execRef, "receipt_acknowledged")
 
 	// Observe stream until completion. The worker context is the termination
 	// scope only; a cancellation request does not cancel it, so observation,
@@ -195,21 +202,24 @@ func (s *ExecutionSupervisor) Run(ctx context.Context) {
 	}
 }
 
-// recordTerminalOutcomeWithRetry persists the terminal outcome, resilient to concurrent
-// session row_version advances.
+// recordTerminalOutcomeWithRetry persists the terminal outcome under the
+// execution's original identity (no controller-lease comparison — the
+// issuing controller's authority was consumed at release time), resilient
+// to concurrent session row_version advances.
 func (s *ExecutionSupervisor) recordTerminalOutcomeWithRetry(ctx context.Context, status council.TurnStatus, rawResult string) error {
 	if s.coordinator != nil {
 		doneCommit := s.coordinator.TrackCommit()
 		defer doneCommit()
 	}
 
-	expectedVer := s.receipt.CommittedVersion
-	if expectedVer <= 0 {
-		expectedVer = s.initialExpectedVersion
-	}
 	attemptID := s.receipt.AttemptID
 	if attemptID == "" {
 		attemptID = "1"
+	}
+	execRef := storage.ExecutionRef{
+		SessionID: s.sessionID,
+		TurnKey:   s.turnKey,
+		AttemptID: attemptID,
 	}
 	opID := fmt.Sprintf("op-term-%s-%s-%s", s.sessionID, s.turnKey, attemptID)
 
@@ -217,17 +227,17 @@ func (s *ExecutionSupervisor) recordTerminalOutcomeWithRetry(ctx context.Context
 	defer cancel()
 
 	for retries := 0; retries < 10; retries++ {
-		latestVer, err := s.store.GetSessionVersion(dbCtx, s.sessionID)
-		if err == nil && latestVer > 0 {
-			expectedVer = latestVer
+		_, err := s.store.RecordObservedExecutionOutcome(dbCtx, opID, execRef, status, rawResult)
+		// The observed-outcome operation reads authoritative state itself;
+		// retries cover transient write contention only.
+		if err != nil && !errors.Is(err, storage.ErrWrongExecutionAttempt) {
+			return err
 		}
-		_, err = s.store.RecordTerminalOutcome(dbCtx, opID, s.callerLease, s.sessionID, expectedVer, s.turnKey, status, rawResult)
-		if errors.Is(err, storage.ErrStaleUpdate) {
-			continue
+		if err == nil {
+			return nil
 		}
-		return err
 	}
-	return errors.New("exhausted version retries recording terminal outcome")
+	return errors.New("exhausted retries recording observed execution outcome")
 }
 
 // collectUntilTerminal polls the adapter until it verifies a terminal result
