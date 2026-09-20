@@ -25,6 +25,7 @@ func TestReview9DC_CancellingTurnCountsAsUnresolved(t *testing.T) {
 	if _, err := store.CreateRun(ctx, "op-run-9dc", "run-9dc", "brief", "spec", "profile", "lease-9dc"); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	adoptControllerForTest(t, store, "run-9dc", "lease-9dc")
 	sessRec, err := store.CreateSession(ctx, "op-sess-9dc", "lease-9dc", SessionRecord{
 		ID: "sess-9dc", RunID: "run-9dc", Contributor: "claude", Role: "reviewer",
 		IsActiveContributor: true, State: "parked", Visibility: "reachable",

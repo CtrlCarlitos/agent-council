@@ -273,6 +273,7 @@ func TestReviewPR29_ReconcilePostTerminalRetainedContext(t *testing.T) {
 	if _, err := store.CreateRun(ctx, "op-run-pt", "run-pt", "brief", "spec", "profile", "lease-pt"); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	adoptForTest(t, store, "run-pt", "lease-pt")
 	sessRec, err := store.CreateSession(ctx, "op-sess-pt", "lease-pt", storage.SessionRecord{
 		ID: "sess-pt", RunID: "run-pt", Contributor: "claude", Role: "reviewer",
 		IsActiveContributor: true, State: "parked", Visibility: "reachable",
@@ -469,6 +470,7 @@ func TestReviewPR29_ForcedTeardownSurfacesError(t *testing.T) {
 	if _, err := store.CreateRun(ctx, "op-run-ft", "run-ft", "b", "s", "p", "lease-ft"); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	adoptForTest(t, store, "run-ft", "lease-ft")
 	sessRec, err := store.CreateSession(ctx, "op-sess-ft", "lease-ft", storage.SessionRecord{
 		ID: "sess-ft", RunID: "run-ft", Contributor: "claude", Role: "reviewer",
 		IsActiveContributor: true, State: "parked", Visibility: "reachable",

@@ -54,18 +54,28 @@ type ControllerRecord struct {
 	AttachmentID  string
 }
 
-// classifyRunController resolves the authority state of a presented
-// credential for runID inside a transaction. Empty credentials never pass;
-// superseded/revoked credentials classify distinctly from unknown ones.
-func classifyRunController(ctx context.Context, tx *sql.Tx, runID, presentedLease string) (uint64, error) {
+// rowQueryer abstracts QueryRowContext over transactions and read pools so
+// credential classification runs identically in write transitions and
+// read-only replay resolvers.
+type rowQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// classifyCredential resolves the authority state of a presented credential
+// for runID. Empty credentials never pass; superseded/revoked credentials
+// classify distinctly (ErrLeaseSuperseded); success requires an internally
+// consistent grant — controller class demands an adopted active grant,
+// administrator class additionally accepts the unadopted run's legacy
+// provenance credential (operator maintenance handle). A bare string match
+// against runs.controller_lease authorizes nothing.
+func classifyCredential(ctx context.Context, q rowQueryer, runID, presentedLease string, requireAdopted bool) (uint64, error) {
 	if strings.TrimSpace(presentedLease) == "" {
 		return 0, ErrAdoptionRequired
 	}
 
 	var adopted int
-	var runLease string
-	var lifecycle string
-	err := tx.QueryRowContext(ctx, `SELECT controller_adopted, controller_lease, lifecycle FROM runs WHERE run_id = ?;`, runID).
+	var runLease, lifecycle string
+	err := q.QueryRowContext(ctx, `SELECT controller_adopted, controller_lease, lifecycle FROM runs WHERE run_id = ?;`, runID).
 		Scan(&adopted, &runLease, &lifecycle)
 	if err == sql.ErrNoRows {
 		return 0, fmt.Errorf("run %s not found", runID)
@@ -77,10 +87,25 @@ func classifyRunController(ctx context.Context, tx *sql.Tx, runID, presentedLeas
 		return 0, ErrSessionArchived
 	}
 
-	// Superseded/revoked classification precedes everything else: a
-	// credential matching retired history never re-authorizes.
+	// Current authority first: an internally consistent adopted, active
+	// grant (an active match outranks any retired-history collision with
+	// the same value). Never a bare string match, never the legacy
+	// provenance for controller-class commands.
+	var activeGen uint64
+	var activeLease string
+	err = q.QueryRowContext(ctx, `SELECT generation, lease FROM controller_leases
+		WHERE run_id = ? AND status = 'active';`, runID).Scan(&activeGen, &activeLease)
+	if err != nil && err != sql.ErrNoRows {
+		return 0, fmt.Errorf("query active grant: %w", err)
+	}
+	if err == nil && adopted == 1 && activeLease == presentedLease && runLease == presentedLease {
+		return activeGen, nil
+	}
+
+	// Superseded/revoked classification: a credential matching only
+	// retired history never re-authorizes.
 	var gen uint64
-	err = tx.QueryRowContext(ctx, `SELECT generation FROM controller_leases
+	err = q.QueryRowContext(ctx, `SELECT generation FROM controller_leases
 		WHERE run_id = ? AND lease = ? AND status IN ('superseded','revoked');`, runID, presentedLease).Scan(&gen)
 	if err == nil {
 		return 0, fmt.Errorf("%w (generation %d)", ErrLeaseSuperseded, gen)
@@ -89,23 +114,45 @@ func classifyRunController(ctx context.Context, tx *sql.Tx, runID, presentedLeas
 		return 0, fmt.Errorf("classify retired credential: %w", err)
 	}
 
-	// Current authority requires an internally consistent adopted, active
-	// grant: never a bare string match, and never the legacy provenance.
-	var activeGen uint64
-	var activeLease string
-	err = tx.QueryRowContext(ctx, `SELECT generation, lease FROM controller_leases
-		WHERE run_id = ? AND status = 'active';`, runID).Scan(&activeGen, &activeLease)
-	if err == nil && adopted == 1 && activeLease == presentedLease && runLease == presentedLease {
-		return activeGen, nil
-	}
-	if err != nil && err != sql.ErrNoRows {
-		return 0, fmt.Errorf("query active grant: %w", err)
-	}
-
 	if adopted == 0 {
-		return 0, ErrAdoptionRequired
+		if requireAdopted {
+			return 0, ErrAdoptionRequired
+		}
+		// Administrator class: the unadopted run's legacy provenance
+		// credential remains the operator's maintenance handle.
+		var legacyLease string
+		err = q.QueryRowContext(ctx, `SELECT lease FROM controller_leases
+			WHERE run_id = ? AND generation = 0 AND status = 'legacy';`, runID).Scan(&legacyLease)
+		if err == nil && legacyLease == presentedLease && runLease == presentedLease {
+			return 0, nil
+		}
+		if err != nil && err != sql.ErrNoRows {
+			return 0, fmt.Errorf("query legacy provenance: %w", err)
+		}
+		return 0, ErrUnauthorizedOperation
 	}
 	return 0, ErrUnauthorizedOperation
+}
+
+// classifyRunController enforces controller-class authority inside a write
+// transaction. Attachment requirements join this boundary in Task 5.
+func classifyRunController(ctx context.Context, tx *sql.Tx, runID, presentedLease string) (uint64, error) {
+	return classifyCredential(ctx, tx, runID, presentedLease, true)
+}
+
+// authorizeSessionController resolves a session's run and classifies the
+// presented credential; controller commands call this before any
+// idempotency lookup.
+func authorizeSessionController(ctx context.Context, q rowQueryer, sessionID, presentedLease string, requireAdopted bool) (uint64, error) {
+	var runID string
+	err := q.QueryRowContext(ctx, `SELECT run_id FROM sessions WHERE session_id = ?;`, sessionID).Scan(&runID)
+	if err == sql.ErrNoRows {
+		return 0, ErrSessionNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("resolve session run: %w", err)
+	}
+	return classifyCredential(ctx, q, runID, presentedLease, requireAdopted)
 }
 
 // resolveGrantReplay returns the original committed issuance for opID when

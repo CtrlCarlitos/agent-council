@@ -59,10 +59,11 @@ func checkOrRecordIdempotency(tx *sql.Tx, opID string, callerLease string, cmdTy
 		return nil, fmt.Errorf("unmarshal stored receipt: %w", err)
 	}
 
-	// Authority check: callerLease must match
-	if jp.CallerLease != callerLease {
-		return nil, ErrUnauthorizedOperation
-	}
+	// Idempotency semantics only (AC-004 §4.3 adaptation): authority is
+	// classified at the operation boundary before this helper runs, and the
+	// recorded caller_lease may legitimately belong to a superseded
+	// controller whose committed response the current controller recovers.
+	_ = callerLease
 
 	// Parameters check
 	if storedCmdType != cmdType || storedFingerprint != fingerprint {
@@ -163,6 +164,12 @@ func (s *Store) CreateSession(ctx context.Context, opID string, callerLease stri
 	}
 	defer tx.Rollback()
 
+	// Administrator-class authority precedes idempotent replay (AC-004).
+	// CreateSession resolves the run directly: the session does not exist yet.
+	if _, err := classifyCredential(ctx, tx.Tx(), session.RunID, callerLease, false); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "create_session", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
@@ -172,9 +179,10 @@ func (s *Store) CreateSession(ctx context.Context, opID string, callerLease stri
 	// Validate caller authority against runs.controller_lease
 	var runLease string
 	err = tx.Tx().QueryRowContext(ctx, "SELECT controller_lease FROM runs WHERE run_id = ?;", session.RunID).Scan(&runLease)
-	if err != nil || runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
+	if err != nil {
+		return OperationReceipt{}, err
 	}
+	_ = runLease // authority classified before replay
 
 	isActive := 0
 	if session.IsActiveContributor {
@@ -228,6 +236,11 @@ func (s *Store) QueuePrompt(ctx context.Context, opID string, callerLease string
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, true); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "queue_prompt", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
@@ -247,9 +260,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return OperationReceipt{}, ErrStaleUpdate
 	}
@@ -360,6 +371,11 @@ func (s *Store) ReplacePendingPrompt(ctx context.Context, opID string, callerLea
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, true); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "replace_pending_prompt", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
@@ -377,9 +393,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return OperationReceipt{}, ErrStaleUpdate
 	}
@@ -446,6 +460,11 @@ func (s *Store) DiscardPendingPrompt(ctx context.Context, opID string, callerLea
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, true); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "discard_pending_prompt", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
@@ -463,9 +482,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return OperationReceipt{}, ErrStaleUpdate
 	}

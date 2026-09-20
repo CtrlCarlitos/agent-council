@@ -372,7 +372,31 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	stageReconcileID := fmt.Sprintf("%s:reconcile", req.OpID)
 	stageHostLossID := fmt.Sprintf("%s:host_loss", req.OpID)
 
-	// Step 1: Check completed stage first!
+	// Step 1: Current controller authority precedes receipt replay
+	// (AC-004): a superseded controller cannot recover a committed
+	// reconcile response.
+	if err := s.store.ValidateControllerLease(r.Context(), sessionID, req.ControllerLease); err != nil {
+		if errors.Is(err, storage.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "session_not_found", err.Error(), req.OpID)
+			return
+		}
+		if errors.Is(err, storage.ErrLeaseSuperseded) {
+			writeError(w, http.StatusForbidden, "lease_superseded", err.Error(), req.OpID)
+			return
+		}
+		if errors.Is(err, storage.ErrAdoptionRequired) {
+			writeError(w, http.StatusConflict, "adoption_required", err.Error(), req.OpID)
+			return
+		}
+		if errors.Is(err, storage.ErrUnauthorizedOperation) {
+			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), req.OpID)
+		return
+	}
+
+	// Step 2: Check completed stage next.
 	committedReceipt, found, err := s.store.FindOperationReceipt(r.Context(), stageReconcileID, req.ControllerLease)
 	if err != nil {
 		if errors.Is(err, storage.ErrUnauthorizedOperation) {
@@ -401,20 +425,7 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 2: Validate caller authority against runs.controller_lease and active turn before probes
-	if err := s.store.ValidateControllerLease(r.Context(), sessionID, req.ControllerLease); err != nil {
-		if errors.Is(err, storage.ErrSessionNotFound) {
-			writeError(w, http.StatusNotFound, "session_not_found", err.Error(), req.OpID)
-			return
-		}
-		if errors.Is(err, storage.ErrUnauthorizedOperation) {
-			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), req.OpID)
-		return
-	}
-
+	// Step 3: Load current recovery state for turn-scope authorization.
 	recState, err := s.store.GetSessionRecoveryState(r.Context(), sessionID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "get_session_failed", err.Error(), req.OpID)
@@ -462,7 +473,7 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Step 3: Load the saved native-session binding and attach to the
+	// Step 4: Load the saved native-session binding and attach to the
 	// original execution. Recovery must never substitute a fresh session.
 	if s.adapter == nil {
 		writeError(w, http.StatusServiceUnavailable, "harness_unavailable", "harness adapter unavailable", req.OpID)
@@ -506,7 +517,7 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 4: Persist reconciled outcome under bounded service context
+	// Step 5: Persist reconciled outcome under bounded service context
 	persistCtx, persistCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer persistCancel()
 	recReceipt, err := s.store.ReconcileSession(persistCtx, stageReconcileID, req.ControllerLease, recoveryRef, outcome)
@@ -523,7 +534,7 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 5: Notify terminal subscribers after any authoritative
+	// Step 6: Notify terminal subscribers after any authoritative
 	// command-driven terminal commit, not only supervisor-driven completion.
 	if details, derr := s.store.GetTurnDetails(r.Context(), sessionID, turnKey); derr == nil && details != nil &&
 		(details.Status == council.TurnCompleted || details.Status == council.TurnFailed || details.Status == council.TurnCancelled || details.Status == council.TurnInterrupted) {

@@ -197,6 +197,7 @@ func TestServer_StatusDiagnosticCounts(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-diag", "run-diag-1", "brief", "spec", "profile", "lease-1")
+	adoptForTest(t, store, "run-diag-1", "lease-1")
 	sessRec, _ := store.CreateSession(ctx, "op-sess-diag", "lease-1", storage.SessionRecord{
 		ID:                  "sess-diag-1",
 		RunID:               "run-diag-1",

@@ -20,6 +20,7 @@ func TestStore_CredentialRedaction_RealStorageBoundary(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-1")
+	adoptControllerForTest(t, store, "run-1", "lease-1")
 	_, _ = store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable",
 	})

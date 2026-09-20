@@ -31,6 +31,7 @@ func TestRelease_IdempotentRetryAndDraining(t *testing.T) {
 
 	ctx := context.Background()
 	_, err = store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile-1", "lease-1")
+	adoptForTest(t, store, "run-1", "lease-1")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -212,6 +213,7 @@ func TestRelease_HarnessUnavailable(t *testing.T) {
 
 	ctx := context.Background()
 	_, err = store.CreateRun(ctx, "op-run-harn", "run-harn", "brief", "spec", "profile-1", "lease-harn")
+	adoptForTest(t, store, "run-harn", "lease-harn")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -302,6 +304,7 @@ func TestRelease_ClientDisconnectDoesNotCancelWorker(t *testing.T) {
 
 	ctx := context.Background()
 	_, err = store.CreateRun(ctx, "op-run-disc", "run-disc", "brief", "spec", "profile-1", "lease-disc")
+	adoptForTest(t, store, "run-disc", "lease-disc")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -403,6 +406,7 @@ func TestSupervisor_VersionAdvanceResilience(t *testing.T) {
 
 	ctx := context.Background()
 	_, err = store.CreateRun(ctx, "op-run-res", "run-res", "brief", "spec", "profile-1", "lease-res")
+	adoptForTest(t, store, "run-res", "lease-res")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}

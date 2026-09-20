@@ -31,6 +31,7 @@ func TestReview28_ReconciliationNonterminalPreservesReservation(t *testing.T) {
 
 	ctx := context.Background()
 	_, err = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha", "src_sha", "prof_sha", "lease-1")
+	adoptControllerForTest(t, store, "run-1", "lease-1")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -256,6 +257,7 @@ func TestReview28_QueueOperationsStrictlyKeyed(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha", "src_sha", "prof_sha", "lease-1")
+	adoptControllerForTest(t, store, "run-1", "lease-1")
 	sessReceipt, err := store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable",
 	})
@@ -455,6 +457,7 @@ func TestReview28_HydrationSnapshotAndCompleteness(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_123", "src_sha_456", "prof_sha_789", "lease-1")
+	adoptControllerForTest(t, store, "run-1", "lease-1")
 
 	_, err = store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable",
@@ -545,6 +548,7 @@ func TestReview28_LifecycleCommandsAndGuards(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "b", "s", "p", "lease-1")
+	adoptControllerForTest(t, store, "run-1", "lease-1")
 	sessReceipt, err := store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable",
 	})
@@ -686,6 +690,7 @@ func TestReview28_SensitiveDataAndFilesystemProtections(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "b", "s", "p", "lease-1")
+	adoptControllerForTest(t, store, "run-1", "lease-1")
 	_, _ = store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable",
 	})
@@ -745,6 +750,7 @@ func TestReview28_ArtifactStoreRevisionBoundary(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "b", "s", "p", "lease-valid")
+	adoptControllerForTest(t, store, "run-1", "lease-valid")
 	_, _ = store.CreateSession(ctx, "op-sess-1", "lease-valid", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable",
 	})

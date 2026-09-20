@@ -21,6 +21,7 @@ func setupRunAndSession(t *testing.T, store *storage.Store, runID, sessID, lease
 	if err != nil {
 		t.Fatalf("setup create run: %v", err)
 	}
+	adoptControllerForTest(t, store, runID, lease)
 	_, err = store.CreateSession(ctx, "op-sess-"+sessID, lease, storage.SessionRecord{
 		ID:                  sessID,
 		RunID:               runID,

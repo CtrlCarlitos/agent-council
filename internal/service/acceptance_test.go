@@ -126,6 +126,7 @@ func TestAcceptance_CrashRecovery_WithoutAccessibleNativeEvidence(t *testing.T) 
 
 	ctx := context.Background()
 	_, _ = store1.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile", "lease-1")
+	adoptForTest(t, store1, "run-1", "lease-1")
 	sessRec, _ := store1.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID:                  "sess-1",
 		RunID:               "run-1",
@@ -257,6 +258,7 @@ func TestAcceptance_RestartWithIndependentlyRetainedEvidence(t *testing.T) {
 	if _, err := store1.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile", "lease-1"); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	adoptForTest(t, store1, "run-1", "lease-1")
 	sessRec, err := store1.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID:                  "sess-1",
 		RunID:               "run-1",

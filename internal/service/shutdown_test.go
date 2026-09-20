@@ -176,6 +176,7 @@ func TestShutdown_DrainingWaitsForWorkerCompletion(t *testing.T) {
 
 	ctx := context.Background()
 	_, err = store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile-1", "lease-1")
+	adoptForTest(t, store, "run-1", "lease-1")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}

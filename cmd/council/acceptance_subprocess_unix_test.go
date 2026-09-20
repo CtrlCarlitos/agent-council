@@ -118,6 +118,7 @@ func TestSubprocess_WorkSurvival_ClientProcessExit(t *testing.T) {
 	if _, err := store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile", "lease-1"); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	adoptForTest(t, store, "run-1", "lease-1")
 	sessRec, err := store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer",
 		IsActiveContributor: true, State: "parked", Visibility: "reachable",
@@ -275,6 +276,7 @@ func TestSubprocess_CrashRecovery_IndependentLedger(t *testing.T) {
 	if _, err := store.CreateRun(ctx, "op-run-2", "run-2", "brief", "spec", "profile", "lease-1"); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	adoptForTest(t, store, "run-2", "lease-1")
 	sessRec, err := store.CreateSession(ctx, "op-sess-2", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-2", Contributor: "claude", Role: "reviewer",
 		IsActiveContributor: true, State: "parked", Visibility: "reachable",
