@@ -586,7 +586,11 @@ func TestReview18F_CrashRecoveryHooks_Unit(t *testing.T) {
 	var hookedBoundaries []string
 
 	hook := func(boundary string) {
-		hookedBoundaries = append(hookedBoundaries, boundary)
+		// This test tracks the release and artifact boundaries only; the
+		// migration boundary fires during Open by design.
+		if boundary == "pre_commit_release" || boundary == "uncommitted_artifact_metadata" {
+			hookedBoundaries = append(hookedBoundaries, boundary)
+		}
 	}
 
 	store, err := storage.Open(storage.StoreOptions{
