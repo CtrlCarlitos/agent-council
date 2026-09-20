@@ -51,7 +51,7 @@ WHERE run_id = ? AND controller_status != ?;`, status, now, runID, status)
 // classification of the current grant (no replacement identity can appear).
 // Idempotent replay within the same episode recovers the existing receipt
 // without creating a second episode.
-func (s *Store) ConnectRunController(ctx context.Context, opID, runID, lease string, expectedGeneration uint64) (ConnectReceipt, error) {
+func (s *Store) ConnectRunController(ctx context.Context, opID, runID, lease string, expectedGeneration uint64, instanceID string) (ConnectReceipt, error) {
 	if strings.TrimSpace(opID) == "" {
 		return ConnectReceipt{}, errors.New("empty operation id")
 	}
@@ -63,7 +63,20 @@ func (s *Store) ConnectRunController(ctx context.Context, opID, runID, lease str
 	}
 	defer tx.Rollback()
 
-	// Idempotent replay: recover the existing episode receipt.
+	// Current controller authority and generation precede attachment
+	// replay: a superseded or unknown credential never reaches a
+	// successful replay (AC-004 Gate 1 review finding 1).
+	gen, err := classifyRunController(ctx, tx.Tx(), runID, lease)
+	if err != nil {
+		return ConnectReceipt{}, err
+	}
+	if gen != expectedGeneration {
+		return ConnectReceipt{}, ErrGenerationMismatch
+	}
+
+	// Idempotent replay: recover the existing episode receipt. The caller
+	// distinguishes a historical episode from the current one by comparing
+	// the returned identity with the durable attachment state.
 	var storedFingerprint, payloadJSON string
 	err = tx.Tx().QueryRowContext(ctx, `SELECT command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;`, opID).
 		Scan(&storedFingerprint, &payloadJSON)
@@ -85,14 +98,6 @@ func (s *Store) ConnectRunController(ctx context.Context, opID, runID, lease str
 		return ConnectReceipt{}, fmt.Errorf("query connect operation: %w", err)
 	}
 
-	gen, err := classifyRunController(ctx, tx.Tx(), runID, lease)
-	if err != nil {
-		return ConnectReceipt{}, err
-	}
-	if gen != expectedGeneration {
-		return ConnectReceipt{}, ErrGenerationMismatch
-	}
-
 	attachmentID, err := newAttachmentID()
 	if err != nil {
 		return ConnectReceipt{}, err
@@ -100,8 +105,8 @@ func (s *Store) ConnectRunController(ctx context.Context, opID, runID, lease str
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := tx.Tx().ExecContext(ctx, `UPDATE controller_leases
-		SET connected = 1, attachment_id = ?, updated_at = ?
-		WHERE run_id = ? AND generation = ? AND status = 'active';`, attachmentID, now, runID, gen); err != nil {
+		SET connected = 1, attachment_id = ?, instance_id = ?, updated_at = ?
+		WHERE run_id = ? AND generation = ? AND status = 'active';`, attachmentID, instanceID, now, runID, gen); err != nil {
 		return ConnectReceipt{}, fmt.Errorf("establish attachment: %w", err)
 	}
 	if err := projectSessionConnection(ctx, tx.Tx(), runID, "connected"); err != nil {
@@ -142,6 +147,18 @@ func (s *Store) DisconnectRunController(ctx context.Context, opID, runID, lease,
 	}
 	defer tx.Rollback()
 
+	// Current controller authority and generation precede replay: an old
+	// disconnect operation replayed by its superseded controller is fenced
+	// here, and a replayed receipt for an ended episode never disconnects
+	// a successor (AC-004 Gate 1 review finding 1).
+	gen, err := classifyRunController(ctx, tx.Tx(), runID, lease)
+	if err != nil {
+		return OperationReceipt{}, err
+	}
+	if gen != expectedGeneration {
+		return OperationReceipt{}, ErrGenerationMismatch
+	}
+
 	// Idempotent replay.
 	var storedFingerprint, payloadJSON string
 	err = tx.Tx().QueryRowContext(ctx, `SELECT command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;`, opID).
@@ -158,14 +175,6 @@ func (s *Store) DisconnectRunController(ctx context.Context, opID, runID, lease,
 	}
 	if err != sql.ErrNoRows {
 		return OperationReceipt{}, fmt.Errorf("query disconnect operation: %w", err)
-	}
-
-	gen, err := classifyRunController(ctx, tx.Tx(), runID, lease)
-	if err != nil {
-		return OperationReceipt{}, err
-	}
-	if gen != expectedGeneration {
-		return OperationReceipt{}, ErrGenerationMismatch
 	}
 
 	var currentAttachment string
@@ -187,7 +196,7 @@ func (s *Store) DisconnectRunController(ctx context.Context, opID, runID, lease,
 		if err := projectSessionConnection(ctx, tx.Tx(), runID, "disconnected"); err != nil {
 			return OperationReceipt{}, err
 		}
-		payload = "disconnected"
+		payload = "disconnected:attachment=" + attachmentID
 	}
 
 	receipt := OperationReceipt{

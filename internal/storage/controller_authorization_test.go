@@ -39,6 +39,10 @@ func adoptedFixture(t *testing.T, lease string) (*Store, string, string) {
 	if _, err := store.AdoptController(ctx, "op-adopt-auth", "run-auth", "claude", "controller-ref", "bootstrap-"+lease, nil, lease); err != nil {
 		t.Fatalf("adopt: %v", err)
 	}
+	// Establish the durable connection episode (new decisions require it).
+	if _, err := store.ConnectRunController(ctx, "op-conn-auth", "run-auth", lease, 1, "test-instance"); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
 	_ = sess
 	return store, "run-auth", "sess-auth"
 }
@@ -135,7 +139,7 @@ func TestAC004_SupersededReplayFencedEverywhere(t *testing.T) {
 					Status:       adapter.ReconciliationUncertain,
 					Observed:     council.TurnRunning,
 				}
-				if _, err := store.ReconcileSession(ctx, "op-rec-1:reconcile", lease, ref, outcome); err != nil {
+				if _, err := store.ReconcileSession(ctx, "op-rec-1:reconcile", store.ExecutionRefForTurn(ctx, string(ref.SessionID), ref.TurnKey), ref, outcome); err != nil {
 					t.Fatalf("reconcile: %v", err)
 				}
 			},
@@ -299,6 +303,10 @@ func TestAC004_MigratedRunLegacyDeniedAdoptedReleases(t *testing.T) {
 	// Explicit adoption through the new contract (bootstrap credential).
 	if _, err := store.AdoptController(ctx, "op-adopt-migrated", "run-v1", "agy", "controller-migrated", "legacy-secret-1", nil, "adopted-secret-M"); err != nil {
 		t.Fatalf("adopt migrated run: %v", err)
+	}
+
+	if _, err := store.ConnectRunController(ctx, "op-conn-migrated", "run-v1", "adopted-secret-M", 1, "test-instance"); err != nil {
+		t.Fatalf("connect migrated controller: %v", err)
 	}
 
 	// The adopted controller completes the migrated running turn and then

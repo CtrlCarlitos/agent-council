@@ -441,12 +441,15 @@ func (c *Coordinator) CloseAllSubscribers() {
 }
 
 // MarkControllerAttached publishes an in-instance attachment record for a
-// run and generation. It is set only from validated connect transitions in
-// this instance: a persisted connected flag, or a replayed old connect
-// operation, never establishes a live attachment on a fresh instance.
+// run, generation, and episode. It is set only from validated connect
+// transitions in this instance, and never downgrades: a delayed handler
+// from an older generation cannot overwrite a newer controller's record.
 func (c *Coordinator) MarkControllerAttached(runID string, generation uint64, attachmentID, instanceID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if existing, ok := c.attachments[runID]; ok && existing.generation > generation {
+		return
+	}
 	c.attachments[runID] = attachmentState{
 		runID:        runID,
 		generation:   generation,
@@ -455,8 +458,19 @@ func (c *Coordinator) MarkControllerAttached(runID string, generation uint64, at
 	}
 }
 
-// ControllerAttached reports whether the given generation of a run's
-// controller attached in this service instance.
+// ControllerAttachedEpisode reports whether the exact durable identity —
+// generation and attachment episode — is the one published in this service
+// instance. Generation-only or boolean matches are insufficient: a stale
+// local episode must not authorize decisions for a different durable one.
+func (c *Coordinator) ControllerAttachedEpisode(runID string, generation uint64, attachmentID string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	att, ok := c.attachments[runID]
+	return ok && att.generation == generation && att.attachmentID == attachmentID && att.instanceID != ""
+}
+
+// ControllerAttached reports whether any episode of the given generation
+// attached in this instance (used by tests and diagnostics).
 func (c *Coordinator) ControllerAttached(runID string, generation uint64) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

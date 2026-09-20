@@ -336,7 +336,7 @@ func TestReview18F_DurableReceipts_AcceptedNoOps(t *testing.T) {
 		Observed:     council.TurnCancelled,
 		Result:       "cancelled",
 	}
-	recReceipt, err := store.ReconcileSession(ctx, "op-rec-q", "lease-1", outcome.Ref, outcome)
+	recReceipt, err := store.ReconcileSession(ctx, "op-rec-q", store.ExecutionRefForTurn(ctx, string(outcome.Ref.SessionID), outcome.Ref.TurnKey), outcome.Ref, outcome)
 	if err != nil {
 		t.Fatalf("reconcile session: %v", err)
 	}

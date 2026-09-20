@@ -17,6 +17,7 @@ type ControllerConnectRunRequest struct {
 	OpID               string `json:"op_id"`
 	ControllerLease    string `json:"controller_lease"`
 	ExpectedGeneration uint64 `json:"expected_generation"`
+	InstanceID         string `json:"instance_id"` // advisory; the server records its own instance
 }
 
 type ControllerDisconnectRunRequest struct {
@@ -60,15 +61,20 @@ func (s *Server) handleRunControllerConnect(w http.ResponseWriter, r *http.Reque
 	}
 	defer doneControl()
 
-	receipt, err := s.store.ConnectRunController(r.Context(), req.OpID, runID, req.ControllerLease, req.ExpectedGeneration)
+	receipt, err := s.store.ConnectRunController(r.Context(), req.OpID, runID, req.ControllerLease, req.ExpectedGeneration, s.cfg.InstanceID)
 	if err != nil {
 		s.writeGrantError(w, err, req.OpID)
 		return
 	}
 
-	// Only a validated connect transition in this instance establishes the
-	// in-instance attachment gate.
-	s.coordinator.MarkControllerAttached(runID, req.ExpectedGeneration, receipt.AttachmentID, s.cfg.InstanceID)
+	// Publication is conditional on the receipt describing the CURRENT
+	// durable episode: a replayed historical connect (including one from a
+	// previous service instance) must not become fresh reattachment.
+	rec, err := s.store.GetControllerRecord(r.Context(), runID)
+	if err == nil && rec.Adopted && rec.Connected && rec.Generation == req.ExpectedGeneration &&
+		rec.AttachmentID == receipt.AttachmentID && rec.InstanceID == s.cfg.InstanceID {
+		s.coordinator.MarkControllerAttached(runID, req.ExpectedGeneration, receipt.AttachmentID, s.cfg.InstanceID)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -107,10 +113,14 @@ func (s *Server) handleRunControllerDisconnect(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// The durable state is authoritative for the episode outcome; clearing
-	// the in-instance record follows the same transition.
-	if receipt.Payload == "disconnected" {
-		s.coordinator.InvalidateControllerAttachment(runID)
+	// Local invalidation follows the durable transition and its exact
+	// episode: a replayed disconnect for an already-ended episode must not
+	// clear a successor's in-instance record.
+	if episode, ok := strings.CutPrefix(receipt.Payload, "disconnected:attachment="); ok {
+		rec, rerr := s.store.GetControllerRecord(r.Context(), runID)
+		if rerr == nil && rec.AttachmentID == episode && !rec.Connected {
+			s.coordinator.InvalidateControllerAttachment(runID)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -169,7 +179,7 @@ func (s *Server) requireConnectedController(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusConflict, "adoption_required", "run has no adopted controller", opID)
 		return false
 	}
-	if !rec.Connected || !s.coordinator.ControllerAttached(runID, rec.Generation) {
+	if !rec.Connected || !s.coordinator.ControllerAttachedEpisode(runID, rec.Generation, rec.AttachmentID) {
 		writeError(w, http.StatusConflict, "not_connected", "current controller must attach to this service instance before new decisions", opID)
 		return false
 	}

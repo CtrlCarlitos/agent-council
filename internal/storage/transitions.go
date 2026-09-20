@@ -463,7 +463,6 @@ func (s *Store) ReleaseTurn(ctx context.Context, opID string, callerLease string
 	if err != nil {
 		return ReleaseResult{}, err
 	}
-
 	// Idempotency check for release_turn
 	var storedCmdType, storedFingerprint, payloadJSON string
 	err = tx.Tx().QueryRowContext(ctx, "SELECT command_type, command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;", opID).Scan(&storedCmdType, &storedFingerprint, &payloadJSON)
@@ -473,9 +472,9 @@ func (s *Store) ReleaseTurn(ctx context.Context, opID string, callerLease string
 			if jp.Receipt.OperationReceipt.TurnKey == "" {
 				jp.Receipt.OperationReceipt.TurnKey = jp.Receipt.TurnKey
 			}
-			if jp.CallerLease != callerLease {
-				return ReleaseResult{}, ErrUnauthorizedOperation
-			}
+			// Authority was classified before this transaction; the recorded
+			// caller_lease may belong to a superseded controller whose
+			// committed release the current controller recovers.
 			if storedCmdType != "release_turn" || storedFingerprint != fp {
 				return ReleaseResult{}, ErrIdempotencyConflict
 			}
@@ -484,6 +483,12 @@ func (s *Store) ReleaseTurn(ctx context.Context, opID string, callerLease string
 				Disposition: ReleaseDispositionReplayed,
 			}, nil
 		}
+	}
+
+	// New decisions enforce the run connection precondition at this write
+	// boundary; the replay above follows the disconnected-read policy.
+	if err := requireRunConnected(ctx, tx.Tx(), runIDOfSession(ctx, tx.Tx(), sessionID)); err != nil {
+		return ReleaseResult{}, err
 	}
 
 	var runID, runLease, state, lifecycle, controllerStatus, visibility string
@@ -603,7 +608,7 @@ VALUES (?, 'release_turn', ?, ?, ?, ?, 'turn_released', 1, ?, ?);`, opID, fp, ru
 	}, nil
 }
 
-func (s *Store) ReconcileSession(ctx context.Context, opID string, callerLease string, ref adapter.RecoveryRef, outcome adapter.ReconciliationOutcome) (OperationReceipt, error) {
+func (s *Store) ReconcileSession(ctx context.Context, opID string, execRef ExecutionRef, ref adapter.RecoveryRef, outcome adapter.ReconciliationOutcome) (OperationReceipt, error) {
 	if err := outcome.Validate(); err != nil {
 		return OperationReceipt{}, fmt.Errorf("invalid reconciliation outcome: %w", err)
 	}
@@ -623,7 +628,14 @@ func (s *Store) ReconcileSession(ctx context.Context, opID string, callerLease s
 	}
 	defer tx.Rollback()
 
-	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "reconcile_session", fp); err != nil {
+	// The original execution reference is validated against the persisted
+	// accepted execution inside the atomic transition: session, turn, and
+	// the exact attempt identity (AC-004 Gate 1 review finding 4).
+	if _, err := resolveExecutionRef(ctx, tx.Tx(), execRef); err != nil {
+		return OperationReceipt{}, err
+	}
+
+	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, "", "reconcile_session", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
 		return *receipt, nil
@@ -781,7 +793,7 @@ WHERE session_id = ?;`, newVer, now, sessID)
 		Payload:          payload,
 	}
 
-	if err := recordJournalEntry(tx.Tx(), opID, "reconcile_session", fp, runID, sessID, ref.TurnKey, "session_reconciled", receipt, callerLease); err != nil {
+	if err := recordJournalEntry(tx.Tx(), opID, "reconcile_session", fp, runID, sessID, ref.TurnKey, "session_reconciled", receipt, ""); err != nil {
 		return OperationReceipt{}, err
 	}
 
@@ -931,6 +943,11 @@ func (s *Store) RequestCancel(ctx context.Context, opID string, callerLease stri
 		return OperationReceipt{}, err
 	} else if receipt != nil {
 		return *receipt, nil
+	}
+	// New decisions enforce the run connection precondition at this write
+	// boundary; idempotent replay above follows the disconnected-read policy.
+	if err := requireRunConnected(ctx, tx.Tx(), runIDOfSession(ctx, tx.Tx(), sessionID)); err != nil {
+		return OperationReceipt{}, err
 	}
 
 	var runID, runLease, lifecycle, controllerStatus, state string
@@ -1494,6 +1511,12 @@ func (s *Store) RecordDecision(ctx context.Context, opID string, callerLease str
 		return OperationReceipt{}, err
 	} else if receipt != nil {
 		return *receipt, nil
+	}
+
+	// New decisions enforce the run connection precondition at this write
+	// boundary; idempotent replay above follows the disconnected-read policy.
+	if err := requireRunConnected(ctx, tx.Tx(), runID); err != nil {
+		return OperationReceipt{}, err
 	}
 
 	var runLease string

@@ -117,7 +117,7 @@ func TestStore_ReconcileSession_GenerationAndTurnValidation(t *testing.T) {
 		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-WRONG"},
 		Generation: 2,
 	}
-	_, err = store.ReconcileSession(ctx, "op-rec-mismatch", "lease-1", refMismatch, adapter.ReconciliationOutcome{
+	_, err = store.ReconcileSession(ctx, "op-rec-mismatch", store.ExecutionRefForTurn(ctx, string(refMismatch.SessionID), refMismatch.TurnKey), refMismatch, adapter.ReconciliationOutcome{
 		Ref: refMismatch, Reachability: council.VisibilityReachable, Status: adapter.ReconciliationReachableTerminal, Observed: council.TurnCompleted,
 	})
 	if err == nil {
@@ -129,7 +129,7 @@ func TestStore_ReconcileSession_GenerationAndTurnValidation(t *testing.T) {
 		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-1"},
 		Generation: 1,
 	}
-	_, err = store.ReconcileSession(ctx, "op-rec-stale", "lease-1", refStale, adapter.ReconciliationOutcome{
+	_, err = store.ReconcileSession(ctx, "op-rec-stale", store.ExecutionRefForTurn(ctx, string(refStale.SessionID), refStale.TurnKey), refStale, adapter.ReconciliationOutcome{
 		Ref: refStale, Reachability: council.VisibilityReachable, Status: adapter.ReconciliationReachableTerminal, Observed: council.TurnCompleted,
 	})
 	if err == nil {
@@ -141,7 +141,7 @@ func TestStore_ReconcileSession_GenerationAndTurnValidation(t *testing.T) {
 		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-1"},
 		Generation: 2,
 	}
-	recReceipt, err := store.ReconcileSession(ctx, "op-rec-valid", "lease-1", refValid, adapter.ReconciliationOutcome{
+	recReceipt, err := store.ReconcileSession(ctx, "op-rec-valid", store.ExecutionRefForTurn(ctx, string(refValid.SessionID), refValid.TurnKey), refValid, adapter.ReconciliationOutcome{
 		Ref: refValid, Reachability: council.VisibilityReachable, Status: adapter.ReconciliationReachableTerminal, Observed: council.TurnCompleted, Result: "approved",
 	})
 	if err != nil {
@@ -182,7 +182,7 @@ func TestStore_RecordDispatchObservation_LateArrivalIgnored(t *testing.T) {
 		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-1"},
 		Generation: 2,
 	}
-	_, err = store.ReconcileSession(ctx, "op-rec-1", "lease-1", ref, adapter.ReconciliationOutcome{
+	_, err = store.ReconcileSession(ctx, "op-rec-1", store.ExecutionRefForTurn(ctx, string(ref.SessionID), ref.TurnKey), ref, adapter.ReconciliationOutcome{
 		Ref: ref, Reachability: council.VisibilityReachable, Status: adapter.ReconciliationReachableTerminal, Observed: council.TurnCompleted,
 	})
 	if err != nil {

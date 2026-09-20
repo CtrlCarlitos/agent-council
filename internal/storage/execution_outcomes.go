@@ -23,6 +23,24 @@ import (
 // reconciliation handlers call them internally after obtaining adapter
 // evidence.
 
+// currentSessionVersion reads the session row version inside a transition.
+func currentSessionVersion(ctx context.Context, q rowQueryer, sessionID string) int64 {
+	var v int64
+	_ = q.QueryRowContext(ctx, `SELECT row_version FROM sessions WHERE session_id = ?;`, sessionID).Scan(&v)
+	return v
+}
+
+// ExecutionRefForTurn resolves the persisted execution reference (session,
+// turn, attempt) for a turn, or a zero reference when none is recorded.
+func (s *Store) ExecutionRefForTurn(ctx context.Context, sessionID, turnKey string) ExecutionRef {
+	var attempt string
+	err := s.readDB.QueryRowContext(ctx, `SELECT attempt_id FROM dispatch_intents WHERE session_id = ? AND turn_key = ?;`, sessionID, turnKey).Scan(&attempt)
+	if err != nil || attempt == "" {
+		return ExecutionRef{}
+	}
+	return ExecutionRef{SessionID: sessionID, TurnKey: turnKey, AttemptID: attempt}
+}
+
 // ErrWrongExecutionAttempt reports an execution reference whose attempt
 // identity does not match the persisted accepted execution.
 var ErrWrongExecutionAttempt = errors.New("execution reference attempt mismatch")
@@ -269,13 +287,20 @@ UPDATE dispatch_intents SET phase = ?, updated_at = ?
 WHERE session_id = ? AND turn_key = ?;`, phase, now, ref.SessionID, ref.TurnKey); err != nil {
 		return OperationReceipt{}, fmt.Errorf("update dispatch intent phase: %w", err)
 	}
+	// Child-state changes advance the parent session version so snapshot
+	// concurrency checks observe them.
+	newVer := currentSessionVersion(ctx, tx.Tx(), ref.SessionID)
+	if _, err := tx.Tx().ExecContext(ctx, `UPDATE sessions SET row_version = row_version + 1, updated_at = ? WHERE session_id = ?;`, now, ref.SessionID); err != nil {
+		return OperationReceipt{}, fmt.Errorf("bump session version for dispatch observation: %w", err)
+	}
+	newVer++
 
 	receipt := OperationReceipt{
 		OpID:             opID,
 		CommandType:      "record_dispatch_observation",
 		SessionID:        ref.SessionID,
 		TurnKey:          ref.TurnKey,
-		CommittedVersion: 0,
+		CommittedVersion: newVer,
 		CreatedAt:        time.Now().UTC(),
 		Payload:          fmt.Sprintf("%s:issued_by_generation=%d", phase, issuingGeneration),
 	}

@@ -15,7 +15,7 @@ func TestAC004_AttachmentEpisodesAndDelayedDisconnect(t *testing.T) {
 	defer store.Close()
 	ctx := context.Background()
 
-	rec1, err := store.ConnectRunController(ctx, "op-conn-A1", runID, "lease-A", 1)
+	rec1, err := store.ConnectRunController(ctx, "op-conn-A1", runID, "lease-A", 1, "test-instance")
 	if err != nil {
 		t.Fatalf("first connect: %v", err)
 	}
@@ -24,13 +24,13 @@ func TestAC004_AttachmentEpisodesAndDelayedDisconnect(t *testing.T) {
 	}
 
 	// Replay of the same connect operation recovers the same episode.
-	rec1Replay, err := store.ConnectRunController(ctx, "op-conn-A1", runID, "lease-A", 1)
+	rec1Replay, err := store.ConnectRunController(ctx, "op-conn-A1", runID, "lease-A", 1, "test-instance")
 	if err != nil || rec1Replay.AttachmentID != rec1.AttachmentID {
 		t.Fatalf("replay must recover the existing episode: %+v err=%v", rec1Replay, err)
 	}
 
 	// Same controller, same generation: reconnecting creates episode B.
-	rec2, err := store.ConnectRunController(ctx, "op-conn-B", runID, "lease-A", 1)
+	rec2, err := store.ConnectRunController(ctx, "op-conn-B", runID, "lease-A", 1, "test-instance")
 	if err != nil {
 		t.Fatalf("second connect: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestAC004_HandoffInvalidatesAttachmentAndProjects(t *testing.T) {
 	defer store.Close()
 	ctx := context.Background()
 
-	if _, err := store.ConnectRunController(ctx, "op-conn-h", runID, "lease-A", 1); err != nil {
+	if _, err := store.ConnectRunController(ctx, "op-conn-h", runID, "lease-A", 1, "test-instance"); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 
@@ -82,7 +82,7 @@ func TestAC004_HandoffInvalidatesAttachmentAndProjects(t *testing.T) {
 
 	// The new controller connects explicitly (never inherits flags) and
 	// reconnecting never creates a second controller.
-	recB, err := store.ConnectRunController(ctx, "op-conn-B2", runID, "lease-B", 2)
+	recB, err := store.ConnectRunController(ctx, "op-conn-B2", runID, "lease-B", 2, "test-instance")
 	if err != nil {
 		t.Fatalf("new controller connect: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestAC004_RevokeInvalidatesAttachment(t *testing.T) {
 	defer store.Close()
 	ctx := context.Background()
 
-	if _, err := store.ConnectRunController(ctx, "op-conn-r", runID, "lease-A", 1); err != nil {
+	if _, err := store.ConnectRunController(ctx, "op-conn-r", runID, "lease-A", 1, "test-instance"); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 	if _, err := store.RevokeController(ctx, "op-revoke-inv", runID, "lease-A", nil); err != nil {
@@ -122,7 +122,7 @@ func TestAC004_ConnectRequiresCurrentGrantNotPriorConnection(t *testing.T) {
 	if _, err := store.DisconnectRunController(ctx, "op-disc-x", runID, "lease-A", "nonexistent-attachment", 1); err != nil {
 		t.Fatalf("stale-attachment disconnect on unattached grant: %v", err)
 	}
-	if _, err := store.ConnectRunController(ctx, "op-conn-fresh", runID, "lease-A", 1); err != nil {
+	if _, err := store.ConnectRunController(ctx, "op-conn-fresh", runID, "lease-A", 1, "test-instance"); err != nil {
 		t.Fatalf("connect must not require a prior attachment: %v", err)
 	}
 }

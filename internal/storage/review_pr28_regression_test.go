@@ -62,7 +62,7 @@ func TestReview28_ReconciliationNonterminalPreservesReservation(t *testing.T) {
 		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-1"},
 		Generation: 1,
 	}
-	_, err = store.ReconcileSession(ctx, "op-rec-bad-vis", "lease-1", ref1, adapter.ReconciliationOutcome{
+	_, err = store.ReconcileSession(ctx, "op-rec-bad-vis", store.ExecutionRefForTurn(ctx, string(ref1.SessionID), ref1.TurnKey), ref1, adapter.ReconciliationOutcome{
 		Ref:          ref1,
 		Reachability: council.VisibilityReachable,
 		Status:       adapter.ReconciliationReachableActive,
@@ -86,7 +86,7 @@ func TestReview28_ReconciliationNonterminalPreservesReservation(t *testing.T) {
 		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-1"},
 		Generation: 1,
 	}
-	_, err = store.ReconcileSession(ctx, "op-rec-stale", "lease-1", staleRef, adapter.ReconciliationOutcome{
+	_, err = store.ReconcileSession(ctx, "op-rec-stale", store.ExecutionRefForTurn(ctx, string(staleRef.SessionID), staleRef.TurnKey), staleRef, adapter.ReconciliationOutcome{
 		Ref:          staleRef,
 		Reachability: council.VisibilityReachable,
 		Status:       adapter.ReconciliationReachableActive,
@@ -101,7 +101,7 @@ func TestReview28_ReconciliationNonterminalPreservesReservation(t *testing.T) {
 		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-1"},
 		Generation: 2,
 	}
-	_, err = store.ReconcileSession(ctx, "op-rec-ref-mismatch", "lease-1", validRef, adapter.ReconciliationOutcome{
+	_, err = store.ReconcileSession(ctx, "op-rec-ref-mismatch", store.ExecutionRefForTurn(ctx, string(validRef.SessionID), validRef.TurnKey), validRef, adapter.ReconciliationOutcome{
 		Ref:          staleRef,
 		Reachability: council.VisibilityReachable,
 		Status:       adapter.ReconciliationReachableActive,
@@ -112,7 +112,7 @@ func TestReview28_ReconciliationNonterminalPreservesReservation(t *testing.T) {
 	}
 
 	// 3. ReconciliationReachableActive: turn remains active!
-	recReceipt, err := store.ReconcileSession(ctx, "op-rec-active", "lease-1", validRef, adapter.ReconciliationOutcome{
+	recReceipt, err := store.ReconcileSession(ctx, "op-rec-active", store.ExecutionRefForTurn(ctx, string(validRef.SessionID), validRef.TurnKey), validRef, adapter.ReconciliationOutcome{
 		Ref:          validRef,
 		Reachability: council.VisibilityReachable,
 		Status:       adapter.ReconciliationReachableActive,
@@ -162,7 +162,7 @@ func TestReview28_ReconciliationNonterminalPreservesReservation(t *testing.T) {
 		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-1"},
 		Generation: 3,
 	}
-	_, err = store.ReconcileSession(ctx, "op-rec-uncert", "lease-1", uncertRef, adapter.ReconciliationOutcome{
+	_, err = store.ReconcileSession(ctx, "op-rec-uncert", store.ExecutionRefForTurn(ctx, string(uncertRef.SessionID), uncertRef.TurnKey), uncertRef, adapter.ReconciliationOutcome{
 		Ref:          uncertRef,
 		Reachability: council.VisibilityHostLost,
 		Status:       adapter.ReconciliationUncertain,
@@ -211,7 +211,7 @@ func TestReview28_ReconciliationNonterminalPreservesReservation(t *testing.T) {
 		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-1"},
 		Generation: 3,
 	}
-	_, err = store.ReconcileSession(ctx, "op-rec-conflict", "lease-1", postRef, adapter.ReconciliationOutcome{
+	_, err = store.ReconcileSession(ctx, "op-rec-conflict", store.ExecutionRefForTurn(ctx, string(postRef.SessionID), postRef.TurnKey), postRef, adapter.ReconciliationOutcome{
 		Ref:          postRef,
 		Reachability: council.VisibilityReachable,
 		Status:       adapter.ReconciliationReachableActive,
@@ -222,7 +222,7 @@ func TestReview28_ReconciliationNonterminalPreservesReservation(t *testing.T) {
 	}
 
 	// Post-terminal recovery: ReconciliationReachableTerminal succeeds and closes recovery episode
-	_, err = store.ReconcileSession(ctx, "op-rec-post-term", "lease-1", postRef, adapter.ReconciliationOutcome{
+	_, err = store.ReconcileSession(ctx, "op-rec-post-term", store.ExecutionRefForTurn(ctx, string(postRef.SessionID), postRef.TurnKey), postRef, adapter.ReconciliationOutcome{
 		Ref:          postRef,
 		Reachability: council.VisibilityReachable,
 		Status:       adapter.ReconciliationReachableTerminal,

@@ -153,7 +153,7 @@ func TestAC004_ReconcileCommitSurvivesMidProbeHandoff(t *testing.T) {
 		Observed:     council.TurnCompleted,
 		Result:       "verified while rotated",
 	}
-	if _, err := store.ReconcileSession(ctx, "op-mid:reconcile", "lease-A", rref, outcome); err != nil {
+	if _, err := store.ReconcileSession(ctx, "op-mid:reconcile", store.ExecutionRefForTurn(ctx, string(rref.SessionID), rref.TurnKey), rref, outcome); err != nil {
 		t.Fatalf("reconcile commit after mid-probe handoff: %v", err)
 	}
 	d, _ := store.GetTurnDetails(ctx, "sess-auth", "t-mid")
@@ -170,7 +170,7 @@ func TestAC004_ReconcileCommitSurvivesMidProbeHandoff(t *testing.T) {
 	stale := rref
 	stale.Generation = gen + 1
 	outcome.Ref = stale
-	if _, err := store.ReconcileSession(ctx, "op-mid:stale", "lease-B", stale, outcome); err == nil {
+	if _, err := store.ReconcileSession(ctx, "op-mid:stale", store.ExecutionRefForTurn(ctx, string(stale.SessionID), stale.TurnKey), stale, outcome); err == nil {
 		t.Fatal("stale recovery generation must be rejected")
 	}
 }

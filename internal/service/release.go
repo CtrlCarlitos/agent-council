@@ -75,12 +75,11 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	// If found, return 200 OK immediately without checking adapter availability or draining state.
 	existingReceipt, found, err := s.store.FindCommittedRelease(r.Context(), req.OpID, req.ControllerLease, sessionID, turnKey)
 	if err != nil {
-		if errors.Is(err, storage.ErrIdempotencyConflict) {
-			writeError(w, http.StatusConflict, "idempotency_conflict", err.Error(), req.OpID)
+		if writeControllerAuthError(w, err, req.OpID) {
 			return
 		}
-		if errors.Is(err, storage.ErrUnauthorizedOperation) {
-			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
+		if errors.Is(err, storage.ErrIdempotencyConflict) {
+			writeError(w, http.StatusConflict, "idempotency_conflict", err.Error(), req.OpID)
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), req.OpID)

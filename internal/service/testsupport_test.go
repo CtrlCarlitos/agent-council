@@ -17,6 +17,9 @@ func adoptForTest(t *testing.T, store *storage.Store, runID, lease string) {
 	if _, err := store.AdoptController(context.Background(), "op-adopt-fixture-"+runID, runID, "claude", "fixture-controller", lease, nil, lease); err != nil {
 		t.Fatalf("adopt controller for fixture (run %s): %v", runID, err)
 	}
+	if _, err := store.ConnectRunController(context.Background(), "op-conn-fixture-"+runID, runID, lease, 1, "test-instance"); err != nil {
+		t.Fatalf("connect fixture controller (run %s): %v", runID, err)
+	}
 }
 
 // connectControllerForTest establishes the run-scoped attachment episode
@@ -28,7 +31,7 @@ func connectControllerForTest(t *testing.T, srv *Server, store *storage.Store, r
 	if err != nil || !rec.Adopted {
 		t.Fatalf("fixture controller not adopted (run %s): %+v err=%v", runID, rec, err)
 	}
-	receipt, err := store.ConnectRunController(context.Background(), "op-conn-fixture-"+runID, runID, lease, rec.Generation)
+	receipt, err := store.ConnectRunController(context.Background(), "op-conn-fixture-"+runID, runID, lease, rec.Generation, srv.InstanceID())
 	if err != nil {
 		t.Fatalf("fixture connect (run %s): %v", runID, err)
 	}

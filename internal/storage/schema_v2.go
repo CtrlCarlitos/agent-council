@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS controller_leases (
     status TEXT NOT NULL CHECK (status IN ('active','legacy','superseded','revoked')),
     granted_by_op_id TEXT NOT NULL,
     attachment_id TEXT,
+    instance_id TEXT,
     connected INTEGER NOT NULL DEFAULT 0 CHECK (connected IN (0, 1)),
     attached_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,

@@ -189,11 +189,22 @@ func (s *Store) CreateSession(ctx context.Context, opID string, callerLease stri
 		isActive = 1
 	}
 
+	// The compatibility projection is derived from the run's actual
+	// connection state — never defaulted to connected.
+	var runConnected int
+	if err := tx.Tx().QueryRowContext(ctx, `SELECT connected FROM controller_leases WHERE run_id = ? AND status = 'active';`, session.RunID).Scan(&runConnected); err != nil {
+		runConnected = 0
+	}
+	projection := "disconnected"
+	if runConnected == 1 {
+		projection = "connected"
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err = tx.Tx().ExecContext(ctx, `
 INSERT INTO sessions (session_id, run_id, contributor, is_active_contributor, state, lifecycle, controller_status, visibility, recovery_gen, active_recovery_gen, row_version, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, 'active', 'connected', ?, ?, ?, 1, ?, ?);`,
-		session.ID, session.RunID, session.Contributor, isActive, session.State, session.Visibility, session.RecoveryGeneration, session.RecoveryGeneration, now, now)
+VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, 1, ?, ?);`,
+		session.ID, session.RunID, session.Contributor, isActive, session.State, projection, session.Visibility, session.RecoveryGeneration, session.RecoveryGeneration, now, now)
 	if err != nil {
 		return OperationReceipt{}, fmt.Errorf("insert session: %w", err)
 	}
@@ -245,6 +256,11 @@ func (s *Store) QueuePrompt(ctx context.Context, opID string, callerLease string
 		return OperationReceipt{}, err
 	} else if receipt != nil {
 		return *receipt, nil
+	}
+	// New decisions enforce the run connection precondition at this write
+	// boundary; idempotent replay above follows the disconnected-read policy.
+	if err := requireRunConnected(ctx, tx.Tx(), runIDOfSession(ctx, tx.Tx(), sessionID)); err != nil {
+		return OperationReceipt{}, err
 	}
 
 	// Validate session, authority, expected version, lifecycle, controller status
@@ -381,6 +397,11 @@ func (s *Store) ReplacePendingPrompt(ctx context.Context, opID string, callerLea
 	} else if receipt != nil {
 		return *receipt, nil
 	}
+	// New decisions enforce the run connection precondition at this write
+	// boundary; idempotent replay above follows the disconnected-read policy.
+	if err := requireRunConnected(ctx, tx.Tx(), runIDOfSession(ctx, tx.Tx(), sessionID)); err != nil {
+		return OperationReceipt{}, err
+	}
 
 	var runID, runLease, lifecycle, controllerStatus string
 	var currentVer int64
@@ -469,6 +490,11 @@ func (s *Store) DiscardPendingPrompt(ctx context.Context, opID string, callerLea
 		return OperationReceipt{}, err
 	} else if receipt != nil {
 		return *receipt, nil
+	}
+	// New decisions enforce the run connection precondition at this write
+	// boundary; idempotent replay above follows the disconnected-read policy.
+	if err := requireRunConnected(ctx, tx.Tx(), runIDOfSession(ctx, tx.Tx(), sessionID)); err != nil {
+		return OperationReceipt{}, err
 	}
 
 	var runID, runLease, lifecycle, controllerStatus string

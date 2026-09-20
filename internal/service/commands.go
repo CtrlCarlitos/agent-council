@@ -177,6 +177,11 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		TurnKey:   turnKey,
 	}
 
+	// Capture the accepted execution's identity before contacting the
+	// adapter: the confirmed-commit evidence write validates exactly this
+	// reference rather than a later lookup.
+	execRef := s.executionRefForTurn(r.Context(), sessionID, turnKey)
+
 	// Request cancellation through the adapter under an independent timeout.
 	// The supervisor's observation, collection, and persistence
 	// responsibilities stay alive independently of this request: a request,
@@ -201,10 +206,9 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 					bgCtx, bgCancel := context.WithTimeout(context.Background(), 3*time.Second)
 					defer bgCancel()
 
-					// The evidence write uses the accepted execution's
-					// identity (AC-004 §6) — it must not depend on the
-					// requesting controller's lease remaining current.
-					execRef := s.executionRefForTurn(bgCtx, sessionID, turnKey)
+					// The evidence write uses the identity captured before
+					// the adapter call (AC-004 §6) — it must not depend on
+					// the requesting controller's lease remaining current.
 					persisted := false
 					if execRef != nil {
 						_, termErr := s.store.RecordObservedExecutionOutcome(bgCtx, termOpID, *execRef, council.TurnCancelled, reason)
@@ -317,7 +321,7 @@ func (s *Server) handleControllerConnect(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusConflict, "adoption_required", "run has no adopted controller", req.OpID)
 		return
 	}
-	connectReceipt, err := s.store.ConnectRunController(r.Context(), req.OpID, runID, req.ControllerLease, rec.Generation)
+	connectReceipt, err := s.store.ConnectRunController(r.Context(), req.OpID, runID, req.ControllerLease, rec.Generation, s.cfg.InstanceID)
 	if err != nil {
 		s.writeGrantError(w, err, req.OpID)
 		return
@@ -452,6 +456,15 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Capture the original execution reference after turn-scope
+	// authorization and before the probe: the atomic commit validates
+	// exactly this identity.
+	execRef := s.executionRefForTurn(r.Context(), sessionID, turnKey)
+	if execRef == nil {
+		writeError(w, http.StatusConflict, "no_accepted_execution", "no accepted execution reference for this turn", req.OpID)
+		return
+	}
+
 	var generation uint64
 	if recState.Visibility == "host_lost" && recState.ActiveRecoveryGen > 0 {
 		generation = recState.ActiveRecoveryGen
@@ -526,7 +539,7 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	// Step 5: Persist reconciled outcome under bounded service context
 	persistCtx, persistCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer persistCancel()
-	recReceipt, err := s.store.ReconcileSession(persistCtx, stageReconcileID, req.ControllerLease, recoveryRef, outcome)
+	recReceipt, err := s.store.ReconcileSession(persistCtx, stageReconcileID, *execRef, recoveryRef, outcome)
 	if err != nil {
 		if errors.Is(err, storage.ErrUnauthorizedOperation) {
 			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)

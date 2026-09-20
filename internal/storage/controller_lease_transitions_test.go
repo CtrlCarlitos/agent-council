@@ -222,10 +222,10 @@ func TestAC004_ReplayReturnsOriginalIssuanceNeverTheCandidate(t *testing.T) {
 		t.Fatalf("adopt: %v", err)
 	}
 
-	// Duplicate request with a different random candidate returns the
-	// original committed issuance; the unused candidate is neither installed
-	// nor disclosed.
-	replay, err := store.AdoptController(ctx, "op-adopt-x", runID, "claude", "ref-a", "", &OperatorRecovery{Reason: "lost response", ExpectedGeneration: 1}, "fresh-unused-candidate")
+	// Duplicate request with a different random candidate and the SAME
+	// authorization content returns the original committed issuance; the
+	// unused candidate is neither installed nor disclosed.
+	replay, err := store.AdoptController(ctx, "op-adopt-x", runID, "claude", "ref-a", "legacy-lease-g", nil, "fresh-unused-candidate")
 	if err != nil {
 		t.Fatalf("replay adopt: %v", err)
 	}
@@ -235,14 +235,22 @@ func TestAC004_ReplayReturnsOriginalIssuanceNeverTheCandidate(t *testing.T) {
 	if replay.Generation != 1 {
 		t.Fatalf("replay must not advance the generation, got %d", replay.Generation)
 	}
+	if !replay.ReplayedReceipt || replay.IssuanceStatus != "active" {
+		t.Fatalf("replay must report itself as a replay with current issuance status: %+v", replay)
+	}
 	var count int
 	if err := store.readDB.QueryRow(`SELECT count(*) FROM controller_leases WHERE run_id = ?;`, runID).Scan(&count); err != nil || count != 2 {
 		t.Fatalf("replay must not create rows (legacy+adopted only), got %d err=%v", count, err)
 	}
 
-	// Command-content mismatch on the same operation ID is a conflict.
-	if _, err := store.AdoptController(ctx, "op-adopt-x", runID, "codex", "ref-a", "", &OperatorRecovery{Reason: "lost response", ExpectedGeneration: 1}, "c"); !errors.Is(err, ErrIdempotencyConflict) {
+	// Changed command content on the same operation ID conflicts, including
+	// a different authorization mode (recovery instead of the original
+	// bootstrap credential).
+	if _, err := store.AdoptController(ctx, "op-adopt-x", runID, "codex", "ref-a", "legacy-lease-g", nil, "c"); !errors.Is(err, ErrIdempotencyConflict) {
 		t.Fatalf("expected ErrIdempotencyConflict for changed command, got %v", err)
+	}
+	if _, err := store.AdoptController(ctx, "op-adopt-x", runID, "claude", "ref-a", "", &OperatorRecovery{Reason: "lost response", ExpectedGeneration: 1}, "c"); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("expected ErrIdempotencyConflict for changed authorization mode, got %v", err)
 	}
 }
 

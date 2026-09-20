@@ -13,4 +13,7 @@ func adoptControllerForTest(t *testing.T, store *Store, runID, lease string) {
 	if _, err := store.AdoptController(context.Background(), "op-adopt-fixture-"+runID, runID, "claude", "fixture-controller", lease, nil, lease); err != nil {
 		t.Fatalf("adopt controller for fixture (run %s): %v", runID, err)
 	}
+	if _, err := store.ConnectRunController(context.Background(), "op-conn-fixture-"+runID, runID, lease, 1, "test-instance"); err != nil {
+		t.Fatalf("connect fixture controller (run %s): %v", runID, err)
+	}
 }

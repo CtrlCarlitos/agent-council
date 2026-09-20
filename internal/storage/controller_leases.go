@@ -36,10 +36,15 @@ type OperatorRecovery struct {
 // ControllerGrantReceipt is returned by adopt, handoff, and credential
 // recovery. LeaseSecret is present only while the issued generation is
 // active; historical replays and inspections return receipts without it.
+// IssuanceStatus reports the generation's current state ("active",
+// "superseded", "revoked") — an evolving fact kept outside the immutable
+// committed receipt.
 type ControllerGrantReceipt struct {
 	OperationReceipt
-	Generation  uint64
-	LeaseSecret string
+	Generation      uint64
+	LeaseSecret     string
+	IssuanceStatus  string
+	ReplayedReceipt bool
 }
 
 // ControllerRecord is the redacted outward view of run-scoped controller
@@ -52,6 +57,7 @@ type ControllerRecord struct {
 	Adopted       bool
 	Connected     bool
 	AttachmentID  string
+	InstanceID    string // service instance owning the current episode
 }
 
 // rowQueryer abstracts QueryRowContext over transactions and read pools so
@@ -134,6 +140,31 @@ func classifyCredential(ctx context.Context, q rowQueryer, runID, presentedLease
 	return 0, ErrUnauthorizedOperation
 }
 
+// runIDOfSession resolves a session's run inside a transaction.
+func runIDOfSession(ctx context.Context, q rowQueryer, sessionID string) string {
+	var rid string
+	_ = q.QueryRowContext(ctx, `SELECT run_id FROM sessions WHERE session_id = ?;`, sessionID).Scan(&rid)
+	return rid
+}
+
+// requireRunConnected enforces the new-decision connection precondition at
+// the authoritative mutation boundary: the run's active grant must be
+// connected. Session projections are derived views, never the check.
+func requireRunConnected(ctx context.Context, q rowQueryer, runID string) error {
+	var connected int
+	err := q.QueryRowContext(ctx, `SELECT connected FROM controller_leases WHERE run_id = ? AND status = 'active';`, runID).Scan(&connected)
+	if err == sql.ErrNoRows {
+		return ErrAdoptionRequired
+	}
+	if err != nil {
+		return fmt.Errorf("query run connection state: %w", err)
+	}
+	if connected == 0 {
+		return ErrControllerDisconnected
+	}
+	return nil
+}
+
 // classifyRunController enforces controller-class authority inside a write
 // transaction. Attachment requirements join this boundary in Task 5.
 func classifyRunController(ctx context.Context, tx *sql.Tx, runID, presentedLease string) (uint64, error) {
@@ -156,12 +187,14 @@ func authorizeSessionController(ctx context.Context, q rowQueryer, sessionID, pr
 }
 
 // resolveGrantReplay returns the original committed issuance for opID when
-// the operation has already committed with matching command content.
-// LeaseSecret is included only while that generation remains active.
+// the operation has already committed with matching command identity. The
+// committed receipt is returned verbatim from the journal; the generation's
+// current status is reported outside it, and LeaseSecret is included only
+// while that generation remains active.
 func resolveGrantReplay(ctx context.Context, tx *sql.Tx, opID, commandType, fingerprint string) (*ControllerGrantReceipt, bool, error) {
-	var storedCmdType, storedFingerprint string
-	err := tx.QueryRowContext(ctx, `SELECT command_type, command_fingerprint FROM journal_entries WHERE op_id = ?;`, opID).
-		Scan(&storedCmdType, &storedFingerprint)
+	var storedCmdType, storedFingerprint, payloadJSON string
+	err := tx.QueryRowContext(ctx, `SELECT command_type, command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;`, opID).
+		Scan(&storedCmdType, &storedFingerprint, &payloadJSON)
 	if err == sql.ErrNoRows {
 		return nil, false, nil
 	}
@@ -172,11 +205,15 @@ func resolveGrantReplay(ctx context.Context, tx *sql.Tx, opID, commandType, fing
 		return nil, false, ErrIdempotencyConflict
 	}
 
+	var jp journalPayload
+	if err := json.Unmarshal([]byte(payloadJSON), &jp); err != nil || jp.Receipt.OpID == "" {
+		return nil, false, fmt.Errorf("grant operation %s has an unreadable committed receipt", opID)
+	}
+
 	var gen uint64
 	var lease, status string
-	var runID string
-	err = tx.QueryRowContext(ctx, `SELECT run_id, generation, lease, status FROM controller_leases WHERE granted_by_op_id = ?;`, opID).
-		Scan(&runID, &gen, &lease, &status)
+	err = tx.QueryRowContext(ctx, `SELECT generation, lease, status FROM controller_leases WHERE granted_by_op_id = ?;`, opID).
+		Scan(&gen, &lease, &status)
 	if err == sql.ErrNoRows {
 		return nil, false, fmt.Errorf("grant operation %s has no issuance record", opID)
 	}
@@ -189,15 +226,11 @@ func resolveGrantReplay(ctx context.Context, tx *sql.Tx, opID, commandType, fing
 		secret = lease
 	}
 	return &ControllerGrantReceipt{
-		OperationReceipt: OperationReceipt{
-			OpID:             opID,
-			CommandType:      commandType,
-			CommittedVersion: int64(gen),
-			CreatedAt:        time.Now().UTC(),
-			Payload:          "replay:" + status,
-		},
-		Generation:  gen,
-		LeaseSecret: secret,
+		OperationReceipt: jp.Receipt,
+		Generation:       gen,
+		LeaseSecret:      secret,
+		IssuanceStatus:   status,
+		ReplayedReceipt:  true,
 	}, true, nil
 }
 
@@ -219,7 +252,14 @@ func (s *Store) AdoptController(ctx context.Context, opID, runID, harness, contr
 		return ControllerGrantReceipt{}, errors.New("lease candidate is required")
 	}
 
-	fingerprint := computeFingerprint("adopt_controller", runID, harness, controllerRef)
+	// The fingerprint binds the command, run, target, and recovery intent —
+	// authorization inputs (bootstrap credential) and the secret candidate
+	// stay excluded.
+	authMode := "bootstrap"
+	if recovery != nil {
+		authMode = fmt.Sprintf("recovery:gen=%d:reason=%s", recovery.ExpectedGeneration, SanitizeText(recovery.Reason))
+	}
+	fingerprint := computeFingerprint("adopt_controller", runID, harness, controllerRef, authMode)
 
 	tx, err := s.BeginWrite(ctx)
 	if err != nil {
@@ -252,7 +292,13 @@ func (s *Store) AdoptController(ctx context.Context, opID, runID, harness, contr
 		var legacyGen uint64
 		err = tx.Tx().QueryRowContext(ctx, `SELECT generation FROM controller_leases
 			WHERE run_id = ? AND status IN ('legacy','revoked') ORDER BY generation DESC LIMIT 1;`, runID).Scan(&legacyGen)
-		if err == nil && recovery.ExpectedGeneration != legacyGen {
+		if err == sql.ErrNoRows {
+			return ControllerGrantReceipt{}, ErrGenerationMismatch
+		}
+		if err != nil {
+			return ControllerGrantReceipt{}, fmt.Errorf("query recovery adoption target: %w", err)
+		}
+		if recovery.ExpectedGeneration != legacyGen {
 			return ControllerGrantReceipt{}, ErrGenerationMismatch
 		}
 	} else {
@@ -265,7 +311,7 @@ func (s *Store) AdoptController(ctx context.Context, opID, runID, harness, contr
 		}
 	}
 
-	return s.installGrant(ctx, tx.Tx(), opID, runID, harness, controllerRef, newLeaseCandidate, "adopt_controller", fingerprint, "controller_adopted")
+	return s.installGrant(ctx, tx.Tx(), opID, runID, harness, controllerRef, newLeaseCandidate, "adopt_controller", fingerprint, "controller_adopted", authMode)
 }
 
 // HandoffController supersedes the current active grant with the next
@@ -285,7 +331,7 @@ func (s *Store) HandoffController(ctx context.Context, opID, runID, currentLease
 		return ControllerGrantReceipt{}, errors.New("lease candidate is required")
 	}
 
-	fingerprint := computeFingerprint("handoff_controller", runID, harness, controllerRef)
+	fingerprint := computeFingerprint("handoff_controller", runID, harness, controllerRef, fmt.Sprintf("%d", expectedGeneration))
 
 	tx, err := s.BeginWrite(ctx)
 	if err != nil {
@@ -320,15 +366,24 @@ func (s *Store) HandoffController(ctx context.Context, opID, runID, currentLease
 		return ControllerGrantReceipt{}, err
 	}
 
-	return s.installGrant(ctx, tx.Tx(), opID, runID, harness, controllerRef, newLeaseCandidate, "handoff_controller", fingerprint, "controller_handed_off")
+	return s.installGrant(ctx, tx.Tx(), opID, runID, harness, controllerRef, newLeaseCandidate, "handoff_controller", fingerprint, "controller_handed_off", "controller")
 }
 
 // RevokeController removes controller authority. With the current lease it
 // is controller self-revocation; with verified operator recovery it is a
-// lost-lease recovery revocation targeting the expected generation.
+// lost-lease recovery revocation targeting the expected generation. Replay
+// is bound to this command, run, target generation, and recovery intent.
 func (s *Store) RevokeController(ctx context.Context, opID, runID, controllerLease string, recovery *OperatorRecovery) (OperationReceipt, error) {
 	if strings.TrimSpace(opID) == "" {
 		return OperationReceipt{}, errors.New("empty operation id")
+	}
+	if recovery != nil && strings.TrimSpace(recovery.Reason) == "" {
+		return OperationReceipt{}, errors.New("operator recovery requires an explicit reason")
+	}
+
+	authMode := "controller"
+	if recovery != nil {
+		authMode = fmt.Sprintf("recovery:reason=%s", SanitizeText(recovery.Reason))
 	}
 
 	tx, err := s.BeginWrite(ctx)
@@ -337,11 +392,16 @@ func (s *Store) RevokeController(ctx context.Context, opID, runID, controllerLea
 	}
 	defer tx.Rollback()
 
-	// Idempotent replay of the revocation.
+	// Idempotent replay is bound to this exact command, run, and recovery
+	// intent; any other journal payload under this operation ID conflicts.
 	var storedCmdType, storedFingerprint, payloadJSON string
 	err = tx.Tx().QueryRowContext(ctx, `SELECT command_type, command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;`, opID).
 		Scan(&storedCmdType, &storedFingerprint, &payloadJSON)
 	if err == nil {
+		expected := computeFingerprint("revoke_controller", runID, authMode)
+		if storedCmdType != "revoke_controller" || storedFingerprint != expected {
+			return OperationReceipt{}, ErrIdempotencyConflict
+		}
 		var jp journalPayload
 		if err := json.Unmarshal([]byte(payloadJSON), &jp); err == nil && jp.Receipt.OpID != "" {
 			return jp.Receipt, nil
@@ -355,8 +415,6 @@ func (s *Store) RevokeController(ctx context.Context, opID, runID, controllerLea
 	var targetGen uint64
 	switch {
 	case recovery != nil:
-		// Operator recovery: revoke the grant at the expected generation —
-		// the legacy bootstrap (0) or the active adopted grant.
 		var gen uint64
 		var status string
 		err = tx.Tx().QueryRowContext(ctx, `SELECT generation, status FROM controller_leases
@@ -386,11 +444,6 @@ func (s *Store) RevokeController(ctx context.Context, opID, runID, controllerLea
 		WHERE run_id = ? AND generation = ?;`, now, runID, targetGen); err != nil {
 		return OperationReceipt{}, fmt.Errorf("revoke grant: %w", err)
 	}
-	// The revoked controller's attachment is invalidated and session
-	// projections updated transactionally.
-	if err := projectSessionConnection(ctx, tx.Tx(), runID, "disconnected"); err != nil {
-		return OperationReceipt{}, err
-	}
 	if _, err := tx.Tx().ExecContext(ctx, `UPDATE runs SET controller_lease = '', updated_at = ? WHERE run_id = ?;`, now, runID); err != nil {
 		return OperationReceipt{}, fmt.Errorf("clear run lease: %w", err)
 	}
@@ -399,16 +452,21 @@ func (s *Store) RevokeController(ctx context.Context, opID, runID, controllerLea
 			return OperationReceipt{}, fmt.Errorf("clear adoption flag: %w", err)
 		}
 	}
+	// The revoked controller's attachment is invalidated and session
+	// projections updated transactionally.
+	if err := projectSessionConnection(ctx, tx.Tx(), runID, "disconnected"); err != nil {
+		return OperationReceipt{}, err
+	}
 
 	receipt := OperationReceipt{
 		OpID:             opID,
 		CommandType:      "revoke_controller",
 		CommittedVersion: int64(targetGen),
 		CreatedAt:        time.Now().UTC(),
-		Payload:          fmt.Sprintf("revoked:generation=%d", targetGen),
+		Payload:          fmt.Sprintf("revoked:generation=%d:authorized_by=%s", targetGen, authMode),
 	}
 	if err := recordJournalEntry(tx.Tx(), opID, "revoke_controller",
-		computeFingerprint("revoke_controller", runID, fmt.Sprintf("%d", targetGen)),
+		computeFingerprint("revoke_controller", runID, authMode),
 		runID, "", "", "controller_revoked", receipt, ""); err != nil {
 		return OperationReceipt{}, err
 	}
@@ -459,7 +517,7 @@ func (s *Store) RecoverControllerCredential(ctx context.Context, opID, runID, so
 		CommandType:      "recover_controller_credential",
 		CommittedVersion: int64(grant.Generation),
 		CreatedAt:        time.Now().UTC(),
-		Payload:          fmt.Sprintf("recovered:generation=%d", grant.Generation),
+		Payload:          fmt.Sprintf("recovered:generation=%d:source=%s", grant.Generation, sourceOpID),
 	}
 	if err := recordJournalEntry(tx.Tx(), opID, "recover_controller_credential",
 		computeFingerprint("recover_controller_credential", runID, sourceOpID, fmt.Sprintf("%d", expectedGeneration)),
@@ -512,15 +570,16 @@ func (s *Store) resolveIssuanceForRecovery(ctx context.Context, tx *sql.Tx, runI
 			CreatedAt:        time.Now().UTC(),
 			Payload:          fmt.Sprintf("generation=%d", gen),
 		},
-		Generation:  gen,
-		LeaseSecret: lease,
+		Generation:     gen,
+		LeaseSecret:    lease,
+		IssuanceStatus: status,
 	}, nil
 }
 
 // installGrant supersedes nothing itself (callers retire the previous
 // state), installs the new active generation, updates the run, and journals
 // the transition. The secret is never placed in the journal payload.
-func (s *Store) installGrant(ctx context.Context, tx *sql.Tx, opID, runID, harness, controllerRef, newLeaseCandidate, commandType, fingerprint, eventKind string) (ControllerGrantReceipt, error) {
+func (s *Store) installGrant(ctx context.Context, tx *sql.Tx, opID, runID, harness, controllerRef, newLeaseCandidate, commandType, fingerprint, eventKind, authorizationMode string) (ControllerGrantReceipt, error) {
 	var nextGen uint64
 	err := tx.QueryRowContext(ctx, `SELECT coalesce(max(generation), 0) + 1 FROM controller_leases WHERE run_id = ?;`, runID).Scan(&nextGen)
 	if err != nil {
@@ -553,10 +612,11 @@ func (s *Store) installGrant(ctx context.Context, tx *sql.Tx, opID, runID, harne
 			CommandType:      commandType,
 			CommittedVersion: int64(nextGen),
 			CreatedAt:        time.Now().UTC(),
-			Payload:          fmt.Sprintf("generation=%d", nextGen),
+			Payload:          fmt.Sprintf("generation=%d:authorized_by=%s", nextGen, authorizationMode),
 		},
-		Generation:  nextGen,
-		LeaseSecret: newLeaseCandidate,
+		Generation:     nextGen,
+		LeaseSecret:    newLeaseCandidate,
+		IssuanceStatus: "active",
 	}
 	if err := recordJournalEntry(tx, opID, commandType, fingerprint, runID, "", "", eventKind, receipt.OperationReceipt, ""); err != nil {
 		return ControllerGrantReceipt{}, err
@@ -576,7 +636,7 @@ func (s *Store) ValidateRunControllerLease(ctx context.Context, runID, callerLea
 
 // GetControllerRecord returns the redacted run-scoped controller record.
 func (s *Store) GetControllerRecord(ctx context.Context, runID string) (ControllerRecord, error) {
-	rows, err := s.readDB.QueryContext(ctx, `SELECT generation, coalesce(harness,''), controller_ref, status, connected, coalesce(attachment_id,'')
+	rows, err := s.readDB.QueryContext(ctx, `SELECT generation, coalesce(harness,''), controller_ref, status, connected, coalesce(attachment_id,''), coalesce(instance_id,'')
 		FROM controller_leases WHERE run_id = ? ORDER BY generation DESC;`, runID)
 	if err != nil {
 		return ControllerRecord{}, fmt.Errorf("query controller leases: %w", err)
@@ -591,9 +651,9 @@ func (s *Store) GetControllerRecord(ctx context.Context, runID string) (Controll
 	rec := ControllerRecord{Status: "none"}
 	for rows.Next() {
 		var gen uint64
-		var harness, controllerRef, status, attachment string
+		var harness, controllerRef, status, attachment, instance string
 		var connected int
-		if err := rows.Scan(&gen, &harness, &controllerRef, &status, &connected, &attachment); err != nil {
+		if err := rows.Scan(&gen, &harness, &controllerRef, &status, &connected, &attachment, &instance); err != nil {
 			return ControllerRecord{}, fmt.Errorf("scan controller lease: %w", err)
 		}
 		if err := rows.Err(); err != nil {
@@ -603,7 +663,7 @@ func (s *Store) GetControllerRecord(ctx context.Context, runID string) (Controll
 		case "active":
 			rec = ControllerRecord{
 				Generation: gen, Harness: harness, ControllerRef: controllerRef,
-				Status: "active", Adopted: adopted == 1, Connected: connected == 1, AttachmentID: attachment,
+				Status: "active", Adopted: adopted == 1, Connected: connected == 1, AttachmentID: attachment, InstanceID: instance,
 			}
 		case "legacy":
 			rec = ControllerRecord{Generation: gen, Status: "legacy", Adopted: false}

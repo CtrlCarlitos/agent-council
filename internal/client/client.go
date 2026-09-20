@@ -177,6 +177,7 @@ func (c *Client) ConnectRunController(ctx context.Context, runID, opID, controll
 		OpID:               opID,
 		ControllerLease:    controllerLease,
 		ExpectedGeneration: expectedGeneration,
+		InstanceID:         c.Meta().InstanceID,
 	}
 	var resp service.ControllerConnectRunResponse
 	path := fmt.Sprintf("/v1/runs/%s/controller/connect", runID)
