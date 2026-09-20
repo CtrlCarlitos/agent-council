@@ -1,3 +1,5 @@
+//go:build unix
+
 package service
 
 import (
@@ -23,7 +25,7 @@ func newTestClient(socketPath string) *http.Client {
 }
 
 func TestServer_ReadinessAndStatus(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, err := AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("acquire lock: %v", err)
@@ -114,7 +116,7 @@ func TestServer_ReadinessAndStatus(t *testing.T) {
 }
 
 func TestServer_SocketPermissions0600(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, err := AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("acquire lock: %v", err)
@@ -150,7 +152,7 @@ func TestServer_SocketPermissions0600(t *testing.T) {
 }
 
 func TestServer_ReadinessReturns503WhenDraining(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, _ := AcquireServiceLock(dir)
 	defer lock.Release()
 	store, _ := storage.Open(storage.StoreOptions{StateDir: dir})
@@ -187,7 +189,7 @@ func TestServer_ReadinessReturns503WhenDraining(t *testing.T) {
 }
 
 func TestServer_StatusDiagnosticCounts(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, _ := AcquireServiceLock(dir)
 	defer lock.Release()
 	store, _ := storage.Open(storage.StoreOptions{StateDir: dir})

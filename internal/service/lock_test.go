@@ -1,3 +1,5 @@
+//go:build unix
+
 package service
 
 import (
@@ -12,7 +14,7 @@ func fileExists(path string) bool {
 }
 
 func TestServiceLock_Exclusivity(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	l1, err := AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("first lock acquisition failed: %v", err)

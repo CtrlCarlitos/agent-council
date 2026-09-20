@@ -1,15 +1,33 @@
+//go:build unix
+
 package service
 
 import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/adaptertest"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
+
+// testStateDir returns a short-lived state directory with a bounded path
+// length. macOS limits unix socket paths to ~104 bytes (sun_path), which
+// t.TempDir() directories routinely exceed.
+func testStateDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "acsvc-")
+	if err != nil {
+		t.Fatalf("create short state dir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(dir)
+	})
+	return dir
+}
 
 type testHarness struct {
 	t           *testing.T
@@ -27,7 +45,7 @@ type testHarness struct {
 
 func newTestHarnessWithFaults(t *testing.T, faults adaptertest.ScriptedFaults) *testHarness {
 	t.Helper()
-	dir := t.TempDir()
+	dir := testStateDir(t)
 
 	lock, err := AcquireServiceLock(dir)
 	if err != nil {

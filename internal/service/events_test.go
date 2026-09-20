@@ -1,3 +1,5 @@
+//go:build unix
+
 package service
 
 import (
@@ -16,7 +18,7 @@ import (
 )
 
 func TestEvents_SynchronizedSnapshotAndCleanDisconnect(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, err := AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("acquire lock: %v", err)
@@ -121,7 +123,7 @@ func TestEvents_SynchronizedSnapshotAndCleanDisconnect(t *testing.T) {
 }
 
 func TestEvents_TerminalSnapshotOnConnect(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, err := AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("acquire lock: %v", err)
@@ -320,7 +322,7 @@ func TestEvents_SessionScopedSubscriberIsolation(t *testing.T) {
 }
 
 func TestEvents_LiveObservationStreaming(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, err := AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("acquire lock: %v", err)

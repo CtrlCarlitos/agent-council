@@ -1,3 +1,5 @@
+//go:build unix
+
 package main
 
 import (
@@ -18,11 +20,36 @@ import (
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
-// 1. Real Dual Launcher Race: Two launcher processes concurrently starting
-// against the same state directory; exactly one wins, loser fails.
+// shortStateDir returns a state directory with a bounded path length; macOS
+// limits unix socket paths to ~104 bytes (sun_path), which t.TempDir()
+// directories routinely exceed.
+func shortStateDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "ac-cli-")
+	if err != nil {
+		t.Fatalf("create short state dir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(dir)
+	})
+	return dir
+}
+
+func stopBackgroundService(t *testing.T, bin, dir string) {
+	t.Helper()
+	ctxClean, cancelClean := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelClean()
+	_ = exec.CommandContext(ctxClean, bin, "service", "stop", "--state-dir", dir, "--timeout", "5s").Run()
+}
+
+// Ownership smoke: two launcher processes race for the same state directory;
+// exactly one wins and the survivor serves status. (Component evidence for
+// exclusivity; it does not exercise worker execution.)
 func TestSubprocess_DualLauncherRace(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortStateDir(t)
 	bin := buildTestBinary(t)
+
+	defer stopBackgroundService(t, bin, dir)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -44,7 +71,6 @@ func TestSubprocess_DualLauncherRace(t *testing.T) {
 
 	wg.Wait()
 
-	// Exactly one launcher must succeed
 	successCount := 0
 	if err1 == nil {
 		successCount++
@@ -58,14 +84,6 @@ func TestSubprocess_DualLauncherRace(t *testing.T) {
 			successCount, err1, string(out1), err2, string(out2))
 	}
 
-	// Always ensure cleanup
-	defer func() {
-		ctxClean, cancelClean := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancelClean()
-		_ = exec.CommandContext(ctxClean, bin, "service", "stop", "--state-dir", dir, "--timeout", "3s").Run()
-	}()
-
-	// Status command confirms service is ready
 	cmdStatus := exec.Command(bin, "service", "status", "--state-dir", dir)
 	outStatus, err := cmdStatus.CombinedOutput()
 	if err != nil {
@@ -73,20 +91,23 @@ func TestSubprocess_DualLauncherRace(t *testing.T) {
 	}
 }
 
-// 2. Real Service Crash & Restart: Kill service process with SIGKILL;
-// external ledger survives; restart recovers without redispatch.
+// Crash-restart reservation smoke: a pre-seeded running reservation survives
+// SIGKILL and restart as unresolved, without redispatch. (No service-owned
+// executing worker is crashed here; see the acceptance subprocess tests for
+// independent-execution recovery evidence.)
 func TestSubprocess_ServiceCrashAndRestart(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortStateDir(t)
 	bin := buildTestBinary(t)
 
-	// Pre-seed storage with a run, session, and turn
 	store, err := storage.Open(storage.StoreOptions{StateDir: dir})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
 	ctx := context.Background()
-	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile", "lease-1")
-	sessRec, _ := store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
+	if _, err := store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile", "lease-1"); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	sessRec, err := store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID:                  "sess-1",
 		RunID:               "run-1",
 		Contributor:         "claude",
@@ -95,25 +116,30 @@ func TestSubprocess_ServiceCrashAndRestart(t *testing.T) {
 		State:               "parked",
 		Visibility:          "reachable",
 	})
-	qRec, _ := store.QueuePrompt(ctx, "op-q-1", "lease-1", "sess-1", sessRec.CommittedVersion, storage.PendingPrompt{
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	qRec, err := store.QueuePrompt(ctx, "op-q-1", "lease-1", "sess-1", sessRec.CommittedVersion, storage.PendingPrompt{
 		SessionID: "sess-1",
 		TurnKey:   "t-crash",
 		Prompt:    "work before crash",
 	})
-	_, err = store.ReleaseTurn(ctx, "op-rel-crash", "lease-1", "sess-1", qRec.CommittedVersion, "t-crash")
 	if err != nil {
+		t.Fatalf("queue prompt: %v", err)
+	}
+	if _, err := store.ReleaseTurn(ctx, "op-rel-crash", "lease-1", "sess-1", qRec.CommittedVersion, "t-crash"); err != nil {
 		t.Fatalf("release turn: %v", err)
 	}
-	_ = store.Close()
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
 
-	// 1. Start service subprocess
 	cmdStart := exec.Command(bin, "service", "start", "--state-dir", dir)
 	outStart, err := cmdStart.CombinedOutput()
 	if err != nil {
 		t.Fatalf("service start: %v, out: %s", err, string(outStart))
 	}
 
-	// Read discovery metadata to find PID
 	metaPath := filepath.Join(dir, "service.json")
 	metaData, err := os.ReadFile(metaPath)
 	if err != nil {
@@ -124,12 +150,10 @@ func TestSubprocess_ServiceCrashAndRestart(t *testing.T) {
 		t.Fatalf("unmarshal service.json: %v", err)
 	}
 
-	// 2. Kill service subprocess with SIGKILL (simulating hard ungraceful crash)
 	if err := syscall.Kill(meta.PID, syscall.SIGKILL); err != nil {
 		t.Fatalf("kill service pid %d: %v", meta.PID, err)
 	}
 
-	// Wait for process to fully exit
 	for i := 0; i < 100; i++ {
 		if err := syscall.Kill(meta.PID, 0); err != nil {
 			break
@@ -137,25 +161,18 @@ func TestSubprocess_ServiceCrashAndRestart(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Invariant: service.lock must remain on disk after SIGKILL
 	lockPath := filepath.Join(dir, "service.lock")
 	if !fileExists(lockPath) {
 		t.Fatal("service.lock must remain on disk after crash")
 	}
 
-	// 3. Restart service against same state directory
 	cmdRestart := exec.Command(bin, "service", "start", "--state-dir", dir)
 	outRestart, err := cmdRestart.CombinedOutput()
 	if err != nil {
 		t.Fatalf("service restart: %v, out: %s", err, string(outRestart))
 	}
-	defer func() {
-		ctxClean, cancelClean := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancelClean()
-		_ = exec.CommandContext(ctxClean, bin, "service", "stop", "--state-dir", dir, "--timeout", "3s").Run()
-	}()
+	defer stopBackgroundService(t, bin, dir)
 
-	// Query status after restart
 	c, err := client.New(dir)
 	if err != nil {
 		t.Fatalf("client new: %v", err)
@@ -171,19 +188,18 @@ func TestSubprocess_ServiceCrashAndRestart(t *testing.T) {
 	}
 }
 
-// 3. Real OS Signal Grace: Send real SIGTERM to service subprocess;
-// verify graceful draining, discovery cleanup, and lock retention.
+// Idle signal smoke: an empty service exits cleanly on SIGTERM with
+// discovery cleanup and lock retention. (No active execution exists here, so
+// grace-period expiry behavior is not exercised.)
 func TestSubprocess_RealOSSignalGrace(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortStateDir(t)
 	bin := buildTestBinary(t)
 
-	// Run foreground service subprocess
 	cmd := exec.Command(bin, "service", "run", "--state-dir", dir)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start service run: %v", err)
 	}
 
-	// Poll until service is ready
 	sockPath := filepath.Join(dir, "council.sock")
 	ready := false
 	for i := 0; i < 100; i++ {
@@ -206,13 +222,11 @@ func TestSubprocess_RealOSSignalGrace(t *testing.T) {
 		t.Fatal("service did not become ready in time")
 	}
 
-	// Send real SIGTERM
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		_ = cmd.Process.Kill()
 		t.Fatalf("send SIGTERM: %v", err)
 	}
 
-	// Wait for process to exit cleanly
 	done := make(chan error, 1)
 	go func() {
 		done <- cmd.Wait()
@@ -228,7 +242,6 @@ func TestSubprocess_RealOSSignalGrace(t *testing.T) {
 		t.Fatal("timed out waiting for service to exit cleanly on SIGTERM")
 	}
 
-	// Invariants: discovery unlinked, service.lock retained
 	tokenPath := filepath.Join(dir, "auth.token")
 	lockPath := filepath.Join(dir, "service.lock")
 	if fileExists(sockPath) || fileExists(tokenPath) {
@@ -239,20 +252,23 @@ func TestSubprocess_RealOSSignalGrace(t *testing.T) {
 	}
 }
 
-// 4. Real Client Disconnect: Client process terminated mid-turn;
-// service survives; second process queries result.
+// Disconnect survival smoke (pre-seeded unresolved row): closing an SSE
+// response body does not stop a service holding a previously unresolved
+// turn. (No worker executes and no client process is terminated here; see
+// the acceptance subprocess tests for the full work-survival sequence.)
 func TestSubprocess_ClientDisconnectMidTurn(t *testing.T) {
-	dir := t.TempDir()
+	dir := shortStateDir(t)
 	bin := buildTestBinary(t)
 
-	// Pre-seed storage
 	store, err := storage.Open(storage.StoreOptions{StateDir: dir})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
 	ctx := context.Background()
-	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile", "lease-1")
-	sessRec, _ := store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
+	if _, err := store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile", "lease-1"); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	sessRec, err := store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID:                  "sess-1",
 		RunID:               "run-1",
 		Contributor:         "claude",
@@ -261,33 +277,33 @@ func TestSubprocess_ClientDisconnectMidTurn(t *testing.T) {
 		State:               "parked",
 		Visibility:          "reachable",
 	})
-	qRec, _ := store.QueuePrompt(ctx, "op-q-1", "lease-1", "sess-1", sessRec.CommittedVersion, storage.PendingPrompt{
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	qRec, err := store.QueuePrompt(ctx, "op-q-1", "lease-1", "sess-1", sessRec.CommittedVersion, storage.PendingPrompt{
 		SessionID: "sess-1",
 		TurnKey:   "t-disc",
 		Prompt:    "disconnect test",
 	})
-	_, err = store.ReleaseTurn(ctx, "op-rel-disc", "lease-1", "sess-1", qRec.CommittedVersion, "t-disc")
 	if err != nil {
+		t.Fatalf("queue prompt: %v", err)
+	}
+	if _, err := store.ReleaseTurn(ctx, "op-rel-disc", "lease-1", "sess-1", qRec.CommittedVersion, "t-disc"); err != nil {
 		t.Fatalf("release turn: %v", err)
 	}
-	_, err = store.RecordDispatchObservation(ctx, "op-obs-disc", "lease-1", "sess-1", "t-disc", "receipt_acknowledged")
-	if err != nil {
+	if _, err := store.RecordDispatchObservation(ctx, "op-obs-disc", "lease-1", "sess-1", "t-disc", "receipt_acknowledged"); err != nil {
 		t.Fatalf("record dispatch observation: %v", err)
 	}
-	_ = store.Close()
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
 
-	// Start background service
 	cmdStart := exec.Command(bin, "service", "start", "--state-dir", dir)
 	if out, err := cmdStart.CombinedOutput(); err != nil {
 		t.Fatalf("service start: %v, out: %s", err, string(out))
 	}
-	defer func() {
-		ctxClean, cancelClean := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancelClean()
-		_ = exec.CommandContext(ctxClean, bin, "service", "stop", "--state-dir", dir, "--timeout", "3s").Run()
-	}()
+	defer stopBackgroundService(t, bin, dir)
 
-	// Client 1: connect to event stream and disconnect mid-turn
 	c1, err := client.New(dir)
 	if err != nil {
 		t.Fatalf("client 1 new: %v", err)
@@ -305,10 +321,8 @@ func TestSubprocess_ClientDisconnectMidTurn(t *testing.T) {
 	if err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("stream connect failed: %v (code: %v)", err, resp.StatusCode)
 	}
-	// Abruptly terminate connection mid-stream
 	_ = resp.Body.Close()
 
-	// Verify service process survives
 	c2, err := client.New(dir)
 	if err != nil {
 		t.Fatalf("client 2 new: %v", err)
@@ -326,7 +340,6 @@ func TestSubprocess_ClientDisconnectMidTurn(t *testing.T) {
 		t.Fatalf("expected preserved unresolved turn after disconnect: %+v", status)
 	}
 
-	// Client 2 can query turn state
 	reqGet, err := http.NewRequestWithContext(ctx, "GET", "http://localhost/v1/runs/run-1/sessions/sess-1/turns/t-disc", nil)
 	if err != nil {
 		t.Fatalf("new get request: %v", err)

@@ -1,3 +1,5 @@
+//go:build unix
+
 package service
 
 import (
@@ -14,7 +16,7 @@ import (
 )
 
 func TestRelease_IdempotentRetryAndDraining(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, err := AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("acquire lock: %v", err)
@@ -195,7 +197,7 @@ func TestRelease_IdempotentRetryAndDraining(t *testing.T) {
 }
 
 func TestRelease_HarnessUnavailable(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, err := AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("acquire lock: %v", err)
@@ -285,7 +287,7 @@ func TestRelease_HarnessUnavailable(t *testing.T) {
 }
 
 func TestRelease_ClientDisconnectDoesNotCancelWorker(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, err := AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("acquire lock: %v", err)
@@ -392,7 +394,7 @@ func TestRelease_ClientDisconnectDoesNotCancelWorker(t *testing.T) {
 }
 
 func TestSupervisor_VersionAdvanceResilience(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	store, err := storage.Open(storage.StoreOptions{StateDir: dir})
 	if err != nil {
 		t.Fatalf("open store: %v", err)

@@ -1,3 +1,5 @@
+//go:build unix
+
 package service
 
 import (
@@ -16,7 +18,7 @@ import (
 )
 
 func TestShutdown_IdleAndDrainingContracts(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, err := AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("acquire lock: %v", err)
@@ -103,7 +105,7 @@ func TestShutdown_IdleAndDrainingContracts(t *testing.T) {
 }
 
 func TestShutdown_BusyRejectionWithoutDrain(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, err := AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("acquire lock: %v", err)
@@ -159,7 +161,7 @@ func TestShutdown_BusyRejectionWithoutDrain(t *testing.T) {
 }
 
 func TestShutdown_DrainingWaitsForWorkerCompletion(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, err := AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("acquire lock: %v", err)
@@ -268,7 +270,7 @@ func TestShutdown_DrainingWaitsForWorkerCompletion(t *testing.T) {
 }
 
 func TestShutdown_ForcedTeardownOnDeadline(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, err := AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("acquire lock: %v", err)
@@ -335,7 +337,7 @@ func TestShutdown_ForcedTeardownOnDeadline(t *testing.T) {
 }
 
 func TestShutdown_TeardownReturnsWithinDeadlineEvenIfWorkerNeverCallsDone(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, _ := AcquireServiceLock(dir)
 	defer lock.Release()
 	store, _ := storage.Open(storage.StoreOptions{StateDir: dir})

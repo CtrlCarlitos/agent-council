@@ -1,3 +1,5 @@
+//go:build unix
+
 package service
 
 import (
@@ -8,7 +10,7 @@ import (
 )
 
 func TestDiscovery_SeparationAndPermissions(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	lock, err := AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("acquire lock: %v", err)
@@ -59,7 +61,7 @@ func TestDiscovery_SeparationAndPermissions(t *testing.T) {
 }
 
 func TestDiscovery_FailedStartAndSuccessorSafety(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	winnerLock, err := AcquireServiceLock(dir)
 	if err != nil {
 		t.Fatalf("winner lock failed: %v", err)
@@ -102,7 +104,7 @@ func TestDiscovery_FailedStartAndSuccessorSafety(t *testing.T) {
 }
 
 func TestDiscovery_PreExistingRegularFileAtSocket(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	sockPath := filepath.Join(dir, "council.sock")
 	if err := os.WriteFile(sockPath, []byte("regular file content"), 0644); err != nil {
 		t.Fatalf("create regular file: %v", err)
@@ -129,7 +131,7 @@ func TestDiscovery_PreExistingRegularFileAtSocket(t *testing.T) {
 }
 
 func TestDiscovery_PreExistingSymlinkAtTokenTmp(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	targetFile := filepath.Join(dir, "external-target.txt")
 	if err := os.WriteFile(targetFile, []byte("original content"), 0644); err != nil {
 		t.Fatalf("create target file: %v", err)
@@ -162,7 +164,7 @@ func TestDiscovery_PreExistingSymlinkAtTokenTmp(t *testing.T) {
 }
 
 func TestDiscovery_PreExistingBroadModeTokenTmp(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	tmpPath := filepath.Join(dir, "auth.token.tmp")
 	if err := os.WriteFile(tmpPath, []byte("old content"), 0644); err != nil {
 		t.Fatalf("create broad mode tmp: %v", err)
@@ -192,7 +194,7 @@ func TestDiscovery_PreExistingBroadModeTokenTmp(t *testing.T) {
 }
 
 func TestLock_RejectsSymlinkLockFile(t *testing.T) {
-	dir := t.TempDir()
+	dir := testStateDir(t)
 	targetFile := filepath.Join(dir, "target.lock")
 	if err := os.WriteFile(targetFile, []byte("content"), 0600); err != nil {
 		t.Fatalf("create target lock: %v", err)
