@@ -245,19 +245,19 @@ UPDATE sessions SET row_version = ?, updated_at = ? WHERE session_id = ?;`, newV
 	return receipt, nil
 }
 
-func (s *Store) ReleaseTurn(ctx context.Context, opID string, callerLease string, sessionID string, expectedVersion int64, turnKey string) (ReleaseReceipt, error) {
+func (s *Store) ReleaseTurn(ctx context.Context, opID string, callerLease string, sessionID string, expectedVersion int64, turnKey string) (ReleaseResult, error) {
 	if expectedVersion <= 0 {
-		return ReleaseReceipt{}, ErrInvalidExpectedVersion
+		return ReleaseResult{}, ErrInvalidExpectedVersion
 	}
 	if strings.TrimSpace(turnKey) == "" {
-		return ReleaseReceipt{}, errors.New("empty turn key")
+		return ReleaseResult{}, errors.New("empty turn key")
 	}
 
 	fp := computeFingerprint("release_turn", sessionID, turnKey)
 
 	tx, err := s.BeginWrite(ctx)
 	if err != nil {
-		return ReleaseReceipt{}, err
+		return ReleaseResult{}, err
 	}
 	defer tx.Rollback()
 
@@ -267,13 +267,19 @@ func (s *Store) ReleaseTurn(ctx context.Context, opID string, callerLease string
 	if err == nil {
 		var jp releaseJournalPayload
 		if err := json.Unmarshal([]byte(payloadJSON), &jp); err == nil && jp.Receipt.TurnKey != "" {
+			if jp.Receipt.OperationReceipt.TurnKey == "" {
+				jp.Receipt.OperationReceipt.TurnKey = jp.Receipt.TurnKey
+			}
 			if jp.CallerLease != callerLease {
-				return ReleaseReceipt{}, ErrUnauthorizedOperation
+				return ReleaseResult{}, ErrUnauthorizedOperation
 			}
 			if storedCmdType != "release_turn" || storedFingerprint != fp {
-				return ReleaseReceipt{}, ErrIdempotencyConflict
+				return ReleaseResult{}, ErrIdempotencyConflict
 			}
-			return jp.Receipt, nil
+			return ReleaseResult{
+				Receipt:     jp.Receipt,
+				Disposition: ReleaseDispositionReplayed,
+			}, nil
 		}
 	}
 
@@ -286,26 +292,26 @@ FROM sessions s
 JOIN runs r ON s.run_id = r.run_id
 WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &state, &lifecycle, &controllerStatus, &visibility, &activeKey)
 	if err != nil {
-		return ReleaseReceipt{}, fmt.Errorf("query session for release: %w", err)
+		return ReleaseResult{}, fmt.Errorf("query session for release: %w", err)
 	}
 
 	if runLease != callerLease {
-		return ReleaseReceipt{}, ErrUnauthorizedOperation
+		return ReleaseResult{}, ErrUnauthorizedOperation
 	}
 	if currentVer != expectedVersion {
-		return ReleaseReceipt{}, ErrStaleUpdate
+		return ReleaseResult{}, ErrStaleUpdate
 	}
 	if lifecycle == "archived" {
-		return ReleaseReceipt{}, ErrSessionArchived
+		return ReleaseResult{}, ErrSessionArchived
 	}
 	if controllerStatus == "disconnected" {
-		return ReleaseReceipt{}, ErrControllerDisconnected
+		return ReleaseResult{}, ErrControllerDisconnected
 	}
 	if visibility == "host_lost" {
-		return ReleaseReceipt{}, ErrHostLost
+		return ReleaseResult{}, ErrHostLost
 	}
 	if state != "parked" || (activeKey.Valid && activeKey.String != "") {
-		return ReleaseReceipt{}, fmt.Errorf("session %s is not parked or already has active turn %v", sessionID, activeKey)
+		return ReleaseResult{}, fmt.Errorf("session %s is not parked or already has active turn %v", sessionID, activeKey)
 	}
 
 	// Fetch EXACT pending prompt for turnKey
@@ -313,16 +319,16 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &state
 	err = tx.Tx().QueryRowContext(ctx, `
 SELECT prompt FROM pending_prompts WHERE session_id = ? AND turn_key = ?;`, sessionID, turnKey).Scan(&rawPrompt)
 	if err == sql.ErrNoRows {
-		return ReleaseReceipt{}, ErrPromptNotQueued
+		return ReleaseResult{}, ErrPromptNotQueued
 	}
 	if err != nil {
-		return ReleaseReceipt{}, fmt.Errorf("query pending prompt for session %s, turn %s: %w", sessionID, turnKey, err)
+		return ReleaseResult{}, fmt.Errorf("query pending prompt for session %s, turn %s: %w", sessionID, turnKey, err)
 	}
 
 	// Delete ONLY this pending prompt
 	_, err = tx.Tx().ExecContext(ctx, `DELETE FROM pending_prompts WHERE session_id = ? AND turn_key = ?;`, sessionID, turnKey)
 	if err != nil {
-		return ReleaseReceipt{}, fmt.Errorf("delete pending prompt: %w", err)
+		return ReleaseResult{}, fmt.Errorf("delete pending prompt: %w", err)
 	}
 
 	sanitizedPrompt := SanitizeText(rawPrompt)
@@ -335,7 +341,7 @@ SELECT prompt FROM pending_prompts WHERE session_id = ? AND turn_key = ?;`, sess
 INSERT INTO turns (session_id, turn_key, prompt, status, result, attempt_id, created_at)
 VALUES (?, ?, ?, 'running', '', ?, ?);`, sessionID, turnKey, sanitizedPrompt, attemptID, now)
 	if err != nil {
-		return ReleaseReceipt{}, fmt.Errorf("insert turn: %w", err)
+		return ReleaseResult{}, fmt.Errorf("insert turn: %w", err)
 	}
 
 	// Insert into dispatch_intents
@@ -343,7 +349,7 @@ VALUES (?, ?, ?, 'running', '', ?, ?);`, sessionID, turnKey, sanitizedPrompt, at
 INSERT INTO dispatch_intents (session_id, turn_key, attempt_id, phase, recorded_at, updated_at)
 VALUES (?, ?, ?, 'intent_recorded', ?, ?);`, sessionID, turnKey, attemptID, now, now)
 	if err != nil {
-		return ReleaseReceipt{}, fmt.Errorf("insert dispatch intent: %w", err)
+		return ReleaseResult{}, fmt.Errorf("insert dispatch intent: %w", err)
 	}
 
 	// Update session
@@ -351,7 +357,7 @@ VALUES (?, ?, ?, 'intent_recorded', ?, ?);`, sessionID, turnKey, attemptID, now,
 UPDATE sessions SET active_key = ?, state = 'running', row_version = ?, updated_at = ?
 WHERE session_id = ?;`, turnKey, newVer, now, sessionID)
 	if err != nil {
-		return ReleaseReceipt{}, fmt.Errorf("update session for release: %w", err)
+		return ReleaseResult{}, fmt.Errorf("update session for release: %w", err)
 	}
 
 	receipt := ReleaseReceipt{
@@ -379,7 +385,7 @@ WHERE session_id = ?;`, turnKey, newVer, now, sessionID)
 INSERT INTO journal_entries (op_id, command_type, command_fingerprint, run_id, session_id, turn_key, event_kind, payload_version, payload_json, created_at)
 VALUES (?, 'release_turn', ?, ?, ?, ?, 'turn_released', 1, ?, ?);`, opID, fp, runID, sessionID, turnKey, string(payloadBytes), now)
 	if err != nil {
-		return ReleaseReceipt{}, fmt.Errorf("record release journal entry: %w", err)
+		return ReleaseResult{}, fmt.Errorf("record release journal entry: %w", err)
 	}
 
 	if s.testHookBeforeCommit != nil {
@@ -387,9 +393,12 @@ VALUES (?, 'release_turn', ?, ?, ?, ?, 'turn_released', 1, ?, ?);`, opID, fp, ru
 	}
 
 	if err := tx.Commit(); err != nil {
-		return ReleaseReceipt{}, err
+		return ReleaseResult{}, err
 	}
-	return receipt, nil
+	return ReleaseResult{
+		Receipt:     receipt,
+		Disposition: ReleaseDispositionNew,
+	}, nil
 }
 
 func (s *Store) ReconcileSession(ctx context.Context, opID string, callerLease string, ref adapter.RecoveryRef, outcome adapter.ReconciliationOutcome) (OperationReceipt, error) {

@@ -64,3 +64,15 @@ type ReleaseReceipt struct {
 	TurnKey         string `json:"turn_key"`
 	AttemptID       string `json:"attempt_id"`
 }
+
+type ReleaseDisposition string
+
+const (
+	ReleaseDispositionNew      ReleaseDisposition = "new"
+	ReleaseDispositionReplayed ReleaseDisposition = "replayed"
+)
+
+type ReleaseResult struct {
+	Receipt     ReleaseReceipt
+	Disposition ReleaseDisposition
+}

@@ -50,10 +50,11 @@ func TestReview28_ReconciliationNonterminalPreservesReservation(t *testing.T) {
 		t.Fatalf("queue prompt: %v", err)
 	}
 
-	relReceipt, err := store.ReleaseTurn(ctx, "op-rel-1", "lease-1", "sess-1", 2, "turn-1")
+	relRes, err := store.ReleaseTurn(ctx, "op-rel-1", "lease-1", "sess-1", 2, "turn-1")
 	if err != nil {
 		t.Fatalf("release turn: %v", err)
 	}
+	relReceipt := relRes.Receipt
 
 	// 1. ReconcileSession while visibility is still reachable must be rejected with ErrReconciliationInvalid
 	ref1 := adapter.RecoveryRef{
@@ -355,10 +356,11 @@ func TestReview28_QueueOperationsStrictlyKeyed(t *testing.T) {
 	}
 
 	// Release t1 -> deletes t1 from pending prompts, promotes to active turn; t3 remains pending!
-	rRel, err := store.ReleaseTurn(ctx, "op-rel-t1", "lease-1", "sess-1", ver, "t1")
+	relRes, err := store.ReleaseTurn(ctx, "op-rel-t1", "lease-1", "sess-1", ver, "t1")
 	if err != nil {
 		t.Fatalf("release t1: %v", err)
 	}
+	rRel := relRes.Receipt
 	ver = rRel.CommittedVersion
 
 	hydrated, err = store.HydrateState(ctx)
@@ -578,7 +580,8 @@ func TestReview28_LifecycleCommandsAndGuards(t *testing.T) {
 	})
 	ver = qReceipt.CommittedVersion
 
-	relReceipt, _ := store.ReleaseTurn(ctx, "op-rel", "lease-1", "sess-1", ver, "turn-lc")
+	relRes, _ := store.ReleaseTurn(ctx, "op-rel", "lease-1", "sess-1", ver, "turn-lc")
+	relReceipt := relRes.Receipt
 	ver = relReceipt.CommittedVersion
 
 	// 3. RequestCancel: transitions session to cancelling and turn to cancelling
