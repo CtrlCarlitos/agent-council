@@ -54,10 +54,11 @@ func TestReview18F_TerminalDelivery_NoOverwrite_DuplicateAcknowledge(t *testing.
 	if err != nil {
 		t.Fatalf("queue prompt: %v", err)
 	}
-	relReceipt, err := store.ReleaseTurn(ctx, "op-rel1", "lease-1", "sess-1", 2, "turn-1")
+	relRes, err := store.ReleaseTurn(ctx, "op-rel1", "lease-1", "sess-1", 2, "turn-1")
 	if err != nil {
 		t.Fatalf("release turn: %v", err)
 	}
+	relReceipt := relRes.Receipt
 
 	// 1. Complete turn-1 with "Original Success"
 	termReceipt, err := store.RecordTerminalOutcome(ctx, "op-term1", "lease-1", "sess-1", relReceipt.CommittedVersion, "turn-1", council.TurnCompleted, "Original Success")
@@ -263,10 +264,11 @@ func TestReview18F_DurableReceipts_AcceptedNoOps(t *testing.T) {
 	}
 
 	// Release turn
-	relReceipt, err := store.ReleaseTurn(ctx, "op-rel-q", "lease-1", "sess-1", 2, "turn-q")
+	relRes, err := store.ReleaseTurn(ctx, "op-rel-q", "lease-1", "sess-1", 2, "turn-q")
 	if err != nil {
 		t.Fatalf("release turn: %v", err)
 	}
+	relReceipt := relRes.Receipt
 
 	// 2. RequestCancel durable no-op when already cancelling
 	cancel1, err := store.RequestCancel(ctx, "op-c-1", "lease-1", "sess-1", relReceipt.CommittedVersion, "turn-q")

@@ -27,6 +27,8 @@ var (
 	ErrTurnAlreadyExists          = errors.New("turn identifier already exists")
 	ErrSymlinkForbidden           = errors.New("symlink state directory not permitted")
 	ErrConflictingTerminalOutcome = errors.New("conflicting terminal outcome on already-terminal turn")
+	ErrSessionNotFound            = errors.New("session not found")
+	ErrRunSessionMismatch         = errors.New("session does not belong to run")
 )
 
 type QueryRower interface {
@@ -63,4 +65,23 @@ type ReleaseReceipt struct {
 	SanitizedPrompt string `json:"sanitized_prompt"`
 	TurnKey         string `json:"turn_key"`
 	AttemptID       string `json:"attempt_id"`
+}
+
+type ReleaseDisposition string
+
+const (
+	ReleaseDispositionNew      ReleaseDisposition = "new"
+	ReleaseDispositionReplayed ReleaseDisposition = "replayed"
+)
+
+type ReleaseResult struct {
+	Receipt     ReleaseReceipt
+	Disposition ReleaseDisposition
+}
+
+type DiagnosticCounts struct {
+	ActiveRuns       []string
+	ReservedTurns    int
+	UnresolvedTurns  int
+	RecoveryBlockers int
 }

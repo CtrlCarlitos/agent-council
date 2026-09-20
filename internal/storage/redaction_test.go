@@ -44,10 +44,11 @@ func TestStore_CredentialRedaction_RealStorageBoundary(t *testing.T) {
 	}
 
 	// 2. ReleaseTurn receipt must also have redacted tokens
-	relReceipt, err := store.ReleaseTurn(ctx, "op-rel-sec", "lease-1", "sess-1", 2, "turn-sec")
+	relRes, err := store.ReleaseTurn(ctx, "op-rel-sec", "lease-1", "sess-1", 2, "turn-sec")
 	if err != nil {
 		t.Fatalf("release turn: %v", err)
 	}
+	relReceipt := relRes.Receipt
 	if strings.Contains(relReceipt.SanitizedPrompt, secretKey) || strings.Contains(relReceipt.SanitizedPrompt, githubToken) || strings.Contains(relReceipt.SanitizedPrompt, slackToken) {
 		t.Fatalf("release receipt contains raw secret tokens: %s", relReceipt.SanitizedPrompt)
 	}

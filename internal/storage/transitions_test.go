@@ -94,10 +94,11 @@ func TestStore_ReconcileSession_GenerationAndTurnValidation(t *testing.T) {
 	_, _ = store.QueuePrompt(ctx, "op-q-1", "lease-1", "sess-1", 1, storage.PendingPrompt{
 		SessionID: "sess-1", TurnKey: "turn-1", Prompt: "Review diff", CreatedAt: time.Now(),
 	})
-	relReceipt, err := store.ReleaseTurn(ctx, "op-rel-1", "lease-1", "sess-1", 2, "turn-1")
+	relRes, err := store.ReleaseTurn(ctx, "op-rel-1", "lease-1", "sess-1", 2, "turn-1")
 	if err != nil {
 		t.Fatalf("release turn: %v", err)
 	}
+	relReceipt := relRes.Receipt
 	if relReceipt.SanitizedPrompt != "Review diff" {
 		t.Fatalf("expected sanitized prompt in release receipt, got %s", relReceipt.SanitizedPrompt)
 	}
