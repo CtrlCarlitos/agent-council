@@ -128,9 +128,21 @@ VALUES (1, 'initial_schema', ?, ?);`, schemaChecksum(), now)
 	}
 
 	// Test hook: deterministic interruption point after v2 changes have been
-	// staged but before commit (rollback evidence).
+	// staged but before commit (rollback evidence). A hook panic is
+	// converted to an error so Open's connection cleanup always runs.
 	if s.testHookBeforeCommit != nil {
-		s.testHookBeforeCommit("pre_commit_migration_v2")
+		hookErr := func() (err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("injected migration failure: %v", r)
+				}
+			}()
+			s.testHookBeforeCommit("pre_commit_migration_v2")
+			return nil
+		}()
+		if hookErr != nil {
+			return hookErr
+		}
 	}
 
 	_, err = tx.Tx().Exec(`

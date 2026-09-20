@@ -393,23 +393,16 @@ func TestAC004_Migration_RollbackAfterV2Begins(t *testing.T) {
 	seedV1GoldenData(t, db)
 	_ = db.Close()
 
-	_, err := func() (s *Store, err error) {
-		defer func() {
-			if r := recover(); r != nil {
-				s, err = nil, fmt.Errorf("hook panic: %v", r)
+	_, err := Open(StoreOptions{
+		StateDir: dir,
+		TestHookBeforeCommit: func(boundary string) {
+			if boundary == "pre_commit_migration_v2" {
+				panic("injected failure after v2 staged")
 			}
-		}()
-		return Open(StoreOptions{
-			StateDir: dir,
-			TestHookBeforeCommit: func(boundary string) {
-				if boundary == "pre_commit_migration_v2" {
-					panic("injected failure after v2 staged")
-				}
-			},
-		})
-	}()
-	if err == nil {
-		t.Fatal("expected the injected migration failure to surface")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "injected migration failure") {
+		t.Fatalf("expected the injected migration failure to surface, got %v", err)
 	}
 
 	// No partial v2 state survived the rollback.
