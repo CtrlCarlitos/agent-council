@@ -64,11 +64,11 @@ func (s *Store) PublishArtifact(ctx context.Context, opID string, callerLease st
 		return ArtifactMetadata{}, ErrArtifactOversized
 	}
 
-	// 3. Pre-authorization: validate caller authority against runs.controller_lease BEFORE creating any files
-	var runLease string
-	err := s.readDB.QueryRowContext(ctx, "SELECT controller_lease FROM runs WHERE run_id = ?;", meta.RunID).Scan(&runLease)
-	if err != nil || runLease != callerLease {
-		return ArtifactMetadata{}, ErrUnauthorizedOperation
+	// 3. Pre-authorization: classify caller authority before any file work
+	// (AC-004; administrator class — the current credential on unadopted
+	// runs remains the operator's maintenance handle).
+	if _, err := classifyCredential(ctx, s.readDB, meta.RunID, callerLease, false); err != nil {
+		return ArtifactMetadata{}, err
 	}
 
 	// 4. Pre-write sanitization of content
@@ -83,13 +83,12 @@ func (s *Store) PublishArtifact(ctx context.Context, opID string, callerLease st
 
 	// Check idempotency first before file creation
 	var storedCmdType, storedFingerprint, payloadJSON string
-	err = s.readDB.QueryRowContext(ctx, "SELECT command_type, command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;", opID).Scan(&storedCmdType, &storedFingerprint, &payloadJSON)
+	err := s.readDB.QueryRowContext(ctx, "SELECT command_type, command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;", opID).Scan(&storedCmdType, &storedFingerprint, &payloadJSON)
 	if err == nil {
 		var ajp artifactJournalPayload
 		if err := json.Unmarshal([]byte(payloadJSON), &ajp); err == nil && ajp.CommittedMeta.ID != "" {
-			if ajp.CallerLease != callerLease {
-				return ArtifactMetadata{}, ErrUnauthorizedOperation
-			}
+			// Authority was classified before this lookup; the recorded
+			// caller_lease may belong to a superseded controller.
 			if storedCmdType != "publish_artifact" || storedFingerprint != fp {
 				return ArtifactMetadata{}, ErrIdempotencyConflict
 			}

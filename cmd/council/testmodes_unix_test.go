@@ -247,9 +247,26 @@ func runClientAMode() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Attach the adopted controller to this service instance before
+	// authorizing work (AC-004: adoption grants no connection state).
+	lease := os.Getenv("COUNCIL_TEST_LEASE")
+	if lease == "" {
+		lease = "lease-1"
+	}
+	gen := uint64(1)
+	if g := os.Getenv("COUNCIL_TEST_EXPECTED_GENERATION"); g != "" {
+		if parsed, err := strconv.ParseUint(g, 10, 64); err == nil {
+			gen = parsed
+		}
+	}
+	if _, err := c.ConnectRunController(ctx, runID, "op-conn-client-a", lease, gen); err != nil {
+		fmt.Fprintf(os.Stderr, "client-a mode: connect: %v\n", err)
+		os.Exit(2)
+	}
+
 	// Authorize the work through the release command.
 	ver, _ := strconv.ParseInt(expectedVersion, 10, 64)
-	if _, err := c.ReleaseTurn(ctx, runID, session, turn, "op-rel-client-a", "lease-1", ver); err != nil {
+	if _, err := c.ReleaseTurn(ctx, runID, session, turn, "op-rel-client-a", lease, ver); err != nil {
 		fmt.Fprintf(os.Stderr, "client-a mode: release: %v\n", err)
 		os.Exit(2)
 	}

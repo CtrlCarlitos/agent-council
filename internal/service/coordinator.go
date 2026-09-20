@@ -29,6 +29,16 @@ type SSEEvent struct {
 	Data  string `json:"data"`
 }
 
+// attachmentState identifies an in-instance controller attachment by run,
+// generation, episode, and owning service instance (AC-004 §7).
+type attachmentState struct {
+	runID        string
+	generation   uint64
+	attachmentID string
+	instanceID   string
+	revision     uint64
+}
+
 // Coordinator manages the release admission gate, live worker accounting,
 // service-owned execution lifetimes, and SSE event fanout.
 //
@@ -57,6 +67,7 @@ type Coordinator struct {
 	blockerEpoch     uint64
 	activeTurns      map[adapter.TurnRef]context.CancelFunc
 	subscribers      map[adapter.TurnRef][]chan SSEEvent
+	attachments      map[string]attachmentState
 }
 
 // NewCoordinator initializes a new coordinator in the running state.
@@ -68,6 +79,7 @@ func NewCoordinator() *Coordinator {
 		cancel:      cancel,
 		activeTurns: make(map[adapter.TurnRef]context.CancelFunc),
 		subscribers: make(map[adapter.TurnRef][]chan SSEEvent),
+		attachments: make(map[string]attachmentState),
 	}
 }
 
@@ -427,6 +439,83 @@ func (c *Coordinator) CloseAllSubscribers() {
 		}
 	}
 	c.subscribers = make(map[adapter.TurnRef][]chan SSEEvent)
+}
+
+// MarkControllerAttached publishes an in-instance attachment record for a
+// run, generation, and episode. Attachment revisions are generation-scoped
+// (each grant row counts its own episodes), so generation is compared
+// first: a newer controller generation always replaces an older one —
+// including when its first episode's revision restarts at 1 — while within
+// the same generation the newer episode revision wins and an older
+// generation can never overwrite a successor regardless of revision
+// numbers. Identical episode replays are idempotent.
+func (c *Coordinator) MarkControllerAttached(runID string, generation uint64, attachmentID, instanceID string, revision uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if existing, ok := c.attachments[runID]; ok {
+		if existing.generation > generation {
+			return
+		}
+		if existing.generation == generation {
+			if existing.revision > revision {
+				return
+			}
+			if existing.revision == revision && existing.attachmentID != attachmentID {
+				return
+			}
+		}
+	}
+	c.attachments[runID] = attachmentState{
+		runID:        runID,
+		generation:   generation,
+		attachmentID: attachmentID,
+		instanceID:   instanceID,
+		revision:     revision,
+	}
+}
+
+// ControllerAttachedEpisode reports whether the exact durable identity —
+// generation and attachment episode — is the one published in this service
+// instance. Generation-only or boolean matches are insufficient: a stale
+// local episode must not authorize decisions for a different durable one.
+func (c *Coordinator) ControllerAttachedEpisode(runID string, generation uint64, attachmentID string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	att, ok := c.attachments[runID]
+	return ok && att.generation == generation && att.attachmentID == attachmentID && att.instanceID != ""
+}
+
+// ControllerAttached reports whether any episode of the given generation
+// attached in this instance (used by tests and diagnostics).
+func (c *Coordinator) ControllerAttached(runID string, generation uint64) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	att, ok := c.attachments[runID]
+	return ok && att.generation == generation && att.instanceID != ""
+}
+
+// InvalidateControllerAttachment clears the in-instance attachment record
+// (used when authority transitions arrive through this instance).
+func (c *Coordinator) InvalidateControllerAttachment(runID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.attachments, runID)
+}
+
+// InvalidateControllerAttachmentIf performs a compare-and-delete of the
+// exact local identity — generation, episode, and owning instance — so a
+// disconnect for one episode never clears a successor's record, and a
+// normal disconnect clears its own record without consulting durable
+// fields the committed transition already cleared.
+func (c *Coordinator) InvalidateControllerAttachmentIf(runID string, generation uint64, attachmentID, instanceID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if existing, ok := c.attachments[runID]; ok &&
+		existing.generation == generation &&
+		existing.attachmentID == attachmentID &&
+		existing.instanceID == instanceID {
+		delete(c.attachments, runID)
+	}
 }
 
 // WaitTasks blocks until every admitted unit of work (workers, accepted

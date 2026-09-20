@@ -178,6 +178,11 @@ func (s *Store) SetNativeBinding(ctx context.Context, opID string, callerLease s
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, false); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "set_native_binding", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
@@ -195,9 +200,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return OperationReceipt{}, ErrStaleUpdate
 	}
@@ -247,6 +250,10 @@ UPDATE sessions SET row_version = ?, updated_at = ? WHERE session_id = ?;`, newV
 
 // FindCommittedRelease checks if opID has already been committed as a release_turn operation.
 func (s *Store) FindCommittedRelease(ctx context.Context, opID string, callerLease string, sessionID string, turnKey string) (*ReleaseReceipt, bool, error) {
+	// Current controller authority precedes receipt replay (AC-004).
+	if _, err := authorizeSessionController(ctx, s.readDB, sessionID, callerLease, true); err != nil {
+		return nil, false, err
+	}
 	fp := computeFingerprint("release_turn", sessionID, turnKey)
 	var storedCmdType, storedFingerprint, payloadJSON string
 	err := s.readDB.QueryRowContext(ctx, "SELECT command_type, command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;", opID).Scan(&storedCmdType, &storedFingerprint, &payloadJSON)
@@ -261,9 +268,9 @@ func (s *Store) FindCommittedRelease(ctx context.Context, opID string, callerLea
 		if jp.Receipt.OperationReceipt.TurnKey == "" {
 			jp.Receipt.OperationReceipt.TurnKey = jp.Receipt.TurnKey
 		}
-		if jp.CallerLease != callerLease {
-			return nil, false, ErrUnauthorizedOperation
-		}
+		// Authority was classified at the boundary before this lookup; the
+		// recorded caller_lease may belong to a superseded controller whose
+		// committed response the current controller recovers.
 		if storedCmdType != "release_turn" || storedFingerprint != fp {
 			return nil, false, ErrIdempotencyConflict
 		}
@@ -295,18 +302,25 @@ func (s *Store) GetTurnPrompt(ctx context.Context, sessionID, turnKey string) (s
 // FindOperationReceipt checks if opID exists in journal_entries and validates callerLease if non-empty.
 func (s *Store) FindOperationReceipt(ctx context.Context, opID string, callerLease string) (*OperationReceipt, bool, error) {
 	var storedCmdType, storedFingerprint, payloadJSON string
-	err := s.readDB.QueryRowContext(ctx, "SELECT command_type, command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;", opID).Scan(&storedCmdType, &storedFingerprint, &payloadJSON)
+	var runID string
+	err := s.readDB.QueryRowContext(ctx, "SELECT command_type, command_fingerprint, payload_json, run_id FROM journal_entries WHERE op_id = ?;", opID).Scan(&storedCmdType, &storedFingerprint, &payloadJSON, &runID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, err
 	}
+	// Current controller authority precedes receipt replay (AC-004); the
+	// journal row's run scopes the classification.
+	if _, err := classifyCredential(ctx, s.readDB, runID, callerLease, true); err != nil {
+		return nil, false, err
+	}
 	var jp journalPayload
 	if err := json.Unmarshal([]byte(payloadJSON), &jp); err == nil && jp.Receipt.OpID != "" {
-		if callerLease != "" && jp.CallerLease != callerLease {
-			return nil, false, ErrUnauthorizedOperation
-		}
+		// Authority was classified before this lookup; the recorded
+		// caller_lease may belong to a superseded controller whose
+		// committed response the current controller recovers.
+		_ = callerLease
 		return &jp.Receipt, true, nil
 	}
 	return nil, false, nil
@@ -444,6 +458,11 @@ func (s *Store) ReleaseTurn(ctx context.Context, opID string, callerLease string
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	issuingGeneration, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, true)
+	if err != nil {
+		return ReleaseResult{}, err
+	}
 	// Idempotency check for release_turn
 	var storedCmdType, storedFingerprint, payloadJSON string
 	err = tx.Tx().QueryRowContext(ctx, "SELECT command_type, command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;", opID).Scan(&storedCmdType, &storedFingerprint, &payloadJSON)
@@ -453,9 +472,9 @@ func (s *Store) ReleaseTurn(ctx context.Context, opID string, callerLease string
 			if jp.Receipt.OperationReceipt.TurnKey == "" {
 				jp.Receipt.OperationReceipt.TurnKey = jp.Receipt.TurnKey
 			}
-			if jp.CallerLease != callerLease {
-				return ReleaseResult{}, ErrUnauthorizedOperation
-			}
+			// Authority was classified before this transaction; the recorded
+			// caller_lease may belong to a superseded controller whose
+			// committed release the current controller recovers.
 			if storedCmdType != "release_turn" || storedFingerprint != fp {
 				return ReleaseResult{}, ErrIdempotencyConflict
 			}
@@ -464,6 +483,12 @@ func (s *Store) ReleaseTurn(ctx context.Context, opID string, callerLease string
 				Disposition: ReleaseDispositionReplayed,
 			}, nil
 		}
+	}
+
+	// New decisions enforce the run connection precondition at this write
+	// boundary; the replay above follows the disconnected-read policy.
+	if err := requireRunConnected(ctx, tx.Tx(), runIDOfSession(ctx, tx.Tx(), sessionID)); err != nil {
+		return ReleaseResult{}, err
 	}
 
 	var runID, runLease, state, lifecycle, controllerStatus, visibility string
@@ -478,9 +503,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &state
 		return ReleaseResult{}, fmt.Errorf("query session for release: %w", err)
 	}
 
-	if runLease != callerLease {
-		return ReleaseResult{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return ReleaseResult{}, ErrStaleUpdate
 	}
@@ -527,10 +550,11 @@ VALUES (?, ?, ?, 'running', '', ?, ?);`, sessionID, turnKey, sanitizedPrompt, at
 		return ReleaseResult{}, fmt.Errorf("insert turn: %w", err)
 	}
 
-	// Insert into dispatch_intents
+	// Insert into dispatch_intents, stamped with the issuing controller
+	// generation that authorized this execution (AC-004 §6).
 	_, err = tx.Tx().ExecContext(ctx, `
-INSERT INTO dispatch_intents (session_id, turn_key, attempt_id, phase, recorded_at, updated_at)
-VALUES (?, ?, ?, 'intent_recorded', ?, ?);`, sessionID, turnKey, attemptID, now, now)
+INSERT INTO dispatch_intents (session_id, turn_key, attempt_id, phase, issuing_controller_generation, recorded_at, updated_at)
+VALUES (?, ?, ?, 'intent_recorded', ?, ?, ?);`, sessionID, turnKey, attemptID, issuingGeneration, now, now)
 	if err != nil {
 		return ReleaseResult{}, fmt.Errorf("insert dispatch intent: %w", err)
 	}
@@ -584,7 +608,7 @@ VALUES (?, 'release_turn', ?, ?, ?, ?, 'turn_released', 1, ?, ?);`, opID, fp, ru
 	}, nil
 }
 
-func (s *Store) ReconcileSession(ctx context.Context, opID string, callerLease string, ref adapter.RecoveryRef, outcome adapter.ReconciliationOutcome) (OperationReceipt, error) {
+func (s *Store) ReconcileSession(ctx context.Context, opID string, execRef ExecutionRef, ref adapter.RecoveryRef, outcome adapter.ReconciliationOutcome) (OperationReceipt, error) {
 	if err := outcome.Validate(); err != nil {
 		return OperationReceipt{}, fmt.Errorf("invalid reconciliation outcome: %w", err)
 	}
@@ -596,7 +620,7 @@ func (s *Store) ReconcileSession(ctx context.Context, opID string, callerLease s
 	}
 
 	sessID := string(ref.SessionID)
-	fp := computeFingerprint("reconcile_session", sessID, ref.TurnKey, fmt.Sprintf("%d", ref.Generation), string(outcome.Status), string(outcome.Observed), outcome.Result)
+	fp := computeFingerprint("reconcile_session", sessID, ref.TurnKey, execRef.AttemptID, fmt.Sprintf("%d", ref.Generation), string(outcome.Status), string(outcome.Observed), outcome.Result)
 
 	tx, err := s.BeginWrite(ctx)
 	if err != nil {
@@ -604,7 +628,19 @@ func (s *Store) ReconcileSession(ctx context.Context, opID string, callerLease s
 	}
 	defer tx.Rollback()
 
-	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "reconcile_session", fp); err != nil {
+	// The execution and recovery references must identify the SAME
+	// execution before replay or mutation: one execution must never
+	// validate another's recovery (Gate 1 re-review finding 1). The bound
+	// target's original attempt is then validated inside this transition.
+	if execRef.SessionID != sessID || execRef.TurnKey != ref.TurnKey {
+		return OperationReceipt{}, fmt.Errorf("%w: execution reference (%s/%s) does not match recovery reference (%s/%s)",
+			ErrWrongExecutionAttempt, execRef.SessionID, execRef.TurnKey, sessID, ref.TurnKey)
+	}
+	if _, err := resolveExecutionRef(ctx, tx.Tx(), execRef); err != nil {
+		return OperationReceipt{}, err
+	}
+
+	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, "", "reconcile_session", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
 		return *receipt, nil
@@ -623,9 +659,14 @@ WHERE s.session_id = ?;`, sessID).Scan(&runID, &runLease, &currentVer, &state, &
 		return OperationReceipt{}, fmt.Errorf("query session for reconcile: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	// Two-boundary form (AC-004 §6): the controller authorized this
+	// recovery operation at initiation (service boundary classifies
+	// authority before the probe); this commit records the verified
+	// observation under the captured execution and recovery references —
+	// an authorized probe stays persistable even if controller authority
+	// rotates while it is in flight. The active recovery generation below
+	// remains the episode-scoped validity check.
+	_ = runLease
 	if visibility != "host_lost" {
 		return OperationReceipt{}, errors.New("session host is not lost")
 	}
@@ -757,7 +798,7 @@ WHERE session_id = ?;`, newVer, now, sessID)
 		Payload:          payload,
 	}
 
-	if err := recordJournalEntry(tx.Tx(), opID, "reconcile_session", fp, runID, sessID, ref.TurnKey, "session_reconciled", receipt, callerLease); err != nil {
+	if err := recordJournalEntry(tx.Tx(), opID, "reconcile_session", fp, runID, sessID, ref.TurnKey, "session_reconciled", receipt, ""); err != nil {
 		return OperationReceipt{}, err
 	}
 
@@ -898,10 +939,20 @@ func (s *Store) RequestCancel(ctx context.Context, opID string, callerLease stri
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, true); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "request_cancel", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
 		return *receipt, nil
+	}
+	// New decisions enforce the run connection precondition at this write
+	// boundary; idempotent replay above follows the disconnected-read policy.
+	if err := requireRunConnected(ctx, tx.Tx(), runIDOfSession(ctx, tx.Tx(), sessionID)); err != nil {
+		return OperationReceipt{}, err
 	}
 
 	var runID, runLease, lifecycle, controllerStatus, state string
@@ -916,9 +967,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return OperationReceipt{}, ErrStaleUpdate
 	}
@@ -1022,6 +1071,11 @@ func (s *Store) RecordTerminalOutcome(ctx context.Context, opID string, callerLe
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, true); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "record_terminal_outcome", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
@@ -1041,9 +1095,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return OperationReceipt{}, ErrStaleUpdate
 	}
@@ -1172,6 +1224,11 @@ func (s *Store) RecordHostLoss(ctx context.Context, opID string, callerLease str
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, true); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "record_host_loss", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
@@ -1191,9 +1248,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return OperationReceipt{}, ErrStaleUpdate
 	}
@@ -1272,6 +1327,11 @@ func (s *Store) SetControllerConnection(ctx context.Context, opID string, caller
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, true); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "set_controller_connection", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
@@ -1289,9 +1349,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return OperationReceipt{}, ErrStaleUpdate
 	}
@@ -1359,6 +1417,11 @@ func (s *Store) ArchiveSession(ctx context.Context, opID string, callerLease str
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, false); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "archive_session", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
@@ -1377,9 +1440,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &state
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return OperationReceipt{}, ErrStaleUpdate
 	}
@@ -1446,17 +1507,29 @@ func (s *Store) RecordDecision(ctx context.Context, opID string, callerLease str
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := classifyCredential(ctx, tx.Tx(), runID, callerLease, true); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "record_decision", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
 		return *receipt, nil
 	}
 
+	// New decisions enforce the run connection precondition at this write
+	// boundary; idempotent replay above follows the disconnected-read policy.
+	if err := requireRunConnected(ctx, tx.Tx(), runID); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	var runLease string
 	err = tx.Tx().QueryRowContext(ctx, "SELECT controller_lease FROM runs WHERE run_id = ?;", runID).Scan(&runLease)
-	if err != nil || runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
+	if err != nil {
+		return OperationReceipt{}, err
 	}
+	_ = runLease // authority classified before replay
 
 	// Verify that referenced (artifact_id, revision) exists in artifact_revisions for this run and query digest
 	var digest string
@@ -1539,22 +1612,8 @@ func (s *Store) ValidateSessionRun(ctx context.Context, sessionID, runID string)
 
 // ValidateControllerLease checks whether the caller lease matches the session's run controller lease.
 func (s *Store) ValidateControllerLease(ctx context.Context, sessionID, callerLease string) error {
-	var runLease string
-	err := s.readDB.QueryRowContext(ctx, `
-SELECT r.controller_lease
-FROM sessions s
-JOIN runs r ON s.run_id = r.run_id
-WHERE s.session_id = ?;`, sessionID).Scan(&runLease)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ErrSessionNotFound
-	}
-	if err != nil {
-		return fmt.Errorf("validate controller lease: %w", err)
-	}
-	if runLease != callerLease {
-		return ErrUnauthorizedOperation
-	}
-	return nil
+	_, err := authorizeSessionController(ctx, s.readDB, sessionID, callerLease, true)
+	return err
 }
 
 // GetDiagnosticCounts computes active runs, reserved turns, unresolved turns, and recovery blockers.

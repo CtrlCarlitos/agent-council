@@ -104,9 +104,11 @@ func TestSubprocess_ServiceCrashAndRestart(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	ctx := context.Background()
+	_ = ctx
 	if _, err := store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile", "lease-1"); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	adoptForTest(t, store, "run-1", "lease-1")
 	sessRec, err := store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID:                  "sess-1",
 		RunID:               "run-1",
@@ -265,9 +267,11 @@ func TestSubprocess_ClientDisconnectMidTurn(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	ctx := context.Background()
+	_ = ctx
 	if _, err := store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile", "lease-1"); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	adoptForTest(t, store, "run-1", "lease-1")
 	sessRec, err := store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID:                  "sess-1",
 		RunID:               "run-1",

@@ -149,6 +149,11 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	}
 	defer doneControl()
 
+	// New decisions require the current controller attached to this instance.
+	if !s.requireConnectedController(w, r, runID, sessionID, req.ControllerLease, req.OpID) {
+		return
+	}
+
 	stageOpID := fmt.Sprintf("%s:req", req.OpID)
 	receipt, err := s.store.RequestCancel(r.Context(), stageOpID, req.ControllerLease, sessionID, req.ExpectedVersion, turnKey)
 	if err != nil {
@@ -160,6 +165,9 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
 			return
 		}
+		if writeControllerAuthError(w, err, req.OpID) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "cancel_failed", err.Error(), req.OpID)
 		return
 	}
@@ -168,6 +176,11 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		SessionID: adapter.SessionID(sessionID),
 		TurnKey:   turnKey,
 	}
+
+	// Capture the accepted execution's identity before contacting the
+	// adapter: the confirmed-commit evidence write validates exactly this
+	// reference rather than a later lookup.
+	execRef := s.executionRefForTurn(r.Context(), sessionID, turnKey)
 
 	// Request cancellation through the adapter under an independent timeout.
 	// The supervisor's observation, collection, and persistence
@@ -193,26 +206,13 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 					bgCtx, bgCancel := context.WithTimeout(context.Background(), 3*time.Second)
 					defer bgCancel()
 
+					// The evidence write uses the identity captured before
+					// the adapter call (AC-004 §6) — it must not depend on
+					// the requesting controller's lease remaining current.
 					persisted := false
-					for retries := 0; retries < 5; retries++ {
-						ver, verErr := s.store.GetSessionVersion(bgCtx, sessionID)
-						if verErr != nil {
-							ver = receipt.CommittedVersion
-						}
-						_, termErr := s.store.RecordTerminalOutcome(bgCtx, termOpID, req.ControllerLease, sessionID, ver, turnKey, council.TurnCancelled, reason)
-						if termErr == nil {
-							persisted = true
-							break
-						}
-						if errors.Is(termErr, storage.ErrConflictingTerminalOutcome) {
-							// Another authoritative committer (the
-							// supervisor collecting the cancelled result)
-							// recorded this outcome first.
-							break
-						}
-						if !errors.Is(termErr, storage.ErrStaleUpdate) {
-							break
-						}
+					if execRef != nil {
+						_, termErr := s.store.RecordObservedExecutionOutcome(bgCtx, termOpID, *execRef, council.TurnCancelled, reason)
+						persisted = termErr == nil
 					}
 					// Resolve against durable state: the cancellation is
 					// confirmed only when the turn is durably cancelled.
@@ -297,8 +297,8 @@ func (s *Server) handleControllerConnect(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if req.OpID == "" || req.ControllerLease == "" || req.ExpectedVersion <= 0 {
-		writeError(w, http.StatusBadRequest, "invalid_request", "op_id, controller_lease, and expected_version (>0) are required", req.OpID)
+	if req.OpID == "" || req.ControllerLease == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "op_id and controller_lease are required", req.OpID)
 		return
 	}
 
@@ -309,26 +309,31 @@ func (s *Server) handleControllerConnect(w http.ResponseWriter, r *http.Request)
 	}
 	defer doneControl()
 
-	receipt, err := s.store.SetControllerConnection(r.Context(), req.OpID, req.ControllerLease, sessionID, req.ExpectedVersion, council.ControllerConnected)
+	// Compatibility delegation (AC-004 §7): the session route establishes
+	// the run-scoped attachment episode; session controller_status columns
+	// are projections.
+	rec, err := s.store.GetControllerRecord(r.Context(), runID)
 	if err != nil {
-		if errors.Is(err, storage.ErrStaleUpdate) {
-			writeError(w, http.StatusConflict, "stale_version", err.Error(), req.OpID)
-			return
-		}
-		if errors.Is(err, storage.ErrUnauthorizedOperation) {
-			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
-			return
-		}
-		writeError(w, http.StatusBadRequest, "connect_failed", err.Error(), req.OpID)
+		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), req.OpID)
 		return
 	}
+	if !rec.Adopted {
+		writeError(w, http.StatusConflict, "adoption_required", "run has no adopted controller", req.OpID)
+		return
+	}
+	connectReceipt, err := s.store.ConnectRunController(r.Context(), req.OpID, runID, req.ControllerLease, rec.Generation, s.cfg.InstanceID)
+	if err != nil {
+		s.writeGrantError(w, err, req.OpID)
+		return
+	}
+	s.coordinator.MarkControllerAttached(runID, rec.Generation, connectReceipt.AttachmentID, s.cfg.InstanceID, connectReceipt.AttachmentRev)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(ControllerConnectResponse{
 		InstanceID: s.cfg.InstanceID,
 		OpID:       req.OpID,
-		Receipt:    receipt,
+		Receipt:    connectReceipt.OperationReceipt,
 	})
 }
 
@@ -369,10 +374,39 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	}
 	defer doneControl()
 
+	// New decisions require the current controller attached to this instance.
+	if !s.requireConnectedController(w, r, runID, sessionID, req.ControllerLease, req.OpID) {
+		return
+	}
+
 	stageReconcileID := fmt.Sprintf("%s:reconcile", req.OpID)
 	stageHostLossID := fmt.Sprintf("%s:host_loss", req.OpID)
 
-	// Step 1: Check completed stage first!
+	// Step 1: Current controller authority precedes receipt replay
+	// (AC-004): a superseded controller cannot recover a committed
+	// reconcile response.
+	if err := s.store.ValidateControllerLease(r.Context(), sessionID, req.ControllerLease); err != nil {
+		if errors.Is(err, storage.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "session_not_found", err.Error(), req.OpID)
+			return
+		}
+		if errors.Is(err, storage.ErrLeaseSuperseded) {
+			writeError(w, http.StatusForbidden, "lease_superseded", err.Error(), req.OpID)
+			return
+		}
+		if errors.Is(err, storage.ErrAdoptionRequired) {
+			writeError(w, http.StatusConflict, "adoption_required", err.Error(), req.OpID)
+			return
+		}
+		if errors.Is(err, storage.ErrUnauthorizedOperation) {
+			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), req.OpID)
+		return
+	}
+
+	// Step 2: Check completed stage next.
 	committedReceipt, found, err := s.store.FindOperationReceipt(r.Context(), stageReconcileID, req.ControllerLease)
 	if err != nil {
 		if errors.Is(err, storage.ErrUnauthorizedOperation) {
@@ -401,20 +435,7 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 2: Validate caller authority against runs.controller_lease and active turn before probes
-	if err := s.store.ValidateControllerLease(r.Context(), sessionID, req.ControllerLease); err != nil {
-		if errors.Is(err, storage.ErrSessionNotFound) {
-			writeError(w, http.StatusNotFound, "session_not_found", err.Error(), req.OpID)
-			return
-		}
-		if errors.Is(err, storage.ErrUnauthorizedOperation) {
-			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), req.OpID)
-		return
-	}
-
+	// Step 3: Load current recovery state for turn-scope authorization.
 	recState, err := s.store.GetSessionRecoveryState(r.Context(), sessionID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "get_session_failed", err.Error(), req.OpID)
@@ -432,6 +453,15 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		recState.ActiveRecoveryGen > 0
 	if !activeMatch && !retainedMatch {
 		writeError(w, http.StatusBadRequest, "invalid_turn", fmt.Sprintf("session active turn is %q, not %q", recState.ActiveKey, turnKey), req.OpID)
+		return
+	}
+
+	// Capture the original execution reference after turn-scope
+	// authorization and before the probe: the atomic commit validates
+	// exactly this identity.
+	execRef := s.executionRefForTurn(r.Context(), sessionID, turnKey)
+	if execRef == nil {
+		writeError(w, http.StatusConflict, "no_accepted_execution", "no accepted execution reference for this turn", req.OpID)
 		return
 	}
 
@@ -462,7 +492,7 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Step 3: Load the saved native-session binding and attach to the
+	// Step 4: Load the saved native-session binding and attach to the
 	// original execution. Recovery must never substitute a fresh session.
 	if s.adapter == nil {
 		writeError(w, http.StatusServiceUnavailable, "harness_unavailable", "harness adapter unavailable", req.OpID)
@@ -506,10 +536,10 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 4: Persist reconciled outcome under bounded service context
+	// Step 5: Persist reconciled outcome under bounded service context
 	persistCtx, persistCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer persistCancel()
-	recReceipt, err := s.store.ReconcileSession(persistCtx, stageReconcileID, req.ControllerLease, recoveryRef, outcome)
+	recReceipt, err := s.store.ReconcileSession(persistCtx, stageReconcileID, *execRef, recoveryRef, outcome)
 	if err != nil {
 		if errors.Is(err, storage.ErrUnauthorizedOperation) {
 			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
@@ -523,7 +553,7 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 5: Notify terminal subscribers after any authoritative
+	// Step 6: Notify terminal subscribers after any authoritative
 	// command-driven terminal commit, not only supervisor-driven completion.
 	if details, derr := s.store.GetTurnDetails(r.Context(), sessionID, turnKey); derr == nil && details != nil &&
 		(details.Status == council.TurnCompleted || details.Status == council.TurnFailed || details.Status == council.TurnCancelled || details.Status == council.TurnInterrupted) {
@@ -574,6 +604,23 @@ var ErrUnsupportedBindingConfig = errors.New("unsupported native-binding configu
 // env_allowlist, or other policy metadata: those keys are outside
 // adapter.SessionConfig and require an explicit enforcement owner when
 // native integrations use them.
+// executionRefForTurn resolves the persisted execution reference (session,
+// turn, attempt) for a nonterminal turn, or nil when none is recorded.
+func (s *Server) executionRefForTurn(ctx context.Context, sessionID, turnKey string) *storage.ExecutionRef {
+	details, err := s.store.GetTurnDetails(ctx, sessionID, turnKey)
+	if err != nil || details == nil || details.DispatchIntent == nil {
+		return nil
+	}
+	if details.DispatchIntent.AttemptID == "" {
+		return nil
+	}
+	return &storage.ExecutionRef{
+		SessionID: sessionID,
+		TurnKey:   turnKey,
+		AttemptID: details.DispatchIntent.AttemptID,
+	}
+}
+
 func sessionBindingFromStorage(nb storage.NativeBinding, contributor string) (adapter.SessionBinding, error) {
 	binding := adapter.SessionBinding{
 		SessionID:       adapter.SessionID(nb.LogicalSessionID),
@@ -676,6 +723,11 @@ func (s *Server) handleQueuePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 	defer doneControl()
 
+	// New decisions require the current controller attached to this instance.
+	if !s.requireConnectedController(w, r, runID, sessionID, req.ControllerLease, req.OpID) {
+		return
+	}
+
 	receipt, err := s.store.QueuePrompt(r.Context(), req.OpID, req.ControllerLease, sessionID, req.ExpectedVersion, storage.PendingPrompt{
 		SessionID: sessionID,
 		TurnKey:   req.TurnKey,
@@ -688,6 +740,9 @@ func (s *Server) handleQueuePrompt(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, storage.ErrUnauthorizedOperation) {
 			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
+			return
+		}
+		if writeControllerAuthError(w, err, req.OpID) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "queue_failed", err.Error(), req.OpID)
@@ -735,6 +790,11 @@ func (s *Server) handleReplacePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 	defer doneControl()
 
+	// New decisions require the current controller attached to this instance.
+	if !s.requireConnectedController(w, r, runID, sessionID, req.ControllerLease, req.OpID) {
+		return
+	}
+
 	receipt, err := s.store.ReplacePendingPrompt(r.Context(), req.OpID, req.ControllerLease, sessionID, req.ExpectedVersion, storage.PendingPrompt{
 		SessionID: sessionID,
 		TurnKey:   turnKey,
@@ -747,6 +807,9 @@ func (s *Server) handleReplacePrompt(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, storage.ErrUnauthorizedOperation) {
 			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
+			return
+		}
+		if writeControllerAuthError(w, err, req.OpID) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "replace_failed", err.Error(), req.OpID)
@@ -794,6 +857,11 @@ func (s *Server) handleDiscardPrompt(w http.ResponseWriter, r *http.Request) {
 	}
 	defer doneControl()
 
+	// New decisions require the current controller attached to this instance.
+	if !s.requireConnectedController(w, r, runID, sessionID, req.ControllerLease, req.OpID) {
+		return
+	}
+
 	receipt, err := s.store.DiscardPendingPrompt(r.Context(), req.OpID, req.ControllerLease, sessionID, req.ExpectedVersion, turnKey)
 	if err != nil {
 		if errors.Is(err, storage.ErrStaleUpdate) {
@@ -802,6 +870,9 @@ func (s *Server) handleDiscardPrompt(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, storage.ErrUnauthorizedOperation) {
 			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
+			return
+		}
+		if writeControllerAuthError(w, err, req.OpID) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "discard_failed", err.Error(), req.OpID)
@@ -842,6 +913,11 @@ func (s *Server) handleRecordDecision(w http.ResponseWriter, r *http.Request) {
 	}
 	defer doneControl()
 
+	// New decisions require the current controller attached to this instance.
+	if !s.requireConnectedController(w, r, runID, "", req.ControllerLease, req.OpID) {
+		return
+	}
+
 	receipt, err := s.store.RecordDecision(r.Context(), req.OpID, req.ControllerLease, runID, req.ArtifactID, req.Revision, req.DecisionPayload)
 	if err != nil {
 		if errors.Is(err, storage.ErrUnauthorizedOperation) {
@@ -850,6 +926,9 @@ func (s *Server) handleRecordDecision(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, storage.ErrArtifactNotFound) {
 			writeError(w, http.StatusNotFound, "artifact_not_found", err.Error(), req.OpID)
+			return
+		}
+		if writeControllerAuthError(w, err, req.OpID) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "decision_failed", err.Error(), req.OpID)

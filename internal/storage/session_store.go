@@ -59,10 +59,11 @@ func checkOrRecordIdempotency(tx *sql.Tx, opID string, callerLease string, cmdTy
 		return nil, fmt.Errorf("unmarshal stored receipt: %w", err)
 	}
 
-	// Authority check: callerLease must match
-	if jp.CallerLease != callerLease {
-		return nil, ErrUnauthorizedOperation
-	}
+	// Idempotency semantics only (AC-004 §4.3 adaptation): authority is
+	// classified at the operation boundary before this helper runs, and the
+	// recorded caller_lease may legitimately belong to a superseded
+	// controller whose committed response the current controller recovers.
+	_ = callerLease
 
 	// Parameters check
 	if storedCmdType != cmdType || storedFingerprint != fingerprint {
@@ -127,6 +128,16 @@ VALUES (?, ?, ?, ?, ?, 'active', ?, ?);`, runID, briefDigest, sourceDigest, prof
 		return OperationReceipt{}, fmt.Errorf("insert run: %w", err)
 	}
 
+	// The supplied lease is recorded as generation-0 provenance only —
+	// never an adopted controller grant (AC-004).
+	_, err = tx.Tx().ExecContext(ctx, `INSERT INTO controller_leases
+		(run_id, generation, harness, controller_ref, lease, status, granted_by_op_id, attached_at, updated_at)
+		VALUES (?, 0, NULL, 'create-run-provenance', ?, 'legacy', ?, ?, ?);`,
+		runID, controllerLease, opID, now, now)
+	if err != nil {
+		return OperationReceipt{}, fmt.Errorf("insert run provenance: %w", err)
+	}
+
 	receipt := OperationReceipt{
 		OpID:             opID,
 		CommandType:      "create_run",
@@ -153,6 +164,12 @@ func (s *Store) CreateSession(ctx context.Context, opID string, callerLease stri
 	}
 	defer tx.Rollback()
 
+	// Administrator-class authority precedes idempotent replay (AC-004).
+	// CreateSession resolves the run directly: the session does not exist yet.
+	if _, err := classifyCredential(ctx, tx.Tx(), session.RunID, callerLease, false); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "create_session", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
@@ -162,20 +179,32 @@ func (s *Store) CreateSession(ctx context.Context, opID string, callerLease stri
 	// Validate caller authority against runs.controller_lease
 	var runLease string
 	err = tx.Tx().QueryRowContext(ctx, "SELECT controller_lease FROM runs WHERE run_id = ?;", session.RunID).Scan(&runLease)
-	if err != nil || runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
+	if err != nil {
+		return OperationReceipt{}, err
 	}
+	_ = runLease // authority classified before replay
 
 	isActive := 0
 	if session.IsActiveContributor {
 		isActive = 1
 	}
 
+	// The compatibility projection is derived from the run's actual
+	// connection state — never defaulted to connected.
+	var runConnected int
+	if err := tx.Tx().QueryRowContext(ctx, `SELECT connected FROM controller_leases WHERE run_id = ? AND status = 'active';`, session.RunID).Scan(&runConnected); err != nil {
+		runConnected = 0
+	}
+	projection := "disconnected"
+	if runConnected == 1 {
+		projection = "connected"
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err = tx.Tx().ExecContext(ctx, `
 INSERT INTO sessions (session_id, run_id, contributor, is_active_contributor, state, lifecycle, controller_status, visibility, recovery_gen, active_recovery_gen, row_version, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, 'active', 'connected', ?, ?, ?, 1, ?, ?);`,
-		session.ID, session.RunID, session.Contributor, isActive, session.State, session.Visibility, session.RecoveryGeneration, session.RecoveryGeneration, now, now)
+VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, 1, ?, ?);`,
+		session.ID, session.RunID, session.Contributor, isActive, session.State, projection, session.Visibility, session.RecoveryGeneration, session.RecoveryGeneration, now, now)
 	if err != nil {
 		return OperationReceipt{}, fmt.Errorf("insert session: %w", err)
 	}
@@ -218,10 +247,20 @@ func (s *Store) QueuePrompt(ctx context.Context, opID string, callerLease string
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, true); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "queue_prompt", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
 		return *receipt, nil
+	}
+	// New decisions enforce the run connection precondition at this write
+	// boundary; idempotent replay above follows the disconnected-read policy.
+	if err := requireRunConnected(ctx, tx.Tx(), runIDOfSession(ctx, tx.Tx(), sessionID)); err != nil {
+		return OperationReceipt{}, err
 	}
 
 	// Validate session, authority, expected version, lifecycle, controller status
@@ -237,9 +276,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return OperationReceipt{}, ErrStaleUpdate
 	}
@@ -350,10 +387,20 @@ func (s *Store) ReplacePendingPrompt(ctx context.Context, opID string, callerLea
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, true); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "replace_pending_prompt", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
 		return *receipt, nil
+	}
+	// New decisions enforce the run connection precondition at this write
+	// boundary; idempotent replay above follows the disconnected-read policy.
+	if err := requireRunConnected(ctx, tx.Tx(), runIDOfSession(ctx, tx.Tx(), sessionID)); err != nil {
+		return OperationReceipt{}, err
 	}
 
 	var runID, runLease, lifecycle, controllerStatus string
@@ -367,9 +414,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return OperationReceipt{}, ErrStaleUpdate
 	}
@@ -436,10 +481,20 @@ func (s *Store) DiscardPendingPrompt(ctx context.Context, opID string, callerLea
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, true); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "discard_pending_prompt", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
 		return *receipt, nil
+	}
+	// New decisions enforce the run connection precondition at this write
+	// boundary; idempotent replay above follows the disconnected-read policy.
+	if err := requireRunConnected(ctx, tx.Tx(), runIDOfSession(ctx, tx.Tx(), sessionID)); err != nil {
+		return OperationReceipt{}, err
 	}
 
 	var runID, runLease, lifecycle, controllerStatus string
@@ -453,9 +508,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return OperationReceipt{}, ErrStaleUpdate
 	}

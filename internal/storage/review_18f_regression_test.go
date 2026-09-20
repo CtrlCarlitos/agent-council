@@ -21,6 +21,7 @@ func setupRunAndSession(t *testing.T, store *storage.Store, runID, sessID, lease
 	if err != nil {
 		t.Fatalf("setup create run: %v", err)
 	}
+	adoptControllerForTest(t, store, runID, lease)
 	_, err = store.CreateSession(ctx, "op-sess-"+sessID, lease, storage.SessionRecord{
 		ID:                  sessID,
 		RunID:               runID,
@@ -335,7 +336,7 @@ func TestReview18F_DurableReceipts_AcceptedNoOps(t *testing.T) {
 		Observed:     council.TurnCancelled,
 		Result:       "cancelled",
 	}
-	recReceipt, err := store.ReconcileSession(ctx, "op-rec-q", "lease-1", outcome.Ref, outcome)
+	recReceipt, err := store.ReconcileSession(ctx, "op-rec-q", store.ExecutionRefForTurn(ctx, string(outcome.Ref.SessionID), outcome.Ref.TurnKey), outcome.Ref, outcome)
 	if err != nil {
 		t.Fatalf("reconcile session: %v", err)
 	}
@@ -586,7 +587,11 @@ func TestReview18F_CrashRecoveryHooks_Unit(t *testing.T) {
 	var hookedBoundaries []string
 
 	hook := func(boundary string) {
-		hookedBoundaries = append(hookedBoundaries, boundary)
+		// This test tracks the release and artifact boundaries only; the
+		// migration boundary fires during Open by design.
+		if boundary == "pre_commit_release" || boundary == "uncommitted_artifact_metadata" {
+			hookedBoundaries = append(hookedBoundaries, boundary)
+		}
 	}
 
 	store, err := storage.Open(storage.StoreOptions{

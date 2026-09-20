@@ -126,6 +126,7 @@ func TestAcceptance_CrashRecovery_WithoutAccessibleNativeEvidence(t *testing.T) 
 
 	ctx := context.Background()
 	_, _ = store1.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile", "lease-1")
+	adoptForTest(t, store1, "run-1", "lease-1")
 	sessRec, _ := store1.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID:                  "sess-1",
 		RunID:               "run-1",
@@ -180,6 +181,7 @@ func TestAcceptance_CrashRecovery_WithoutAccessibleNativeEvidence(t *testing.T) 
 	if err := srv2.Start(); err != nil {
 		t.Fatalf("start server 2: %v", err)
 	}
+	connectControllerForTest(t, srv2, store2, "run-1", "lease-1")
 	defer srv2.Close()
 
 	client2 := newTestClient(srv2.SocketPath())
@@ -257,6 +259,7 @@ func TestAcceptance_RestartWithIndependentlyRetainedEvidence(t *testing.T) {
 	if _, err := store1.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile", "lease-1"); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	adoptForTest(t, store1, "run-1", "lease-1")
 	sessRec, err := store1.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID:                  "sess-1",
 		RunID:               "run-1",
@@ -334,6 +337,7 @@ func TestAcceptance_RestartWithIndependentlyRetainedEvidence(t *testing.T) {
 	if err := srv2.Start(); err != nil {
 		t.Fatalf("start server 2: %v", err)
 	}
+	connectControllerForTest(t, srv2, store2, "run-1", "lease-1")
 	defer srv2.Close()
 
 	client2 := newTestClient(srv2.SocketPath())

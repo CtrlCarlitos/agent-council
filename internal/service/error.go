@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+
+	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
 type ErrorDetail struct {
@@ -27,6 +29,24 @@ func writeError(w http.ResponseWriter, status int, code, message, opID string) {
 			OpID:    opID,
 		},
 	})
+}
+
+// writeControllerAuthError maps storage credential-classification errors to
+// their HTTP envelopes (AC-004). It reports whether the error was an
+// authority classification (already written) or should be handled by the
+// caller's generic branch.
+func writeControllerAuthError(w http.ResponseWriter, err error, opID string) bool {
+	switch {
+	case errors.Is(err, storage.ErrLeaseSuperseded):
+		writeError(w, http.StatusForbidden, "lease_superseded", err.Error(), opID)
+	case errors.Is(err, storage.ErrAdoptionRequired):
+		writeError(w, http.StatusConflict, "adoption_required", err.Error(), opID)
+	case errors.Is(err, storage.ErrUnauthorizedOperation):
+		writeError(w, http.StatusForbidden, "unauthorized", err.Error(), opID)
+	default:
+		return false
+	}
+	return true
 }
 
 func decodeStrictJSON(w http.ResponseWriter, r *http.Request, dst any) error {

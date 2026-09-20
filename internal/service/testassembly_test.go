@@ -146,6 +146,8 @@ func (h *testHarness) createSessionAndTurn(ctx context.Context, runID, sessionID
 	if err != nil {
 		h.t.Fatalf("create run: %v", err)
 	}
+	adoptForTest(h.t, h.store, runID, "lease-1")
+	connectControllerForTest(h.t, h.server, h.store, runID, "lease-1")
 
 	sessRec, err := h.store.CreateSession(ctx, "op-sess-"+sessionID, "lease-1", storage.SessionRecord{
 		ID:                  sessionID,

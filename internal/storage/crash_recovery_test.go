@@ -46,6 +46,7 @@ func TestStore_CrashRecovery_MultiBoundaryMatrix(t *testing.T) {
 			}
 			ctx := context.Background()
 			_, err = initStore.CreateRun(ctx, "op-run-init", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-1")
+			adoptControllerForTest(t, initStore, "run-1", "lease-1")
 			if err != nil {
 				t.Fatalf("init create run: %v", err)
 			}

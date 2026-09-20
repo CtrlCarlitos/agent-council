@@ -170,6 +170,32 @@ func (c *Client) StopService(ctx context.Context, instanceID string, drain bool)
 	return &resp, nil
 }
 
+// GetControllerRecord reads the redacted run-scoped controller record.
+func (c *Client) GetControllerRecord(ctx context.Context, runID string) (*service.ControllerRecordResponse, error) {
+	var resp service.ControllerRecordResponse
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/v1/runs/%s/controller", runID), nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// ConnectRunController attaches the run's current controller to this
+// service instance, establishing a new attachment episode.
+func (c *Client) ConnectRunController(ctx context.Context, runID, opID, controllerLease string, expectedGeneration uint64) (*service.ControllerConnectRunResponse, error) {
+	req := service.ControllerConnectRunRequest{
+		OpID:               opID,
+		ControllerLease:    controllerLease,
+		ExpectedGeneration: expectedGeneration,
+		InstanceID:         c.Meta().InstanceID,
+	}
+	var resp service.ControllerConnectRunResponse
+	path := fmt.Sprintf("/v1/runs/%s/controller/connect", runID)
+	if err := c.do(ctx, http.MethodPost, path, req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // ReleaseTurn calls POST /v1/runs/run-1-style release for a session turn.
 // The session and turn identify the target; runID correlates the session.
 func (c *Client) ReleaseTurn(ctx context.Context, runID, sessionID, turnKey, opID, controllerLease string, expectedVersion int64) (*service.ReleaseResponse, error) {
@@ -208,4 +234,28 @@ func (c *Client) ReconcileTurn(ctx context.Context, runID, sessionID, turnKey, o
 		return nil, err
 	}
 	return &resp, nil
+}
+
+// SubscribeEvents opens the SSE event stream for a turn and returns the
+// raw *http.Response. The caller must close resp.Body when done. This uses
+// the underlying http.Client directly because do() reads the full body,
+// which is incompatible with an open SSE stream.
+func (c *Client) SubscribeEvents(ctx context.Context, runID, sessionID, turnKey string) (*http.Response, error) {
+	path := fmt.Sprintf("/v1/runs/%s/sessions/%s/turns/%s/events", runID, sessionID, turnKey)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost"+path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create events request: %w", err)
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+c.token)
+	httpReq.Header.Set("Accept", "text/event-stream")
+	httpReq.Close = true
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("events request: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("events: server error status %d", resp.StatusCode)
+	}
+	return resp, nil
 }

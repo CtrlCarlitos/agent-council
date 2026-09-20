@@ -75,12 +75,11 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	// If found, return 200 OK immediately without checking adapter availability or draining state.
 	existingReceipt, found, err := s.store.FindCommittedRelease(r.Context(), req.OpID, req.ControllerLease, sessionID, turnKey)
 	if err != nil {
-		if errors.Is(err, storage.ErrIdempotencyConflict) {
-			writeError(w, http.StatusConflict, "idempotency_conflict", err.Error(), req.OpID)
+		if writeControllerAuthError(w, err, req.OpID) {
 			return
 		}
-		if errors.Is(err, storage.ErrUnauthorizedOperation) {
-			writeError(w, http.StatusForbidden, "unauthorized", err.Error(), req.OpID)
+		if errors.Is(err, storage.ErrIdempotencyConflict) {
+			writeError(w, http.StatusConflict, "idempotency_conflict", err.Error(), req.OpID)
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), req.OpID)
@@ -108,6 +107,11 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	}
 	defer doneAdmission()
 
+	// New decisions require the current controller attached to this instance.
+	if !s.requireConnectedController(w, r, runID, sessionID, req.ControllerLease, req.OpID) {
+		return
+	}
+
 	// Verify required harness adapter is available.
 	if s.adapter == nil {
 		writeError(w, http.StatusServiceUnavailable, "harness_unavailable", "harness adapter is unavailable", req.OpID)
@@ -127,6 +131,9 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, storage.ErrPromptNotQueued) {
 			writeError(w, http.StatusNotFound, "prompt_not_queued", err.Error(), req.OpID)
+			return
+		}
+		if writeControllerAuthError(w, err, req.OpID) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "release_failed", err.Error(), req.OpID)

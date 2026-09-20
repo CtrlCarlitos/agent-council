@@ -71,7 +71,7 @@ func TestStore_WriteTx_RollbackAndReuse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin tx1: %v", err)
 	}
-	_, err = tx1.Tx().ExecContext(ctx, "INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (2, 'rollback_test', 'dummy', '2026-09-19T00:00:00Z');")
+	_, err = tx1.Tx().ExecContext(ctx, "INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (50, 'rollback_test', 'dummy', '2026-09-19T00:00:00Z');")
 	if err != nil {
 		_ = tx1.Rollback()
 		t.Fatalf("exec insert: %v", err)
@@ -82,7 +82,7 @@ func TestStore_WriteTx_RollbackAndReuse(t *testing.T) {
 
 	// Verify row was not committed
 	var count int
-	if err := store.DB().QueryRow("SELECT count(*) FROM schema_migrations WHERE version = 2;").Scan(&count); err != nil {
+	if err := store.DB().QueryRow("SELECT count(*) FROM schema_migrations WHERE version = 50;").Scan(&count); err != nil {
 		t.Fatalf("query count: %v", err)
 	}
 	if count != 0 {

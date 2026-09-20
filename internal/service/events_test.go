@@ -33,6 +33,7 @@ func TestEvents_SynchronizedSnapshotAndCleanDisconnect(t *testing.T) {
 
 	ctx := context.Background()
 	_, err = store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile-1", "lease-1")
+	adoptForTest(t, store, "run-1", "lease-1")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -77,6 +78,7 @@ func TestEvents_SynchronizedSnapshotAndCleanDisconnect(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+	connectControllerForTest(t, srv, store, "run-1", "lease-1")
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())
@@ -138,6 +140,7 @@ func TestEvents_TerminalSnapshotOnConnect(t *testing.T) {
 
 	ctx := context.Background()
 	_, err = store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile-1", "lease-1")
+	adoptForTest(t, store, "run-1", "lease-1")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -187,6 +190,7 @@ func TestEvents_TerminalSnapshotOnConnect(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+	connectControllerForTest(t, srv, store, "run-1", "lease-1")
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())
@@ -337,6 +341,7 @@ func TestEvents_LiveObservationStreaming(t *testing.T) {
 
 	ctx := context.Background()
 	_, err = store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile-1", "lease-1")
+	adoptForTest(t, store, "run-1", "lease-1")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -375,6 +380,7 @@ func TestEvents_LiveObservationStreaming(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+	connectControllerForTest(t, srv, store, "run-1", "lease-1")
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())

@@ -32,6 +32,7 @@ func TestCommands_TurnReadCancelAndReconcile(t *testing.T) {
 
 	ctx := context.Background()
 	_, err = store.CreateRun(ctx, "op-run-1", "run-1", "brief", "spec", "profile-1", "lease-1")
+	adoptForTest(t, store, "run-1", "lease-1")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -83,6 +84,7 @@ func TestCommands_TurnReadCancelAndReconcile(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+	connectControllerForTest(t, srv, store, "run-1", "lease-1")
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())
@@ -181,6 +183,7 @@ func TestCommands_PromptLifecycleAndDecisions(t *testing.T) {
 
 	ctx := context.Background()
 	_, err = store.CreateRun(ctx, "op-run-cmd", "run-cmd", "brief", "spec", "profile-1", "lease-cmd")
+	adoptForTest(t, store, "run-cmd", "lease-cmd")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -209,6 +212,7 @@ func TestCommands_PromptLifecycleAndDecisions(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+	connectControllerForTest(t, srv, store, "run-cmd", "lease-cmd")
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())
@@ -322,6 +326,7 @@ func TestCommands_CompositeReconciliation(t *testing.T) {
 
 	ctx := context.Background()
 	_, err = store.CreateRun(ctx, "op-run-rec", "run-rec", "brief", "spec", "profile-1", "lease-rec")
+	adoptForTest(t, store, "run-rec", "lease-rec")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -381,6 +386,7 @@ func TestCommands_CompositeReconciliation(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
+	connectControllerForTest(t, srv, store, "run-rec", "lease-rec")
 	defer srv.Close()
 
 	client := newTestClient(srv.SocketPath())
@@ -442,6 +448,7 @@ func TestCommands_StrictJSONRejectsExtraFields(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-strict", "run-strict-1", "brief", "spec", "profile", "lease-strict")
+	adoptForTest(t, store, "run-strict-1", "lease-strict")
 	sessRec, _ := store.CreateSession(ctx, "op-sess-strict", "lease-strict", storage.SessionRecord{
 		ID:                  "sess-strict-1",
 		RunID:               "run-strict-1",
@@ -487,6 +494,7 @@ func TestCommands_RunSessionCorrelation(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-corr", "run-corr-1", "brief", "spec", "profile", "lease-corr")
+	adoptForTest(t, store, "run-corr-1", "lease-corr")
 	sessRec, _ := store.CreateSession(ctx, "op-sess-corr", "lease-corr", storage.SessionRecord{
 		ID:                  "sess-corr-1",
 		RunID:               "run-corr-1",
