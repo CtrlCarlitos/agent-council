@@ -235,3 +235,27 @@ func (c *Client) ReconcileTurn(ctx context.Context, runID, sessionID, turnKey, o
 	}
 	return &resp, nil
 }
+
+// SubscribeEvents opens the SSE event stream for a turn and returns the
+// raw *http.Response. The caller must close resp.Body when done. This uses
+// the underlying http.Client directly because do() reads the full body,
+// which is incompatible with an open SSE stream.
+func (c *Client) SubscribeEvents(ctx context.Context, runID, sessionID, turnKey string) (*http.Response, error) {
+	path := fmt.Sprintf("/v1/runs/%s/sessions/%s/turns/%s/events", runID, sessionID, turnKey)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost"+path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create events request: %w", err)
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+c.token)
+	httpReq.Header.Set("Accept", "text/event-stream")
+	httpReq.Close = true
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("events request: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("events: server error status %d", resp.StatusCode)
+	}
+	return resp, nil
+}

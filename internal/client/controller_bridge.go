@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 
 	"github.com/CtrlCarlitos/agent-council/internal/service"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
@@ -22,9 +23,10 @@ var ErrBridgeEscalation = errors.New("operation is not available through the con
 // interface. Real harness integration is later work; this boundary is
 // endpoint-level.
 type ControllerBridge struct {
-	c     *Client
-	runID string
-	lease string
+	c            *Client
+	runID        string
+	lease        string
+	attachmentID string // episode established by this bridge's Connect call
 }
 
 // NewControllerBridge reads the operator transport credential itself; the
@@ -70,27 +72,103 @@ func (b *ControllerBridge) ReleaseTurn(ctx context.Context, opID, sessionID, tur
 	return &resp, nil
 }
 
+// ReplacePrompt replaces a queued prompt that has not yet been released.
+func (b *ControllerBridge) ReplacePrompt(ctx context.Context, opID, sessionID, turnKey, prompt string, expectedVersion int64) (*service.ReplacePromptResponse, error) {
+	req := service.ReplacePromptRequest{
+		OpID:            opID,
+		ControllerLease: b.lease,
+		ExpectedVersion: expectedVersion,
+		Prompt:          prompt,
+	}
+	var resp service.ReplacePromptResponse
+	if err := b.c.do(ctx, "POST", fmt.Sprintf("/v1/runs/%s/sessions/%s/prompts/%s/replace", b.runID, sessionID, turnKey), req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// DiscardPrompt discards a queued prompt that has not yet been released.
+func (b *ControllerBridge) DiscardPrompt(ctx context.Context, opID, sessionID, turnKey string, expectedVersion int64) (*service.DiscardPromptResponse, error) {
+	req := service.DiscardPromptRequest{
+		OpID:            opID,
+		ControllerLease: b.lease,
+		ExpectedVersion: expectedVersion,
+	}
+	var resp service.DiscardPromptResponse
+	if err := b.c.do(ctx, "POST", fmt.Sprintf("/v1/runs/%s/sessions/%s/prompts/%s/discard", b.runID, sessionID, turnKey), req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// CancelTurn requests cancellation of an active turn.
+func (b *ControllerBridge) CancelTurn(ctx context.Context, opID, sessionID, turnKey, reason string, expectedVersion int64) (*service.CancelResponse, error) {
+	req := service.CancelRequest{
+		OpID:            opID,
+		ControllerLease: b.lease,
+		ExpectedVersion: expectedVersion,
+		Reason:          reason,
+	}
+	var resp service.CancelResponse
+	if err := b.c.do(ctx, "POST", fmt.Sprintf("/v1/runs/%s/sessions/%s/turns/%s/cancel", b.runID, sessionID, turnKey), req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// RecordDecision records a controller decision for the bridge's run.
+func (b *ControllerBridge) RecordDecision(ctx context.Context, opID, artifactID string, revision int64, decisionPayload string) (*service.RecordDecisionResponse, error) {
+	req := service.RecordDecisionRequest{
+		OpID:            opID,
+		ControllerLease: b.lease,
+		ArtifactID:      artifactID,
+		Revision:        revision,
+		DecisionPayload: decisionPayload,
+	}
+	var resp service.RecordDecisionResponse
+	if err := b.c.do(ctx, "POST", fmt.Sprintf("/v1/runs/%s/decisions", b.runID), req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // GetTurnDetails retrieves authoritative turn state in the bridge's run.
 func (b *ControllerBridge) GetTurnDetails(ctx context.Context, sessionID, turnKey string) (*storage.TurnDetails, error) {
 	return b.c.GetTurnDetails(ctx, b.runID, sessionID, turnKey)
 }
 
-// Connect attaches the bridge's controller to the service instance.
-func (b *ControllerBridge) Connect(ctx context.Context, opID string, expectedGeneration uint64) (*service.ControllerConnectRunResponse, error) {
-	return b.c.ConnectRunController(ctx, b.runID, opID, b.lease, expectedGeneration)
+// SubscribeEvents opens the SSE event stream for a turn. The caller is
+// responsible for closing resp.Body when done. The controller lease is not
+// required for read-only SSE subscription; the bridge issues the request
+// with the operator transport credential (held internally).
+func (b *ControllerBridge) SubscribeEvents(ctx context.Context, sessionID, turnKey string) (*http.Response, error) {
+	return b.c.SubscribeEvents(ctx, b.runID, sessionID, turnKey)
 }
 
-// Disconnect ends the bridge controller's current attachment episode.
-func (b *ControllerBridge) Disconnect(ctx context.Context, opID string, expectedGeneration uint64) error {
-	rec, err := b.c.GetControllerRecord(ctx, b.runID)
+// Connect attaches the bridge's controller to the service instance and
+// retains the episode's attachment ID for use by Disconnect.
+func (b *ControllerBridge) Connect(ctx context.Context, opID string, expectedGeneration uint64) (*service.ControllerConnectRunResponse, error) {
+	resp, err := b.c.ConnectRunController(ctx, b.runID, opID, b.lease, expectedGeneration)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	// Retain this bridge's own episode so Disconnect submits the exact
+	// attachment it established, not whichever episode is current at
+	// disconnect time.
+	b.attachmentID = resp.Receipt.AttachmentID
+	return resp, nil
+}
+
+// Disconnect ends the bridge controller's own attachment episode.
+// It uses the attachment ID returned by Connect — not the current record —
+// so a later bridge instance reconnecting under the same lease cannot be
+// disconnected by an older bridge calling Disconnect.
+func (b *ControllerBridge) Disconnect(ctx context.Context, opID string, expectedGeneration uint64) error {
 	req := service.ControllerDisconnectRunRequest{
 		OpID:               opID,
 		ControllerLease:    b.lease,
 		ExpectedGeneration: expectedGeneration,
-		AttachmentID:       rec.AttachmentID,
+		AttachmentID:       b.attachmentID,
 	}
 	var resp service.ControllerDisconnectRunResponse
 	return b.c.do(ctx, "POST", fmt.Sprintf("/v1/runs/%s/controller/disconnect", b.runID), req, &resp)
