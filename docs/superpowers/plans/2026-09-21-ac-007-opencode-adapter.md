@@ -34,9 +34,10 @@
 ### Task 1: Executor `GeneratedServerEnv` + Probe Launch Template
 
 **Files:**
-- Modify: `internal/adapter/execpolicy/executor.go` (add `GeneratedServerEnv *GeneratedServerEnv` to `LaunchRequest`; add `ProbeLaunchTemplate` type)
+- Modify: `internal/adapter/execpolicy/executor.go` (add `GeneratedServerEnv *GeneratedServerEnv` to `LaunchRequest`)
 - Create: `internal/adapter/execpolicy/generated_env.go`
 - Test: `internal/adapter/execpolicy/generated_env_test.go`
+- Create (Task 2, not here): `internal/adapter/opencode/probe_template.go` — operator-owned `ProbeLaunchTemplate` builder (OpenCode-specific; stays out of execpolicy)
 
 **Interfaces:**
 - `type GeneratedServerEnv struct { Username, Password string }` — expanded verbatim to `OPENCODE_SERVER_USERNAME=<Username>` / `OPENCODE_SERVER_PASSWORD=<Password>` after allowlist/scrub; rejected if either key collides with an inherited/allowlisted key; rejected on non-`opencode serve` launches.
@@ -46,8 +47,7 @@
 
 - [ ] **1.1 Failing tests:** GeneratedServerEnv expands to exactly the two keys; rejected when the launch command is not `opencode serve` shape; rejected when either key collides with an inherited/allowlisted key; accepted and injected after allowlist/scrub for a valid `opencode serve` launch.
 - [ ] **1.2 Implement** `GeneratedServerEnv` handling in `executor.Start` env construction (step 7: inject after allowlist construction, before proxy env).
-- [ ] **1.3 Define** `ProbeLaunchTemplate` type (no behavior yet; consumed in Task 2).
-- [ ] **1.4 Suite + race; commit** `feat(execpolicy): GeneratedServerEnv and probe launch template`.
+- [ ] **1.3 Suite + race; commit** `feat(execpolicy): GeneratedServerEnv for opencode serve launches`.
 
 ### Task 2: OpenCodeServer Lifecycle
 
@@ -62,7 +62,7 @@
 - `type OpenCodeServer struct { … }` — one per contributor session.
   - `Start(ctx) (endpoint string, err error)` — PolicyExecutor.Start with the verified launch shape (command `opencode`, args `serve --hostname 127.0.0.1 --port 0`, cwd = workspace root, GeneratedServerEnv); parse endpoint from startup output; wait for `/api/health`.
   - `Endpoint() string`, `PID() int`, `Close(ctx) error` (graceful dispose → terminate split, pipes drained, exit evidence).
-- `Probe(ctx, tpl execpolicy.ProbeLaunchTemplate) (ProbeResult, error)` — scratch dir; start probe serve; call `/api/health` + `/api/model`; terminate; return {ServerVersion, Models, Capabilities}.
+- `Probe(ctx) (ProbeResult, error)` — uses the injected operator-owned `ProbeLaunchTemplate` (defined in `internal/adapter/opencode`); scratch dir; start probe serve; call `/api/health` + `/api/model`; terminate; return {ServerVersion, Models, Capabilities}.
 - Park lifecycle: adapter stops the server after IdleGrace when parked.
 
 **Steps:**
