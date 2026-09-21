@@ -1,3 +1,6 @@
+//go:build !windows
+
+// POSIX enforcement evidence only: workspace fixtures use git (CRLF/autocrlf-dependent content assertions) and POSIX directory permission enforcement. Windows read-only enforcement requires an ACL model and is separate work.
 package workspace_test
 
 import (

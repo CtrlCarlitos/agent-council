@@ -1,3 +1,6 @@
+//go:build !windows
+
+// POSIX enforcement evidence only: the proxy injects and verifies environment through POSIX child shells; Windows process enforcement is fail-closed by design.
 package execpolicy_test
 
 import (

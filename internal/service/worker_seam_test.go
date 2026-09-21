@@ -1,3 +1,6 @@
+//go:build !windows
+
+// POSIX enforcement evidence only: service lifetime management (flock + unix domain sockets) is deliberately unsupported on native Windows.
 package service_test
 
 import (
