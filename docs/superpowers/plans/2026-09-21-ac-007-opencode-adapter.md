@@ -26,8 +26,8 @@
 - All enforcement evidence POSIX-scoped (//go:build !windows); windows/darwin vet+compile must stay green.
 
 ## Verification Gates
-- **Gate 1 (after Tasks 1–3):** server lifecycle via PolicyExecutor (launch shape validation, GeneratedServerEnv, scratch-dir probe lifecycle, park/resume replacement); typed HTTP client against the fake server; deterministic digest; dispatch reservation. Full suites + race ×3.
-- **Gate 2 (after Tasks 4–6):** full adapter contract against the fake server (create/resume/dispatch/observe/collect/cancel/reconcile per semantics); permission deny-all with event mirroring; event pump tap/detach; acceptance story through the bridge; integration script (manual, sanitized) documented. Full suites + race ×3 + cross-platform CI.
+- **Gate 1 (after Tasks 1–3):** executor GeneratedServerEnv + probe template validation; server lifecycle via PolicyExecutor (launch shape, park/resume replacement); typed HTTP client against the fake server; deterministic digest. Covers executor, lifecycle, client, and digest evidence only. Full suites + race ×3.
+- **Gate 2 (after Tasks 6–7):** adapter contract + event pump (Task 5), service wiring (Task 6), acceptance story + matrix (Task 7). Full suites + race ×3 + cross-platform CI.
 
 ---
 
@@ -40,7 +40,7 @@
 
 **Interfaces:**
 - `type GeneratedServerEnv struct { Username, Password string }` — expanded verbatim to `OPENCODE_SERVER_USERNAME=<Username>` / `OPENCODE_SERVER_PASSWORD=<Password>` after allowlist/scrub; rejected if either key collides with an inherited/allowlisted key; rejected on non-`opencode serve` launches.
-- `type ProbeLaunchTemplate struct { VersionArgs []string; ServeArgs []string; WorkingDir string }` — operator-owned template consumed by the OpenCode adapter's Probe (Task 2); the adapter never synthesizes a permissive profile.
+- `type ProbeLaunchTemplate interface { VersionLaunch(ctx) (LaunchRequest, error); ProbeServeLaunch(ctx, scratchDir string) (LaunchRequest, error) }` — operator-owned builder producing **fully validated `LaunchRequest` values** (command, args, Paths, Profile, RunID, SessionID) for the version check and the probe-server launch. The adapter only appends `GeneratedServerEnv` to the probe-server request; it never synthesizes Paths, Profile, or identifiers internally.
 
 **Steps:**
 
@@ -57,7 +57,7 @@
 - Test: `internal/adapter/opencode/server_test.go`
 
 **Interfaces:**
-- `type ServerConfig struct { WorkspaceRoot, StateDir string; Executor execpolicy.PolicyExecutor; ProbeTemplate execpolicy.ProbeLaunchTemplate; Identity DispatchIdentitySource; IdleGrace time.Duration }`
+- `type ServerConfig struct { WorkspaceRoot string; Executor execpolicy.PolicyExecutor; ProbeTemplate execpolicy.ProbeLaunchTemplate; Identity DispatchIdentitySource; IdleGrace time.Duration }` — no StateDir: the adapter must not gain access to Council state storage for process lifecycle management.
 - `type OpenCodeServer struct { … }` — one per contributor session.
   - `Start(ctx) (endpoint string, err error)` — PolicyExecutor.Start with the verified launch shape (command `opencode`, args `serve --hostname 127.0.0.1 --port 0`, cwd = workspace root, GeneratedServerEnv); parse endpoint from startup output; wait for `/api/health`.
   - `Endpoint() string`, `PID() int`, `Close(ctx) error` (graceful dispose → terminate split, pipes drained, exit evidence).
@@ -91,46 +91,50 @@
 - [ ] **3.4 Implement** client.
 - [ ] **3.5 Suite + race; commit** `feat(adapter/opencode): typed client, digest, identity seam`.
 
-### Task 4: AC-006 Adapter Contract (dispatch/observe/collect/cancel/reconcile)
-
-**Files:**
-- Create: `internal/adapter/opencode/adapter.go`
-- Test: `internal/adapter/opencode/adapter_test.go`
-
-**Interfaces:**
-- `OpenCodeAdapter` implements `adapter.Adapter` over `OpenCodeServer` + `client` + `DispatchIdentitySource` + `EventPump`.
-- Dispatch: resolve attempt via identity seam (missing ⇒ DispatchRejected); reserve (per-native-session single-flight); baseline cursor; PromptAsync with deterministic messageID; classify per evidence boundary; publish on success; release reservation on failure.
-- Observe: tap the event pump's per-turn buffer.
-- Collect: poll assistant message with parentID == deterministic user-message ID; extract text/usage/completed-at; ResultUnavailable while pending.
-- Cancel: Abort endpoint; verify; map to Confirmed/AlreadyTerminal/Unknown.
-- Reconcile: evidence rules per spec §3.5 with parentID correlation.
-- Probe: scratch-server capability check per §3.2.1 (uses injected ProbeLaunchTemplate).
-
-**Steps:**
-
-- [ ] **4.1 Failing contract tests** against the fake server: create (fresh session, model preset, project = workspace); resume (exact 200 / 404 ⇒ ErrNativeSessionMissing); dispatch accepted (messageID deterministic); dispatch rejected (never-written); dispatch unknown (post-write timeout); concurrent duplicate dispatch (single launch); retry rules (GET-by-ID first; never resubmit after unknown); observe via event pump tap (caller detach doesn't close native stream); collect (parentID correlation, usage extraction, pending ⇒ unavailable); cancel (abort → confirmed); reconcile three-state (live/finished/unrecorded).
-- [ ] **4.2 Implement** adapter + event pump.
-- [ ] **4.3 Race + full suite; commit** `feat(adapter/opencode): AC-006 contract implementation`.
-
-### Task 5: Fake Server (CI evidence)
+### Task 4: Fake OpenCode Server (CI evidence)
 
 **Files:**
 - Create: `internal/adapter/opencode/opencodefake_test.go`
 
+Cross-platform: runs on every OS (pure `httptest` + net/http).
+
 **Steps:**
 
-- [ ] **5.1 Implement** `httptest` fake server: `POST /session` (rejects mismatched directory context), `GET /session/{id}` (404 for unknown), `POST /session/{id}/prompt_async` (accepts messageID, creates user message, scripts async events + assistant message with parentID), `GET /session/{id}/message` + `/{messageID}`, `POST /session/{id}/abort`, `GET /session/{id}/event` (SSE), `GET /api/health`, `GET /api/model`, permission request/reply endpoints. Scripted delays for event-pump and timeout tests.
-- [ ] **5.2 Gate 1:** full suites + race ×3 on `internal/adapter/opencode` + `internal/adapter/execpolicy`. Commit (if not already committed with Task 4).
+- [ ] **4.1 Implement** the fake server: `POST /session` (rejects mismatched directory context), `GET /session/{id}` (200/404), `POST /session/{id}/prompt_async` (accepts messageID, creates user message, scripts async events + assistant message with `parentID == messageID`), `GET /session/{id}/message` + `GET /session/{id}/message/{messageID}`, `POST /session/{id}/abort`, `GET /session/{id}/event` (SSE with scripted event sequence and delay control), `GET /api/health`, `GET /api/model`, permission request/reply endpoints.
+- [ ] **4.2 Gate 1:** full suites + race ×3 on `internal/adapter/opencode` (Tasks 1–3 + fake server). Commit.
+
+### Task 5: AC-006 Adapter Contract (dispatch/observe/collect/cancel/reconcile) + Event Pump
+
+**Files:**
+- Create: `internal/adapter/opencode/adapter.go`
+- Create: `internal/adapter/opencode/eventpump.go`
+- Test: `internal/adapter/opencode/adapter_test.go`
+- Test: `internal/adapter/opencode/eventpump_test.go`
+
+Cross-platform: runs on every OS (HTTP + fake server; no POSIX process/permission dependency).
+
+**Interfaces:**
+- `OpenCodeAdapter` implements `adapter.Adapter` over `OpenCodeServer` + `client` + `DispatchIdentitySource` + `EventPump`.
+- Dispatch: resolve attempt via identity seam; reserve (per-native-session single-flight); record baseline cursor; PromptAsync with deterministic messageID; classify per evidence boundary; publish on success; release reservation on failure.
+- EventPump: adapter-owned per-session SSE drain; per-TurnRef bounded buffers; cursor-based dedup/resync; caller-detach never closes the native stream.
+- Collect: poll assistant message with parentID == deterministic user-message ID.
+- Reconcile: evidence rules per spec §3.5 with parentID correlation.
+
+**Steps:**
+
+- [ ] **5.1 Failing contract tests** against the fake server (cross-platform): create (fresh session, model preset); resume (200 / 404 ⇒ ErrNativeSessionMissing); dispatch accepted (deterministic messageID); dispatch rejected (never-written); dispatch unknown (post-write timeout); concurrent duplicate dispatch (single launch); retry rules (GET-by-ID first; never resubmit after unknown); observe via event pump tap (caller detach doesn't close native stream); collect (parentID correlation, usage, pending ⇒ unavailable); cancel (abort → confirmed); reconcile three-state (live/finished/unrecorded ⇒ uncertain).
+- [ ] **5.2 Implement** adapter + event pump.
+- [ ] **5.3 Race + full suite; commit** `feat(adapter/opencode): AC-006 contract implementation`.
 
 ### Task 6: Service Wiring + Restricted Bridge Extension
 
 **Files:**
-- Modify: `internal/service` (adapter registry / construction site: wire OpenCodeAdapter with DispatchIdentitySource backed by storage dispatch_intents, ProbeLaunchTemplate from operator config)
+- Modify: `internal/service` (adapter construction: wire OpenCodeAdapter with DispatchIdentitySource backed by storage dispatch_intents, ProbeLaunchTemplate from operator config)
 - Test: `internal/service/review_ac007_wiring_test.go`
 
 **Steps:**
 
-- [ ] **6.1 Failing wiring test:** the service constructs an OpenCodeAdapter with a DispatchIdentitySource backed by the real store, and the probe template is operator-owned (not synthesized).
+- [ ] **6.1 Failing wiring test:** the service constructs an OpenCodeAdapter with a DispatchIdentitySource backed by the real store; the probe template is operator-owned (not synthesized).
 - [ ] **6.2 Implement** wiring.
 - [ ] **6.3 Commit** `feat(service): wire OpenCode adapter construction`.
 
@@ -138,27 +142,29 @@
 
 **Files:**
 - Create: `internal/adapter/opencode/acceptance_test.go`
-- Create: `scripts/ac007-integration-evidence.sh` (manual, sanitized; documented as not required in CI)
+- Create: `scripts/ac007-integration-evidence.sh` (manual, sanitized; operator-invoked; explicitly excluded from CI)
 - Modify: PR body
 
 **Steps:**
 
-- [ ] **7.1 Primary acceptance story** through the bridge + fake server: adopt (secret once) → bridge connect → queue → bridge release → gated execution → collect → disconnect → park → resume replacement server → B connect → B collect. Four harness rotations where applicable.
+- [ ] **7.1 Primary acceptance story** through the bridge + fake server: adopt (secret once) → bridge connect → bridge queue → bridge release → gated execution → collect (parentID correlation) → bridge disconnect → park → resume replacement server → replacement connect → bridge collect → bridge release follow-up. Durable-outcome assertions throughout.
 - [ ] **7.2 Matrix verification** against spec §10: every row maps to a committed test.
-- [ ] **7.3 Integration evidence script** (manual; sanitized; labeled as real-installation): start a real `opencode serve`, adopt a controller via HTTP, create/resume a session, submit a trivial prompt with a free model, capture sanitized transcripts, abort, reconcile. Explicitly excluded from CI.
-- [ ] **7.4 Full verification:** gofmt/vet/CGO_ENABLED=0/race ×3/cross-platform compile.
+- [ ] **7.3 Integration evidence script** (manual; sanitized; **operator-invoked and optional** — the script does not automatically select or invoke any model, including free-tier models; the operator explicitly chooses and runs the provider/model step). Explicitly excluded from CI.
+- [ ] **7.4 Full verification:** gofmt/vet/CGO_ENABLED=0/race ×3; windows/darwin vet+compile; POSIX-process tests scoped //go:build !windows (signal/shell/permission fixtures only — digest, HTTP client, fake server, dispatch reservation, parentID correlation, reconciliation, and event-pump tests run on every platform).
 - [ ] **7.5 Gate 2:** push, CI green, PR body evidence map, request review.
 
 ## Self-Review: Invariant → Interface → Assertion
 
 | Invariant | Interface | Assertion |
 |---|---|---|
-| Server launch through PolicyExecutor; never os/exec | `OpenCodeServer.Start` uses `executor.Start` | server_test: fake executor records the launch request shape |
-| GeneratedServerEnv: narrow, validated, redacted | executor env construction + launch-shape validation | generated_env_test: expansion, collision rejection, non-serve rejection |
-| Probe: scratch server, no session/workspace needed, provider-free | `Probe(ctx, tpl)` on scratch dir; template from operator config | server_test: probe uses scratch, calls only health+model, terminates |
-| Digest: deterministic, unambiguous, NUL-rejected, collision-resistant | `NativeMessageID` | digest_test: distinct tuples distinct, NUL rejected, prefix+length |
-| Single launch under concurrency | `launchReservation` per-turn ready channel | review_gate2_test pattern applied to OpenCodeAdapter |
-| Reconcile: verifiable state only | evidence rules per spec §3.5 with parentID correlation | adapter_test: live/finished/unrecorded three-state |
+| Server launch through PolicyExecutor; never os/exec | `OpenCodeServer.Start` uses `executor.Start` with a fully validated `LaunchRequest` from the probe template | server_test: fake executor records the launch request shape; Task 1 generated_env_test validates the template produces complete LaunchRequests |
+| GeneratedServerEnv: narrow, validated, shape-checked, redacted | executor env construction + launch-shape validation (`opencode serve` shape required) | Task 1: expansion to exactly two keys, collision rejection, non-serve launch rejection |
+| Probe: scratch server via template, no session/workspace needed, provider-free | `Probe(ctx)` + operator-owned `ProbeLaunchTemplate` builder | server_test: probe uses scratch dir from the template, calls only health+model, terminates before return |
+| Digest: deterministic, unambiguous length-prefixed encoding, NUL-rejected, collision-resistant | `NativeMessageID` | digest_test: distinct tuples distinct, NUL rejected, prefix+length |
+| Single launch under concurrency; failed launch releases reservation | per-native-session launching map + ready channel | adapter_test (Task 5, cross-platform): concurrent callers → one invocation; failure releases reservation |
+| Reconcile: verifiable state only, uncertainty for unrecorded turns | evidence rules per spec §3.5 | adapter_test (cross-platform): live → reachable-active; finished → uncertain; unrecorded → uncertain |
+| Collect/Reconcile correlate via parentID | assistant message selected by parentID == deterministic user-message ID | adapter_test (cross-platform): parentID match required; latest-message-only rejected |
 | Permission deny-all | permission responder in event pump | adapter_test: request → deny reply + tool-denied event |
 | No secrets in views/logs | redaction in record/response/captured output | admin_test pattern: no known-secret substring |
-| ParentID correlation in Collect and Reconcile | `resolveAssistantByParentID` | adapter_test: parentID match required; latest-message-only rejected |
+| Dispatch identity via trusted seam (no storage reads, no invented attempt) | `DispatchIdentitySource` wired by the service | wiring_test (Task 6): service constructs adapter with real-store-backed seam |
+| POSIX-only tests scoped; core tests cross-platform | //go:build !windows on signal/shell/permission fixture files only | CI: digest/client/fake-server/dispatch/parentID/reconcile/event-pump tests run on all three platforms |
