@@ -41,6 +41,10 @@ type LaunchRequest struct {
 	ExtraEnvAllowlist []string
 	Paths             workspace.WorkspacePaths
 	Profile           storage.CanonicalProfile
+	// GeneratedServerEnv carries Council-generated transport credentials for
+	// an `opencode serve` child. The executor accepts it only on that exact
+	// launch shape and injects it after the scrub pass.
+	GeneratedServerEnv *GeneratedServerEnv
 }
 
 // CapabilityChecker verifies whether the host environment supports required isolation capabilities.
@@ -190,6 +194,14 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 		}
 	}
 
+	// 5b. Validate GeneratedServerEnv shape and key collisions
+	if err := validateGeneratedServerEnvShape(req); err != nil {
+		return nil, err
+	}
+	if err := validateGeneratedServerEnvCollisions(req, profileAllowedEnv); err != nil {
+		return nil, err
+	}
+
 	// 6. Check isolation capabilities
 	if req.Profile.IsolationStrictness == "strict" {
 		if err := e.capabilityChecker(ctx, req); err != nil {
@@ -280,6 +292,11 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 		}
 		scrubbedEnv = append(scrubbedEnv, entry)
 	}
+
+	// Inject Council-generated server credentials after the scrub pass so
+	// the secret filter cannot strip them (Gate-spec: these are Council-
+	// generated transport credentials, not inherited secrets).
+	scrubbedEnv = appendGeneratedServerEnv(scrubbedEnv, req)
 
 	cmd := exec.CommandContext(ctx, req.Command, req.Args...)
 	cmd.Dir = req.Paths.Root
