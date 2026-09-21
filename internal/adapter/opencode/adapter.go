@@ -1,5 +1,3 @@
-//go:build !windows
-
 package opencode
 
 import (
@@ -48,12 +46,11 @@ type OpenCodeAdapter struct {
 	probeTemplate ProbeLaunchTemplate
 	identity      DispatchIdentitySource
 	idleGrace     time.Duration
+	servers       *serverManager
 
 	mu         sync.Mutex
-	servers    map[string]*serverProcess
 	dispatches map[adapter.TurnRef]*managedDispatch
 	launching  map[adapter.TurnRef]*launchReservation
-	inflight   map[string]chan struct{}
 }
 
 // OpenCodeAdapterOption configures an OpenCodeAdapter.
@@ -76,15 +73,80 @@ func NewOpenCodeAdapter(
 		probeTemplate: probeTemplate,
 		identity:      identity,
 		idleGrace:     30 * time.Second,
-		servers:       make(map[string]*serverProcess),
+		servers:       newServerManager(executor, nil), // wired in SetSessionLaunchSource
 		dispatches:    make(map[adapter.TurnRef]*managedDispatch),
 		launching:     make(map[adapter.TurnRef]*launchReservation),
-		inflight:      make(map[string]chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(a)
 	}
 	return a
+}
+
+// authenticatedRequest builds an HTTP request with server basic-auth
+// credentials.
+func (a *OpenCodeAdapter) authenticatedRequest(ctx context.Context, method, url string, body string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, strings.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// Server credentials come from the serve child's GeneratedServerEnv;
+	// they were set on the process env and must be presented on each HTTP
+	// call. The adapter stores them per session in the server manager.
+	return req, nil
+}
+
+// dispatchToServer submits a prompt to the native server.
+func (a *OpenCodeAdapter) dispatchToServer(ctx context.Context, sessionID, msgID, prompt string) error {
+	sp, err := a.servers.child(sessionID)
+	if err != nil {
+		return err
+	}
+	payload := map[string]any{
+		"messageID": msgID,
+		"parts":     []map[string]string{{"type": "text", "text": prompt}},
+	}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		fmt.Sprintf("%s/session/%s/prompt_async", sp.endpoint, sessionID), strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(sp.username, sp.password)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("prompt_async returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// serverGet performs an authenticated GET and decodes the response.
+func (a *OpenCodeAdapter) serverGet(ctx context.Context, sessionID, path string, dst any) error {
+	sp, err := a.servers.child(sessionID)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", sp.endpoint+path, nil)
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(sp.username, sp.password)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET %s returned %d", path, resp.StatusCode)
+	}
+	return json.NewDecoder(resp.Body).Decode(dst)
 }
 
 // ── Dispatch ────────────────────────────────────────────────────────────
@@ -210,10 +272,15 @@ func (a *OpenCodeAdapter) ResumeSession(ctx context.Context, binding adapter.Ses
 // ── Internal helpers ────────────────────────────────────────────────────
 
 func (a *OpenCodeAdapter) endpointFor(sessionID adapter.SessionID) (string, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if sp, ok := a.servers[string(sessionID)]; ok {
-		return sp.endpoint, nil
+	sp, err := a.servers.child(string(sessionID))
+	if err != nil {
+		return "", err
 	}
-	return "", fmt.Errorf("no server for session %s", sessionID)
+	return sp.endpoint, nil
+}
+
+// SetSessionLaunchSource wires the service-owned launch authority. Must be
+// called before any session operation.
+func (a *OpenCodeAdapter) SetSessionLaunchSource(src SessionLaunchSource) {
+	a.servers.launch = src
 }

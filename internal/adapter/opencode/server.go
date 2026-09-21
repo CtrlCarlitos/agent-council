@@ -1,5 +1,3 @@
-//go:build !windows
-
 package opencode
 
 import (
@@ -32,6 +30,8 @@ type serverProcess struct {
 	proc      execpolicy.ManagedProcess
 	endpoint  string
 	workspace string
+	username  string
+	password  string
 	startedAt time.Time
 }
 
@@ -46,6 +46,7 @@ type serverManager struct {
 	executor execpolicy.PolicyExecutor
 	launch   SessionLaunchSource
 	children map[string]*serverProcess // native session ID → child
+	starting map[string]chan struct{}  // session ID → in-flight launch
 }
 
 func newServerManager(executor execpolicy.PolicyExecutor, launch SessionLaunchSource) *serverManager {
@@ -53,6 +54,7 @@ func newServerManager(executor execpolicy.PolicyExecutor, launch SessionLaunchSo
 		executor: executor,
 		launch:   launch,
 		children: make(map[string]*serverProcess),
+		starting: make(map[string]chan struct{}),
 	}
 }
 
@@ -69,7 +71,26 @@ func (m *serverManager) start(ctx context.Context, sessionID adapter.SessionID) 
 		m.mu.Unlock()
 		return existing, nil
 	}
+	if launching, ok := m.starting[string(sessionID)]; ok {
+		m.mu.Unlock()
+		<-launching // wait for the in-flight launch to complete
+		m.mu.Lock()
+		sp, ok := m.children[string(sessionID)]
+		m.mu.Unlock()
+		if !ok {
+			return nil, fmt.Errorf("server launch for %s failed", sessionID)
+		}
+		return sp, nil
+	}
+	launchDone := make(chan struct{})
+	m.starting[string(sessionID)] = launchDone
 	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.starting, string(sessionID))
+		m.mu.Unlock()
+		close(launchDone)
+	}()
 
 	launchReq, err := m.launch.OpenCodeServeLaunch(ctx, sessionID)
 	if err != nil {
@@ -150,6 +171,17 @@ func (m *serverManager) stopAll(ctx context.Context) {
 	}
 }
 
+// child returns the server process for a session.
+func (m *serverManager) child(sessionID string) (*serverProcess, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sp, ok := m.children[sessionID]
+	if !ok {
+		return nil, fmt.Errorf("no serve child for session %s", sessionID)
+	}
+	return sp, nil
+}
+
 // endpoint returns the HTTP endpoint for a session's serve child.
 func (m *serverManager) endpoint(sessionID adapter.SessionID) (string, error) {
 	m.mu.Lock()
@@ -177,21 +209,23 @@ func (m *serverManager) waitForHealthy(ctx context.Context, proc execpolicy.Mana
 	deadline := time.After(timeout)
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
+	healthyOnce := false
 	for {
 		out := buf.string()
 		ep := scanEndpoint(out)
-		if ep != "" {
-			if healthy := m.checkHealth(ctx, ep); healthy {
+		if ep != "" && !healthyOnce {
+			if m.checkHealth(ctx, ep) {
+				healthyOnce = true
 				return ep, nil
 			}
 		}
 		select {
 		case <-done:
 			// Child exited; check one last time.
-			if ep := scanEndpoint(buf.string()); ep != "" {
-				return ep, nil
+			if ep := scanEndpoint(buf.string()); ep != "" && !healthyOnce {
+				return "", fmt.Errorf("opencode serve exited before printing a healthy endpoint")
 			}
-			return "", fmt.Errorf("opencode serve exited before printing its endpoint")
+			return "", fmt.Errorf("opencode serve exited before becoming healthy")
 		case <-deadline:
 			return "", fmt.Errorf("opencode serve did not become healthy in %v", timeout)
 		case <-ticker.C:
