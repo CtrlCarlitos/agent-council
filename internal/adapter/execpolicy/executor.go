@@ -374,7 +374,7 @@ func validateGitCommand(req LaunchRequest, runID string) error {
 					return fmt.Errorf("%w: git %s to %s is disallowed", ErrDisallowedCommand, arg, opt)
 				}
 				if assignedBranch != "" && !strings.HasPrefix(opt, "-") && opt != "." && opt != assignedBranch && opt != altAssignedBranch {
-					return fmt.Errorf("%w: git %s outside assigned branch %s is disallowed", ErrDisallowedCommand, arg, assignedBranch)
+					return fmt.Errorf("%w: git %s outside assigned branch %s is disallowed (use 'git checkout -- <path>' for files)", ErrDisallowedCommand, arg, assignedBranch)
 				}
 			}
 		case "branch":

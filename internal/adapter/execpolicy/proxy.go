@@ -392,11 +392,11 @@ func (p *NetworkProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 
 		go func() {
-			_, _ = io.Copy(destConn, clientConn)
+			copyWithIdleTimeout(destConn, clientConn, 5*time.Minute)
 			_ = destConn.Close()
 			_ = clientConn.Close()
 		}()
-		_, _ = io.Copy(clientConn, destConn)
+		copyWithIdleTimeout(clientConn, destConn, 5*time.Minute)
 		_ = destConn.Close()
 		_ = clientConn.Close()
 		return
@@ -429,6 +429,16 @@ func (p *NetworkProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	resp.Header.Del("Proxy-Connection")
+	resp.Header.Del("Connection")
+	resp.Header.Del("Keep-Alive")
+	resp.Header.Del("Proxy-Authenticate")
+	resp.Header.Del("Proxy-Authorization")
+	resp.Header.Del("Te")
+	resp.Header.Del("Trailer")
+	resp.Header.Del("Transfer-Encoding")
+	resp.Header.Del("Upgrade")
+
 	for k, vv := range resp.Header {
 		for _, v := range vv {
 			w.Header().Add(k, v)
@@ -436,4 +446,31 @@ func (p *NetworkProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func copyWithIdleTimeout(dst, src net.Conn, timeout time.Duration) {
+	buf := make([]byte, 32*1024)
+	for {
+		src.SetReadDeadline(time.Now().Add(timeout))
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			dst.SetWriteDeadline(time.Now().Add(timeout))
+			nw, ew := dst.Write(buf[0:nr])
+			if nw < 0 || nr < nw {
+				nw = 0
+				if ew == nil {
+					ew = errors.New("short write")
+				}
+			}
+			if ew != nil {
+				return
+			}
+			if nr != nw {
+				return
+			}
+		}
+		if er != nil {
+			return
+		}
+	}
 }

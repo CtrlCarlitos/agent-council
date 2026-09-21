@@ -199,6 +199,10 @@ func ParseCanonicalProfileJSON(data []byte) (CanonicalProfile, error) {
 		return CanonicalProfile{}, fmt.Errorf("decode canonical profile json: %w", err)
 	}
 
+	if dec.More() {
+		return CanonicalProfile{}, errors.New("trailing characters after profile json")
+	}
+
 	if prof.AlgoVersion != "cprof-v1" {
 		return CanonicalProfile{}, fmt.Errorf("unsupported profile algo_version: %q (expected %q)", prof.AlgoVersion, "cprof-v1")
 	}

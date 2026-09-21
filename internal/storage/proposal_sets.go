@@ -54,7 +54,11 @@ func (s *Store) ReleaseArtifacts(ctx context.Context, opID string, callerLease s
 	}
 
 	// Validate members for duplicate or malformed references
-	seen := make(map[string]bool, len(members))
+	type memberKey struct {
+		id  string
+		rev int64
+	}
+	seen := make(map[memberKey]bool, len(members))
 	for _, m := range members {
 		if strings.TrimSpace(m.ArtifactID) == "" {
 			return ProposalSetReceipt{}, errors.New("empty artifact id in member reference")
@@ -65,7 +69,7 @@ func (s *Store) ReleaseArtifacts(ctx context.Context, opID string, callerLease s
 		if strings.TrimSpace(m.Digest) == "" {
 			return ProposalSetReceipt{}, errors.New("empty digest in member reference")
 		}
-		key := fmt.Sprintf("%s:%d", m.ArtifactID, m.Revision)
+		key := memberKey{id: m.ArtifactID, rev: m.Revision}
 		if seen[key] {
 			return ProposalSetReceipt{}, errors.New("duplicate proposal member")
 		}
@@ -154,7 +158,7 @@ WHERE op_id = ?;`, opID).Scan(&storedCmdType, &storedFingerprint, &payloadJSON)
 		}
 		var ajp releaseArtifactsJournalPayload
 		if err := json.Unmarshal([]byte(payloadJSON), &ajp); err != nil || ajp.Receipt.ProposalSetDigest == "" {
-			return ProposalSetReceipt{}, fmt.Errorf("grant operation %s has an unreadable committed receipt", opID)
+			return ProposalSetReceipt{}, fmt.Errorf("release artifacts operation %s has an unreadable committed receipt", opID)
 		}
 		return ajp.Receipt, nil
 	} else if err != sql.ErrNoRows {

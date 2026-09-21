@@ -110,13 +110,30 @@ func NewWorkspaceManager(stateDir, workspaceBaseDir string) (*WorkspaceManager, 
 }
 
 // AllocateWorkspace allocates session directories under $WORKSPACE_BASE_DIR/{run_id}/{session_id}.
-func (m *WorkspaceManager) AllocateWorkspace(runID, sessionID, mode, sourceRepo, commit string) (WorkspacePaths, error) {
+func (m *WorkspaceManager) AllocateWorkspace(runID, sessionID, mode, sourceRepo, commit string) (paths WorkspacePaths, err error) {
 	if err := ValidateIdentifier(runID); err != nil {
 		return WorkspacePaths{}, err
 	}
 	if err := ValidateIdentifier(sessionID); err != nil {
 		return WorkspacePaths{}, err
 	}
+
+	key := sessionKey(runID, sessionID)
+	m.mu.Lock()
+	if _, exists := m.sessions[key]; exists {
+		m.mu.Unlock()
+		return WorkspacePaths{}, fmt.Errorf("session %s/%s is already allocated", runID, sessionID)
+	}
+	m.sessions[key] = &allocatedSession{} // placeholder
+	m.mu.Unlock()
+
+	defer func() {
+		if err != nil {
+			m.mu.Lock()
+			delete(m.sessions, key)
+			m.mu.Unlock()
+		}
+	}()
 
 	// Validate mode early
 	switch mode {
@@ -162,7 +179,6 @@ func (m *WorkspaceManager) AllocateWorkspace(runID, sessionID, mode, sourceRepo,
 		return WorkspacePaths{}, fmt.Errorf("failed creating config directory: %w", err)
 	}
 
-	var paths WorkspacePaths
 	var branch string
 
 	switch mode {
@@ -330,9 +346,14 @@ func nearestExistingAncestor(path string) string {
 }
 
 func isStrictSubdirectory(base, target string) bool {
-	cleanBase := filepath.Clean(base)
-	cleanTarget := filepath.Clean(target)
-	return strings.HasPrefix(cleanTarget, cleanBase+string(filepath.Separator))
+	rel, err := filepath.Rel(base, target)
+	if err != nil {
+		return false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == "." {
+		return false
+	}
+	return true
 }
 
 func isGitRepo(dir string) bool {
