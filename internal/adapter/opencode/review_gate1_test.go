@@ -1,10 +1,9 @@
-//go:build unix
-
 package opencode
 
 import (
 	"context"
-	"strings"
+	"fmt"
+	"net"
 	"sync"
 	"testing"
 
@@ -12,17 +11,31 @@ import (
 	"github.com/CtrlCarlitos/agent-council/internal/council"
 )
 
+const (
+	gate1Session  = "sess-g2"
+	gate1User     = "svc-council"
+	gate1Password = "generated-secret"
+)
+
+// gate1Fixture wires an adapter against an authenticated fake OpenCode
+// server. The serverProcess retains the same generated credentials a real
+// launch would preserve from GeneratedServerEnv.
 func gate1Fixture(t *testing.T) (*OpenCodeAdapter, *fakeOpenCodeServer) {
 	t.Helper()
-	fake, endpoint := startFakeServer(t)
-	identity := &fakeGate1Identity{}
+	fake, endpoint := startFakeServerWithAuth(t, gate1User, gate1Password)
 	fake.mu.Lock()
-	fake.sessions["sess-g2"] = &fakeSession{id: "sess-g2"}
+	fake.sessions[gate1Session] = &fakeSession{id: gate1Session}
 	fake.mu.Unlock()
+
+	identity := &fakeGate1Identity{}
 	adp := NewOpenCodeAdapter(nil, nil, identity, func(a *OpenCodeAdapter) {
 		a.mu.Lock()
 		a.servers = &serverManager{children: map[string]*serverProcess{
-			"sess-g2": {endpoint: endpoint},
+			gate1Session: {
+				endpoint: endpoint,
+				username: gate1User,
+				password: gate1Password,
+			},
 		}}
 		a.mu.Unlock()
 	})
@@ -35,41 +48,52 @@ func (f *fakeGate1Identity) AttemptFor(ctx context.Context, ref adapter.TurnRef)
 	return "att_1_" + ref.TurnKey, true
 }
 
-// Concurrent duplicate dispatches must launch only once.
+// expectedGate1MessageID derives the native message ID through the same
+// identity seam the adapter consults during Dispatch.
+func expectedGate1MessageID(t *testing.T, ref adapter.TurnRef) string {
+	t.Helper()
+	attempt, ok := (&fakeGate1Identity{}).AttemptFor(context.Background(), ref)
+	if !ok {
+		t.Fatal("identity seam returned no attempt")
+	}
+	id, err := NativeMessageID(string(ref.SessionID), ref.TurnKey, attempt)
+	if err != nil {
+		t.Fatalf("native message id: %v", err)
+	}
+	return id
+}
+
+// Concurrent duplicate dispatches must produce exactly one native
+// prompt_async request and every caller must receive the launcher's verdict.
 func TestGate1Review_ConcurrentDuplicateDispatchSingleLaunch(t *testing.T) {
-	adp, _ := gate1Fixture(t)
-	ref := adapter.TurnRef{SessionID: "sess-g2", TurnKey: "t-race"}
+	adp, fake := gate1Fixture(t)
+	ref := adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-race"}
 	ctx := context.Background()
 
+	const callers = 5
 	var wg sync.WaitGroup
-	outcomes := make([]adapter.DispatchOutcome, 5)
-	errs := make([]error, 5)
-	var mu sync.Mutex
-	for i := 0; i < 5; i++ {
+	outcomes := make([]adapter.DispatchOutcome, callers)
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
-			out, err := adp.Dispatch(ctx, ref, "prompt")
-			mu.Lock()
-			defer mu.Unlock()
-			if err == nil {
-				outcomes[i] = out
-			}
-			if err != nil && errs[i] == nil {
-				errs[i] = err
-			}
-		}()
+			outcomes[i], errs[i] = adp.Dispatch(ctx, ref, "prompt")
+		}(i)
 	}
 	wg.Wait()
 
-	accepted := 0
 	for i := range outcomes {
-		if outcomes[i].Status == adapter.DispatchAccepted {
-			accepted++
+		if errs[i] != nil || outcomes[i].Status != adapter.DispatchAccepted {
+			t.Fatalf("caller %d: expected accepted verdict shared from launcher, got %v (err: %v)", i, outcomes[i].Status, errs[i])
 		}
 	}
-	if accepted != 5 {
-		t.Fatalf("expected 5 accepted dispatches, got %d", accepted)
+
+	if got := fake.ledger.promptAsyncCount(); got != 1 {
+		t.Fatalf("expected exactly 1 native prompt_async request, got %d", got)
+	}
+	if id := fake.ledger.promptAsyncMessageID(0); id != expectedGate1MessageID(t, ref) {
+		t.Fatalf("native message ID mismatch: server recorded %q", id)
 	}
 
 	adp.mu.Lock()
@@ -80,41 +104,34 @@ func TestGate1Review_ConcurrentDuplicateDispatchSingleLaunch(t *testing.T) {
 	}
 }
 
-// Collect finds the assistant message whose parentID equals the
-// deterministic user-message ID.
+// Dispatch-to-Collect correlation must flow through the identity seam: the
+// server records the message ID Dispatch derived from the persisted attempt,
+// and Collect returns the assistant message whose parentID is exactly that
+// ID. The test never mutates adapter internals.
 func TestGate1Review_CollectParentIDCorrelation(t *testing.T) {
 	adp, fake := gate1Fixture(t)
 	ctx := context.Background()
 
-	ref := adapter.TurnRef{SessionID: "sess-g2", TurnKey: "t-collect"}
-	msgID, _ := NativeMessageID("sess-g2", "t-collect", "att_1")
+	ref := adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-collect"}
+	outcome, err := adp.Dispatch(ctx, ref, "prompt")
+	if err != nil || outcome.Status != adapter.DispatchAccepted {
+		t.Fatalf("dispatch: status=%v err=%v", outcome.Status, err)
+	}
 
-	adp.mu.Lock()
-	adp.dispatches[ref] = &managedDispatch{userMessageID: msgID}
-	adp.mu.Unlock()
-
-	fake.mu.Lock()
-	sess := &fakeSession{id: "sess-g2"}
-	sess.messages = append(sess.messages, fakeMessage{
-		ID: msgID, Role: "user",
-		Parts: []fakePart{{Type: "text", Text: "prompt"}},
-	})
-	sess.messages = append(sess.messages, fakeMessage{
-		ID: "msg_asst_parent", Role: "assistant", ParentID: msgID,
-		Parts: []fakePart{{Type: "text", Text: "verified response"}},
-	})
-	fake.sessions["sess-g2"] = sess
-	fake.mu.Unlock()
+	wantID := expectedGate1MessageID(t, ref)
+	if got := fake.ledger.promptAsyncMessageID(0); got != wantID {
+		t.Fatalf("dispatch must persist the seam-derived message ID: got %q want %q", got, wantID)
+	}
 
 	result, err := adp.Collect(ctx, ref)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
-	if result.Output != "verified response" {
-		t.Fatalf("expected parentID-correlated response, got %q", result.Output)
+	if result.Status != council.TurnCompleted || result.ResultStatus != adapter.ResultAvailable {
+		t.Fatalf("expected completed turn, got status=%v result=%v", result.Status, result.ResultStatus)
 	}
-	if result.Status != council.TurnCompleted {
-		t.Fatalf("expected completed, got %v", result.Status)
+	if result.Output != "fake assistant response" {
+		t.Fatalf("expected parentID-correlated response, got %q", result.Output)
 	}
 }
 
@@ -125,7 +142,7 @@ func TestGate1Review_ReconcileUncertainForUnrecorded(t *testing.T) {
 	ctx := context.Background()
 
 	ref := adapter.RecoveryRef{
-		TurnRef:    adapter.TurnRef{SessionID: "sess-g2", TurnKey: "t-unrecorded"},
+		TurnRef:    adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-unrecorded"},
 		Generation: 1,
 	}
 	out, err := adp.Reconcile(ctx, ref)
@@ -140,16 +157,16 @@ func TestGate1Review_ReconcileUncertainForUnrecorded(t *testing.T) {
 	}
 }
 
-// Cancellation sends abort to the correct session.
+// Cancellation goes through the authenticated abort endpoint for the
+// addressed session.
 func TestGate1Review_CancelSendsAbort(t *testing.T) {
 	adp, fake := gate1Fixture(t)
 	ctx := context.Background()
 
-	msgID, _ := NativeMessageID("sess-g2", "t-cancel", "att_1")
-	ref := adapter.TurnRef{SessionID: "sess-g2", TurnKey: "t-cancel"}
-	adp.mu.Lock()
-	adp.dispatches[ref] = &managedDispatch{userMessageID: msgID, nativeSessionID: "sess-g2"}
-	adp.mu.Unlock()
+	ref := adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-cancel"}
+	if outcome, err := adp.Dispatch(ctx, ref, "prompt"); err != nil || outcome.Status != adapter.DispatchAccepted {
+		t.Fatalf("dispatch: status=%v err=%v", outcome.Status, err)
+	}
 
 	outcome, err := adp.Cancel(ctx, ref)
 	if err != nil {
@@ -158,15 +175,18 @@ func TestGate1Review_CancelSendsAbort(t *testing.T) {
 	if outcome.Disposition != adapter.CancelConfirmed {
 		t.Fatalf("expected confirmed, got %v", outcome.Disposition)
 	}
+	if got := fake.ledger.abortCount(); got != 1 {
+		t.Fatalf("expected exactly 1 native abort request, got %d", got)
+	}
 	fake.mu.Lock()
-	aborted := fake.sessions["sess-g2"].abortRequested
+	aborted := fake.sessions[gate1Session].abortRequested
 	fake.mu.Unlock()
 	if !aborted {
-		t.Fatal("abort endpoint must be called")
+		t.Fatal("abort must mark the native session aborted")
 	}
 }
 
-// A never-dispatched turn cannot be cancelled.
+// A turn with no live serve child cannot be cancelled.
 func TestGate1Review_CancelUnknownForUndispatched(t *testing.T) {
 	adp, _ := gate1Fixture(t)
 	ctx := context.Background()
@@ -176,5 +196,121 @@ func TestGate1Review_CancelUnknownForUndispatched(t *testing.T) {
 	if outcome.Disposition != adapter.CancelUnknown {
 		t.Fatalf("undispatched cancel must return unknown, got %v (err: %v)", outcome.Disposition, err)
 	}
-	_ = strings.TrimSpace("")
+}
+
+// After a post-write ambiguity where the server did record the turn, retry
+// must verify by GET-by-message-ID and accept without resubmitting.
+func TestGate1Review_RetryAfterAmbiguitySkipsResubmission(t *testing.T) {
+	adp, fake := gate1Fixture(t)
+	ctx := context.Background()
+
+	ref := adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-retry-recorded"}
+	fake.armFlakyPromptAsync("drop-after-record")
+
+	first, err := adp.Dispatch(ctx, ref, "prompt")
+	if first.Status != adapter.DispatchUnknown {
+		t.Fatalf("dropped response after record must be unknown, got %v (err: %v)", first.Status, err)
+	}
+	if got := fake.ledger.promptAsyncCount(); got != 1 {
+		t.Fatalf("expected 1 native request after ambiguous attempt, got %d", got)
+	}
+
+	second, err := adp.Dispatch(ctx, ref, "prompt")
+	if err != nil || second.Status != adapter.DispatchAccepted {
+		t.Fatalf("retry must accept an already-recorded message, got %v (err: %v)", second.Status, err)
+	}
+	if second.Reason != "message already recorded; resubmission skipped" {
+		t.Fatalf("retry must skip resubmission, reason: %q", second.Reason)
+	}
+	if got := fake.ledger.promptAsyncCount(); got != 1 {
+		t.Fatalf("recorded message must not be resubmitted, prompt_async count: %d", got)
+	}
+}
+
+// After a post-write ambiguity where the server did not record the turn, a
+// verified 404 authorizes exactly one resubmission.
+func TestGate1Review_RetryAfterAmbiguityResubmitsAfterVerified404(t *testing.T) {
+	adp, fake := gate1Fixture(t)
+	ctx := context.Background()
+
+	ref := adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-retry-resubmit"}
+	fake.armFlakyPromptAsync("drop-before-record")
+
+	first, err := adp.Dispatch(ctx, ref, "prompt")
+	if first.Status != adapter.DispatchUnknown {
+		t.Fatalf("dropped request before record must be unknown, got %v (err: %v)", first.Status, err)
+	}
+
+	second, err := adp.Dispatch(ctx, ref, "prompt")
+	if err != nil || second.Status != adapter.DispatchAccepted {
+		t.Fatalf("retry after verified 404 must resubmit and accept, got %v (err: %v)", second.Status, err)
+	}
+	if got := fake.ledger.promptAsyncCount(); got != 2 {
+		t.Fatalf("expected exactly 1 resubmission (2 total native requests), got %d", got)
+	}
+	if id := fake.ledger.promptAsyncMessageID(1); id != expectedGate1MessageID(t, ref) {
+		t.Fatalf("resubmission must reuse the same deterministic message ID, got %q", id)
+	}
+}
+
+// A serve child whose retained credentials do not match the server's
+// generated credentials is rejected with 401 and recorded as an
+// authentication failure.
+func TestGate1Review_RejectsMismatchedCredentials(t *testing.T) {
+	fake, endpoint := startFakeServerWithAuth(t, gate1User, gate1Password)
+	fake.mu.Lock()
+	fake.sessions[gate1Session] = &fakeSession{id: gate1Session}
+	fake.mu.Unlock()
+
+	adp := NewOpenCodeAdapter(nil, nil, &fakeGate1Identity{}, func(a *OpenCodeAdapter) {
+		a.mu.Lock()
+		a.servers = &serverManager{children: map[string]*serverProcess{
+			gate1Session: {
+				endpoint: endpoint,
+				username: gate1User,
+				password: "wrong-password",
+			},
+		}}
+		a.mu.Unlock()
+	})
+	ctx := context.Background()
+
+	ref := adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-auth"}
+	outcome, err := adp.Dispatch(ctx, ref, "prompt")
+	if outcome.Status != adapter.DispatchRejected {
+		t.Fatalf("mismatched credentials must reject dispatch, got %v (err: %v)", outcome.Status, err)
+	}
+	if got := fake.ledger.authFailureCount(); got != 1 {
+		t.Fatalf("expected 1 recorded authentication failure, got %d", got)
+	}
+	if got := fake.ledger.promptAsyncCount(); got != 0 {
+		t.Fatalf("unauthenticated request must not reach prompt_async, got %d calls", got)
+	}
+}
+
+// A refused connection before the request is written is a rejection, not an
+// ambiguous unknown.
+func TestGate1Review_PreWriteRefusalIsRejected(t *testing.T) {
+	// Reserve a port and close it: connections to it are refused.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	unreachable := fmt.Sprintf("http://%s", ln.Addr().String())
+	_ = ln.Close()
+
+	adp := NewOpenCodeAdapter(nil, nil, &fakeGate1Identity{}, func(a *OpenCodeAdapter) {
+		a.mu.Lock()
+		a.servers = &serverManager{children: map[string]*serverProcess{
+			gate1Session: {endpoint: unreachable, username: gate1User, password: gate1Password},
+		}}
+		a.mu.Unlock()
+	})
+	ctx := context.Background()
+
+	ref := adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-refused"}
+	outcome, err := adp.Dispatch(ctx, ref, "prompt")
+	if outcome.Status != adapter.DispatchRejected {
+		t.Fatalf("pre-write refusal must be rejected, got %v (err: %v)", outcome.Status, err)
+	}
 }

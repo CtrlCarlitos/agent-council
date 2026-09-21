@@ -1,14 +1,15 @@
 package opencode
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
+	"io"
 	"net/http"
+	"net/http/httptrace"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -50,6 +51,7 @@ type OpenCodeAdapter struct {
 	servers    *serverManager
 	dispatches map[adapter.TurnRef]*managedDispatch
 	launching  map[adapter.TurnRef]*launchReservation
+	unknown    map[adapter.TurnRef]string // ref → messageID of an ambiguous attempt
 }
 
 // OpenCodeAdapterOption configures an OpenCodeAdapter.
@@ -75,6 +77,7 @@ func NewOpenCodeAdapter(
 		scratchRoot:   os.TempDir(),
 		dispatches:    make(map[adapter.TurnRef]*managedDispatch),
 		launching:     make(map[adapter.TurnRef]*launchReservation),
+		unknown:       make(map[adapter.TurnRef]string),
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -141,36 +144,99 @@ func (a *OpenCodeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, pro
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: err.Error()}, err
 	}
 
+	// Reservation: concurrent Dispatch calls for the same ref share one
+	// native attempt and the launcher's verdict.
+	a.mu.Lock()
+	if _, ok := a.dispatches[ref]; ok {
+		a.mu.Unlock()
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchAccepted}, nil
+	}
+	if res, ok := a.launching[ref]; ok {
+		a.mu.Unlock()
+		<-res.ready
+		return res.outcome, res.err
+	}
+	res := &launchReservation{ready: make(chan struct{})}
+	a.launching[ref] = res
+	a.mu.Unlock()
+
+	outcome, err := a.dispatchNative(ctx, ref, ep, msgID, prompt)
+
+	a.mu.Lock()
+	delete(a.launching, ref)
+	switch outcome.Status {
+	case adapter.DispatchAccepted:
+		delete(a.unknown, ref)
+		a.dispatches[ref] = &managedDispatch{userMessageID: msgID, nativeSessionID: string(ref.SessionID)}
+	case adapter.DispatchUnknown:
+		a.unknown[ref] = msgID
+	}
+	a.mu.Unlock()
+
+	res.outcome, res.err = outcome, err
+	close(res.ready)
+	return outcome, err
+}
+
+// dispatchNative performs the authenticated POST for one turn attempt. For a
+// ref with a prior ambiguous attempt it first verifies by GET-by-message-ID:
+// only a verified 404 authorizes resubmission; an already-recorded message is
+// accepted without a second prompt_async.
+func (a *OpenCodeAdapter) dispatchNative(ctx context.Context, ref adapter.TurnRef, ep serverEndpoint, msgID, prompt string) (adapter.DispatchOutcome, error) {
+	a.mu.Lock()
+	_, priorUnknown := a.unknown[ref]
+	a.mu.Unlock()
+
+	if priorUnknown {
+		recorded, verifyErr := a.userMessageRecorded(ctx, ep, string(ref.SessionID), msgID)
+		if verifyErr != nil {
+			return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown, Reason: "retry verification failed: " + verifyErr.Error()}, verifyErr
+		}
+		if recorded {
+			return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchAccepted, Reason: "message already recorded; resubmission skipped"}, nil
+		}
+	}
+
 	payload := map[string]any{
 		"messageID": msgID,
 		"parts":     []map[string]string{{"type": "text", "text": prompt}},
 	}
 	body, _ := json.Marshal(payload)
-	httpReq, reqErr := http.NewRequestWithContext(ctx, "POST",
-		fmt.Sprintf("%s/session/%s/prompt_async", ep, ref.SessionID), strings.NewReader(string(body)))
-	if reqErr != nil {
-		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: reqErr.Error()}, reqErr
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, respErr := http.DefaultClient.Do(httpReq)
-	if respErr != nil {
-		var opErr *net.OpError
-		if errors.As(respErr, &opErr) && opErr.Op == "dial" {
-			return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: respErr.Error()}, respErr
+	resp, err := a.doAuth(ctx, ep, "POST",
+		fmt.Sprintf("%s/session/%s/prompt_async", ep.url, ref.SessionID), "application/json", bytes.NewReader(body))
+	if err != nil {
+		var pw *errPostWrite
+		if errors.As(err, &pw) {
+			return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown, Reason: "post-write transport failure: " + err.Error()}, err
 		}
-		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown, Reason: respErr.Error()}, respErr
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: err.Error()}, err
 	}
 	defer resp.Body.Close()
 
 	switch {
 	case resp.StatusCode == 204 || resp.StatusCode == 200:
-		a.mu.Lock()
-		a.dispatches[ref] = &managedDispatch{userMessageID: msgID, nativeSessionID: string(ref.SessionID)}
-		a.mu.Unlock()
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchAccepted}, nil
 	default:
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: fmt.Sprintf("HTTP %d", resp.StatusCode)}, nil
+	}
+}
+
+// userMessageRecorded queries the server for an exact user message ID.
+// Returns true on 200, false on a verified 404, and an error otherwise.
+func (a *OpenCodeAdapter) userMessageRecorded(ctx context.Context, ep serverEndpoint, sessionID, msgID string) (bool, error) {
+	resp, err := a.doAuth(ctx, ep, "GET",
+		fmt.Sprintf("%s/session/%s/message/%s", ep.url, sessionID, msgID), "", nil)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		return true, nil
+	case resp.StatusCode == http.StatusNotFound:
+		return false, nil
+	default:
+		return false, fmt.Errorf("message lookup returned HTTP %d", resp.StatusCode)
 	}
 }
 
@@ -205,12 +271,7 @@ func (a *OpenCodeAdapter) Cancel(ctx context.Context, ref adapter.TurnRef) (adap
 	if err != nil {
 		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown, Reason: err.Error()}, err
 	}
-	url := fmt.Sprintf("%s/session/%s/abort", ep, ref.SessionID)
-	req, reqErr := http.NewRequestWithContext(ctx, "POST", url, nil)
-	if reqErr != nil {
-		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelRejected, Reason: reqErr.Error()}, reqErr
-	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := a.doAuth(ctx, ep, "POST", fmt.Sprintf("%s/session/%s/abort", ep.url, ref.SessionID), "", nil)
 	if err != nil {
 		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown, Reason: err.Error()}, err
 	}
@@ -288,12 +349,7 @@ func (a *OpenCodeAdapter) findAssistantByParentID(ctx context.Context, sessionID
 	if err != nil {
 		return nil, false
 	}
-	url := fmt.Sprintf("%s/session/%s/message", ep, sessionID)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, false
-	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := a.doAuth(ctx, ep, "GET", fmt.Sprintf("%s/session/%s/message", ep.url, sessionID), "", nil)
 	if err != nil {
 		return nil, false
 	}
@@ -326,15 +382,62 @@ func (a *OpenCodeAdapter) findAssistantByParentID(ctx context.Context, sessionID
 
 // ── Internal helpers ────────────────────────────────────────────────────
 
-func (a *OpenCodeAdapter) endpointFor(sessionID adapter.SessionID) (string, error) {
+// serverEndpoint bundles the HTTP endpoint of a launched serve child with
+// the generated Basic credentials retained from its GeneratedServerEnv.
+type serverEndpoint struct {
+	url      string
+	username string
+	password string
+}
+
+func (a *OpenCodeAdapter) endpointFor(sessionID adapter.SessionID) (serverEndpoint, error) {
 	if a.servers == nil {
-		return "", errors.New("no server manager wired")
+		return serverEndpoint{}, errors.New("no server manager wired")
 	}
 	sp, err := a.servers.child(string(sessionID))
 	if err != nil {
-		return "", err
+		return serverEndpoint{}, err
 	}
-	return sp.endpoint, nil
+	return serverEndpoint{url: sp.endpoint, username: sp.username, password: sp.password}, nil
+}
+
+// errPostWrite marks a transport failure that occurred after the request
+// body was fully written: the server may have processed the turn, so the
+// outcome is ambiguous (unknown), never rejected.
+type errPostWrite struct{ cause error }
+
+func (e *errPostWrite) Error() string { return e.cause.Error() }
+func (e *errPostWrite) Unwrap() error { return e.cause }
+
+// doAuth performs an authenticated request against the endpoint and
+// classifies transport failures: anything before the request body was fully
+// written (dial refused, connect reset) is a pre-write rejection; a failure
+// after the write completes is post-write ambiguity.
+func (a *OpenCodeAdapter) doAuth(ctx context.Context, ep serverEndpoint, method, url string, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	req.SetBasicAuth(ep.username, ep.password)
+
+	wrote := false
+	trace := &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) { wrote = true },
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		if !wrote {
+			return nil, err
+		}
+		return nil, &errPostWrite{cause: err}
+	}
+	return resp, nil
 }
 
 // fakeAssistantMsg mirrors the assistant message shape returned by the
