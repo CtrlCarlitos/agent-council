@@ -27,6 +27,12 @@ type DispatchIdentitySource interface {
 // contributor session (construction/wiring in Task 2's ServerConfig).
 // See server.go for the full lifecycle (Task 2).
 
+// managedDispatch tracks one in-flight or completed native dispatch.
+type managedDispatch struct {
+	userMessageID string
+	baselineMsgID string
+}
+
 // OpenCodeAdapter implements the AC-006 adapter.Adapter contract against
 // the installed OpenCode headless HTTP server.
 type OpenCodeAdapter struct {
@@ -36,22 +42,9 @@ type OpenCodeAdapter struct {
 	idleGrace     time.Duration
 
 	mu         sync.Mutex
-	processes  map[string]*serverProcess // keyed by sessionID
+	servers    map[string]*serverProcess // keyed by native session ID
 	dispatches map[adapter.TurnRef]*managedDispatch
 	inFlight   map[string]chan struct{} // native sessionID → done channel
-}
-
-// serverProcess holds the per-session serve child handle.
-type serverProcess struct {
-	pid         int
-	endpoint    string
-	workspaceRo string
-}
-
-// managedDispatch holds one in-flight or completed native dispatch.
-type managedDispatch struct {
-	userMessageID string
-	baselineMsgID string
 }
 
 // OpenCodeAdapterOption configures an OpenCodeAdapter.
@@ -76,7 +69,7 @@ func NewOpenCodeAdapter(
 		probeTemplate: probeTemplate,
 		identity:      identity,
 		idleGrace:     30 * time.Second,
-		processes:     make(map[string]*serverProcess),
+		servers:       make(map[string]*serverProcess),
 		dispatches:    make(map[adapter.TurnRef]*managedDispatch),
 		inFlight:      make(map[string]chan struct{}),
 	}
