@@ -6,10 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -80,15 +80,18 @@ func NewServer(store *storage.Store, lock *ServiceLock, cfg ServerConfig) (*Serv
 }
 
 func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerConfig, adp adapter.Adapter) (*Server, error) {
-	// If no adapter is provided but OpenCode is configured, construct the
-	// production OpenCode adapter with fail-closed seams.
+	// If no adapter is provided but OpenCode is configured, create shared
+	// dependencies once and construct the production OpenCode adapter with
+	// fail-closed seams backed by the same instances the service uses.
 	if adp == nil && strings.TrimSpace(cfg.OpenCodeBinaryPath) != "" {
-		wm, wmErr := workspace.NewWorkspaceManager(cfg.StateDir, filepath.Join(cfg.StateDir, "workspaces"))
+		wm, wmErr := workspace.NewWorkspaceManager(cfg.StateDir, cfg.WorkspaceBaseDir)
 		if wmErr != nil {
 			return nil, fmt.Errorf("workspace manager for OpenCode adapter: %w", wmErr)
 		}
+		executor := execpolicy.New()
+		probeTemplate := opencode.NewOperatorProbeLaunchTemplate(cfg.OpenCodeBinaryPath, filepath.Join(cfg.StateDir, "probe-scratch"))
 		var opErr error
-		adp, opErr = opencode.NewProductionOpenCodeAdapter(store, wm, execpolicy.New(), cfg.OpenCodeBinaryPath)
+		adp, opErr = opencode.NewProductionOpenCodeAdapter(store, wm, executor, probeTemplate)
 		if opErr != nil {
 			return nil, fmt.Errorf("OpenCode adapter construction: %w", opErr)
 		}

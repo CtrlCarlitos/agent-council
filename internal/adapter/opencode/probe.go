@@ -87,7 +87,7 @@ func (a *OpenCodeAdapter) Probe(ctx context.Context) (adapter.ProbeReport, error
 	}
 
 	// 2. Probe serve child in an adapter-owned scratch directory.
-	scratch, err := os.MkdirTemp("", "ac-opencode-probe-")
+	scratch, err := os.MkdirTemp(a.scratchRoot, "ac-opencode-probe-")
 	if err != nil {
 		return report, fmt.Errorf("probe scratch dir: %w", err)
 	}

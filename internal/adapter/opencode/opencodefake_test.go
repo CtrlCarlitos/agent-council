@@ -18,6 +18,16 @@ type fakeOpenCodeServer struct {
 	connected bool
 }
 
+type fakePart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type fakeProbeError struct {
+	Name    string `json:"name"`
+	Message string `json:"message"`
+}
+
 type fakeSession struct {
 	id             string
 	title          string

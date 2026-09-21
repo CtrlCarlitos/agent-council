@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -55,15 +54,13 @@ func (s *storageSessionLaunchSource) OpenCodeServeLaunch(ctx context.Context, se
 	if profileRec.Profile.AlgoVersion == "" || len(profileRec.Profile.Harnesses) == 0 {
 		return execpolicy.LaunchRequest{}, fmt.Errorf("run %s has no frozen canonical profile", meta.RunID)
 	}
-	// Verify the session's contributor has an OpenCode harness profile and
-	// that OpenCode is in the tooling allowlist.
-	harness, hasHarness := profileRec.Profile.Harnesses[string(sessionID)]
-	if !hasHarness {
-		harness, hasHarness = profileRec.Profile.Harnesses["opencode"]
+	// Verify the session's contributor is OpenCode and that the frozen
+	// profile contains an OpenCode harness entry in the tooling allowlist.
+	if meta.Contributor != "opencode" {
+		return execpolicy.LaunchRequest{}, fmt.Errorf("session %s contributor is %q, not opencode; cannot launch OpenCode serve", sessionID, meta.Contributor)
 	}
-	_ = harness
-	if !hasHarness {
-		return execpolicy.LaunchRequest{}, fmt.Errorf("no OpenCode harness profile for session %s in run %s", sessionID, meta.RunID)
+	if _, hasOpenCodeHarness := profileRec.Profile.Harnesses["opencode"]; !hasOpenCodeHarness {
+		return execpolicy.LaunchRequest{}, fmt.Errorf("frozen profile for run %s has no opencode harness entry", meta.RunID)
 	}
 	toolAllowed := false
 	for _, tool := range profileRec.Profile.Tooling {
@@ -92,9 +89,6 @@ func (s *storageSessionLaunchSource) OpenCodeServeLaunch(ctx context.Context, se
 	}, nil
 }
 
-// operatorProbeLaunchTemplate produces validated LaunchRequest values for
-// the Probe capability check. Constructed from explicit operator
-// configuration (binary path and scratch root), never synthesized.
 // operatorProbeLaunchTemplate produces validated LaunchRequest values for
 // the Probe capability check. Constructed from explicit operator
 // configuration: binary path, scratch root, and a minimal canonical
@@ -139,7 +133,7 @@ func NewProductionOpenCodeAdapter(
 	store *storage.Store,
 	wm *workspace.WorkspaceManager,
 	executor execpolicy.PolicyExecutor,
-	opencodeBinaryPath string,
+	probeTemplate ProbeLaunchTemplate,
 	opts ...OpenCodeAdapterOption,
 ) (*OpenCodeAdapter, error) {
 	if store == nil {
@@ -151,20 +145,40 @@ func NewProductionOpenCodeAdapter(
 	if executor == nil {
 		return nil, errors.New("policy executor is required")
 	}
-	if strings.TrimSpace(opencodeBinaryPath) == "" {
-		return nil, errors.New("opencode binary path is required")
-	}
-
 	identity := &storageDispatchIdentitySource{store: store}
 	launch := &storageSessionLaunchSource{store: store, wm: wm}
-	probeProfile := storage.CanonicalProfile{
-		AlgoVersion:         "cprof-v1",
-		WorkspaceMode:       "none",
-		IsolationStrictness: "permissive_dev",
-		NetworkMode:         "unrestricted",
-		Tooling:             []string{opencodeBinaryPath},
-	}
-	template := &operatorProbeLaunchTemplate{binaryPath: opencodeBinaryPath, scratchRoot: os.TempDir(), profile: probeProfile}
+	template := probeTemplate
 
 	return NewOpenCodeAdapterWithLaunch(executor, template, identity, launch, opts...), nil
+}
+
+// buildProductionOpenCodeAdapter constructs a production adapter from
+// explicit dependencies. Test-friendly wrapper for the wiring path.
+func buildProductionOpenCodeAdapter(
+	store *storage.Store,
+	wm *workspace.WorkspaceManager,
+	executor execpolicy.PolicyExecutor,
+	probeTemplate ProbeLaunchTemplate,
+) (*OpenCodeAdapter, error) {
+	if store == nil {
+		return nil, errors.New("store is required")
+	}
+	if wm == nil {
+		return nil, errors.New("workspace manager is required")
+	}
+	if executor == nil {
+		return nil, errors.New("executor is required")
+	}
+	if probeTemplate == nil {
+		return nil, errors.New("probe template is required")
+	}
+	identity := &storageDispatchIdentitySource{store: store}
+	launch := &storageSessionLaunchSource{store: store, wm: wm}
+	return NewOpenCodeAdapterWithLaunch(executor, probeTemplate, identity, launch), nil
+}
+
+// NewOperatorProbeLaunchTemplate creates an operator-owned probe launch
+// template from explicit configuration.
+func NewOperatorProbeLaunchTemplate(binaryPath, scratchRoot string) *operatorProbeLaunchTemplate {
+	return &operatorProbeLaunchTemplate{binaryPath: binaryPath, scratchRoot: scratchRoot}
 }
