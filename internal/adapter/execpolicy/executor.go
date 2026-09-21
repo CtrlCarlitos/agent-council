@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/workspace"
@@ -91,30 +90,7 @@ func NewPolicyExecutor(opts ...Option) PolicyExecutor {
 }
 
 func defaultCapabilityChecker(ctx context.Context, req LaunchRequest) error {
-	if req.Profile.IsolationStrictness != "strict" {
-		return nil
-	}
-
-	if runtime.GOOS != "linux" {
-		return fmt.Errorf("%w: strict isolation requires Linux host capabilities", ErrUnsupportedIsolationCapability)
-	}
-
-	if req.Profile.WorkspaceMode == "readonly" {
-		if _, err := os.Stat("/proc/self/ns/user"); err != nil {
-			return fmt.Errorf("%w: user namespace unavailable for mount isolation", ErrUnsupportedIsolationCapability)
-		}
-		if _, err := os.Stat("/proc/self/ns/mnt"); err != nil {
-			return fmt.Errorf("%w: mount namespace unavailable for mount isolation", ErrUnsupportedIsolationCapability)
-		}
-	}
-
-	if req.Profile.NetworkMode == "allowlist" || req.Profile.NetworkMode == "none" {
-		if _, err := os.Stat("/proc/self/ns/net"); err != nil {
-			return fmt.Errorf("%w: network namespace unavailable", ErrUnsupportedIsolationCapability)
-		}
-	}
-
-	return nil
+	return checkPlatformCapabilities(ctx, req)
 }
 
 func isForbiddenSecretKey(key string) bool {
@@ -305,10 +281,16 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 		scrubbedEnv = append(scrubbedEnv, entry)
 	}
 
-	// 8. Construct exec.Cmd
 	cmd := exec.CommandContext(ctx, req.Command, req.Args...)
 	cmd.Dir = req.Paths.Root
 	cmd.Env = scrubbedEnv
+
+	if err := configureSysProcAttr(req, cmd); err != nil {
+		if proxyToClose != nil {
+			_ = proxyToClose.Close()
+		}
+		return nil, fmt.Errorf("configure isolation sysprocattr: %w", err)
+	}
 
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
