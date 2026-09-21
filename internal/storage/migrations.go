@@ -13,9 +13,10 @@ import (
 var schemaSQL string
 
 // schema.sql is the frozen released v1 schema; schemaV2DDL is the immutable
-// v2 migration body. Fresh databases apply v1 then v2 sequentially — there
+// v2 migration body; schemaV3DDL is the immutable v3 migration body.
+// Fresh databases apply v1 then v2 then v3 sequentially — there
 // is no separate "latest schema" path that could diverge from upgrading.
-const currentSchemaVersion = 2
+const currentSchemaVersion = 3
 
 func schemaChecksum() string {
 	sum := sha256.Sum256([]byte(schemaSQL))
@@ -24,6 +25,11 @@ func schemaChecksum() string {
 
 func schemaV2Checksum() string {
 	sum := sha256.Sum256([]byte(schemaV2DDL + backfillControllerLeaseProvenance))
+	return fmt.Sprintf("%x", sum)
+}
+
+func schemaV3Checksum() string {
+	sum := sha256.Sum256([]byte(schemaV3DDL + backfillRunProfilesAndArtifacts))
 	return fmt.Sprintf("%x", sum)
 }
 
@@ -106,7 +112,7 @@ VALUES (1, 'initial_schema', ?, ?);`, schemaChecksum(), now)
 	}
 
 	if currentVer >= 2 {
-		// Verify the v2 checksum and stop: fully migrated.
+		// Verify the v2 checksum before proceeding.
 		var recordedV2Checksum string
 		err := tx.Tx().QueryRow("SELECT checksum FROM schema_migrations WHERE version = 2;").Scan(&recordedV2Checksum)
 		if err != nil {
@@ -115,21 +121,60 @@ VALUES (1, 'initial_schema', ?, ?);`, schemaChecksum(), now)
 		if recordedV2Checksum != schemaV2Checksum() {
 			return ErrMigrationChecksumMismatch
 		}
+	} else {
+		// Apply v2: schema additions plus legacy provenance backfill, atomically.
+		if _, err := tx.Tx().Exec(schemaV2DDL); err != nil {
+			return fmt.Errorf("execute schema v2: %w", err)
+		}
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := tx.Tx().Exec(backfillControllerLeaseProvenance, now, now); err != nil {
+			return fmt.Errorf("backfill controller lease provenance: %w", err)
+		}
+
+		if s.testHookBeforeCommit != nil {
+			hookErr := func() (err error) {
+				defer func() {
+					if r := recover(); r != nil {
+						err = fmt.Errorf("injected migration failure: %v", r)
+					}
+				}()
+				s.testHookBeforeCommit("pre_commit_migration_v2")
+				return nil
+			}()
+			if hookErr != nil {
+				return hookErr
+			}
+		}
+
+		_, err = tx.Tx().Exec(`
+INSERT INTO schema_migrations (version, name, checksum, applied_at)
+VALUES (2, 'controller_leases_provenance', ?, ?);`, schemaV2Checksum(), now)
+		if err != nil {
+			return fmt.Errorf("record migration v2: %w", err)
+		}
+	}
+
+	if currentVer >= 3 {
+		// Verify the v3 checksum and stop: fully migrated.
+		var recordedV3Checksum string
+		err := tx.Tx().QueryRow("SELECT checksum FROM schema_migrations WHERE version = 3;").Scan(&recordedV3Checksum)
+		if err != nil {
+			return fmt.Errorf("read recorded v3 checksum: %w", err)
+		}
+		if recordedV3Checksum != schemaV3Checksum() {
+			return ErrMigrationChecksumMismatch
+		}
 		return nil
 	}
 
-	// Apply v2: schema additions plus legacy provenance backfill, atomically.
-	if _, err := tx.Tx().Exec(schemaV2DDL); err != nil {
-		return fmt.Errorf("execute schema v2: %w", err)
+	// Apply v3: run_profiles, artifact_revisions columns, proposal_sets, proposal_set_members, and backfills.
+	if _, err := tx.Tx().Exec(schemaV3DDL); err != nil {
+		return fmt.Errorf("execute schema v3: %w", err)
 	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := tx.Tx().Exec(backfillControllerLeaseProvenance, now, now); err != nil {
-		return fmt.Errorf("backfill controller lease provenance: %w", err)
+	if _, err := tx.Tx().Exec(backfillRunProfilesAndArtifacts); err != nil {
+		return fmt.Errorf("backfill run profiles and artifacts: %w", err)
 	}
 
-	// Test hook: deterministic interruption point after v2 changes have been
-	// staged but before commit (rollback evidence). A hook panic is
-	// converted to an error so Open's connection cleanup always runs.
 	if s.testHookBeforeCommit != nil {
 		hookErr := func() (err error) {
 			defer func() {
@@ -137,7 +182,7 @@ VALUES (1, 'initial_schema', ?, ?);`, schemaChecksum(), now)
 					err = fmt.Errorf("injected migration failure: %v", r)
 				}
 			}()
-			s.testHookBeforeCommit("pre_commit_migration_v2")
+			s.testHookBeforeCommit("pre_commit_migration_v3")
 			return nil
 		}()
 		if hookErr != nil {
@@ -145,11 +190,12 @@ VALUES (1, 'initial_schema', ?, ?);`, schemaChecksum(), now)
 		}
 	}
 
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err = tx.Tx().Exec(`
 INSERT INTO schema_migrations (version, name, checksum, applied_at)
-VALUES (2, 'controller_leases_provenance', ?, ?);`, schemaV2Checksum(), now)
+VALUES (3, 'run_profiles_proposal_sets', ?, ?);`, schemaV3Checksum(), now)
 	if err != nil {
-		return fmt.Errorf("record migration v2: %w", err)
+		return fmt.Errorf("record migration v3: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
