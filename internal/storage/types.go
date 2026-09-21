@@ -29,6 +29,8 @@ var (
 	ErrConflictingTerminalOutcome = errors.New("conflicting terminal outcome on already-terminal turn")
 	ErrSessionNotFound            = errors.New("session not found")
 	ErrRunSessionMismatch         = errors.New("session does not belong to run")
+	ErrInvalidAttempt             = errors.New("invalid execution attempt")
+	ErrConflictingArtifact        = errors.New("conflicting artifact content")
 )
 
 type QueryRower interface {
