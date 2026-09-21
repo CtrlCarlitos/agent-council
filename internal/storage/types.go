@@ -31,6 +31,7 @@ var (
 	ErrRunSessionMismatch         = errors.New("session does not belong to run")
 	ErrInvalidAttempt             = errors.New("invalid execution attempt")
 	ErrConflictingArtifact        = errors.New("conflicting artifact content")
+	ErrRunNotFound                = errors.New("run not found")
 )
 
 type QueryRower interface {

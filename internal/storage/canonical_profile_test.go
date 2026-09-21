@@ -1,7 +1,9 @@
 package storage
 
 import (
+	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -247,5 +249,107 @@ func TestCanonicalProfile_DisallowUnknownFields(t *testing.T) {
 
 	if _, err := ParseCanonicalProfileJSON([]byte(unknownFieldJSON)); err == nil {
 		t.Fatal("expected error for unknown field in profile JSON")
+	}
+}
+
+func TestStore_CreateRunWithProfile_And_GetRunProfile(t *testing.T) {
+	ctx := context.Background()
+	stateDir := t.TempDir()
+	store, err := Open(StoreOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	prof := CanonicalProfile{
+		AlgoVersion:         "cprof-v1",
+		WorkspaceMode:       "isolated_branch",
+		IsolationStrictness: "permissive_dev",
+		NetworkMode:         "allowlist",
+		NetworkAllowlist:    []string{"api.example.com:443"},
+		CodeIndexScope:      []string{"internal"},
+		Tooling:             []string{"git", "go"},
+		Harnesses: map[string]HarnessProfileSpec{
+			"agy": {
+				ExtraEnvAllowlist: []string{"ENV_FOO"},
+				Model:             "gemini-2.5-pro",
+				NativeAuthMode:    "inherited_host_keychain",
+			},
+		},
+	}
+
+	commit := "0123456789012345678901234567890123456789"
+	tree := "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+	req := CreateRunWithProfileRequest{
+		OpID:               "op-create-prof-1",
+		ControllerLease:    "lease-prof-1",
+		RunID:              "run-with-profile-1",
+		Brief:              "Solve ticket AC-005: freeze tooling and source profiles",
+		SourceRepoIdentity: "github.com/CtrlCarlitos/agent-council",
+		SourceCommit:       commit,
+		SourceTree:         tree,
+		Profile:            prof,
+	}
+
+	res, err := store.CreateRunWithProfile(ctx, req)
+	if err != nil {
+		t.Fatalf("CreateRunWithProfile failed: %v", err)
+	}
+
+	if !strings.HasPrefix(res.BriefDigest, "cbrief-v1:sha256:") {
+		t.Fatalf("expected cbrief-v1 prefix, got: %s", res.BriefDigest)
+	}
+	if !strings.HasPrefix(res.SourceDigest, "csource-v1:sha256:") {
+		t.Fatalf("expected csource-v1 prefix, got: %s", res.SourceDigest)
+	}
+	if !strings.HasPrefix(res.ProfileDigest, "cprof-v1:sha256:") {
+		t.Fatalf("expected cprof-v1 prefix, got: %s", res.ProfileDigest)
+	}
+
+	// Idempotent replay
+	res2, err := store.CreateRunWithProfile(ctx, req)
+	if err != nil {
+		t.Fatalf("expected replay to succeed, got: %v", err)
+	}
+	if res2.BriefDigest != res.BriefDigest || res2.SourceDigest != res.SourceDigest || res2.ProfileDigest != res.ProfileDigest {
+		t.Fatalf("replay digests mismatch: %+v vs %+v", res, res2)
+	}
+
+	// Retrieve run profile
+	rec, err := store.GetRunProfile(ctx, "run-with-profile-1")
+	if err != nil {
+		t.Fatalf("GetRunProfile failed: %v", err)
+	}
+	if rec.RunID != "run-with-profile-1" {
+		t.Fatalf("expected run ID %q, got %q", "run-with-profile-1", rec.RunID)
+	}
+	if rec.ProfileDigest != res.ProfileDigest {
+		t.Fatalf("expected profile digest %q, got %q", res.ProfileDigest, rec.ProfileDigest)
+	}
+	if rec.WorkspaceMode != "isolated_branch" {
+		t.Fatalf("expected workspace mode isolated_branch, got %q", rec.WorkspaceMode)
+	}
+	if rec.Profile.AlgoVersion != "cprof-v1" {
+		t.Fatalf("expected unmarshaled profile algo cprof-v1, got %q", rec.Profile.AlgoVersion)
+	}
+	if rec.BriefArtifactDigest != res.BriefDigest {
+		t.Fatalf("expected brief artifact digest %q, got %q", res.BriefDigest, rec.BriefArtifactDigest)
+	}
+
+	// Verify brief is retrievable from CAS storage
+	briefSum := sha256.Sum256([]byte(req.Brief))
+	briefRawHex := fmt.Sprintf("%x", briefSum)
+	casData, err := store.ReadArtifact(briefRawHex)
+	if err != nil {
+		t.Fatalf("ReadArtifact from CAS failed: %v", err)
+	}
+	if string(casData) != req.Brief {
+		t.Fatalf("expected CAS data %q, got %q", req.Brief, string(casData))
+	}
+
+	// Non-existent run
+	_, err = store.GetRunProfile(ctx, "non-existent-run")
+	if !errors.Is(err, ErrRunNotFound) {
+		t.Fatalf("expected ErrRunNotFound, got: %v", err)
 	}
 }

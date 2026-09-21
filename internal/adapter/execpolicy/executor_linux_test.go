@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"os/exec"
+	"sync"
 	"testing"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/execpolicy"
@@ -124,10 +125,19 @@ except OSError as e:
 
 		var stderrBuf bytes.Buffer
 		var stdoutBuf bytes.Buffer
-		go func() { _, _ = io.Copy(&stdoutBuf, proc.Stdout()) }()
-		go func() { _, _ = io.Copy(&stderrBuf, proc.Stderr()) }()
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _ = io.Copy(&stdoutBuf, proc.Stdout())
+		}()
+		go func() {
+			defer wg.Done()
+			_, _ = io.Copy(&stderrBuf, proc.Stderr())
+		}()
 
 		code, err := proc.Wait()
+		wg.Wait()
 		if err != nil {
 			t.Fatalf("proc.Wait error: %v", err)
 		}

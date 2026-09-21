@@ -276,6 +276,17 @@ func (m *WorkspaceManager) AllocateWorkspace(runID, sessionID, mode, sourceRepo,
 	return paths, nil
 }
 
+// GetPaths returns the allocated workspace paths for an active session, if allocated.
+func (m *WorkspaceManager) GetPaths(runID, sessionID string) (WorkspacePaths, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sess, ok := m.sessions[sessionKey(runID, sessionID)]
+	if !ok {
+		return WorkspacePaths{}, false
+	}
+	return sess.paths, true
+}
+
 // CloseWorkspace closes and cleans up a session workspace.
 func (m *WorkspaceManager) CloseWorkspace(runID, sessionID string) error {
 	if err := ValidateIdentifier(runID); err != nil {

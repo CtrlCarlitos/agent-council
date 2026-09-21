@@ -13,13 +13,16 @@ import (
 	"time"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
+	"github.com/CtrlCarlitos/agent-council/internal/adapter/execpolicy"
+	"github.com/CtrlCarlitos/agent-council/internal/adapter/workspace"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
 type ServerConfig struct {
-	StateDir   string
-	InstanceID string
-	AuthToken  string
+	StateDir         string
+	InstanceID       string
+	AuthToken        string
+	WorkspaceBaseDir string
 }
 
 type ReadinessResponse struct {
@@ -45,16 +48,18 @@ type StatusResponse struct {
 }
 
 type Server struct {
-	store       *storage.Store
-	lock        *ServiceLock
-	cfg         ServerConfig
-	coordinator *Coordinator
-	adapter     adapter.Adapter
-	listener    net.Listener
-	httpServer  *http.Server
-	socketPath  string
-	tokenPath   string
-	startedAt   time.Time
+	store            *storage.Store
+	lock             *ServiceLock
+	cfg              ServerConfig
+	coordinator      *Coordinator
+	adapter          adapter.Adapter
+	workspaceManager *workspace.WorkspaceManager
+	policyExecutor   execpolicy.PolicyExecutor
+	listener         net.Listener
+	httpServer       *http.Server
+	socketPath       string
+	tokenPath        string
+	startedAt        time.Time
 
 	mu           sync.Mutex
 	running      bool
@@ -87,21 +92,39 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 	socketPath := filepath.Join(cfg.StateDir, "council.sock")
 	tokenPath := filepath.Join(cfg.StateDir, "auth.token")
 
+	var wm *workspace.WorkspaceManager
+	if cfg.WorkspaceBaseDir != "" {
+		var err error
+		wm, err = workspace.NewWorkspaceManager(cfg.WorkspaceBaseDir, cfg.StateDir)
+		if err != nil {
+			return nil, fmt.Errorf("new workspace manager: %w", err)
+		}
+	}
+	pe := execpolicy.New()
+
+	if adp == nil && wm != nil {
+		adp = execpolicy.NewWorkerAdapter(wm, pe, store)
+	}
+
 	srv := &Server{
-		store:       store,
-		lock:        lock,
-		cfg:         cfg,
-		coordinator: NewCoordinator(),
-		adapter:     adp,
-		socketPath:  socketPath,
-		tokenPath:   tokenPath,
-		startedAt:   time.Now().UTC(),
-		shutdown:    make(chan struct{}),
+		store:            store,
+		lock:             lock,
+		cfg:              cfg,
+		coordinator:      NewCoordinator(),
+		adapter:          adp,
+		workspaceManager: wm,
+		policyExecutor:   pe,
+		socketPath:       socketPath,
+		tokenPath:        tokenPath,
+		startedAt:        time.Now().UTC(),
+		shutdown:         make(chan struct{}),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/readiness", srv.handleReadiness)
 	mux.HandleFunc("GET /v1/status", srv.handleStatus)
+	mux.HandleFunc("POST /v1/runs", srv.handleCreateRun)
+	mux.HandleFunc("GET /v1/runs/{run_id}", srv.handleGetRun)
 	mux.HandleFunc("POST /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/release", srv.handleRelease)
 	mux.HandleFunc("GET /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}", srv.handleGetTurn)
 	mux.HandleFunc("POST /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/cancel", srv.handleCancel)
@@ -130,6 +153,21 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 	}
 
 	return srv, nil
+}
+
+func (s *Server) WorkspaceManager() *workspace.WorkspaceManager {
+	return s.workspaceManager
+}
+
+func (s *Server) PolicyExecutor() execpolicy.PolicyExecutor {
+	return s.policyExecutor
+}
+
+func (s *Server) Handler() http.Handler {
+	if s.httpServer != nil {
+		return s.httpServer.Handler
+	}
+	return nil
 }
 
 func (s *Server) InstanceID() string {
