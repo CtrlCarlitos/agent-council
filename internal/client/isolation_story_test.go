@@ -31,6 +31,13 @@ import (
 // peer review reading, and explicit negative isolation denials.
 // Controlled fixtures; native containerization is explicitly unverified.
 func TestAC005_WorkerIsolationStory_ControlledFixture(t *testing.T) {
+	// macOS bounds unix socket paths (~104 bytes); t.TempDir() paths exceed
+	// it, so the fixture uses a bounded-length state directory root.
+	dir, dirErr := os.MkdirTemp("/tmp", "ac-iso-")
+	if dirErr != nil {
+		t.Fatalf("state dir: %v", dirErr)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	ctx := context.Background()
 
 	// -------------------------------------------------------------------------
@@ -100,7 +107,7 @@ func TestAC005_WorkerIsolationStory_ControlledFixture(t *testing.T) {
 		t.Fatalf("expected cprof-v1:sha256: prefix, got %q", profileDigest)
 	}
 
-	baseDir := t.TempDir()
+	baseDir := dir
 	stateDir := filepath.Join(baseDir, "council-state")
 	wsBaseDir := filepath.Join(baseDir, "council-workspaces")
 	if err := os.MkdirAll(stateDir, 0700); err != nil {

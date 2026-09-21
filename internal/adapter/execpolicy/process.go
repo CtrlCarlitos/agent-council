@@ -6,7 +6,6 @@ import (
 	"io"
 	"os/exec"
 	"sync"
-	"syscall"
 )
 
 // ManagedProcess defines the interface for interacting with a council-supervised process.
@@ -95,14 +94,15 @@ func (p *managedProcess) Terminate(ctx context.Context) error {
 		return nil
 	}
 
-	// Attempt graceful termination via SIGTERM
-	_ = proc.Signal(syscall.SIGTERM)
+	// Attempt graceful termination first; on platforms without graceful
+	// signals this degrades to an immediate kill.
+	_ = terminateGracefully(proc)
 
 	select {
 	case <-p.waitDoneChan():
 		return nil
 	case <-ctx.Done():
-		_ = proc.Kill()
+		_ = terminateForcefully(proc)
 		<-p.waitDoneChan()
 		return ctx.Err()
 	}
