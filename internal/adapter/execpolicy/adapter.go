@@ -553,22 +553,27 @@ func (a *ManagedWorkerAdapter) Collect(ctx context.Context, ref adapter.TurnRef)
 
 // Reconcile reports only what this adapter can actually verify (Gate 2
 // review finding 2): a live in-memory execution for the turn is
-// ReachableActive; a finished or in-flight-but-unverifiable execution is
-// reported as uncertain with host visibility lost; a turn this process
-// never dispatched is definitive absence — after a daemon restart the
-// in-process worker (and any native execution it owned) is genuinely gone,
-// and absence is never reported as a running worker.
+// ReachableActive. Everything else — a finished or in-flight-but-
+// unverifiable execution, and a turn this process has no record of (the
+// worker is an OS child with no parent-death guarantee and may survive as
+// an orphan after a daemon restart) — is reported as uncertain with host
+// visibility lost. Absence is claimed only with positive evidence, which
+// this adapter does not obtain.
 func (a *ManagedWorkerAdapter) Reconcile(ctx context.Context, ref adapter.RecoveryRef) (adapter.ReconciliationOutcome, error) {
 	a.mu.Lock()
 	turn, ok := a.dispatches[ref.TurnRef]
 	a.mu.Unlock()
 	if !ok {
+		// An empty in-memory record proves only that THIS process cannot
+		// observe the worker. The worker is an OS child with no parent-death
+		// lifetime guarantee: after a daemon restart it may still be running
+		// as an orphan. Without positive evidence of death, the honest
+		// verdict is uncertainty (Gate 2 re-review finding).
 		return adapter.ReconciliationOutcome{
 			Ref:          ref,
-			Reachability: council.VisibilityReachable,
-			Status:       adapter.ReconciliationDefinitivelyMissing,
-			Observed:     council.TurnFailed,
-			Result:       "no in-memory execution record for this turn",
+			Reachability: council.VisibilityHostLost,
+			Status:       adapter.ReconciliationUncertain,
+			Observed:     council.TurnRunning,
 		}, nil
 	}
 

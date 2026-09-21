@@ -205,14 +205,16 @@ func TestGate2Review_ReconcileReportsVerifiableStateOnly(t *testing.T) {
 		t.Fatalf("finished execution must reconcile as uncertain/host_lost, got %+v", out)
 	}
 
-	// A turn this process never dispatched is definitive absence.
+	// A turn this process never dispatched is uncertain: the empty
+	// in-memory record after a restart does not prove the orphan worker
+	// died — it only proves this process cannot observe it.
 	absent := adapter.RecoveryRef{TurnRef: adapter.TurnRef{SessionID: "sess-g2", TurnKey: "t-never"}, Generation: 1}
 	out, err = adp.Reconcile(ctx, absent)
 	if err != nil {
 		t.Fatalf("reconcile absent: %v", err)
 	}
-	if out.Status != adapter.ReconciliationDefinitivelyMissing || out.Observed != council.TurnFailed {
-		t.Fatalf("absent execution must reconcile as definitively missing, got %+v", out)
+	if out.Status != adapter.ReconciliationUncertain || out.Reachability != council.VisibilityHostLost {
+		t.Fatalf("unrecorded execution must reconcile as uncertain/host_lost, got %+v", out)
 	}
 }
 
