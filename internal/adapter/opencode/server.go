@@ -107,7 +107,7 @@ func (m *serverManager) start(ctx context.Context, sessionID adapter.SessionID) 
 		proc:      proc,
 		endpoint:  endpoint,
 		workspace: launchReq.Paths.Root,
-		
+
 		startedAt: time.Now().UTC(),
 	}
 
