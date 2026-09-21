@@ -1,6 +1,6 @@
 # AC-007: OpenCode/GLM Persistent Contributor Adapter — Design
 
-- **Status:** Proposed (research against installed OpenCode 1.18.31)
+- **Status:** Proposed, revised after Gate-spec review (research against installed OpenCode 1.18.31)
 - **Date:** 2026-09-21
 - **Issue:** [#7 (AC-007)](https://github.com/CtrlCarlitos/agent-council/issues/7)
 - **Dependencies:** AC-003 (#3, closed), AC-005 (#5, closed), AC-006 (#6, closed)
@@ -50,7 +50,7 @@ Read-only inspection commands used (no provider calls): `--help` on
 | `GET /session/{id}/event`, `GET /event`, `GET /global/event` | **Observe**: per-session SSE progress stream |
 | `GET /session/{id}/message`, `GET /session/{id}/message/{messageID}` | **Collect**: final assistant message parts (text, usage, cost, tokens) |
 | `POST /session/{id}/abort` | **Cancel**: cooperative abort; turn ends with abort semantics (not fabricated completion) |
-| `GET /permission`, `POST /permission/{requestID}/reply`, `GET /api/session/{id}/permission`, `POST /api/session/{id}/permission/{requestID}/reply` | **Approval wait / tool denial**: permission requests surface on the event stream and permission endpoints; adapter replies deny by default unless Council policy pre-approves |
+| `GET /permission`, `POST /permission/{requestID}/reply`, `GET /api/session/{id}/permission`, `POST /api/session/{id}/permission/{requestID}/reply` | **Approval wait / tool denial**: permission requests surface on the event stream and permission endpoints; adapter denies every request (see §3.6) |
 | `GET /api/model`, `GET /config/providers` | **Probe/CreateSession model validation**: intended provider+model must be listed and authenticated |
 | `POST /session/{id}/fork`, `POST /session/{id}/summarize`, `GET /session/{id}/todo` | Not needed for AC-004-style flow; noted for future tasks |
 
@@ -69,9 +69,13 @@ Read-only inspection commands used (no provider calls): `--help` on
   in every invocation the adapter makes. Permission requests are answered
   explicitly: deny by default; approval only if Council policy pre-approved
   the exact tool/pattern.
-- **`GET /config/providers` returns raw provider API keys.** The adapter
-  treats that response as a credential: never logged, never forwarded, never
-  stored. Model validation uses presence + auth status fields only.
+- **`GET /config/providers` returns raw provider API keys — Council must
+  never request it.** Receiving the response puts provider credentials into
+  Council memory even if redacted afterward, violating the native-auth
+  invariant. Model listing/validation uses the credential-free
+  `GET /api/model` endpoint. Native authentication status is therefore
+  **unknown** to the adapter; if the native side is unauthenticated,
+  session creation or dispatch fails honestly on OpenCode's own auth error.
 - **`prompt_async` + `noReply`** allow fire-and-forget submission with
   completion observed via events — matches Dispatch/Observe split.
 - **Server lifecycle is independent**: `opencode serve` is an OS child with
@@ -85,26 +89,37 @@ Read-only inspection commands used (no provider calls): `--help` on
 
 ## 3. Architecture
 
-### 3.1 Server lifecycle (adapter-owned)
+### 3.1 Server lifecycle — one server per contributor session
 
-`OpenCodeServer` (new, `internal/adapter/opencode/server.go`):
+`opencode serve` has exactly one process working directory, and the
+contributor session's project scoping depends on it. Council cannot share
+one server across workspaces. Therefore: **one adapter-owned
+`opencode serve` child per contributor session** (`OpenCodeServer`,
+`internal/adapter/opencode/server.go`):
 
-- Spawns `opencode serve --hostname 127.0.0.1 --port 0 --print-logs` as a
-  child of the Council service (AC-003 ownership rule), with:
+- Spawned lazily on first CreateSession/ResumeSession for that session,
+  as a child of the Council service (AC-003 ownership rule), with:
+  - Working directory: that session's isolated AC-005 workspace root
+    (project scoping is inherited from the process cwd — no per-request
+    directory selector is trusted).
+  - `--hostname 127.0.0.1 --port 0` (random port; parsed from startup
+    output and verified by listener inspection).
   - `OPENCODE_SERVER_USERNAME`/`OPENCODE_SERVER_PASSWORD` set to a generated
-    ephemeral pair (32-byte hex), never persisted beyond the process env.
-  - Working directory: the contributor workspace root (project scoping).
+    ephemeral pair, never persisted beyond the process env.
   - stdout/stderr drained and captured (termination-evidence pattern from
     AC-005).
-- Waits for `GET /api/health` → `healthy:true`, then parses the printed
-  listen address. Startup deadline → error (fail closed).
+- Waits for `GET /api/health` → `healthy:true` within a startup deadline;
+  failure ⇒ error (fail closed) and child termination.
 - `Close()`: graceful `POST /global/dispose` if available, then
   `terminateGracefully` → force-kill (AC-005 terminate split), drain pipes
   before Wait, record exit evidence.
-- Records PID + exit status for Reconcile honesty (no fabricated liveness).
+- Records child PID + exit status for Reconcile honesty (no fabricated
+  liveness).
 
-One server per Council service instance is shared by all OpenCode
-contributor sessions; sessions themselves are per contributor session.
+Cost: one small headless process per active contributor session
+(bounded by concurrent sessions; contributors park after turns). Benefit:
+hard workspace/project isolation without trusting an experimental
+per-request directory selector, and a single tenant per server.
 
 ### 3.2 Adapter (`internal/adapter/opencode/adapter.go`)
 
@@ -113,36 +128,126 @@ minimal typed client (`httpclient.go`):
 
 | AC-006 method | Behavior |
 |---|---|
-| `Probe` | `GET /api/health` + `GET /config/providers` (redacted parse: provider id, model ids, auth presence) + server version. Returns ProbeReport with capability flags (streaming supported via SSE). |
-| `CreateSession` | `POST /session` with `{title: "council <sessionID>", agent, model: HarnessProfileSpec.Model}`; model validated against the providers list first (fail closed: unknown/unauthenticated provider+model ⇒ error). Records `NativeSessionID = ses_…`. Fresh session: no history copy — OpenCode sessions are new by construction; the controller's OpenCode project is never referenced. |
-| `ResumeSession` | `GET /session/{nativeSessionID}`: 200 ⇒ verified (id + project match asserted); 404 ⇒ `ErrSessionCreationUncertain`-style typed error (session gone). Never falls back to newest-session selection. |
-| `Dispatch` | `POST /session/{id}/prompt_async` with the prompt as a text part, the preset model, and Council-configured agent. Returns `DispatchAccepted`. Non-2xx ⇒ `DispatchRejected` (fail closed). Transport timeout after request sent ⇒ `DispatchUnknown`. |
-| `Observe` | `GET /session/{id}/event` (SSE) wrapped in `adapter.BufferedStream`: progress events from message updates; terminal on assistant message completion or `session.idle`; permission-request events surface as denial-or-wait per §4. Server-side abort/connection loss closes the stream without fabricating a terminal event. |
-| `Cancel` | `POST /session/{id}/abort`; verifies via status/events; maps to `CancelConfirmed` (turn ends aborted), `CancelAlreadyTerminal`, or `CancelUnsupported/Unknown` per response. |
-| `Collect` | Polls `GET /session/{id}/message` for the terminal assistant message: text output, usage (tokens/cost) when present, `CompletedAt` from the message. `ResultUnavailable` while pending. |
-| `Reconcile` | Evidence-based only: `GET /session/{id}` 200 + status idle/busty ⇒ `ReachableActive`; server connection failure ⇒ `Uncertain`/host_lost; 404 ⇒ `DefinitivelyMissing`. The in-memory session map is NOT treated as proof (AC-005 lesson). |
+| `Probe` | `GET /api/health` + credential-free `GET /api/model` (model ids only; native auth status is **unknown** to Council). Server version. Streaming supported via SSE. |
+| `CreateSession` | Spawn the session's `opencode serve` child (§3.1), then `POST /session` with `{title: "council <sessionID>", agent, model: HarnessProfileSpec.Model}`. Model presence is validated against `GET /api/model` (credential-free; fail closed on unknown model). Native auth status is unknown — an unauthenticated native side fails at first prompt, honestly. Records `NativeSessionID = ses_…`. Fresh session in the session's own project: no history copy. |
+| `ResumeSession` | `GET /session/{nativeSessionID}`: 200 with matching project ⇒ verified; 404 ⇒ typed **`ErrNativeSessionMissing`** (a missing persisted binding — distinct from uncertain creation, which remains `ErrSessionCreationUncertain`'s role). Never falls back to newest-session selection. |
+| `Dispatch` | See §3.3 turn-identity contract: baseline cursor, adapter-generated deterministic native message ID, single-flight per native session, explicit pre-acceptance vs unknown classification, and turn/session single-flight enforcement. |
+| `Observe` | Taps the session's adapter-owned event pump (§3.4): buffered, cursor-tracked, deduplicated; caller detach never closes the native stream. |
+| `Cancel` | `POST /session/{id}/abort`; verifies via status/events; maps to `CancelConfirmed` (turn ends aborted), `CancelAlreadyTerminal`, or `CancelUnknown` per response. |
+| `Collect` | Selects the assistant reply for THIS turn by the recorded native message ID and baseline cursor (§3.3) — never "latest session message": text output, usage (tokens/cost) when present, `CompletedAt`. `ResultUnavailable` while pending. |
+| `Reconcile` | Evidence rules per §3.5: verified active ⇒ ReachableActive; verified terminal message ⇒ ReachableTerminal; transport loss / missing session after possible acceptance / ambiguous idle ⇒ Uncertain; DefinitivelyMissing only with positive never-accepted evidence. |
 
-### 3.3 Permission (approval/denial) semantics
+### 3.3 Turn identity and dispatch idempotency
+
+- **Native message ID is adapter-generated and deterministic per attempt:**
+  `msg_council_<sessionID>_<turnKey>_<attempt>`. It is passed as
+  `prompt_async.messageID`, so OpenCode addressability and Council identity
+  coincide: resubmission with the same identity upserts the same message
+  instead of duplicating the prompt.
+- **Single flight per native session.** OpenCode sessions are single
+  conversation streams. The adapter keeps an in-flight map keyed by native
+  session ID; a second Dispatch on the same native session is rejected
+  (`session busy`) rather than interleaved. One TurnRef ↔ at most one
+  in-flight native message.
+- **Pre-acceptance failure vs DispatchUnknown.** Evidence boundary is the
+  HTTP response: connection refused, TLS/setup error, or a timeout that
+  elapsed before any response byte ⇒ `DispatchRejected` (definitely not
+  accepted). A timeout or transport error after the request was fully
+  written, or an ambiguous 5xx ⇒ `DispatchUnknown` (may or may not be
+  accepted). 2xx ⇒ `DispatchAccepted` with the native message ID recorded.
+- **Retry without double submission.** Retry resolves in this order:
+  (1) `GET /session/{id}/message/{messageID}` — if the deterministic message
+  exists, the dispatch was accepted; do not resubmit; collect or observe it.
+  (2) If absent and the previous attempt was `DispatchRejected` with
+  pre-acceptance evidence, resubmit with the same message ID (same attempt)
+  — safe upsert. (3) If the previous attempt was `DispatchUnknown`,
+  resubmission is forbidden at the same attempt: the turn goes to
+  reconciliation (uncertain), and only an explicit operator reconcile that
+  positively resolves absence may clear it for a new attempt.
+- **Baseline cursor.** Before submission the adapter records the session's
+  current last-message ID (from `GET /session/{id}/message`). Collect selects
+  the assistant response with message ID == the adapter-generated
+  submission ID (and falls back to "first assistant message after the
+  baseline" if the native side assigns its own reply IDs), never "latest
+  message in session".
+- **One turn per native session at a time** is enforced by the in-flight
+  map above; a queued follow-up waits for the previous turn's terminal
+  state (completed/failed/aborted) before dispatch.
+
+### 3.4 Adapter-owned event pump
+
+- One continuously drained SSE connection per active session
+  (`GET /session/{id}/event`), owned by the adapter — NOT by any Observe
+  caller. A caller ending Observe detaches from a buffered tap; the native
+  stream stays connected and events keep flowing into per-TurnRef bounded
+  buffers (AC-005 buffered-stream semantics: slow-consumer overflow
+  disconnects the tap, never the native stream).
+- Routing: events carry native session ID and (for message events) message
+  ID. The adapter's turn registry maps (native session ID, message ID) →
+  TurnRef, so progress/terminal/tool events route to the right turn.
+- Deduplication by event sequence/id; reconnect resumes from the recorded
+  cursor where the server supports Last-Event-ID, otherwise the pump
+  resyncs from message history (the deterministic message ID makes resync
+  unambiguous).
+- Permission-request events route to the permission responder (§3.6) and are
+  mirrored into the turn's stream as tool-requested/tool-denied events.
+
+### 3.5 Reconciliation evidence rules
+
+Correlate the exact native message/turn — never the bare session:
+
+| Evidence | Verdict |
+|---|---|
+| Verified active native work (session exists AND the turn's submission message is the live/unanswered one, or native status shows the turn executing) | `ReachableActive` |
+| Verified terminal message for this turn's message ID (assistant reply present) | `ReachableTerminal` with the durable outcome |
+| Transport loss to the server; session 404 **after** a possibly-accepted dispatch (404 proves nothing about an orphan worker's work); ambiguous idle (session idle but this turn's message has no terminal reply and no positive never-accepted evidence) | `Uncertain` / host visibility lost |
+| Positive evidence the specific dispatch was never accepted (e.g., the deterministic message ID provably absent before any acceptance could occur, recorded pre-acceptance failure) | `DefinitivelyMissing` |
+
+`ResumeSession` 404 raises typed **`ErrNativeSessionMissing`** — a missing
+persisted binding — distinct from `ErrSessionCreationUncertain` (uncertain
+creation). Session 404 during reconciliation is NOT the same as a missing
+binding: it routes through the uncertain rule above unless the turn was
+never dispatched (then DefinitivelyMissing with the pre-acceptance
+evidence).
+
 
 - OpenCode surfaces a permission request as an event + a pending entry on the
   permission endpoints while the turn stalls.
-- The adapter maintains a permission responder: on request, it consults the
-  Council-approved tooling allowlist (HarnessProfileSpec.Tooling/ExtraEnvAllowlist
-  and policy from AC-005): allow ⇒ `reply approve`; otherwise ⇒ `reply deny`
-  and the turn observes a tool-denial event which flows to Collect as part of
-  the transcript (honest denial, not hidden).
+- The adapter maintains a permission responder: on every request it replies
+  **deny** and mirrors a tool-denial event into the turn's stream, so the
+  transcript records the denial honestly. No allowlist inference: see §3.6
+  for the policy boundary and the future narrow approval-policy seam.
 - The adapter never enables `--auto`, never edits global permission config,
-  never widens the allowlist.
+  never widens any allowlist.
 
-### 3.4 Model/provider validation
+### 3.6 Permission (approval/denial) semantics
+
+- OpenCode surfaces a permission request as an event plus a pending entry on
+  the permission endpoints while the turn stalls.
+- **The adapter denies every permission request.** CanonicalProfile.Tooling
+  and ExtraEnvAllowlist describe executable/POSIX allowlists (AC-005); they
+  are NOT an OpenCode tool-approval authority, and no approval is ever
+  inferred from them. Each request is answered `deny` and mirrored into the
+  turn's event stream as explicit tool-requested / tool-denied events, so
+  the transcript records the denial honestly.
+- If a future task needs selective approval, it must add a narrow injected
+  permission-policy interface whose decision binds the exact run, session,
+  turn, request ID, tool name, and arguments — never a profile-wide flag.
+  Out of scope here (YAGNI).
+- The adapter never enables `--auto`, never edits global permission config,
+  and never widens any allowlist.
+
+### 3.7 Model/provider validation (credential-free)
 
 - HarnessProfileSpec.Model is `provider/model`. At Probe, the adapter parses
-  `GET /config/providers` **redacted** (provider id, model ids, auth
-  present-flag) and requires: provider present, model id present, auth
-  configured. Missing ⇒ Probe reports the capability gap; CreateSession/Dispatch
-  fail closed with `DispatchRejected`.
-- Intended provider/model validation satisfies acceptance criterion 1
-  ("validate intended provider/model") without any provider call.
+  the credential-free `GET /api/model` listing and requires the intended
+  provider+model to be present; missing ⇒ Probe reports the capability gap
+  and CreateSession/Dispatch fail closed with `DispatchRejected`.
+- Native authentication status is **unknown** to Council (the only
+  auth-inspecting endpoint exposes credentials). An unauthenticated native
+  side fails at session create or first prompt with OpenCode's own error,
+  reported honestly as dispatch/session failure — never converted into a
+  fake success.
 
 ## 4. Evidence plan (fixtures vs integration)
 
