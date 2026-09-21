@@ -23,6 +23,7 @@ type managedProcess struct {
 	stdinPipe io.WriteCloser
 	stdout    io.Reader
 	stderr    io.Reader
+	cleanup   func()
 
 	mu       sync.Mutex
 	waitDone chan struct{}
@@ -65,6 +66,10 @@ func (p *managedProcess) waitDoneChan() <-chan struct{} {
 			} else {
 				p.exitCode = 0
 				p.waitErr = nil
+			}
+			if p.cleanup != nil {
+				p.cleanup()
+				p.cleanup = nil
 			}
 			p.mu.Unlock()
 			close(p.waitDone)

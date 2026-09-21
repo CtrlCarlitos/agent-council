@@ -62,8 +62,16 @@ func WithCapabilityChecker(fn CapabilityChecker) Option {
 	}
 }
 
+// WithNetworkProxy configures a custom NetworkProxy for the executor.
+func WithNetworkProxy(proxy *NetworkProxy) Option {
+	return func(e *defaultPolicyExecutor) {
+		e.proxy = proxy
+	}
+}
+
 type defaultPolicyExecutor struct {
 	capabilityChecker CapabilityChecker
+	proxy             *NetworkProxy
 }
 
 // New creates a new PolicyExecutor with the given options.
@@ -100,7 +108,7 @@ func defaultCapabilityChecker(ctx context.Context, req LaunchRequest) error {
 		}
 	}
 
-	if req.Profile.NetworkMode == "allowlist" {
+	if req.Profile.NetworkMode == "allowlist" || req.Profile.NetworkMode == "none" {
 		if _, err := os.Stat("/proc/self/ns/net"); err != nil {
 			return fmt.Errorf("%w: network namespace unavailable", ErrUnsupportedIsolationCapability)
 		}
@@ -116,6 +124,11 @@ func isForbiddenSecretKey(key string) bool {
 	}
 	lower := strings.ToLower(key)
 	return strings.Contains(lower, "secret") || strings.Contains(lower, "key") || strings.Contains(lower, "token")
+}
+
+func isProxyEnvKey(key string) bool {
+	upper := strings.ToUpper(key)
+	return upper == "HTTP_PROXY" || upper == "HTTPS_PROXY" || upper == "ALL_PROXY" || upper == "NO_PROXY"
 }
 
 func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (ManagedProcess, error) {
@@ -193,6 +206,9 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 		if isForbiddenSecretKey(key) {
 			return nil, fmt.Errorf("%w: secret key %q is forbidden", ErrDisallowedEnv, key)
 		}
+		if req.Profile.NetworkMode == "none" && isProxyEnvKey(key) {
+			return nil, fmt.Errorf("%w: proxy key %q is forbidden when network_mode is none", ErrDisallowedEnv, key)
+		}
 		if _, ok := profileAllowedEnv[key]; !ok {
 			return nil, fmt.Errorf("%w: environment variable %q not allowlisted in canonical profile", ErrDisallowedEnv, key)
 		}
@@ -211,6 +227,9 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 	for _, k := range baseKeys {
 		if v, ok := os.LookupEnv(k); ok {
 			if !isForbiddenSecretKey(k) {
+				if req.Profile.NetworkMode == "none" && isProxyEnvKey(k) {
+					continue
+				}
 				env = append(env, k+"="+v)
 			}
 		}
@@ -222,6 +241,31 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 	}
 	if req.SessionID != "" {
 		env = append(env, "COUNCIL_SESSION_ID="+req.SessionID)
+	}
+
+	var proxyToClose *NetworkProxy
+	switch req.Profile.NetworkMode {
+	case "allowlist":
+		var activeProxy *NetworkProxy
+		if e.proxy != nil {
+			activeProxy = e.proxy
+		} else {
+			var err error
+			activeProxy, err = StartNetworkProxy(req.Profile.NetworkAllowlist)
+			if err != nil {
+				return nil, fmt.Errorf("start network proxy: %w", err)
+			}
+			proxyToClose = activeProxy
+		}
+		endpoint := activeProxy.Endpoint()
+		env = append(env,
+			"HTTP_PROXY="+endpoint,
+			"HTTPS_PROXY="+endpoint,
+			"http_proxy="+endpoint,
+			"https_proxy="+endpoint,
+		)
+	case "none":
+		// Ensure no proxy is supplied
 	}
 
 	for _, extra := range req.ExtraEnvAllowlist {
@@ -237,17 +281,26 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 				continue
 			}
 		}
-		if !isForbiddenSecretKey(key) {
-			env = append(env, key+"="+val)
+		if isForbiddenSecretKey(key) {
+			continue
 		}
+		if req.Profile.NetworkMode == "none" && isProxyEnvKey(key) {
+			continue
+		}
+		env = append(env, key+"="+val)
 	}
 
-	// Final safeguard: filter any secrets from env
+	// Final safeguard: filter any secrets or proxy variables when mode is none
 	var scrubbedEnv []string
 	for _, entry := range env {
 		parts := strings.SplitN(entry, "=", 2)
-		if len(parts) > 0 && isForbiddenSecretKey(parts[0]) {
-			continue
+		if len(parts) > 0 {
+			if isForbiddenSecretKey(parts[0]) {
+				continue
+			}
+			if req.Profile.NetworkMode == "none" && isProxyEnvKey(parts[0]) {
+				continue
+			}
 		}
 		scrubbedEnv = append(scrubbedEnv, entry)
 	}
@@ -259,18 +312,30 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
+		if proxyToClose != nil {
+			_ = proxyToClose.Close()
+		}
 		return nil, fmt.Errorf("create stdin pipe: %w", err)
 	}
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
+		if proxyToClose != nil {
+			_ = proxyToClose.Close()
+		}
 		return nil, fmt.Errorf("create stdout pipe: %w", err)
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
+		if proxyToClose != nil {
+			_ = proxyToClose.Close()
+		}
 		return nil, fmt.Errorf("create stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
+		if proxyToClose != nil {
+			_ = proxyToClose.Close()
+		}
 		return nil, fmt.Errorf("start process: %w", err)
 	}
 
@@ -279,6 +344,11 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 		stdinPipe: stdinPipe,
 		stdout:    stdoutPipe,
 		stderr:    stderrPipe,
+		cleanup: func() {
+			if proxyToClose != nil {
+				_ = proxyToClose.Close()
+			}
+		},
 	}, nil
 }
 
