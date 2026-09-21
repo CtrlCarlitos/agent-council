@@ -30,7 +30,7 @@ var ErrServerEnvKeyCollision = errors.New("GeneratedServerEnv key collides with 
 
 // isOpenCodeServeLaunch reports whether the request launches an
 // `opencode serve` child (command base `opencode`, first arg `serve`).
-func isOpenCodeServeLaunch(req LaunchRequest) bool {
+func IsOpenCodeServeLaunch(req LaunchRequest) bool {
 	cmdBase := req.Command
 	if idx := strings.LastIndex(cmdBase, "/"); idx != -1 {
 		cmdBase = cmdBase[idx+1:]
@@ -44,7 +44,7 @@ func validateGeneratedServerEnvShape(req LaunchRequest) error {
 	if req.GeneratedServerEnv == nil {
 		return nil
 	}
-	if !isOpenCodeServeLaunch(req) {
+	if !IsOpenCodeServeLaunch(req) {
 		return fmt.Errorf("%w: launch is %q %v", ErrServerEnvShape, req.Command, req.Args)
 	}
 	return nil
