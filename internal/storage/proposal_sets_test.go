@@ -239,6 +239,23 @@ func TestProposalSets_MemberValidation(t *testing.T) {
 	if !errors.Is(err, storage.ErrArtifactNotFound) {
 		t.Fatalf("expected ErrArtifactNotFound for artifact from another run, got %v", err)
 	}
+
+	// 7. Reject multiple proposal members from the same author contributor / session
+	meta2, err := store.RecordObservedArtifact(ctx, authorRef, "proposal2.md", []byte("# Claude Proposal 2"))
+	if err != nil {
+		t.Fatalf("record second artifact for author: %v", err)
+	}
+	sameAuthorMembers := []storage.ProposalMemberRef{
+		{ArtifactID: meta.ID, Revision: meta.Revision, Digest: meta.Digest},
+		{ArtifactID: meta2.ID, Revision: meta2.Revision, Digest: meta2.Digest},
+	}
+	_, err = store.ReleaseArtifacts(ctx, "op-val-same-author", lease, runID, sameAuthorMembers)
+	if err == nil {
+		t.Fatal("expected error for multiple proposal members from same author, got nil")
+	}
+	if !strings.Contains(err.Error(), "duplicate contributor proposal member") {
+		t.Fatalf("expected error mentioning duplicate contributor proposal member, got: %v", err)
+	}
 }
 
 func TestProposalSets_CanonicalSortingSealingAndReplay(t *testing.T) {

@@ -90,6 +90,8 @@ func (s *Store) ReleaseArtifacts(ctx context.Context, opID string, callerLease s
 
 	// Validate each referenced artifact revision against persisted records
 	records := make([]canonicalMemberRecord, 0, len(members))
+	seenContributors := make(map[string]bool, len(members))
+	seenSessions := make(map[string]bool, len(members))
 	for _, m := range members {
 		var actualDigest, authorSessionID, authorContributor string
 		err := tx.Tx().QueryRowContext(ctx, `
@@ -110,6 +112,17 @@ WHERE ar.artifact_id = ? AND ar.revision = ? AND ar.run_id = ?;`, m.ArtifactID, 
 		}
 		if authorContributor == "" {
 			return ProposalSetReceipt{}, fmt.Errorf("missing author contributor for artifact %s revision %d", m.ArtifactID, m.Revision)
+		}
+
+		if seenContributors[authorContributor] {
+			return ProposalSetReceipt{}, fmt.Errorf("duplicate contributor proposal member: contributor %q already has a member in the proposal set", authorContributor)
+		}
+		if authorSessionID != "" && seenSessions[authorSessionID] {
+			return ProposalSetReceipt{}, fmt.Errorf("duplicate contributor proposal member: session %q already has a member in the proposal set", authorSessionID)
+		}
+		seenContributors[authorContributor] = true
+		if authorSessionID != "" {
+			seenSessions[authorSessionID] = true
 		}
 
 		records = append(records, canonicalMemberRecord{
