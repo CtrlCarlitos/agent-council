@@ -56,11 +56,15 @@ func (s *storageSessionLaunchSource) OpenCodeServeLaunch(ctx context.Context, se
 	}
 	// Verify the session's contributor is OpenCode and that the frozen
 	// profile contains an OpenCode harness entry in the tooling allowlist.
+	// Require the session's contributor to be opencode — only OpenCode
+	// sessions are served by this adapter.
 	if meta.Contributor != "opencode" {
 		return execpolicy.LaunchRequest{}, fmt.Errorf("session %s contributor is %q, not opencode; cannot launch OpenCode serve", sessionID, meta.Contributor)
 	}
-	if _, hasOpenCodeHarness := profileRec.Profile.Harnesses["opencode"]; !hasOpenCodeHarness {
-		return execpolicy.LaunchRequest{}, fmt.Errorf("frozen profile for run %s has no opencode harness entry", meta.RunID)
+	// Select exactly profile.Harnesses[meta.Contributor] and verify opencode
+	// is in the tooling allowlist.
+	if _, hasHarness := profileRec.Profile.Harnesses[meta.Contributor]; !hasHarness {
+		return execpolicy.LaunchRequest{}, fmt.Errorf("frozen profile for run %s has no %q harness entry", meta.RunID, meta.Contributor)
 	}
 	toolAllowed := false
 	for _, tool := range profileRec.Profile.Tooling {
@@ -144,6 +148,9 @@ func NewProductionOpenCodeAdapter(
 	}
 	if executor == nil {
 		return nil, errors.New("policy executor is required")
+	}
+	if probeTemplate == nil {
+		return nil, errors.New("probe launch template is required")
 	}
 	identity := &storageDispatchIdentitySource{store: store}
 	launch := &storageSessionLaunchSource{store: store, wm: wm}
