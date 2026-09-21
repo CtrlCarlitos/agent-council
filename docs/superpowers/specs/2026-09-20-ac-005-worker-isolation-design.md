@@ -10,35 +10,41 @@
 
 ## 1. Problem and Scope
 
-Equal skill catalogs do not guarantee the same effective toolkit, and bare Git worktrees do not prevent sibling reads, shared indexes, or credential leakage across council workers.
+Equal skill catalogs do not guarantee the same effective toolkit, and bare Git worktrees do not prevent sibling reads, shared indexes, network leakage, or credential disclosure across council workers.
 
-AC-005 establishes the operational contract for immutable run profiles, isolated execution workspaces, defense-in-depth launch policies, service-owned artifact ingestion, and sealed proposal release before native contributor adapters (AC-007 through AC-010) are wired.
+AC-005 establishes the operational contract for immutable run profiles, isolated execution workspaces, unbypassable launch policies, service-owned artifact ingestion, and sealed proposal release before native contributor adapters (AC-007 through AC-010) are wired.
 
 ### In Scope:
 1. **Profile, Brief, and Source Freezing**:
-   - Specification and storage of the immutable input artifacts: the raw brief text, the canonical profile document, and the validated source repository identity with commit/tree anchors.
-   - Deterministic, versioned canonical encoding and digest computation (`brief_digest`, `source_digest`, `profile_digest`).
-2. **Three-Tier Workspace Allocation & Session-Keyed Workspaces**:
+   - Storage and verification of the immutable inputs: raw brief text, canonical profile document, and source repository identity with commit/tree anchors.
+   - Deterministic canonical encoding (RFC 8785) with versioned digest prefixes (`brief_digest`, `source_digest`, `profile_digest`).
+2. **Session-Keyed Workspaces & Symmetric Disjointness**:
    - Workspace directories keyed by `{run_id}/{session_id}` (supporting replacement sessions and clean-room reviewers without collisions).
-   - Placement under an operator-configured `workspace_base_dir` strictly disjoint from the protected `state_dir` (which contains `auth.token`, `council.sock`, SQLite databases, and raw storage blobs).
+   - Operator-configured `workspace_base_dir` verified as strictly disjoint from `state_dir` in both directions: `state_dir` cannot reside inside `workspace_base_dir`, nor `workspace_base_dir` inside `state_dir`.
    - Three operational modes:
-     - `none`: empty scratch directory for non-code deliberation.
+     - `none`: scratch directory for non-code deliberations; no repository access.
      - `readonly`: concrete read-only repository tree with platform-validated enforcement.
      - `isolated_branch`: single dedicated Git worktree on assigned branch `council/{run_id}/{session_id}`.
-3. **Execution Policy & Launch Specification Seam**:
-   - An explicit policy module producing a `ValidatedLaunchSpec` (canonical executable, arguments, resolved `cwd`, allowlisted environment, and file access constraints).
-   - Clear distinction between **Council-mediated policy enforcement** (command gating, path traversal checks, Git branch restrictions) and **underlying OS enforcement** (namespaces/mounts/jail). Unsupported capabilities fail closed with explicit errors.
-4. **Worker Authority & Service-Owned Artifact Ingestion**:
+   - TOCTOU-resistant directory creation and symlink boundary validation.
+3. **Unbypassable Execution Policy Seam (`PolicyExecutor`)**:
+   - A deep execution-policy module (`internal/adapter/execpolicy`) where process launching is encapsulated behind `PolicyExecutor.Start(ctx, LaunchRequest)`.
+   - Private validated launch representation; production adapters cannot bypass policy or invoke `os/exec` directly.
+   - Explicit `isolation_strictness` setting (`strict` vs `permissive_dev`) controlling whether degraded host isolation fails closed.
+4. **Network Policy & Denial Evidence**:
+   - Declarative network policy in profiles (`none`, `allowlist`, `unrestricted`).
+   - Sibling and foreign endpoint isolation; Council-mediated request gating and OS-level network isolation.
+   - Explicit denial evidence in isolation test fixtures.
+5. **Worker Authority & Lifecycle-Tolerant Artifact Ingestion**:
    - Workers **never** hold or receive controller leases or operator bearer tokens.
-   - Artifact creation from workers is internal to the execution supervisor and authorized exclusively via `ExecutionRef{SessionID, TurnKey, AttemptID}` (aligning with AC-004).
-5. **Atomic Sealing of Artifact Revisions**:
+   - Artifact creation is internal to the service supervisor and authorized via `ExecutionRef{SessionID, TurnKey, AttemptID}`.
+   - Ingestion is valid while turns are active or upon terminal completion, matching AC-004's accepted-execution persistence rules.
+   - Trusted internal read interfaces enforce author vs. peer reviewer visibility without allowing arbitrary caller-authored context.
+6. **Atomic Sealing of Artifact Revisions**:
    - `ReleaseArtifacts` binds an explicit sorted set of `(artifact_id, revision, digest, author_session_id)` tuples.
    - Computes an authoritative `proposal_set_digest`. Atomic transaction transitions visibility from unreleased (`released = 0`) to sealed/released (`released = 1`).
-   - Sibling contributors during first-pass generation receive no access to unreleased proposals or controller conversation history; peer reviewers receive released proposals via controller-dispatched turn prompts or typed adapter inputs.
-6. **Native Authentication vs. Config Isolation**:
-   - Model an opaque `NativeAuthMode` per harness (`inherited_host_keychain`, `harness_login_delegation`, `none`).
-   - Council neither copies nor inspects native provider tokens.
-   - Environment sanitization uses strict allowlists (never blanket keyword removal), ensuring native auth sockets function while Council credentials are excluded.
+7. **Native Authentication vs. Config Isolation**:
+   - Opaque `NativeAuthMode` per harness (`inherited_host_keychain`, `harness_login_delegation`, `none`).
+   - Minimal allowlist-based environment sanitization; synthetic secrets test verification.
 
 ### Out of Scope:
 - Native harness CLI subprocess orchestration for specific commercial providers (OpenCode, Claude, Codex, Agy are implemented in AC-007–AC-010).
@@ -52,19 +58,21 @@ AC-005 establishes the operational contract for immutable run profiles, isolated
 
 1. **Immutable Triad**:
    - Every run is permanently bound to `brief_digest`, `source_digest`, and `profile_digest`.
-   - The underlying brief text and canonical profile JSON are stored permanently in the content-addressed store (CAS) or database; a run cannot be initialized without validating that the digests match the stored artifacts.
+   - Underlying brief text and canonical profile JSON are stored permanently in content-addressed storage or database; initialization validates digests against stored artifacts.
 2. **Strict Authority Separation**:
    - Worker processes run without operator tokens (`auth.token`) or controller leases.
    - Workers cannot query administration routes, cannot call `PublishArtifact` as a controller, and cannot alter their own workspace modes or permissions.
    - Artifact ingestion from a running worker is accepted only through internal supervisor coordination using a verified `ExecutionRef`.
 3. **Workspace Boundary & Symlink Defense**:
-   - All workspace paths are resolved using `filepath.EvalSymlinks`. Any path traversing outside the assigned `workspace_root` is rejected with `ErrInvalidPath`.
-   - Workspaces reside outside `state_dir`.
+   - Symmetric root disjointness: `state_dir` and `workspace_base_dir` can never overlap or enclose one another.
+   - Path traversal validation resolves symlinks with race-resistant parent checks.
    - Workspace directories are keyed by session/allocation ID (`{run_id}/{session_id}`), ensuring replacement contributors or clean-room reviewers receive distinct, collision-free workspaces.
-4. **Sealed Proposal Sets**:
+4. **Unbypassable Seam**:
+   - Production adapters cannot instantiate raw subprocesses. All launches pass through `PolicyExecutor.Start`, which validates constraints, applies environment allowlists, and enforces directory pinning.
+5. **Sealed Proposal Sets**:
    - Individual worker artifacts remain private to their creating session until a formal release.
    - A proposal set is sealed as an atomic collection of specific artifact revisions. The `proposal_set_digest` is calculated canonically by the service from the sorted tuple set.
-5. **Native Auth Preservation**:
+6. **Native Auth Preservation**:
    - Provider credentials are not duplicated or managed by Council.
    - Council credentials (`auth.token`, internal socket paths) are strictly excluded from child process environments.
 
@@ -82,8 +90,10 @@ Fresh databases apply `v1 -> v2 -> v3` sequentially. Upgrades from v2 verify the
 CREATE TABLE IF NOT EXISTS run_profiles (
     run_id TEXT NOT NULL PRIMARY KEY REFERENCES runs(run_id) ON DELETE RESTRICT,
     profile_digest TEXT NOT NULL,
-    algorithm_version TEXT NOT NULL, -- e.g. 'cprof-v1'
+    algorithm_version TEXT NOT NULL, -- e.g. 'cprof-v1' or 'legacy-unverified'
     workspace_mode TEXT NOT NULL CHECK (workspace_mode IN ('none', 'readonly', 'isolated_branch')),
+    isolation_strictness TEXT NOT NULL CHECK (isolation_strictness IN ('strict', 'permissive_dev')),
+    network_mode TEXT NOT NULL CHECK (network_mode IN ('none', 'allowlist', 'unrestricted')),
     canonical_profile_json TEXT NOT NULL,
     source_repo_identity TEXT NOT NULL, -- e.g. local path or repo URI
     source_commit TEXT NOT NULL,         -- Git commit SHA or empty for 'none'
@@ -121,22 +131,36 @@ CREATE INDEX IF NOT EXISTS idx_artifact_revisions_lookup
     ON artifact_revisions(run_id, released, proposal_set_digest);
 ```
 
-### 3.2 Migration Backfill Policy
+### 3.2 Migration Backfill Policy (Honest Legacy State)
 - Legacy (v1/v2) runs:
-  - Backfilled with a synthetic `run_profiles` record: `workspace_mode = 'isolated_branch'`, `algorithm_version = 'cprof-v1'`, `canonical_profile_json = '{}'`, `source_repo_identity = 'legacy'`, `source_commit = ''`, `source_tree = ''`, `brief_artifact_digest = ''`.
+  - Backfilled with explicit unverified status:
+    - `algorithm_version = 'legacy-unverified'`
+    - `profile_digest = runs.profile_digest` (preserves existing record without fabricating a new digest)
+    - `workspace_mode = 'none'`
+    - `isolation_strictness = 'permissive_dev'`
+    - `network_mode = 'unrestricted'`
+    - `canonical_profile_json = ''`
+    - `source_repo_identity = 'legacy'`
+    - `source_commit = ''`
+    - `source_tree = ''`
+    - `brief_artifact_digest = ''`
+  - Legacy rows cannot be used to provision new worktrees or claim isolation guarantees.
 - Legacy artifact revisions:
-  - Backfilled as `released = 1`, `proposal_set_digest = 'legacy-proposal-set'`. Existing historical artifacts remain visible to avoid breaking existing runs.
+  - Backfilled with `released = 1`, `proposal_set_digest = NULL`.
+  - No synthetic records are inserted into `proposal_sets` or `proposal_set_members`. Existing historical artifacts remain readable via general inspection without claiming sealed proposal status.
 
 ---
 
 ## 4. Canonical Profile Encoding & Digest Algorithm
 
 ### 4.1 Specification of `CanonicalProfile`
-The canonical profile document specifies:
 ```json
 {
   "algo_version": "cprof-v1",
   "workspace_mode": "isolated_branch",
+  "isolation_strictness": "strict",
+  "network_mode": "none",
+  "network_allowlist": [],
   "code_index_scope": ["cmd/", "internal/"],
   "tooling": ["git", "go", "test"],
   "harnesses": {
@@ -168,7 +192,7 @@ The canonical profile document specifies:
 1. **Key Ordering**: All object keys sorted lexicographically by UTF-16 code units.
 2. **Whitespace**: No whitespace between tokens (`:`, `,`).
 3. **Strings**: Normal UTF-8; tool names lowercase; paths normalized (`filepath.Clean`, forward slashes, trailing slashes stripped).
-4. **Lists**: `tooling` and `code_index_scope` entries deduplicated and sorted.
+4. **Lists**: `tooling`, `network_allowlist`, and `code_index_scope` entries deduplicated and sorted.
 5. **Unknown Fields**: Strict JSON decoding with `DisallowUnknownFields`. Any unrecognized field causes immediate rejection with `ErrDisallowedToolingConfig`.
 6. **Digest Computation**:
    ```
@@ -177,101 +201,130 @@ The canonical profile document specifies:
 
 ---
 
-## 5. Workspace Management & Execution Policy Seam
+## 5. Workspace Management & Unbypassable Execution Seam
 
-### 5.1 Root Placement & Path Validation
-The operator designates a `workspace_base_dir` (e.g. `/var/run/council-workspaces` or `~/.council-workspaces`), strictly disjoint from `state_dir`.
-If `workspace_base_dir` is inside `state_dir` or is a symlink resolving into `state_dir`, service initialization fails immediately.
-
-Worker directory structure:
-```
-$WORKSPACE_BASE_DIR/
-  {run_id}/
-    {session_id}/
-      scratch/           # Local scratch directory (writable in all modes)
-      config/            # Harness configuration directory (private dotfiles/cache)
-      source/            # Read-only source checkout (in readonly mode)
-      worktree/          # Dedicated git worktree (in isolated_branch mode)
-```
-
-Path validation rule:
-Every workspace path component is validated against regex `^[a-zA-Z0-9_\-]+$`.
-Before executing any tool or operation, the target path is resolved using `filepath.EvalSymlinks`.
+### 5.1 Symmetric Disjointness & Path Validation
+The operator designates `workspace_base_dir`, completely separate from `state_dir`.
+Initialization symmetrically evaluates real paths:
 ```go
-if !strings.HasPrefix(resolvedPath, resolvedWorkspaceRoot+string(filepath.Separator)) && resolvedPath != resolvedWorkspaceRoot {
-    return ErrInvalidPath
+realStateDir, err1 := filepath.EvalSymlinks(stateDir)
+realWorkspaceBase, err2 := filepath.EvalSymlinks(workspaceBaseDir)
+// Fail closed if either is contained within the other
+if strings.HasPrefix(realWorkspaceBase, realStateDir+string(filepath.Separator)) || realWorkspaceBase == realStateDir ||
+   strings.HasPrefix(realStateDir, realWorkspaceBase+string(filepath.Separator)) || realStateDir == realWorkspaceBase {
+    return ErrWorkspaceStateOverlap
 }
 ```
 
-### 5.2 Workspace Mode Implementation & Enforcement
+### 5.2 Path Identifier Validation & Race-Resistant Allocation
+- Identifiers (`run_id`, `session_id`, `turn_key`) must match regex `^[a-zA-Z0-9_\-]+$`.
+- Workspace allocation:
+  ```
+  $WORKSPACE_BASE_DIR/
+    {run_id}/
+      {session_id}/
+        scratch/
+        config/
+        source/
+        worktree/
+  ```
+- **Race Defense**:
+  - `EvalSymlinks` is performed on existing parent paths.
+  - Directories are created with `os.MkdirAll` (mode `0700`).
+  - After creation, the leaf directory path is re-verified with `EvalSymlinks` to confirm it strictly resolves within `realWorkspaceBase`.
+
+### 5.3 Workspace Modes
 1. **`none` Mode**:
-   - `workspace_root = $WORKSPACE_BASE_DIR/{run_id}/{session_id}/scratch`
+   - `workspace_root = scratch/`
    - Repository source is neither linked nor visible.
 2. **`readonly` Mode**:
-   - `workspace_root = $WORKSPACE_BASE_DIR/{run_id}/{session_id}/source`
+   - `workspace_root = source/`
    - Source is checked out detached at `source_commit`.
    - **Enforcement**:
-     - Linux: Read-only bind mount (`mount --bind -o ro`) when unprivileged user namespaces or root mounts are available; fallback to filesystem permissions `0500` (directories) / `0400` (files).
-     - Windows/macOS: Read-only attribute bitmask / ACL lock on the source checkout; scratch directory remains separate and writable.
-     - Where read-only enforcement cannot be verified, the execution policy marks `ReadonlyEnforcement: "degraded_file_permissions"` or fails closed if strict isolation was configured.
+     - Linux: Read-only bind mount (`mount --bind -o ro`) when unprivileged user namespaces are available.
+     - Fallback / Windows / macOS: Read-only file permission bitmask / ACL lock on the source checkout.
+     - If `isolation_strictness == "strict"` and mount isolation is unavailable, fails closed with `ErrUnsupportedIsolationCapability`.
 3. **`isolated_branch` Mode**:
-   - `workspace_root = $WORKSPACE_BASE_DIR/{run_id}/{session_id}/worktree`
-   - A dedicated Git worktree is created on branch `council/{run_id}/{session_id}` forked from `source_commit`.
-   - **Git Command Policy**:
-     - Git commands executed through Council tool wrappers enforce branch restriction: `checkout -b`, `push origin main`, and `merge` outside the assigned branch are rejected at the command wrapper level.
-     - Worktree removal and pruning are cleanly managed by `WorkspaceManager.CloseSession()`.
+   - `workspace_root = worktree/`
+   - Dedicated Git worktree on branch `council/{run_id}/{session_id}` forked from `source_commit`.
+   - Council-mediated Git tools enforce branch boundary: attempts to branch or push outside `council/{run_id}/{session_id}` are blocked.
 
-### 5.3 Execution Policy Seam (`ValidatedLaunchSpec`)
-The adapter layer does not directly execute raw commands. It invokes an `ExecutionPolicy` validator that produces:
+### 5.4 Unbypassable Execution Policy Seam (`PolicyExecutor`)
+Production adapters do not call `os/exec` or receive raw launch structs. They invoke:
 
 ```go
-type ValidatedLaunchSpec struct {
-    Executable          string
+type LaunchRequest struct {
+    SessionID           string
+    TurnKey             string
+    AttemptID           string
+    Command             string
     Args                []string
-    Cwd                 string            // Validated canonical workspace root
-    Env                 map[string]string // Strict allowlist; no Council credentials
-    ConfigDir           string            // Isolated config path
-    ReadonlyEnforcement string            // "mount", "permissions", "none"
-    AllowedPathPrefix   string            // Resolved workspace root prefix
+    ExtraEnvAllowlist   []string
+}
+
+type PolicyExecutor interface {
+    Start(ctx context.Context, req LaunchRequest) (ManagedProcess, error)
+}
+
+type ManagedProcess interface {
+    Stdin() io.Writer
+    Stdout() io.Reader
+    Stderr() io.Reader
+    Wait() (ProcessExit, error)
+    Terminate(ctx context.Context) error
 }
 ```
 
-### 5.4 Environment Allowlist
-The child process environment is constructed strictly from an allowlist:
-- Standard minimal system variables: `PATH`, `TMPDIR`, `TERM`, `LANG`, `LC_ALL`, `USER`, `HOME` (pointed to worker `config/`).
-- Council worker variables: `COUNCIL_WORKSPACE_ROOT`, `COUNCIL_RUN_ID`, `COUNCIL_SESSION_ID`.
-- Harness-specific non-secret variables explicitly approved in the canonical profile's `extra_env_allowlist`.
-- **Forbidden**: Any variable containing `AUTH_TOKEN`, `COUNCIL_SOCKET`, `COUNCIL_LEASE`, or any variable not in the allowlist.
+`PolicyExecutor` validates:
+- Current workspace mode and strictness.
+- Resolves and verifies canonical `cwd`.
+- Constructs an allowlisted environment:
+  - Base: `PATH`, `TMPDIR`, `TERM`, `LANG`, `LC_ALL`, `USER`, `HOME` (set to `config/`).
+  - Worker: `COUNCIL_WORKSPACE_ROOT`, `COUNCIL_RUN_ID`, `COUNCIL_SESSION_ID`.
+  - Approved `extra_env_allowlist` variables from profile.
+  - Hard rejection of any variable containing `AUTH_TOKEN`, `COUNCIL_SOCKET`, `COUNCIL_LEASE`.
+- Network policy:
+  - If `network_mode == "none"`, applies OS network namespace isolation or denies socket creation. If unavailable and `strict`, fails closed.
 
 ---
 
-## 6. Service-Owned Worker Artifact Ingestion
+## 6. Service-Owned Worker Artifact Ingestion & Visibility
 
-### 6.1 Worker Ingestion Flow
-Workers do not call HTTP endpoints with controller leases. Instead:
-1. When a worker finishes a turn or writes an artifact, the adapter or supervisor calls an internal storage method:
-   ```go
-   RecordObservedArtifact(ctx context.Context, ref ExecutionRef, name string, content []byte) (ArtifactMetadata, error)
-   ```
-2. The storage engine verifies `ref` (`SessionID`, `TurnKey`, `AttemptID`) matches the active dispatch intent in SQLite.
-3. Content is stored in content-addressed storage, and `artifact_revisions` is inserted with:
-   - `session_id = ref.SessionID`
-   - `attempt_id = ref.AttemptID`
-   - `released = 0`
-   - `proposal_set_digest = NULL`
-4. The artifact is completely unreleased and private to `ref.SessionID`.
+### 6.1 Lifecycle-Tolerant Ingestion (`RecordObservedArtifact`)
+Matching AC-004's accepted-execution authority:
+```go
+func (s *Store) RecordObservedArtifact(
+    ctx context.Context, 
+    ref ExecutionRef, 
+    name string, 
+    content []byte,
+) (ArtifactMetadata, error)
+```
+1. **Attempt Validation**:
+   - Validates `ref` (`SessionID`, `TurnKey`, `AttemptID`) matches the persisted turn attempt in `turns` and `dispatch_intents`.
+   - Accepted whether the turn is currently `running` or already reached a terminal phase (`completed`, `failed`, `cancelling`, `cancelled`, `interrupted`).
+   - Wrong `AttemptID` is rejected with `ErrInvalidAttempt`.
+2. **Idempotency**:
+   - If `(ref, name)` was already ingested with the identical digest, returns the existing metadata.
+   - If re-ingested with conflicting digest, returns `ErrConflictingArtifact`.
+3. **Storage**:
+   - Stored in content-addressed storage.
+   - Inserted into `artifact_revisions` with `released = 0`, `proposal_set_digest = NULL`, `session_id = ref.SessionID`, `attempt_id = ref.AttemptID`.
 
 ### 6.2 Atomic Proposal Set Sealing (`ReleaseArtifacts`)
-When the controller determines that the contribution phase is complete:
-1. The controller calls:
-   ```go
-   ReleaseArtifacts(ctx context.Context, opID string, callerLease string, runID string, members []ProposalMemberRef) (ProposalSetReceipt, error)
-   ```
-2. **Preconditions**:
-   - `callerLease` is verified against current active controller authority.
-   - `members` must contain at least one artifact reference and at most one per active contributor.
-   - Each `(artifact_id, revision)` must exist, match the author session, and have matching content digest.
-3. **Sealing**:
+Controller invokes `ReleaseArtifacts` with explicit members:
+```go
+type ProposalMemberRef struct {
+    ArtifactID string `json:"artifact_id"`
+    Revision   int64  `json:"revision"`
+    Digest     string `json:"digest"`
+}
+```
+1. Preconditions:
+   - Caller lease validates current active controller authority.
+   - Each referenced `(artifact_id, revision)` must exist and match `Digest`.
+   - Exactly one proposal member per contributing session (or designated panel).
+2. Sealing:
    - Sort members canonically by `(author_contributor, artifact_id, revision)`.
    - Compute `proposal_set_digest = "propset-v1:sha256:" + hex(sha256(canonical_members_bytes))`.
    - In a single SQLite write transaction:
@@ -280,56 +333,64 @@ When the controller determines that the contribution phase is complete:
      - Update `artifact_revisions SET released = 1, proposal_set_digest = ? WHERE ...`.
      - Append audit journal record `artifacts_released`.
 
-### 6.3 Visibility Matrix
-| Requestor Context | Artifact State | Visibility |
-| :--- | :--- | :--- |
-| Author Session (Turn Active / Parked) | `released = 0` | **Visible** (can read its own drafts) |
-| Sibling Worker (Turn Active) | `released = 0` | **Denied** (`ErrArtifactNotFound`) |
-| Peer Reviewer Session | `released = 1` | **Visible** (only artifacts in sealed proposal set) |
-| Controller / Operator Inspection | `released = 0` or `1` | **Visible** (redacted audit record) |
-| Archived Run | Any | **Frozen** (read-only audit, no new releases) |
+### 6.3 Trusted Internal Read Authority
+Artifact reading is partitioned by trusted interfaces:
+```go
+// Author session reading its own drafts
+func (s *Store) ReadAuthorArtifact(ctx context.Context, ref ExecutionRef, artifactID string) ([]byte, ArtifactMetadata, error)
+
+// Peer reviewer reading released proposal set members
+func (s *Store) ReadReleasedArtifact(ctx context.Context, reviewerSessionID string, proposalSetDigest string, artifactID string) ([]byte, ArtifactMetadata, error)
+```
+- `ReadAuthorArtifact` verifies `artifact_revisions.session_id == ref.SessionID`.
+- `ReadReleasedArtifact` verifies `released = 1` AND row exists in `proposal_set_members` for `proposalSetDigest`.
+- Sibling attempts to read unreleased artifacts fail with `ErrArtifactNotFound`.
 
 ---
 
 ## 7. Acceptance Evidence Matrix
 
-The test suite must provide explicit, partitioned evidence across three categories:
-
 ### 7.1 Storage and Service Authorization Evidence
 - **`TestAC005_FrozenProfileImmutability`**:
   - Run created with canonical profile, brief text, and repo identity.
-  - Attempting to update or mutate the profile fails with `ErrUnauthorizedOperation`.
-  - Initializing a session with a mismatched `profile_digest` or unapproved model/tool is rejected.
-- **`TestAC005_WorkerArtifactIngestionRequiresExecutionRef`**:
-  - Attempting to ingest an artifact without a valid, active `ExecutionRef` fails.
-  - Ingestion does not accept or require a controller lease.
-- **`TestAC005_AtomicProposalSetRelease`**:
-  - Two workers ingest unreleased artifacts (`released = 0`).
-  - Sibling session querying the artifact gets `ErrArtifactNotFound`.
-  - `ReleaseArtifacts` binds both artifact revisions, calculates `proposal_set_digest`, and commits visibility in a single transaction.
-  - Peer reviewer session can now retrieve the released artifacts.
+  - Attempting to update or mutate profile fields fails.
+  - Mismatched `profile_digest` or unapproved profile fails session initialization.
+- **`TestAC005_WorkerArtifactIngestionMatchesExecutionRef`**:
+  - Ingestion succeeds during `running` turn and immediately after terminal completion with matching `ExecutionRef`.
+  - Ingestion fails with wrong `AttemptID`.
+  - Re-ingesting matching artifact is idempotent; conflicting content returns error.
+- **`TestAC005_AtomicProposalSetSealing`**:
+  - Workers ingest unreleased drafts (`released = 0`).
+  - Sibling session calling `ReadAuthorArtifact` or `ReadReleasedArtifact` gets `ErrArtifactNotFound`.
+  - `ReleaseArtifacts` calculates `proposal_set_digest`, writes membership, and updates visibility atomically.
+  - Peer reviewer calling `ReadReleasedArtifact` successfully retrieves content.
+- **`TestAC005_MigrationV3_HonestLegacyBackfill`**:
+  - Verified v2 database upgraded to v3.
+  - Legacy runs marked `legacy-unverified` with `workspace_mode = 'none'`.
+  - Legacy artifacts marked `released = 1` with `proposal_set_digest = NULL`.
 
 ### 7.2 Controlled Process-Policy & Filesystem Fixtures
-- **`TestAC005_WorkspaceBaseDirDisjointFromStateDir`**:
-  - Configuring `workspace_base_dir` inside `state_dir` fails startup with an explicit error.
-- **`TestAC005_PathTraversalRejection`**:
-  - Symlinks pointing out of workspace, `../` relative traversal, and absolute paths outside `workspace_root` return `ErrInvalidPath`.
-- **`TestAC005_EnvironmentSanitization`**:
-  - Subprocess launch spec strips parent `AUTH_TOKEN`, `COUNCIL_SOCKET`, and unapproved environment variables.
-  - Verified with synthetic canary environment secrets.
+- **`TestAC005_SymmetricWorkspaceDisjointness`**:
+  - `workspace_base_dir` inside `state_dir` fails startup.
+  - `state_dir` inside `workspace_base_dir` fails startup.
+  - Sibling path traversal (`../{sibling_session}`) fails path resolution.
+- **`TestAC005_PolicyExecutor_UnbypassableSeam`**:
+  - Process launch via `PolicyExecutor` pins `cwd` to `workspace_root`.
+  - Environment allowlist verified with synthetic canary secrets; Council tokens excluded.
+- **`TestAC005_NetworkPolicyDenial`**:
+  - Subprocess under `network_mode: "none"` produces explicit denial when attempting socket connection.
+  - Council-mediated HTTP tools reject unallowlisted destinations with typed error.
 - **`TestAC005_WorkspaceModesProvisioning`**:
-  - `none`: verified that no git repo or source files exist in scratch.
-  - `readonly`: verified that source checkout exists and write attempts are blocked.
-  - `isolated_branch`: verified that Git worktree is on `council/{run_id}/{session_id}`.
-- **`TestAC005_GitBranchPolicyGate`**:
-  - Attempting to execute `git checkout -b` or `git push origin main` through Council's Git command policy wrapper fails with a policy rejection.
+  - `none`: verified no Git repository or source files in `scratch/`.
+  - `readonly`: verified source checkout exists; write operations fail.
+  - `isolated_branch`: verified worktree exists on branch `council/{run_id}/{session_id}`.
 
 ### 7.3 Real Native & OS Enforcement Boundaries (Documented Disclosures)
-- Real OS-level user namespace and seccomp/sandbox-exec isolation is documented as dependent on host platform capabilities and verified in native adapter work (AC-007–AC-010).
-- Where OS-level read-only mount enforcement is unavailable (e.g. non-root Windows/Darwin), the degraded mode (file permission bitmask) is explicitly recorded in test reports.
+- Real OS-level network namespaces and bind mounts require supported Linux host environments; where unavailable, behavior depends on `isolation_strictness` (`strict` fails closed; `permissive_dev` logs degradation in audit journal).
+- Real provider execution arrives in AC-007–AC-010; AC-005 proves the policy engine, storage boundaries, and workspace contracts via controlled fixtures.
 
 ---
 
 ## 8. Boundaries and Limitations
-- Same-user local processes on Linux/macOS without elevated privileges or namespaces share kernel user ID; Council-mediated execution policy and workspace separation enforce operational hygiene, but do not replace an OS hypervisor.
+- Same-user local processes on Linux/macOS without elevated privileges or user namespaces share kernel UID; Council-mediated execution policy and workspace separation enforce operational hygiene, but do not replace an OS hypervisor.
 - Real provider execution requires the respective native adapter implementations (AC-007 through AC-010). Controlled fixtures and simulated harness adapters are used for AC-005 verification.
