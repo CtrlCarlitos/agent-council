@@ -23,10 +23,10 @@
 - Single flight per native session (in-flight map keyed by native session ID).
 - Server credentials via `LaunchRequest.GeneratedServerEnv` only (Username/Password; injected after allowlist/scrub; redacted from captured output; accepted only when the executor validates the exact `opencode serve` launch shape).
 - Event pump: adapter-owned per-session SSE; Observe detaches from bounded taps; routing by native session/message ID → TurnRef; cursor-based dedup/resync.
-- All enforcement evidence POSIX-scoped (//go:build !windows); windows/darwin vet+compile must stay green.
+- Only tests requiring POSIX processes, signals, permissions, or shell fixtures are //go:build !windows; digest, HTTP client, fake-server, dispatch reservation, parentID correlation, reconciliation, and event-pump tests run on every platform. windows/darwin vet+compile must stay green.
 
 ## Verification Gates
-- **Gate 1 (after Tasks 1–3):** executor GeneratedServerEnv + probe template validation; server lifecycle via PolicyExecutor (launch shape, park/resume replacement); typed HTTP client against the fake server; deterministic digest. Covers executor, lifecycle, client, and digest evidence only. Full suites + race ×3.
+- **Gate 1 (after Task 4):** executor GeneratedServerEnv + probe template validation (Tasks 1–2); server lifecycle via PolicyExecutor including park/resume replacement (Task 2); typed HTTP client + deterministic digest + identity seam (Task 3); fake OpenCode server (Task 4). Covers executor, lifecycle, client, digest, and fake-server evidence. Full suites + race ×3.
 - **Gate 2 (after Tasks 6–7):** adapter contract + event pump (Task 5), service wiring (Task 6), acceptance story + matrix (Task 7). Full suites + race ×3 + cross-platform CI.
 
 ---
@@ -57,7 +57,8 @@
 - Test: `internal/adapter/opencode/server_test.go`
 
 **Interfaces:**
-- `type ServerConfig struct { WorkspaceRoot string; Executor execpolicy.PolicyExecutor; ProbeTemplate execpolicy.ProbeLaunchTemplate; Identity DispatchIdentitySource; IdleGrace time.Duration }` — no StateDir: the adapter must not gain access to Council state storage for process lifecycle management.
+- `type SessionLaunchSource interface { OpenCodeServeLaunch(ctx context.Context, sessionID adapter.SessionID) (execpolicy.LaunchRequest, error) }` — injected seam; the service implementation builds the complete session-specific LaunchRequest from the persisted frozen run profile and the AC-005 workspace allocation. The adapter verifies the exact `opencode serve` shape and appends `GeneratedServerEnv` but never constructs policy inputs.
+- `type ServerConfig struct { WorkspaceRoot string; Executor execpolicy.PolicyExecutor; SessionLaunch SessionLaunchSource; ProbeTemplate ProbeLaunchTemplate; Identity DispatchIdentitySource; IdleGrace time.Duration }` — no StateDir: the adapter must not gain access to Council state storage for process lifecycle management.
 - `type OpenCodeServer struct { … }` — one per contributor session.
   - `Start(ctx) (endpoint string, err error)` — PolicyExecutor.Start with the verified launch shape (command `opencode`, args `serve --hostname 127.0.0.1 --port 0`, cwd = workspace root, GeneratedServerEnv); parse endpoint from startup output; wait for `/api/health`.
   - `Endpoint() string`, `PID() int`, `Close(ctx) error` (graceful dispose → terminate split, pipes drained, exit evidence).
