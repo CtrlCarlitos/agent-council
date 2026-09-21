@@ -51,7 +51,7 @@ Read-only inspection commands used (no provider calls): `--help` on
 | `GET /session/{id}/message`, `GET /session/{id}/message/{messageID}` | **Collect**: final assistant message parts (text, usage, cost, tokens) |
 | `POST /session/{id}/abort` | **Cancel**: cooperative abort; turn ends with abort semantics (not fabricated completion) |
 | `GET /permission`, `POST /permission/{requestID}/reply`, `GET /api/session/{id}/permission`, `POST /api/session/{id}/permission/{requestID}/reply` | **Approval wait / tool denial**: permission requests surface on the event stream and permission endpoints; adapter denies every request (see §3.6) |
-| `GET /api/model`, `GET /config/providers` | **Probe/CreateSession model validation**: intended provider+model must be listed and authenticated |
+| `GET /api/model` | **Probe/CreateSession model validation**: intended provider+model must be listed (credential-free endpoint; `GET /config/providers` is forbidden — it returns raw provider API keys) |
 | `POST /session/{id}/fork`, `POST /session/{id}/summarize`, `GET /session/{id}/todo` | Not needed for AC-004-style flow; noted for future tasks |
 
 ### 2.3 Verified behaviors and hazards
@@ -109,23 +109,32 @@ one server across workspaces. Therefore: **one adapter-owned
 - Working directory: that session's isolated AC-005 workspace root
   (project scoping is inherited from the process cwd — no per-request
   directory selector is trusted).
-- **Server credentials via a new `LaunchRequest.SetEnv map[string]string`**
-  (narrow AC-005 executor extension): explicit env vars set directly into
-  the child environment (`OPENCODE_SERVER_USERNAME`/`OPENCODE_SERVER_PASSWORD`,
-  generated ephemeral pair). `SetEnv` vars are Council-generated transport
-  credentials, NOT inherited environment — the frozen inherited-env
-  allowlist does not apply to them and they never appear in the frozen
-  profile. The executor injects them verbatim after allowlist
-  construction, and they are redacted from all captured output. Nothing
-  else may use `SetEnv` in this task.
-- Loopback listen plus the run's outbound network policy: the server must
-  listen on `127.0.0.1`; provider egress follows the run's network mode.
-- **Honest strict-isolation behavior:** under a network mode that cannot
-  permit both a loopback listener and provider egress, the server still
-  launches (loopback is local), but provider calls fail natively —
-  dispatches surface honest native failures. If the platform/network
-  enforcement cannot guarantee loopback listening at all, the launch is
-  rejected fail-closed with an explicit unsupported-capability error.
+- **Server credentials via a narrow typed generated-env mechanism** — a new
+  `LaunchRequest.GeneratedServerEnv *GeneratedServerEnv` field
+  (`struct{ Username, Password string }`), NOT a generic env-set map. The
+  executor expands it verbatim to exactly
+  `OPENCODE_SERVER_USERNAME=<Username>` and
+  `OPENCODE_SERVER_PASSWORD=<Password>` after all allowlist/scrub
+  processing; no other key can ever be injected through it. The executor
+  hard-rejects launch if either name collides with an inherited-env or
+  allowlisted key. These are Council-generated transport credentials, not
+  inherited secrets — the frozen profile and inherited-env allowlist are
+  untouched, and the values are redacted from all captured output. The
+  mechanism is restricted to the OpenCode server launch purpose; other
+  managed launches must leave it nil (enforced by an executor error if
+  set on non-server launches).
+- **Network launch matrix (documented and tested per mode):**
+  | Profile network mode | Server launch behavior |
+  |---|---|
+  | `unrestricted` / `permissive_dev` | Launches; loopback listener + direct provider egress. Enforcement is **degraded** per AC-005: provider egress is NOT OS-enforced — this must not be presented as egress control. |
+  | `allowlist` (strict) | Launch rejected: the executor reports the strict network capability as unsupported for a long-lived listening child (current `PolicyExecutor` behavior); fail-closed. |
+  | `none` (strict) | Launch rejected or health-check fails: the executor creates a fresh network namespace whose loopback interface is not guaranteed usable for the health check; the adapter treats launch failure as fail-closed and reports the capability honestly. |
+  | `readonly` (strict) | Fails closed (current executor behavior for strict isolation on listening children). |
+
+  In permissive modes, provider egress is **degraded per AC-005** and must
+  never be presented as OS-enforced provider egress control. The strict
+  modes above are fail-closed by design; the adapter surfaces their errors
+  honestly rather than weakening enforcement to make the server fit.
 - stdout/stderr drained and captured (termination-evidence pattern from
   AC-005); captured output is scanned for redaction (the server never
   receives provider keys from Council).
@@ -166,7 +175,7 @@ minimal typed client (`httpclient.go`):
 | AC-006 method | Behavior |
 |---|---|
 | `Probe` | `GET /api/health` + credential-free `GET /api/model` (model ids only; native auth status is **unknown** to Council). Server version. Streaming supported via SSE. |
-| `CreateSession` | Spawn the session's `opencode serve` child (§3.1), then `POST /session` with `{title: "council <sessionID>", agent, model: HarnessProfileSpec.Model}`. Model presence is validated against `GET /api/model` (credential-free; fail closed on unknown model). Native auth status is unknown — an unauthenticated native side fails at first prompt, honestly. Records `NativeSessionID = ses_…`. Fresh session in the session's own project: no history copy. |
+| `CreateSession` | Spawn the session's `opencode serve` child (§3.1), then `POST /session` with `{title: "council <sessionID>", agent, model: HarnessProfileSpec.Model}`. Model presence is validated against `GET /api/model` (credential-free; fail closed on unknown model). Native authentication status is unknown to Council — an unauthenticated native side fails at first prompt, honestly. Records `NativeSessionID = ses_…`. Fresh session in the session's own project: no history copy. |
 | `ResumeSession` | `GET /session/{nativeSessionID}`: 200 with matching project ⇒ verified; 404 ⇒ typed **`ErrNativeSessionMissing`** (a missing persisted binding — distinct from uncertain creation, which remains `ErrSessionCreationUncertain`'s role). Never falls back to newest-session selection. |
 | `Dispatch` | See §3.3 turn-identity contract: baseline cursor, adapter-generated deterministic native message ID, single-flight per native session, explicit pre-acceptance vs unknown classification, and turn/session single-flight enforcement. |
 | `Observe` | Taps the session's adapter-owned event pump (§3.4): buffered, cursor-tracked, deduplicated; caller detach never closes the native stream. |
@@ -183,12 +192,15 @@ minimal typed client (`httpclient.go`):
   `DispatchIdentitySource.AttemptFor(ctx, ref) (attempt string, ok bool)`,
   wired by the service to the persisted dispatch intent (storage
   `dispatch_intents.attempt_id`); the adapter never reads storage directly
-  and never invents `"1"`. The native message ID is then
-  `msg_council_` + hex(SHA-256(sessionID ∥ turnKey ∥ attempt))[:32]:
-  a fixed-length, fixed-charset digest that cannot exceed or violate the
-  native `^msg` ID pattern, cannot collide across sessions/turns in
-  practice, and leaks no identifiers. The attempt appears in the hash
-  input, so distinct attempts get distinct native messages.
+  and never invents `"1"`. The digest input uses unambiguous canonical
+  encoding — each identifier is length-prefixed
+  (`len(x) "\n" x`, lengths in decimal bytes) and concatenated in a fixed
+  field order (sessionID, turnKey, attempt) — so different tuples can never
+  produce identical input bytes. NUL bytes in any identifier are rejected
+  before encoding. The native message ID is
+  `msg_council_` + hex(SHA-256(canonical-input))[:32]: fixed-length,
+  fixed-charset, satisfying the native `^msg` ID pattern, collision-free
+  across distinct tuples, and leaking no identifiers.
 - **Single flight per native session.** OpenCode sessions are single
   conversation streams. The adapter keeps an in-flight map keyed by native
   session ID; a second Dispatch on the same native session is rejected
@@ -239,12 +251,14 @@ Design conclusions (binding for implementation):
 4. `DispatchAccepted` (204) means natively queued, not executed: native
    failures surface asynchronously through events/collect, which the
    adapter records honestly.
-- **Baseline cursor.** Before submission the adapter records the session's
-  current last-message ID (from `GET /session/{id}/message`). Collect selects
-  the assistant response with message ID == the adapter-generated
-  submission ID (and falls back to "first assistant message after the
-  baseline" if the native side assigns its own reply IDs), never "latest
-  message in session".
+- **Assistant-response correlation via `parentID`.** The native
+  `AssistantMessage` carries a `parentID` field (verified in the live
+  OpenAPI schema) that links the assistant reply to the submitted user
+  message ID. Collect and Reconcile require `AssistantMessage.parentID ==
+  <the deterministic submission ID>` — this is the normal, verified
+  relationship, not a best-effort heuristic. The pre-submission baseline
+  cursor is retained only as a routing/dedup aid in the event pump; it is
+  never used as evidence of response correlation.
 - **One turn per native session at a time** is enforced by the in-flight
   map above; a queued follow-up waits for the previous turn's terminal
   state (completed/failed/aborted) before dispatch.
