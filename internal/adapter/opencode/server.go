@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -28,12 +27,13 @@ type SessionLaunchSource interface {
 
 // serverProcess tracks one running `opencode serve` child.
 type serverProcess struct {
-	proc      execpolicy.ManagedProcess
-	endpoint  string
-	workspace string
-	username  string
-	password  string
-	startedAt time.Time
+	proc       execpolicy.ManagedProcess
+	endpoint   string
+	workspace  string
+	username   string
+	password   string
+	startedAt  time.Time
+	stderrTail *boundedBuffer // last stderr bytes, for failure diagnostics
 }
 
 // serverManager owns all live `opencode serve` children for this adapter
@@ -131,8 +131,9 @@ func (m *serverManager) start(ctx context.Context, sessionID adapter.SessionID) 
 	}
 
 	// Drain stderr for the child's lifetime: an undrained pipe eventually
-	// blocks the child. Discard is safe here; stdout carries the endpoint.
-	go func() { _, _ = io.Copy(io.Discard, proc.Stderr()) }()
+	// blocks the child. The tail is kept for failure diagnostics.
+	stderrTail := newBoundedBuffer(8 << 10)
+	go func() { _, _ = io.Copy(stderrTail, proc.Stderr()) }()
 
 	// Wait for the health endpoint (authenticated with the generated
 	// credentials, mirroring the real server's Basic-auth requirement).
@@ -162,12 +163,13 @@ func (m *serverManager) start(ctx context.Context, sessionID adapter.SessionID) 
 	}
 
 	sp := &serverProcess{
-		proc:      proc,
-		endpoint:  endpoint,
-		workspace: launchReq.Paths.Root,
-		username:  username,
-		password:  password,
-		startedAt: time.Now().UTC(),
+		proc:       proc,
+		endpoint:   endpoint,
+		workspace:  launchReq.Paths.Root,
+		username:   username,
+		password:   password,
+		startedAt:  time.Now().UTC(),
+		stderrTail: stderrTail,
 	}
 
 	m.mu.Lock()
@@ -196,31 +198,27 @@ func (m *serverManager) park(ctx context.Context, sessionID adapter.SessionID) e
 	}
 	termCtx, termCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer termCancel()
+	if sp.proc == nil {
+		// A child without a managed process (injected fixture) has
+		// nothing to terminate.
+		return nil
+	}
 	return sp.proc.Terminate(termCtx)
 }
 
 // verifyNativeSession checks that the resumed server still exposes the
 // exact native session. A verified 404 is a hard resume failure.
 func (m *serverManager) verifyNativeSession(ctx context.Context, endpoint, username, password, nativeID string) error {
-	hc := &http.Client{Timeout: 2 * time.Second}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/session/"+nativeID, nil)
-	if err != nil {
-		return err
-	}
-	req.SetBasicAuth(username, password)
-	resp, err := hc.Do(req)
+	vctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	exists, err := newNativeClient(endpoint, username, password).GetSession(vctx, nativeID)
 	if err != nil {
 		return fmt.Errorf("native session lookup: %w", err)
 	}
-	defer resp.Body.Close()
-	switch {
-	case resp.StatusCode == http.StatusOK:
-		return nil
-	case resp.StatusCode == http.StatusNotFound:
+	if !exists {
 		return fmt.Errorf("native session %s is missing after resume", nativeID)
-	default:
-		return fmt.Errorf("native session lookup returned HTTP %d", resp.StatusCode)
 	}
+	return nil
 }
 
 // stop terminates a specific session's serve child.
@@ -277,6 +275,15 @@ func (m *serverManager) endpoint(sessionID adapter.SessionID) (string, error) {
 	return sp.endpoint, nil
 }
 
+// isParked reports whether the session has a parked (stopped but
+// resumable) serve child.
+func (m *serverManager) isParked(sessionID adapter.SessionID) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.parked[string(sessionID)]
+	return ok
+}
+
 // waitForHealthy polls the child's stdout for the printed listen address,
 // then verifies GET /api/health with the generated credentials. Returns the
 // endpoint.
@@ -317,18 +324,9 @@ func (m *serverManager) waitForHealthy(ctx context.Context, proc execpolicy.Mana
 }
 
 func (m *serverManager) checkHealth(ctx context.Context, endpoint, username, password string) bool {
-	hc := &http.Client{Timeout: 2 * time.Second}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/api/health", nil)
-	if err != nil {
-		return false
-	}
-	req.SetBasicAuth(username, password)
-	resp, err := hc.Do(req)
-	if err != nil {
-		return false
-	}
-	resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
+	hctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	return newNativeClient(endpoint, username, password).Health(hctx) == nil
 }
 
 // generateServerCredentials generates an ephemeral username/password pair
@@ -346,6 +344,34 @@ func generateServerCredentials() (string, string, error) {
 type syncBuffer struct {
 	mu  sync.Mutex
 	buf strings.Builder
+}
+
+// boundedBuffer keeps the most recent maxLen bytes. Used for the child's
+// stderr tail so failures carry diagnostics without unbounded memory.
+type boundedBuffer struct {
+	mu     sync.Mutex
+	buf    []byte
+	maxLen int
+}
+
+func newBoundedBuffer(maxLen int) *boundedBuffer {
+	return &boundedBuffer{maxLen: maxLen}
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf = append(b.buf, p...)
+	if len(b.buf) > b.maxLen {
+		b.buf = b.buf[len(b.buf)-b.maxLen:]
+	}
+	return len(p), nil
+}
+
+func (b *boundedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.buf)
 }
 
 func (b *syncBuffer) append(s string) {

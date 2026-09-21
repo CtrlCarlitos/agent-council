@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeOpenCodeServer implements the verified endpoint subset for CI
@@ -31,7 +32,22 @@ type fakeOpenCodeServer struct {
 	// connection (client sees a post-write failure; state persisted).
 	flakyPromptAsync string
 
+	// workspaceDir, when non-empty, enforces the session-create directory
+	// context: POST /session requests carrying a different directory are
+	// rejected (the server serves exactly one working directory).
+	workspaceDir string
+
+	// extraCreds accepts additional valid credential pairs, mirroring a
+	// server that was launched with freshly generated credentials.
+	extraCreds [][2]string
+
 	ledger fakeRequestLedger
+}
+
+type fakePermission struct {
+	ID     string
+	Type   string
+	Status string
 }
 
 // fakeRequestLedger is a thread-safe record of the native HTTP requests the
@@ -44,6 +60,10 @@ type fakeRequestLedger struct {
 	promptAsyncMessageIDs []string
 	abortCalls            int
 	authFailures          int
+	modelCalls            int
+	sseConnects           []string
+	permissionReplies     []string
+	directoryRejections   int
 }
 
 func (l *fakeRequestLedger) recordPromptAsync(sessionID, messageID string) {
@@ -90,11 +110,44 @@ func (l *fakeRequestLedger) authFailureCount() int {
 	return l.authFailures
 }
 
+func (l *fakeRequestLedger) recordModel() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.modelCalls++
+}
+
+func (l *fakeRequestLedger) recordSSE(sessionID string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.sseConnects = append(l.sseConnects, sessionID)
+}
+
+func (l *fakeRequestLedger) recordPermissionReply(sessionID, permissionID string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.permissionReplies = append(l.permissionReplies, sessionID+"/"+permissionID)
+}
+
+func (l *fakeRequestLedger) recordDirectoryRejection() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.directoryRejections++
+}
+
 type fakeSession struct {
 	id             string
 	title          string
 	abortRequested bool
 	messages       []fakeMessage
+	scriptedEvents []string
+	eventDelay     time.Duration
+	permissions    []fakePermission
+}
+
+// fakeProbeError is the fake server's provider-error shape.
+type fakeProbeError struct {
+	Name    string `json:"name"`
+	Message string `json:"message"`
 }
 
 type fakeMessage struct {
@@ -105,6 +158,12 @@ type fakeMessage struct {
 	Error    *fakeProbeError `json:"error,omitempty"`
 }
 
+// fakePart is the fake server's content-part shape for scripted messages.
+type fakePart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
 func (f *fakeOpenCodeServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
@@ -112,8 +171,9 @@ func (f *fakeOpenCodeServer) handler() http.Handler {
 	})
 	mux.HandleFunc("POST /session", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Title string `json:"title"`
-			Model struct {
+			Title     string `json:"title"`
+			Directory string `json:"directory"`
+			Model     struct {
 				ProviderID string `json:"providerID"`
 				ID         string `json:"id"`
 			} `json:"model"`
@@ -124,6 +184,13 @@ func (f *fakeOpenCodeServer) handler() http.Handler {
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		// Directory-context rejection: the server serves exactly one
+		// working directory; a mismatched context is refused.
+		if f.workspaceDir != "" && body.Directory != f.workspaceDir {
+			f.ledger.recordDirectoryRejection()
+			http.Error(w, "directory mismatch", 403)
+			return
+		}
 		id := fmt.Sprintf("ses_fake_%d", len(f.sessions)+1)
 		sess := &fakeSession{id: id, title: body.Title}
 		f.sessions[id] = sess
@@ -259,6 +326,83 @@ func (f *fakeOpenCodeServer) handler() http.Handler {
 		}
 		http.Error(w, "not found", 404)
 	})
+	mux.HandleFunc("GET /api/model", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.ledger.recordModel()
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]string{{"id": "model", "providerID": "fake"}},
+		})
+	})
+	mux.HandleFunc("GET /session/{sessionID}/events", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		sess := f.sessions[r.PathValue("sessionID")]
+		f.mu.Unlock()
+		if sess == nil {
+			http.Error(w, "not found", 404)
+			return
+		}
+		f.mu.Lock()
+		f.ledger.recordSSE(sess.id)
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		flusher, _ := w.(http.Flusher)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		if delay := sess.eventDelay; delay > 0 {
+			time.Sleep(delay)
+		}
+		for _, ev := range sess.scriptedEvents {
+			fmt.Fprintf(w, "data: %s\n\n", ev)
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		// Hold the stream open until the client disconnects.
+		<-r.Context().Done()
+	})
+	mux.HandleFunc("GET /session/{sessionID}/permission", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		sess, ok := f.sessions[r.PathValue("sessionID")]
+		if !ok {
+			http.Error(w, "not found", 404)
+			return
+		}
+		perms := []map[string]string{}
+		for _, p := range sess.permissions {
+			perms = append(perms, map[string]string{"id": p.ID, "type": p.Type, "status": p.Status})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(perms)
+	})
+	mux.HandleFunc("POST /session/{sessionID}/permission/{permissionID}/reply", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		sessionID, permissionID := r.PathValue("sessionID"), r.PathValue("permissionID")
+		sess, ok := f.sessions[sessionID]
+		if !ok {
+			http.Error(w, "not found", 404)
+			return
+		}
+		var body struct {
+			Response string `json:"response"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad json", 400)
+			return
+		}
+		for i := range sess.permissions {
+			if sess.permissions[i].ID == permissionID {
+				sess.permissions[i].Status = body.Response
+			}
+		}
+		f.ledger.recordPermissionReply(sessionID, permissionID)
+		w.WriteHeader(200)
+	})
 	mux.HandleFunc("POST /session/{sessionID}/abort", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -271,7 +415,16 @@ func (f *fakeOpenCodeServer) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if f.expectedUser != "" {
 			user, pass, ok := r.BasicAuth()
-			if !ok || user != f.expectedUser || pass != f.expectedPass {
+			allowed := ok && user == f.expectedUser && pass == f.expectedPass
+			if !allowed {
+				for _, pair := range f.extraCreds {
+					if user == pair[0] && pass == pair[1] {
+						allowed = true
+						break
+					}
+				}
+			}
+			if !allowed {
 				f.ledger.recordAuthFailure()
 				w.Header().Set("WWW-Authenticate", `Basic realm="opencode"`)
 				http.Error(w, "unauthorized", 401)
@@ -282,12 +435,57 @@ func (f *fakeOpenCodeServer) handler() http.Handler {
 	})
 }
 
+// allowCredentials registers an additional valid credential pair, as a
+// real server would hold its own generated transport credentials.
+func (f *fakeOpenCodeServer) allowCredentials(user, pass string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.extraCreds = append(f.extraCreds, [2]string{user, pass})
+}
+
 // armFlakyPromptAsync injects a one-shot post-write disconnect into the next
 // prompt_async call. mode is "drop-before-record" or "drop-after-record".
 func (f *fakeOpenCodeServer) armFlakyPromptAsync(mode string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.flakyPromptAsync = mode
+}
+
+// setWorkspaceDir enables directory-context enforcement for POST /session.
+func (f *fakeOpenCodeServer) setWorkspaceDir(dir string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.workspaceDir = dir
+}
+
+// scriptEvents arms the session's SSE stream with the given payloads and
+// delay before the first event is written.
+func (f *fakeOpenCodeServer) scriptEvents(sessionID string, delay time.Duration, events ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	sess := f.sessions[sessionID]
+	sess.eventDelay = delay
+	sess.scriptedEvents = events
+}
+
+// addPermission registers a pending permission request on the session.
+func (f *fakeOpenCodeServer) addPermission(sessionID, permissionID, permissionType string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sessions[sessionID].permissions = append(f.sessions[sessionID].permissions,
+		fakePermission{ID: permissionID, Type: permissionType, Status: "pending"})
+}
+
+// permissionStatus reports the current status of a permission request.
+func (f *fakeOpenCodeServer) permissionStatus(sessionID, permissionID string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, p := range f.sessions[sessionID].permissions {
+		if p.ID == permissionID {
+			return p.Status
+		}
+	}
+	return ""
 }
 
 // messageExists reports whether the given user message ID was recorded for

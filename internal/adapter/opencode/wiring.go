@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -115,12 +116,18 @@ func (t *operatorProbeLaunchTemplate) VersionLaunch(ctx context.Context) (execpo
 	}, nil
 }
 
-func (t *operatorProbeLaunchTemplate) ProbeServeLaunch(ctx context.Context, scratchDir string) (execpolicy.LaunchRequest, error) {
+func (t *operatorProbeLaunchTemplate) ProbeServeLaunch(ctx context.Context) (execpolicy.LaunchRequest, error) {
 	if strings.TrimSpace(t.binaryPath) == "" {
 		return execpolicy.LaunchRequest{}, errors.New("opencode binary path is required for probe serve")
 	}
-	if strings.TrimSpace(scratchDir) == "" {
-		return execpolicy.LaunchRequest{}, errors.New("scratchDir is required for probe serve launch")
+	if strings.TrimSpace(t.scratchRoot) == "" {
+		return execpolicy.LaunchRequest{}, errors.New("scratchRoot is required for probe serve launch")
+	}
+	// The operator-owned template allocates the scratch directory; the
+	// adapter never creates directories itself.
+	scratchDir, err := os.MkdirTemp(t.scratchRoot, "ac-opencode-probe-")
+	if err != nil {
+		return execpolicy.LaunchRequest{}, fmt.Errorf("allocate probe scratch dir: %w", err)
 	}
 	return execpolicy.LaunchRequest{
 		Command: t.binaryPath,

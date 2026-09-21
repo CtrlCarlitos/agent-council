@@ -37,10 +37,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"strings"
 	"net/http"
+	"io"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -74,6 +76,11 @@ func main() {
 	user := os.Getenv("OPENCODE_SERVER_USERNAME")
 	pass := os.Getenv("OPENCODE_SERVER_PASSWORD")
 
+	if len(os.Args) > 1 && os.Args[1] == "--version" {
+		fmt.Println("opencode 1.18.31-stub")
+		return
+	}
+
 	appendLine(".stub-launches", fmt.Sprintf("%d", os.Getpid()))
 
 	if _, err := os.Stat(stateFile(".stub-unhealthy")); err == nil {
@@ -97,10 +104,33 @@ func main() {
 	}
 	fmt.Printf("listening on http://127.0.0.1:%d\n", ln.Addr().(*net.TCPAddr).Port)
 
+	// In-memory message store: native session ID -> messages.
+	var msgMu sync.Mutex
+	messages := map[string][]map[string]any{}
+
+	appendMessage := func(sessionID string, m map[string]any) {
+		msgMu.Lock()
+		defer msgMu.Unlock()
+		messages[sessionID] = append(messages[sessionID], m)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]bool{"healthy": true})
+	})
+	mux.HandleFunc("GET /api/model", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]string{{"id": "model", "providerID": "stub"}},
+		})
+	})
+	mux.HandleFunc("POST /session", func(w http.ResponseWriter, r *http.Request) {
+		n := len(readLines(".stub-sessions")) + 1
+		id := fmt.Sprintf("ses_stub_%d", n)
+		appendLine(".stub-sessions", id)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"id": id})
 	})
 	mux.HandleFunc("GET /session/{sessionID}", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("sessionID")
@@ -113,8 +143,73 @@ func main() {
 		}
 		http.Error(w, "not found", 404)
 	})
+	mux.HandleFunc("POST /session/{sessionID}/prompt_async", func(w http.ResponseWriter, r *http.Request) {
+		// Drain the body first so a decode failure cannot mask the real
+		// status behind a connection reset.
+		raw, _ := io.ReadAll(r.Body)
+		var body struct {
+			MessageID string   "json:\"messageID\""
+			Parts     []struct {
+				Type string "json:\"type\""
+				Text string "json:\"text\""
+			} "json:\"parts\""
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			appendLine(".stub-badjson", string(raw))
+			http.Error(w, "bad json", 400)
+			return
+		}
+		sessionID := r.PathValue("sessionID")
+		parts := make([]map[string]any, 0, len(body.Parts))
+		for _, p := range body.Parts {
+			parts = append(parts, map[string]any{"type": p.Type, "text": p.Text})
+		}
+		appendMessage(sessionID, map[string]any{
+			"info": map[string]any{"id": body.MessageID, "role": "user"}, "parts": parts,
+		})
+		// Script an assistant reply correlated by parentID.
+		appendMessage(sessionID, map[string]any{
+			"info": map[string]any{
+				"id": "msg_asst_" + body.MessageID, "role": "assistant", "parentID": body.MessageID,
+			},
+			"parts": []map[string]any{{"type": "text", "text": "stub assistant response"}},
+		})
+		w.WriteHeader(204)
+	})
+	mux.HandleFunc("GET /session/{sessionID}/message", func(w http.ResponseWriter, r *http.Request) {
+		msgMu.Lock()
+		msgs := messages[r.PathValue("sessionID")]
+		msgMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if msgs == nil {
+			msgs = []map[string]any{}
+		}
+		json.NewEncoder(w).Encode(msgs)
+	})
+	mux.HandleFunc("GET /session/{sessionID}/message/{messageID}", func(w http.ResponseWriter, r *http.Request) {
+		sessionID, messageID := r.PathValue("sessionID"), r.PathValue("messageID")
+		msgMu.Lock()
+		msgs := messages[sessionID]
+		msgMu.Unlock()
+		for _, m := range msgs {
+			info := m["info"].(map[string]any)
+			if info["id"] == messageID {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(m)
+				return
+			}
+		}
+		http.Error(w, "not found", 404)
+	})
 
 	authed := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				appendLine(".stub-panic", fmt.Sprintf("%s %s: %v", r.Method, r.URL.Path, rec))
+				panic(rec)
+			}
+		}()
+		appendLine(".stub-hits", r.Method+" "+r.URL.Path)
 		u, p, ok := r.BasicAuth()
 		if !ok ||
 			subtle.ConstantTimeCompare([]byte(u), []byte(user)) != 1 ||
@@ -184,6 +279,16 @@ func compileStubOpencode(t *testing.T) string {
 // `opencode serve` LaunchRequest rooted at the given workspace directory.
 type lifecycleLaunchSource struct{ root string }
 
+func lifecycleProfile() storage.CanonicalProfile {
+	return storage.CanonicalProfile{
+		AlgoVersion:         "cprof-v1",
+		WorkspaceMode:       "none",
+		IsolationStrictness: "permissive_dev",
+		NetworkMode:         "unrestricted",
+		Tooling:             []string{"opencode"},
+	}
+}
+
 func (s lifecycleLaunchSource) OpenCodeServeLaunch(_ context.Context, sessionID adapter.SessionID) (execpolicy.LaunchRequest, error) {
 	return execpolicy.LaunchRequest{
 		RunID:     "run-lc",
@@ -194,13 +299,7 @@ func (s lifecycleLaunchSource) OpenCodeServeLaunch(_ context.Context, sessionID 
 			Root:   s.root,
 			Config: s.root,
 		},
-		Profile: storage.CanonicalProfile{
-			AlgoVersion:         "cprof-v1",
-			WorkspaceMode:       "none",
-			IsolationStrictness: "permissive_dev",
-			NetworkMode:         "unrestricted",
-			Tooling:             []string{"opencode"},
-		},
+		Profile: lifecycleProfile(),
 	}, nil
 }
 

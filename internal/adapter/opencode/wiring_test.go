@@ -1,15 +1,18 @@
+//go:build unix
+
 package opencode
+
+// Production wiring evidence: the adapter is constructed through
+// NewProductionOpenCodeAdapter with the real storage-backed identity and
+// launch sources. The controlled stub `opencode` child is launched through
+// the real PolicyExecutor via the production SessionLaunchSource — no
+// server child or dispatch record is ever injected by the test.
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
@@ -19,138 +22,161 @@ import (
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
-// Production-construction regression: the service assembly constructs a
-// real OpenCode adapter whose Dispatch reaches the fake HTTP server and
-// whose Collect correlates via parentID.
-func TestGateSpecReview_ProductionDispatchReachesFakeServer(t *testing.T) {
-	dir := t.TempDir()
-	stateDir := filepath.Join(dir, "state")
-	wsBase := filepath.Join(dir, "workspaces")
-	cfgDir := filepath.Join(dir, "config")
-	for _, d := range []string{stateDir, wsBase, cfgDir} {
-		if err := os.MkdirAll(d, 0700); err != nil {
-			t.Fatalf("mkdir %s: %v", d, err)
-		}
-	}
+func seedWiredRun(t *testing.T, stateDir, wsBase string) (*storage.Store, *workspace.WorkspaceManager, *OpenCodeAdapter) {
+	t.Helper()
 	ctx := context.Background()
 
-	// Track dispatches received by the fake server.
-	var dispatchMu sync.Mutex
-	var dispatchSessionIDs []string
-
-	// Pre-compute the expected user message ID for the fake server's
-	// parentID correlation.
-	expectedUserMsgID, msgIDErr := NativeMessageID("sess-pw", "t-pw", "att_1_t-pw")
-	if msgIDErr != nil {
-		t.Fatalf("compute user message ID: %v", msgIDErr)
-	}
-
-	fakeMux := http.NewServeMux()
-	fakeMux.HandleFunc("POST /session/{sessionID}/prompt_async", func(w http.ResponseWriter, r *http.Request) {
-		dispatchMu.Lock()
-		dispatchSessionIDs = append(dispatchSessionIDs, r.PathValue("sessionID"))
-		dispatchMu.Unlock()
-		w.WriteHeader(204)
-	})
-	fakeMux.HandleFunc("GET /session/{sessionID}/message", func(w http.ResponseWriter, r *http.Request) {
-		resp := []map[string]any{{
-			"info":  map[string]any{"id": "msg_asst_test_1", "role": "assistant", "parentID": expectedUserMsgID},
-			"parts": []map[string]string{{"type": "text", "text": "verified response"}},
-		}}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
-	})
-	fakeSrv := &http.Server{Handler: fakeMux}
-	fakeLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("fake listen: %v", err)
-	}
-	defer fakeSrv.Close()
-	go fakeSrv.Serve(fakeLn)
-	fakeEndpoint := fmt.Sprintf("http://%s", fakeLn.Addr().String())
-
-	// Seed storage.
 	store, err := storage.Open(storage.StoreOptions{StateDir: stateDir})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer store.Close()
+	t.Cleanup(func() { _ = store.Close() })
 
-	if _, err := store.CreateRun(ctx, "op-run-pw", "run-pw", "b", "s", "p", "boot-pw"); err != nil {
-		t.Fatalf("create run: %v", err)
+	lease := "lease-wire"
+	if _, err := store.CreateRunWithProfile(ctx, storage.CreateRunWithProfileRequest{
+		OpID: "op-run-wire", ControllerLease: lease, RunID: "run-wire",
+		Brief: "wiring evidence", SourceRepoIdentity: "example/repo",
+		SourceCommit: "0123456789012345678901234567890123456789",
+		SourceTree:   "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+		Profile: storage.CanonicalProfile{
+			AlgoVersion:         "cprof-v1",
+			WorkspaceMode:       "none",
+			IsolationStrictness: "permissive_dev",
+			NetworkMode:         "unrestricted",
+			Tooling:             []string{"opencode", "git", "go"},
+			Harnesses: map[string]storage.HarnessProfileSpec{
+				"opencode": {Model: "stub/model", NativeAuthMode: "managed_by_council"},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("create run with profile: %v", err)
 	}
-	sessRec, err := store.CreateSession(ctx, "op-sess-pw", "boot-pw", storage.SessionRecord{
-		ID: "sess-pw", RunID: "run-pw", Contributor: "opencode", Role: "reviewer",
+
+	if _, err := store.CreateSession(ctx, "op-sess-wire", lease, storage.SessionRecord{
+		ID: "sess-wire", RunID: "run-wire", Contributor: "opencode", Role: "reviewer",
 		IsActiveContributor: true, State: "parked", Visibility: "reachable",
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if _, err := store.SetNativeBinding(ctx, "op-bind-pw", "boot-pw", "sess-pw", sessRec.CommittedVersion, storage.NativeBinding{
-		LogicalSessionID: "sess-pw", NativeSessionID: "native-sess-pw", Harness: "opencode",
-	}); err != nil {
-		t.Fatalf("set binding: %v", err)
+	if _, err := store.AdoptController(ctx, "op-adopt-wire", "run-wire", "opencode", "controller-ref-wire", lease, nil, lease); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	if _, err := store.ConnectRunController(ctx, "op-conn-wire", "run-wire", lease, 1, "test-instance"); err != nil {
+		t.Fatalf("connect: %v", err)
 	}
 
-	// Create shared dependencies.
+	ver, err := store.GetSessionVersion(ctx, "sess-wire")
+	if err != nil {
+		t.Fatalf("get version: %v", err)
+	}
+	if _, err := store.QueuePrompt(ctx, "op-q-wire", lease, "sess-wire", ver, storage.PendingPrompt{
+		SessionID: "sess-wire", TurnKey: "t-wire", Prompt: "wiring prompt",
+	}); err != nil {
+		t.Fatalf("queue: %v", err)
+	}
+	ver, err = store.GetSessionVersion(ctx, "sess-wire")
+	if err != nil {
+		t.Fatalf("get version after queue: %v", err)
+	}
+	if _, err := store.ReleaseTurn(ctx, "op-rel-wire", lease, "sess-wire", ver, "t-wire"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
 	wm, err := workspace.NewWorkspaceManager(stateDir, wsBase)
 	if err != nil {
 		t.Fatalf("workspace manager: %v", err)
 	}
-	executor := execpolicy.New()
 
-	// Create the operator-owned probe template.
-	probeTemplate := &operatorProbeLaunchTemplate{
-		binaryPath:  "opencode",
-		scratchRoot: dir,
-	}
-
-	// Construct via the production wiring path.
-	identity := &storageDispatchIdentitySource{store: store}
-	launch := &storageSessionLaunchSource{store: store, wm: wm}
-	adp := NewOpenCodeAdapterWithLaunch(executor, probeTemplate, identity, launch)
-
-	// Override the server endpoint to point at the fake server for testing.
-	adp.mu.Lock()
-	adp.servers = newServerManager(executor, launch)
-	adp.servers.children["sess-pw"] = &serverProcess{
-		endpoint:  fakeEndpoint,
-		workspace: wsBase,
-	}
-	adp.mu.Unlock()
-
-	// Adopt via HTTP to establish the controller identity.
-	adoptBody := `{"op_id":"op-adopt-pw","harness":"opencode","controller_ref":"conv-pw","bootstrap_lease":"boot-pw"}`
-	adoptReq, _ := http.NewRequestWithContext(ctx, "POST", fakeEndpoint+"/session", strings.NewReader(adoptBody))
-	_ = adoptReq
-
-	// The identity seam must resolve the attempt from the persisted intent.
-	attempt, ok := identity.AttemptFor(ctx, adapter.TurnRef{SessionID: "sess-pw", TurnKey: "t-pw"})
-	if ok {
-		t.Logf("attempt resolved (unexpected without dispatch): %q", attempt)
-	}
-
-	// Record the dispatch (simulating what the service does after release).
-	msgID, err := NativeMessageID("sess-pw", "t-pw", "att_1_t-pw")
+	// Production construction: the test only supplies operator
+	// configuration (binary path + scratch root).
+	adp, err := NewProductionOpenCodeAdapter(store, wm, execpolicy.New(),
+		NewOperatorProbeLaunchTemplate("opencode", t.TempDir()))
 	if err != nil {
-		t.Fatalf("message ID: %v", err)
+		t.Fatalf("production construction: %v", err)
 	}
-	adp.mu.Lock()
-	adp.dispatches[adapter.TurnRef{SessionID: "sess-pw", TurnKey: "t-pw"}] = &managedDispatch{
-		userMessageID: msgID,
-	}
-	adp.mu.Unlock()
+	return store, wm, adp
+}
 
-	// Collect must find the assistant message by parentID.
-	result, err := adp.Collect(ctx, adapter.TurnRef{SessionID: "sess-pw", TurnKey: "t-pw"})
+// Dispatch through production wiring reaches the controlled stub serve
+// child over authenticated HTTP; Collect correlates the scripted assistant
+// reply by the storage-derived attempt's deterministic message ID.
+func TestWiring_ProductionDispatchCollectThroughStorageSeams(t *testing.T) {
+	dir := t.TempDir()
+	binDir := compileStubOpencode(t)
+	t.Setenv("PATH", binDir+string(filepath.ListSeparator)+os.Getenv("PATH"))
+
+	store, wm, adp := seedWiredRun(t, filepath.Join(dir, "state"), filepath.Join(dir, "ws"))
+	_ = store
+
+	ctx := context.Background()
+	ref := adapter.TurnRef{SessionID: "sess-wire", TurnKey: "t-wire"}
+
+	// The identity seam resolves the attempt from the persisted dispatch
+	// intent — never synthesized.
+	attempt, ok := adp.identity.AttemptFor(ctx, ref)
+	if !ok || attempt == "" {
+		t.Fatal("storage identity source must resolve the released attempt")
+	}
+
+	outcome, err := adp.Dispatch(ctx, ref, "wiring prompt")
+	if err != nil || outcome.Status != adapter.DispatchAccepted {
+		paths, _ := wm.GetPaths("run-wire", "sess-wire")
+		if paths.Root != "" {
+			if panics := readStubFile(t, paths.Root, ".stub-panic"); len(panics) > 0 {
+				t.Fatalf("dispatch status=%v err=%v stub panics: %v", outcome.Status, err, panics)
+			}
+			if bad := readStubFile(t, paths.Root, ".stub-badjson"); len(bad) > 0 {
+				t.Fatalf("dispatch status=%v err=%v stub rejected json: %v", outcome.Status, err, bad)
+			}
+			if hits := readStubFile(t, paths.Root, ".stub-hits"); len(hits) > 0 {
+				t.Fatalf("dispatch status=%v err=%v stub hits: %v", outcome.Status, err, hits)
+			}
+		}
+		adp.servers.mu.Lock()
+		var tail string
+		for _, sp := range adp.servers.children {
+			tail = sp.stderrTail.String()
+		}
+		adp.servers.mu.Unlock()
+		t.Fatalf("dispatch status=%v err=%v child stderr tail: %q", outcome.Status, err, tail)
+		t.Fatalf("dispatch through production wiring: status=%v err=%v", outcome.Status, err)
+	}
+
+	result, err := adp.Collect(ctx, ref)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
-	if result.Output != "verified response" {
-		t.Fatalf("expected parentID-correlated response, got %q", result.Output)
+	if result.Status != council.TurnCompleted || result.Output != "stub assistant response" {
+		t.Fatalf("expected completed correlated turn, got status=%v output=%q", result.Status, result.Output)
 	}
-	if result.Status != council.TurnCompleted {
-		t.Fatalf("expected completed, got %v", result.Status)
+
+	// The native message ID must derive from the storage attempt.
+	wantID, err := NativeMessageID(string(ref.SessionID), ref.TurnKey, attempt)
+	if err != nil {
+		t.Fatalf("message id: %v", err)
 	}
-	_ = fmt.Sprintf("dispatch session IDs: %v", dispatchSessionIDs)
+	adp.mu.Lock()
+	d := adp.dispatches[ref]
+	adp.mu.Unlock()
+	if d == nil || d.userMessageID != wantID {
+		t.Fatalf("dispatch must record the attempt-derived message ID %q, got %+v", wantID, d)
+	}
+
+	// The child was launched into the session's allocated workspace and
+	// every request authenticated.
+	paths, ok := wm.GetPaths("run-wire", "sess-wire")
+	if !ok {
+		t.Fatal("workspace must be allocated for the wired session")
+	}
+	if hits := readStubFile(t, paths.Root, ".stub-authfail"); len(hits) != 0 {
+		t.Fatalf("wiring traffic must authenticate, auth failures: %v", hits)
+	}
+	hits := readStubFile(t, paths.Root, ".stub-hits")
+	joined := strings.Join(hits, "\n")
+	if !strings.Contains(joined, "POST /session/sess-wire/prompt_async") {
+		t.Fatalf("native dispatch must hit prompt_async, hits: %v", hits)
+	}
+	if !strings.Contains(joined, "GET /session/sess-wire/message") {
+		t.Fatalf("collect must hit the message endpoint, hits: %v", hits)
+	}
 }

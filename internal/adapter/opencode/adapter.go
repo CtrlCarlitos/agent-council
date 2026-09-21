@@ -1,15 +1,9 @@
 package opencode
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"net/http/httptrace"
-	"os"
 	"sync"
 	"time"
 
@@ -29,6 +23,7 @@ type DispatchIdentitySource interface {
 type managedDispatch struct {
 	nativeSessionID string
 	userMessageID   string
+	terminal        bool // Collect observed a terminal outcome
 }
 
 // launchReservation reserves a turn identity during process creation.
@@ -45,13 +40,13 @@ type OpenCodeAdapter struct {
 	probeTemplate ProbeLaunchTemplate
 	identity      DispatchIdentitySource
 	idleGrace     time.Duration
-	scratchRoot   string
 
 	mu         sync.Mutex
 	servers    *serverManager
 	dispatches map[adapter.TurnRef]*managedDispatch
 	launching  map[adapter.TurnRef]*launchReservation
 	unknown    map[adapter.TurnRef]string // ref → messageID of an ambiguous attempt
+	parkTimers map[adapter.SessionID]*time.Timer
 }
 
 // OpenCodeAdapterOption configures an OpenCodeAdapter.
@@ -74,10 +69,10 @@ func NewOpenCodeAdapter(
 		probeTemplate: probeTemplate,
 		identity:      identity,
 		idleGrace:     30 * time.Second,
-		scratchRoot:   os.TempDir(),
 		dispatches:    make(map[adapter.TurnRef]*managedDispatch),
 		launching:     make(map[adapter.TurnRef]*launchReservation),
 		unknown:       make(map[adapter.TurnRef]string),
+		parkTimers:    make(map[adapter.SessionID]*time.Timer),
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -139,7 +134,9 @@ func (a *OpenCodeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, pro
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: err.Error()}, err
 	}
 
-	ep, err := a.endpointFor(ref.SessionID)
+	a.cancelIdleParkTimer(ref.SessionID)
+
+	client, err := a.clientForOrResume(ctx, ref.SessionID)
 	if err != nil {
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: err.Error()}, err
 	}
@@ -160,7 +157,7 @@ func (a *OpenCodeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, pro
 	a.launching[ref] = res
 	a.mu.Unlock()
 
-	outcome, err := a.dispatchNative(ctx, ref, ep, msgID, prompt)
+	outcome, err := a.dispatchNative(ctx, ref, client, msgID, prompt)
 
 	a.mu.Lock()
 	delete(a.launching, ref)
@@ -182,13 +179,13 @@ func (a *OpenCodeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, pro
 // ref with a prior ambiguous attempt it first verifies by GET-by-message-ID:
 // only a verified 404 authorizes resubmission; an already-recorded message is
 // accepted without a second prompt_async.
-func (a *OpenCodeAdapter) dispatchNative(ctx context.Context, ref adapter.TurnRef, ep serverEndpoint, msgID, prompt string) (adapter.DispatchOutcome, error) {
+func (a *OpenCodeAdapter) dispatchNative(ctx context.Context, ref adapter.TurnRef, client *NativeClient, msgID, prompt string) (adapter.DispatchOutcome, error) {
 	a.mu.Lock()
 	_, priorUnknown := a.unknown[ref]
 	a.mu.Unlock()
 
 	if priorUnknown {
-		recorded, verifyErr := a.userMessageRecorded(ctx, ep, string(ref.SessionID), msgID)
+		_, recorded, verifyErr := client.GetMessage(ctx, string(ref.SessionID), msgID)
 		if verifyErr != nil {
 			return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown, Reason: "retry verification failed: " + verifyErr.Error()}, verifyErr
 		}
@@ -197,47 +194,13 @@ func (a *OpenCodeAdapter) dispatchNative(ctx context.Context, ref adapter.TurnRe
 		}
 	}
 
-	payload := map[string]any{
-		"messageID": msgID,
-		"parts":     []map[string]string{{"type": "text", "text": prompt}},
-	}
-	body, _ := json.Marshal(payload)
-	resp, err := a.doAuth(ctx, ep, "POST",
-		fmt.Sprintf("%s/session/%s/prompt_async", ep.url, ref.SessionID), "application/json", bytes.NewReader(body))
-	if err != nil {
-		var pw *errPostWrite
-		if errors.As(err, &pw) {
+	if err := client.PromptAsync(ctx, string(ref.SessionID), msgID, prompt); err != nil {
+		if IsPostWriteError(err) {
 			return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown, Reason: "post-write transport failure: " + err.Error()}, err
 		}
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: err.Error()}, err
 	}
-	defer resp.Body.Close()
-
-	switch {
-	case resp.StatusCode == 204 || resp.StatusCode == 200:
-		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchAccepted}, nil
-	default:
-		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: fmt.Sprintf("HTTP %d", resp.StatusCode)}, nil
-	}
-}
-
-// userMessageRecorded queries the server for an exact user message ID.
-// Returns true on 200, false on a verified 404, and an error otherwise.
-func (a *OpenCodeAdapter) userMessageRecorded(ctx context.Context, ep serverEndpoint, sessionID, msgID string) (bool, error) {
-	resp, err := a.doAuth(ctx, ep, "GET",
-		fmt.Sprintf("%s/session/%s/message/%s", ep.url, sessionID, msgID), "", nil)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-	switch {
-	case resp.StatusCode == http.StatusOK:
-		return true, nil
-	case resp.StatusCode == http.StatusNotFound:
-		return false, nil
-	default:
-		return false, fmt.Errorf("message lookup returned HTTP %d", resp.StatusCode)
-	}
+	return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchAccepted}, nil
 }
 
 // ── Observe ─────────────────────────────────────────────────────────────
@@ -267,19 +230,14 @@ func (a *OpenCodeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (ada
 // ── Cancel ──────────────────────────────────────────────────────────────
 
 func (a *OpenCodeAdapter) Cancel(ctx context.Context, ref adapter.TurnRef) (adapter.CancelOutcome, error) {
-	ep, err := a.endpointFor(ref.SessionID)
+	client, err := a.clientFor(ref.SessionID)
 	if err != nil {
 		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown, Reason: err.Error()}, err
 	}
-	resp, err := a.doAuth(ctx, ep, "POST", fmt.Sprintf("%s/session/%s/abort", ep.url, ref.SessionID), "", nil)
-	if err != nil {
+	if err := client.Abort(ctx, string(ref.SessionID)); err != nil {
 		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown, Reason: err.Error()}, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusOK {
-		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelConfirmed}, nil
-	}
-	return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown, Reason: fmt.Sprintf("abort returned %d", resp.StatusCode)}, nil
+	return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelConfirmed}, nil
 }
 
 // ── Collect ─────────────────────────────────────────────────────────────
@@ -299,6 +257,8 @@ func (a *OpenCodeAdapter) Collect(ctx context.Context, ref adapter.TurnRef) (ada
 			Ref: ref, Status: council.TurnRunning, ResultStatus: adapter.ResultPending,
 		}, nil
 	}
+	d.terminal = true
+	a.scheduleIdleParkIfIdle(ref.SessionID)
 	text := ""
 	for _, p := range msg.Parts {
 		if p.Type == "text" {
@@ -344,37 +304,19 @@ func (a *OpenCodeAdapter) Reconcile(ctx context.Context, ref adapter.RecoveryRef
 
 // findAssistantByParentID polls the server for an assistant message whose
 // parentID matches the given ID. Returns the message and true when found.
-func (a *OpenCodeAdapter) findAssistantByParentID(ctx context.Context, sessionID string, parentID string) (*fakeAssistantMsg, bool) {
-	ep, err := a.endpointFor(adapter.SessionID(sessionID))
+func (a *OpenCodeAdapter) findAssistantByParentID(ctx context.Context, sessionID string, parentID string) (*NativeMessage, bool) {
+	client, err := a.clientFor(adapter.SessionID(sessionID))
 	if err != nil {
 		return nil, false
 	}
-	resp, err := a.doAuth(ctx, ep, "GET", fmt.Sprintf("%s/session/%s/message", ep.url, sessionID), "", nil)
+	msgs, err := client.ListMessages(ctx, sessionID)
 	if err != nil {
 		return nil, false
 	}
-	defer resp.Body.Close()
-	var msgs []struct {
-		Info struct {
-			ID       string `json:"id"`
-			Role     string `json:"role"`
-			ParentID string `json:"parentID"`
-		} `json:"info"`
-		Parts []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"parts"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&msgs); err != nil {
-		return nil, false
-	}
-	for _, m := range msgs {
-		if m.Info.Role == "assistant" && m.Info.ParentID == parentID {
-			result := &fakeAssistantMsg{ID: m.Info.ID, Role: "assistant", ParentID: m.Info.ParentID}
-			for _, p := range m.Parts {
-				result.Parts = append(result.Parts, fakePart{Type: p.Type, Text: p.Text})
-			}
-			return result, true
+	for i := range msgs {
+		m := &msgs[i]
+		if m.Role == "assistant" && m.ParentID == parentID {
+			return m, true
 		}
 	}
 	return nil, false
@@ -382,83 +324,80 @@ func (a *OpenCodeAdapter) findAssistantByParentID(ctx context.Context, sessionID
 
 // ── Internal helpers ────────────────────────────────────────────────────
 
-// serverEndpoint bundles the HTTP endpoint of a launched serve child with
-// the generated Basic credentials retained from its GeneratedServerEnv.
-type serverEndpoint struct {
-	url      string
-	username string
-	password string
-}
-
-func (a *OpenCodeAdapter) endpointFor(sessionID adapter.SessionID) (serverEndpoint, error) {
+// clientFor returns an authenticated typed client for the session's serve
+// child.
+func (a *OpenCodeAdapter) clientFor(sessionID adapter.SessionID) (*NativeClient, error) {
 	if a.servers == nil {
-		return serverEndpoint{}, errors.New("no server manager wired")
+		return nil, errors.New("no server manager wired")
 	}
 	sp, err := a.servers.child(string(sessionID))
 	if err != nil {
-		return serverEndpoint{}, err
-	}
-	return serverEndpoint{url: sp.endpoint, username: sp.username, password: sp.password}, nil
-}
-
-// errPostWrite marks a transport failure that occurred after the request
-// body was fully written: the server may have processed the turn, so the
-// outcome is ambiguous (unknown), never rejected.
-type errPostWrite struct{ cause error }
-
-func (e *errPostWrite) Error() string { return e.cause.Error() }
-func (e *errPostWrite) Unwrap() error { return e.cause }
-
-// doAuth performs an authenticated request against the endpoint and
-// classifies transport failures: anything before the request body was fully
-// written (dial refused, connect reset) is a pre-write rejection; a failure
-// after the write completes is post-write ambiguity.
-func (a *OpenCodeAdapter) doAuth(ctx context.Context, ep serverEndpoint, method, url string, contentType string, body io.Reader) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, method, url, body)
-	if err != nil {
 		return nil, err
 	}
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
-	}
-	req.SetBasicAuth(ep.username, ep.password)
+	return newNativeClient(sp.endpoint, sp.username, sp.password), nil
+}
 
-	wrote := false
-	trace := &httptrace.ClientTrace{
-		WroteRequest: func(httptrace.WroteRequestInfo) { wrote = true },
+// clientForOrResume resolves the client for a session, launching the
+// session's serve child when it is not running (including resuming a
+// parked child, which start verifies against the persisted native
+// session). The launch context is detached from the caller: it must not
+// carry the caller's deadline, because the executor binds the child
+// process lifetime to it — a canceled launch context would kill a
+// healthy child. Launch duration is bounded by healthTimeout inside
+// start; the child's lifetime is owned by the server manager.
+func (a *OpenCodeAdapter) clientForOrResume(ctx context.Context, sessionID adapter.SessionID) (*NativeClient, error) {
+	client, err := a.clientFor(sessionID)
+	if err == nil {
+		return client, nil
 	}
-	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+	if a.servers == nil {
+		return nil, err
+	}
+	if _, startErr := a.servers.start(context.WithoutCancel(ctx), sessionID); startErr != nil {
+		return nil, fmt.Errorf("start serve child for %s: %w", sessionID, startErr)
+	}
+	return a.clientFor(sessionID)
+}
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		if !wrote {
-			return nil, err
+// cancelIdleParkTimer stops any pending idle park for the session.
+func (a *OpenCodeAdapter) cancelIdleParkTimer(sessionID adapter.SessionID) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if timer, ok := a.parkTimers[sessionID]; ok {
+		timer.Stop()
+		delete(a.parkTimers, sessionID)
+	}
+}
+
+// scheduleIdleParkIfIdle parks the session's serve child after the idle
+// grace period when every turn for the session has reached a terminal
+// outcome and none is in flight.
+func (a *OpenCodeAdapter) scheduleIdleParkIfIdle(sessionID adapter.SessionID) {
+	if a.idleGrace <= 0 || a.servers == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for ref, d := range a.dispatches {
+		if ref.SessionID == sessionID && !d.terminal {
+			return
 		}
-		return nil, &errPostWrite{cause: err}
 	}
-	return resp, nil
-}
-
-// fakeAssistantMsg mirrors the assistant message shape returned by the
-// fake server for testing parentID correlation.
-type fakeAssistantMsg struct {
-	ID       string     `json:"id"`
-	Role     string     `json:"role"`
-	ParentID string     `json:"parentID"`
-	Parts    []fakePart `json:"parts"`
-	Error    *struct {
-		Name    string `json:"name"`
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
-type fakePart struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
-}
-
-type fakeProbeError struct {
-	Name    string `json:"name"`
-	Message string `json:"message"`
+	if _, parked := a.parkTimers[sessionID]; parked {
+		return
+	}
+	a.parkTimers[sessionID] = time.AfterFunc(a.idleGrace, func() {
+		a.mu.Lock()
+		delete(a.parkTimers, sessionID)
+		for ref, d := range a.dispatches {
+			if ref.SessionID == sessionID && !d.terminal {
+				a.mu.Unlock()
+				return
+			}
+		}
+		a.mu.Unlock()
+		parkCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = a.servers.park(parkCtx, sessionID)
+	})
 }

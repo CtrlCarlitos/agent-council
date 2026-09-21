@@ -28,14 +28,38 @@ var ErrServerEnvShape = errors.New("GeneratedServerEnv is only permitted on `ope
 // key and an inherited or allowlisted environment key.
 var ErrServerEnvKeyCollision = errors.New("GeneratedServerEnv key collides with an inherited or allowlisted environment key")
 
-// isOpenCodeServeLaunch reports whether the request launches an
-// `opencode serve` child (command base `opencode`, first arg `serve`).
+// approvedOpenCodeServeArgs is the only native serve invocation that may
+// carry GeneratedServerEnv: loopback binding, ephemeral port, no
+// additional flags. Any other invocation — alternate hostname or port,
+// missing flags, permission bypasses such as --auto, or extra arguments —
+// is rejected before credentials are generated.
+var approvedOpenCodeServeArgs = []string{
+	"serve",
+	"--hostname", "127.0.0.1",
+	"--port", "0",
+}
+
+// IsOpenCodeServeLaunch reports whether the request launches the exact
+// approved `opencode serve --hostname 127.0.0.1 --port 0` invocation. The
+// shape is exact: command basename `opencode`, and the complete argument
+// list must equal the approved invocation — no extra or missing flags.
 func IsOpenCodeServeLaunch(req LaunchRequest) bool {
 	cmdBase := req.Command
 	if idx := strings.LastIndex(cmdBase, "/"); idx != -1 {
 		cmdBase = cmdBase[idx+1:]
 	}
-	return cmdBase == "opencode" && len(req.Args) > 0 && req.Args[0] == "serve"
+	if cmdBase != "opencode" {
+		return false
+	}
+	if len(req.Args) != len(approvedOpenCodeServeArgs) {
+		return false
+	}
+	for i, want := range approvedOpenCodeServeArgs {
+		if req.Args[i] != want {
+			return false
+		}
+	}
+	return true
 }
 
 // validateGeneratedServerEnvShape enforces that GeneratedServerEnv appears

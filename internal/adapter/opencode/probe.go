@@ -3,11 +3,9 @@ package opencode
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"os"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -20,29 +18,34 @@ import (
 // validated LaunchRequest values for the adapter's Probe capability check.
 // OpenCode-specific; stays out of execpolicy. The adapter appends only
 // GeneratedServerEnv to the probe-server request; it never synthesizes
-// Paths, Profile, or identifiers internally.
+// Paths, Profile, or identifiers internally, and it never allocates
+// directories: the scratch working directory is owned and allocated by
+// the template (never a contributor workspace, never the Council state
+// dir).
 type ProbeLaunchTemplate interface {
 	// VersionLaunch returns a validated LaunchRequest for
 	// `opencode --version`.
 	VersionLaunch(ctx context.Context) (execpolicy.LaunchRequest, error)
 	// ProbeServeLaunch returns a validated LaunchRequest for a probe
-	// `opencode serve` child whose working directory is the supplied
-	// adapter-owned scratch directory. The args must include `--port 0`
-	// (the child prints its listen address on startup).
-	ProbeServeLaunch(ctx context.Context, scratchDir string) (execpolicy.LaunchRequest, error)
+	// `opencode serve` child. The request must be the exact approved
+	// serve shape (including `--port 0`, so the child prints its listen
+	// address), and Paths.Root must be the operator-allocated scratch
+	// directory.
+	ProbeServeLaunch(ctx context.Context) (execpolicy.LaunchRequest, error)
 }
 
 // Probe performs a provider-free executable capability check against a
-// short-lived probe server in an adapter-owned scratch directory:
+// short-lived probe server in the template-owned scratch directory:
 //
 //  1. Verify the installed opencode binary/version through the
 //     PolicyExecutor using the injected operator-owned launch template.
-//  2. Start a probe `opencode serve` child with an adapter-owned scratch
-//     directory as its working directory (never a contributor workspace,
-//     never the Council state dir).
-//  3. Call only GET /api/health and credential-free GET /api/model.
+//  2. Start a probe `opencode serve` child (exact approved shape,
+//     GeneratedServerEnv appended with freshly generated credentials).
+//  3. Call only GET /api/health and GET /api/model — both authenticated
+//     with the generated probe credentials through the typed client.
 //  4. Terminate the probe server before returning.
 //
+// Both of the child's output pipes are drained for the child's lifetime.
 // No native sessions are created or inspected; native authentication
 // status is reported as unknown. The probe server is never registered as
 // a contributor server.
@@ -86,24 +89,30 @@ func (a *OpenCodeAdapter) Probe(ctx context.Context) (adapter.ProbeReport, error
 		}
 	}
 
-	// 2. Probe serve child in an adapter-owned scratch directory.
-	scratch, err := os.MkdirTemp(a.scratchRoot, "ac-opencode-probe-")
-	if err != nil {
-		return report, fmt.Errorf("probe scratch dir: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(scratch) }()
-
-	serveReq, err := a.probeTemplate.ProbeServeLaunch(ctx, scratch)
+	// 2. Probe serve child in the template-owned scratch directory. The
+	// launch must be the exact approved serve shape before credentials
+	// are generated.
+	serveReq, err := a.probeTemplate.ProbeServeLaunch(ctx)
 	if err != nil {
 		return report, fmt.Errorf("probe serve launch: %w", err)
 	}
+	if !execpolicy.IsOpenCodeServeLaunch(serveReq) {
+		return report, fmt.Errorf("%w: probe launch shape is %q %v",
+			execpolicy.ErrServerEnvShape, serveReq.Command, serveReq.Args)
+	}
+	username, password, err := generateServerCredentials()
+	if err != nil {
+		return report, fmt.Errorf("generate probe credentials: %w", err)
+	}
+	serveReq.GeneratedServerEnv = &execpolicy.GeneratedServerEnv{Username: username, Password: password}
+
 	serveProc, err := a.executor.Start(ctx, serveReq)
 	if err != nil {
 		return report, fmt.Errorf("probe serve start: %w", err)
 	}
 
 	// Drain the child's stdout into a buffer while polling for the printed
-	// listen address. The drain goroutine runs for the child's lifetime.
+	// listen address; drain stderr for the child's lifetime.
 	var stdoutMu sync.Mutex
 	var stdoutBuf strings.Builder
 	stdoutDone := make(chan struct{})
@@ -116,8 +125,10 @@ func (a *OpenCodeAdapter) Probe(ctx context.Context) (adapter.ProbeReport, error
 			stdoutMu.Unlock()
 		}
 	}()
+	go func() { _, _ = io.Copy(io.Discard, serveProc.Stderr()) }()
 
-	// 3. Wait for the listen address on stdout, then call health + models.
+	// 3. Wait for the listen address on stdout, then call health + models
+	// with the generated probe credentials.
 	endpoint, err := waitProbeEndpoint(ctx, &stdoutMu, &stdoutBuf, stdoutDone, 15*time.Second)
 	if err != nil {
 		termCtx, termCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -129,10 +140,12 @@ func (a *OpenCodeAdapter) Probe(ctx context.Context) (adapter.ProbeReport, error
 
 	probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer probeCancel()
-	healthErr := newProbeHTTPClient(endpoint).Health(probeCtx)
-	models, modelErr := newProbeHTTPClient(endpoint).Models(probeCtx)
+	client := newNativeClient(endpoint, username, password)
+	healthErr := client.Health(probeCtx)
+	models, modelErr := client.Models(probeCtx)
 
-	// 4. Terminate the probe server before returning.
+	// 4. Terminate the probe server before returning. It is never
+	// registered in the server manager.
 	termCtx, termCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer termCancel()
 	if termErr := serveProc.Terminate(termCtx); termErr != nil {
@@ -196,62 +209,4 @@ func scanEndpoint(out string) string {
 		}
 	}
 	return ""
-}
-
-// probeHTTPClient is a minimal HTTP client for the probe server's
-// credential-free endpoints.
-type probeHTTPClient struct {
-	endpoint string
-	hc       *http.Client
-}
-
-func newProbeHTTPClient(endpoint string) *probeHTTPClient {
-	return &probeHTTPClient{endpoint: endpoint, hc: &http.Client{Timeout: 5 * time.Second}}
-}
-
-func (c *probeHTTPClient) Health(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint+"/api/health", nil)
-	if err != nil {
-		return err
-	}
-	resp, err := c.hc.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("health returned %d", resp.StatusCode)
-	}
-	return nil
-}
-
-type probeModel struct {
-	ID         string `json:"id"`
-	ProviderID string `json:"providerID"`
-}
-
-func (c *probeHTTPClient) Models(ctx context.Context) ([]string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint+"/api/model", nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := c.hc.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("models returned %d", resp.StatusCode)
-	}
-	var payload struct {
-		Data []probeModel `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, fmt.Errorf("decode models: %w", err)
-	}
-	models := make([]string, 0, len(payload.Data))
-	for _, m := range payload.Data {
-		models = append(models, m.ProviderID+"/"+m.ID)
-	}
-	return models, nil
 }
