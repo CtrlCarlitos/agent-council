@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/execpolicy"
+	"github.com/CtrlCarlitos/agent-council/internal/adapter/opencode"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/workspace"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
@@ -23,6 +25,11 @@ type ServerConfig struct {
 	InstanceID       string
 	AuthToken        string
 	WorkspaceBaseDir string
+	// OpenCodeBinaryPath, when set, enables the OpenCode persistent
+	// contributor adapter via production seams backed by the storage
+	// store and AC-005 workspace manager. Empty means no OpenCode
+	// adapter.
+	OpenCodeBinaryPath string
 }
 
 type ReadinessResponse struct {
@@ -73,6 +80,23 @@ func NewServer(store *storage.Store, lock *ServiceLock, cfg ServerConfig) (*Serv
 }
 
 func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerConfig, adp adapter.Adapter) (*Server, error) {
+	// If no adapter is provided but OpenCode is configured, construct the
+	// production OpenCode adapter with fail-closed seams.
+	if adp == nil && strings.TrimSpace(cfg.OpenCodeBinaryPath) != "" {
+		wm, wmErr := workspace.NewWorkspaceManager(cfg.StateDir, filepath.Join(cfg.StateDir, "workspaces"))
+		if wmErr != nil {
+			return nil, fmt.Errorf("workspace manager for OpenCode adapter: %w", wmErr)
+		}
+		var opErr error
+		adp, opErr = opencode.NewProductionOpenCodeAdapter(store, wm, execpolicy.New(), cfg.OpenCodeBinaryPath)
+		if opErr != nil {
+			return nil, fmt.Errorf("OpenCode adapter construction: %w", opErr)
+		}
+	}
+	return newServerWithAdapter(store, lock, cfg, adp)
+}
+
+func newServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerConfig, adp adapter.Adapter) (*Server, error) {
 	if store == nil {
 		return nil, errors.New("store cannot be nil")
 	}
