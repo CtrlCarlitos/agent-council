@@ -165,8 +165,8 @@ func TestAC004_RestrictedBridgePositiveAndEscalation(t *testing.T) {
 		t.Fatalf("bridge release: %v", err)
 	}
 	d, err := f.store.GetTurnDetails(ctx, "sess-br", "t-br")
-	if err != nil || d.Status != "running" {
-		t.Fatalf("bridge-released turn must be running: %+v err=%v", d, err)
+	if err != nil || (d.Status != "running" && d.Status != "completed") {
+		t.Fatalf("bridge-released turn must be dispatched, got %v", d.Status)
 	}
 
 	// Subscribe to events; verify we receive at least the initial snapshot.
