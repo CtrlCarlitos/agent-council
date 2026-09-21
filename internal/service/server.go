@@ -118,6 +118,7 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 	mux.HandleFunc("POST /v1/runs/{run_id}/sessions/{session_id}/prompts/{turn_key}/replace", srv.handleReplacePrompt)
 	mux.HandleFunc("POST /v1/runs/{run_id}/sessions/{session_id}/prompts/{turn_key}/discard", srv.handleDiscardPrompt)
 	mux.HandleFunc("POST /v1/runs/{run_id}/decisions", srv.handleRecordDecision)
+	mux.HandleFunc("POST /v1/runs/{run_id}/artifacts/release", srv.handleReleaseArtifacts)
 	mux.HandleFunc("GET /v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/events", srv.handleEvents)
 	mux.HandleFunc("POST /v1/service/stop", srv.handleStop)
 
