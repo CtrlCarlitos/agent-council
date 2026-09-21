@@ -123,13 +123,27 @@ one server across workspaces. Therefore: **one adapter-owned
   mechanism is restricted to the OpenCode server launch purpose; other
   managed launches must leave it nil (enforced by an executor error if
   set on non-server launches).
-- **Network launch matrix (documented and tested per mode):**
-  | Profile network mode | Server launch behavior |
-  |---|---|
-  | `unrestricted` / `permissive_dev` | Launches; loopback listener + direct provider egress. Enforcement is **degraded** per AC-005: provider egress is NOT OS-enforced — this must not be presented as egress control. |
-  | `allowlist` (strict) | Launch rejected: the executor reports the strict network capability as unsupported for a long-lived listening child (current `PolicyExecutor` behavior); fail-closed. |
-  | `none` (strict) | Launch rejected or health-check fails: the executor creates a fresh network namespace whose loopback interface is not guaranteed usable for the health check; the adapter treats launch failure as fail-closed and reports the capability honestly. |
-  | `readonly` (strict) | Fails closed (current executor behavior for strict isolation on listening children). |
+- **Network launch matrix (documented and tested per dimension).** The
+  canonical profile separates three dimensions: `WorkspaceMode`
+  (e.g. `none`, `branch`, `readonly`), `IsolationStrictness`
+  (`permissive_dev`, `strict`), and `NetworkMode`
+  (`unrestricted`, `allowlist`, `none`). The matrix is indexed by
+  isolation strictness × network mode; workspace mode affects the
+  workspace manager only (a `readonly` workspace mode means the AC-005
+  workspace manager provisions a read-only root — it is not a network
+  setting).
+
+  | Workspace mode | Isolation strictness | Network mode | Server launch behavior |
+  |---|---|---|---|
+  | any | `permissive_dev` | `unrestricted` | Launches; loopback listener + direct provider egress. Enforcement is **degraded** per AC-005: provider egress is NOT OS-enforced — this must not be presented as egress control. |
+  | any | `permissive_dev` | `allowlist` | Launches; loopback listener; provider egress through the AC-005 allowlist proxy (destination-gated). |
+  | any | `permissive_dev` | `none` | Launches; loopback listener present, but all external egress (including provider calls) fails natively — dispatches surface honest native failures. |
+  | any | `strict` | `allowlist` | Launch rejected: the executor reports the strict network capability as unsupported for a long-lived listening child (current `PolicyExecutor` behavior); fail-closed. |
+  | any | `strict` | `none` | Launch rejected or health-check fails: the executor creates a fresh network namespace whose loopback interface is not guaranteed usable for the health check; the adapter treats launch failure as fail-closed and reports the capability honestly. |
+
+  `readonly` is a **workspace mode** (the AC-005 workspace manager
+  provisions a read-only root), not a network mode; it is orthogonal to
+  network isolation and exercised through the workspace manager tests.
 
   In permissive modes, provider egress is **degraded per AC-005** and must
   never be presented as OS-enforced provider egress control. The strict
@@ -190,11 +204,16 @@ workspace, so it runs against a **short-lived probe server** in an
 adapter-owned scratch directory:
 
 1. Verify the installed `opencode` binary and version through the
-   `PolicyExecutor` (the executor launches `opencode --version` under the
-   same policy gating as any managed process).
+   `PolicyExecutor` using an **injected, operator-owned probe launch
+   template** (`execpolicy.ProbeLaunchTemplate`: `opencode --version`
+   args + the exact `opencode serve` probe shape + scratch working
+   directory). The adapter MUST NOT synthesize a permissive profile
+   internally — the template is the sole authority for the probe launch
+   shape.
 2. Start a probe `opencode serve` child with an **adapter-owned scratch
-   directory** as its working directory — never a contributor workspace,
-   never the Council state dir, never any real project directory.
+   directory** (allocated by the template) as its working directory —
+   never a contributor workspace, never the Council state dir, never any
+   real project directory.
 3. Call only `GET /api/health` and credential-free `GET /api/model` on the
    probe server.
 4. Terminate the probe server (graceful → force, pipes drained) before
@@ -312,7 +331,7 @@ Correlate the exact native message/turn — never the bare session:
 | Evidence | Verdict |
 |---|---|
 | Verified active native work (session exists AND the turn's submission message is the live/unanswered one, or native status shows the turn executing) | `ReachableActive` |
-| Verified terminal message for this turn's message ID (assistant reply present) | `ReachableTerminal` with the durable outcome |
+| Verified assistant message whose `parentID` equals the deterministic user-message ID (assistant reply present) | `ReachableTerminal` with the durable outcome |
 | Transport loss to the server; session 404 **after** a possibly-accepted dispatch (404 proves nothing about an orphan worker's work); ambiguous idle (session idle but this turn's message has no terminal reply and no positive never-accepted evidence) | `Uncertain` / host visibility lost |
 | Positive evidence the specific dispatch was never accepted (e.g., the deterministic message ID provably absent before any acceptance could occur, recorded pre-acceptance failure) | `DefinitivelyMissing` |
 
