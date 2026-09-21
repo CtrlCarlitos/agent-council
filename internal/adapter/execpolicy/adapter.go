@@ -86,6 +86,21 @@ type ManagedWorkerAdapter struct {
 	mu         sync.Mutex
 	sessions   map[adapter.SessionID]adapter.SessionBinding
 	dispatches map[adapter.TurnRef]*managedTurn
+	launching  map[adapter.TurnRef]*launchReservation
+}
+
+// launchReservation reserves a turn identity for the duration of process
+// creation so concurrent duplicate dispatches cannot launch the same turn
+// twice (Gate 2 review finding 1). Waiters receive the launcher's verdict.
+type launchReservation struct {
+	ready   chan struct{}
+	outcome adapter.DispatchOutcome
+	err     error
+}
+
+func (r *launchReservation) complete(outcome adapter.DispatchOutcome, err error) {
+	r.outcome, r.err = outcome, err
+	close(r.ready)
 }
 
 type managedTurn struct {
@@ -121,6 +136,7 @@ func NewWorkerAdapterWithInvocation(
 		builder:    builder,
 		sessions:   make(map[adapter.SessionID]adapter.SessionBinding),
 		dispatches: make(map[adapter.TurnRef]*managedTurn),
+		launching:  make(map[adapter.TurnRef]*launchReservation),
 	}
 }
 
@@ -223,252 +239,276 @@ func (a *ManagedWorkerAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: err.Error()}, err
 	}
 
+	// Reserve the turn identity under the lock BEFORE any process creation:
+	// concurrent duplicate dispatches observe the reservation and receive
+	// the launcher's verdict instead of launching a second worker
+	// (Gate 2 review finding 1).
 	a.mu.Lock()
+	if res, ok := a.launching[ref]; ok {
+		a.mu.Unlock()
+		<-res.ready
+		return res.outcome, res.err
+	}
 	if existing, ok := a.dispatches[ref]; ok {
 		a.mu.Unlock()
 		return existing.outcome, nil
 	}
+	res := &launchReservation{ready: make(chan struct{})}
+	a.launching[ref] = res
 	a.mu.Unlock()
+	outcome, launchErr := func() (adapter.DispatchOutcome, error) {
 
-	if a.store == nil {
-		return adapter.DispatchOutcome{
-			Ref:    ref,
-			Status: adapter.DispatchRejected,
-			Reason: "store is required for dispatch",
-		}, errors.New("store is required")
-	}
+		if a.store == nil {
+			return adapter.DispatchOutcome{
+				Ref:    ref,
+				Status: adapter.DispatchRejected,
+				Reason: "store is required for dispatch",
+			}, errors.New("store is required")
+		}
 
-	sessionID := string(ref.SessionID)
-	meta, err := a.store.GetSessionMetadata(ctx, sessionID)
-	if err != nil {
-		return adapter.DispatchOutcome{
-			Ref:    ref,
-			Status: adapter.DispatchRejected,
-			Reason: fmt.Sprintf("session lookup failed: %v", err),
-		}, fmt.Errorf("lookup session %s: %w", sessionID, err)
-	}
-
-	contributor := council.Contributor(meta.Contributor)
-	if !council.ValidContributor(contributor) {
-		return adapter.DispatchOutcome{
-			Ref:    ref,
-			Status: adapter.DispatchRejected,
-			Reason: fmt.Sprintf("invalid contributor %q", meta.Contributor),
-		}, fmt.Errorf("invalid contributor %q", meta.Contributor)
-	}
-
-	runProfileRec, err := a.store.GetRunProfile(ctx, meta.RunID)
-	if err != nil {
-		return adapter.DispatchOutcome{
-			Ref:    ref,
-			Status: adapter.DispatchRejected,
-			Reason: fmt.Sprintf("failed to retrieve run profile: %v", err),
-		}, fmt.Errorf("retrieve run profile for run %s: %w", meta.RunID, err)
-	}
-
-	profile := runProfileRec.Profile
-	if profile.AlgoVersion == "" || len(profile.Harnesses) == 0 {
-		return adapter.DispatchOutcome{
-			Ref:    ref,
-			Status: adapter.DispatchRejected,
-			Reason: "missing or empty frozen canonical profile",
-		}, errors.New("missing or empty frozen canonical profile")
-	}
-
-	harnessSpec, ok := profile.Harnesses[string(contributor)]
-	if !ok {
-		return adapter.DispatchOutcome{
-			Ref:    ref,
-			Status: adapter.DispatchRejected,
-			Reason: fmt.Sprintf("contributor %q has no configured harness profile", contributor),
-		}, fmt.Errorf("contributor %q has no configured harness profile in run %s", contributor, meta.RunID)
-	}
-	if strings.TrimSpace(harnessSpec.Model) == "" {
-		return adapter.DispatchOutcome{
-			Ref:    ref,
-			Status: adapter.DispatchRejected,
-			Reason: fmt.Sprintf("contributor %q has empty model", contributor),
-		}, fmt.Errorf("contributor %q has empty model in harness profile", contributor)
-	}
-	if strings.TrimSpace(harnessSpec.NativeAuthMode) == "" {
-		return adapter.DispatchOutcome{
-			Ref:    ref,
-			Status: adapter.DispatchRejected,
-			Reason: fmt.Sprintf("contributor %q has empty native auth mode", contributor),
-		}, fmt.Errorf("contributor %q has empty native auth mode in harness profile", contributor)
-	}
-
-	if a.wm == nil {
-		return adapter.DispatchOutcome{
-			Ref:    ref,
-			Status: adapter.DispatchRejected,
-			Reason: "workspace manager required",
-		}, errors.New("workspace manager required")
-	}
-
-	paths, ok := a.wm.GetPaths(meta.RunID, sessionID)
-	if !ok {
-		var err error
-		paths, err = a.wm.AllocateWorkspace(meta.RunID, sessionID, profile.WorkspaceMode, runProfileRec.SourceRepoIdentity, runProfileRec.SourceCommit)
+		sessionID := string(ref.SessionID)
+		meta, err := a.store.GetSessionMetadata(ctx, sessionID)
 		if err != nil {
 			return adapter.DispatchOutcome{
 				Ref:    ref,
 				Status: adapter.DispatchRejected,
-				Reason: fmt.Sprintf("failed to allocate workspace: %v", err),
-			}, fmt.Errorf("allocate workspace: %w", err)
-		}
-	}
-
-	inv, err := a.builder(contributor, harnessSpec, prompt)
-	if err != nil {
-		return adapter.DispatchOutcome{
-			Ref:    ref,
-			Status: adapter.DispatchRejected,
-			Reason: fmt.Sprintf("failed to build native invocation: %v", err),
-		}, fmt.Errorf("build native invocation: %w", err)
-	}
-
-	toolAllowed := false
-	for _, t := range profile.Tooling {
-		if t == inv.Command {
-			toolAllowed = true
-			break
-		}
-	}
-	if !toolAllowed {
-		return adapter.DispatchOutcome{
-			Ref:    ref,
-			Status: adapter.DispatchRejected,
-			Reason: fmt.Sprintf("harness command %q is not in profile tooling allowlist", inv.Command),
-		}, fmt.Errorf("harness command %q is not in profile tooling allowlist", inv.Command)
-	}
-
-	launchReq := LaunchRequest{
-		RunID:             meta.RunID,
-		SessionID:         sessionID,
-		TurnKey:           ref.TurnKey,
-		AttemptID:         "1",
-		Command:           inv.Command,
-		Args:              inv.Args,
-		ExtraEnvAllowlist: inv.ExtraEnvAllowlist,
-		Paths:             paths,
-		Profile:           profile,
-	}
-
-	proc, err := a.executor.Start(ctx, launchReq)
-	if err != nil {
-		return adapter.DispatchOutcome{
-			Ref:    ref,
-			Status: adapter.DispatchRejected,
-			Reason: fmt.Sprintf("policy execution rejected: %v", err),
-		}, err
-	}
-
-	stream := adapter.NewBufferedStream(ref, 100)
-	turn := &managedTurn{
-		ref:     ref,
-		proc:    proc,
-		stream:  stream,
-		done:    make(chan struct{}),
-		outcome: adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchAccepted},
-	}
-
-	a.mu.Lock()
-	a.dispatches[ref] = turn
-	a.mu.Unlock()
-
-	go func() {
-		defer close(turn.done)
-		var copyWg sync.WaitGroup
-		var stdoutBuf bytes.Buffer
-		var stderrBuf bytes.Buffer
-
-		if stdout := proc.Stdout(); stdout != nil {
-			copyWg.Add(1)
-			go func() {
-				defer copyWg.Done()
-				_, _ = io.Copy(&stdoutBuf, stdout)
-			}()
-		}
-		if stderr := proc.Stderr(); stderr != nil {
-			copyWg.Add(1)
-			go func() {
-				defer copyWg.Done()
-				_, _ = io.Copy(&stderrBuf, stderr)
-			}()
+				Reason: fmt.Sprintf("session lookup failed: %v", err),
+			}, fmt.Errorf("lookup session %s: %w", sessionID, err)
 		}
 
-		// Drain stdout/stderr before calling proc.Wait().
-		// io.Copy blocks until the pipe write-end closes (process exits),
-		// so copyWg.Wait() implicitly waits for process completion.
-		// Calling proc.Wait() first causes cmd.Wait() to close the pipe
-		// readers before our goroutines finish reading, losing output under
-		// the race detector (and on any slow goroutine schedule).
-		copyWg.Wait()
-		code, waitErr := proc.Wait()
+		contributor := council.Contributor(meta.Contributor)
+		if !council.ValidContributor(contributor) {
+			return adapter.DispatchOutcome{
+				Ref:    ref,
+				Status: adapter.DispatchRejected,
+				Reason: fmt.Sprintf("invalid contributor %q", meta.Contributor),
+			}, fmt.Errorf("invalid contributor %q", meta.Contributor)
+		}
 
-		outStr := stdoutBuf.String()
-		errStr := stderrBuf.String()
-		fullOutput := outStr
-		if errStr != "" {
-			if fullOutput != "" {
-				fullOutput += "\n"
+		runProfileRec, err := a.store.GetRunProfile(ctx, meta.RunID)
+		if err != nil {
+			return adapter.DispatchOutcome{
+				Ref:    ref,
+				Status: adapter.DispatchRejected,
+				Reason: fmt.Sprintf("failed to retrieve run profile: %v", err),
+			}, fmt.Errorf("retrieve run profile for run %s: %w", meta.RunID, err)
+		}
+
+		profile := runProfileRec.Profile
+		if profile.AlgoVersion == "" || len(profile.Harnesses) == 0 {
+			return adapter.DispatchOutcome{
+				Ref:    ref,
+				Status: adapter.DispatchRejected,
+				Reason: "missing or empty frozen canonical profile",
+			}, errors.New("missing or empty frozen canonical profile")
+		}
+
+		harnessSpec, ok := profile.Harnesses[string(contributor)]
+		if !ok {
+			return adapter.DispatchOutcome{
+				Ref:    ref,
+				Status: adapter.DispatchRejected,
+				Reason: fmt.Sprintf("contributor %q has no configured harness profile", contributor),
+			}, fmt.Errorf("contributor %q has no configured harness profile in run %s", contributor, meta.RunID)
+		}
+		if strings.TrimSpace(harnessSpec.Model) == "" {
+			return adapter.DispatchOutcome{
+				Ref:    ref,
+				Status: adapter.DispatchRejected,
+				Reason: fmt.Sprintf("contributor %q has empty model", contributor),
+			}, fmt.Errorf("contributor %q has empty model in harness profile", contributor)
+		}
+		if strings.TrimSpace(harnessSpec.NativeAuthMode) == "" {
+			return adapter.DispatchOutcome{
+				Ref:    ref,
+				Status: adapter.DispatchRejected,
+				Reason: fmt.Sprintf("contributor %q has empty native auth mode", contributor),
+			}, fmt.Errorf("contributor %q has empty native auth mode in harness profile", contributor)
+		}
+
+		if a.wm == nil {
+			return adapter.DispatchOutcome{
+				Ref:    ref,
+				Status: adapter.DispatchRejected,
+				Reason: "workspace manager required",
+			}, errors.New("workspace manager required")
+		}
+
+		paths, ok := a.wm.GetPaths(meta.RunID, sessionID)
+		if !ok {
+			var err error
+			paths, err = a.wm.AllocateWorkspace(meta.RunID, sessionID, profile.WorkspaceMode, runProfileRec.SourceRepoIdentity, runProfileRec.SourceCommit)
+			if err != nil {
+				return adapter.DispatchOutcome{
+					Ref:    ref,
+					Status: adapter.DispatchRejected,
+					Reason: fmt.Sprintf("failed to allocate workspace: %v", err),
+				}, fmt.Errorf("allocate workspace: %w", err)
 			}
-			fullOutput += errStr
 		}
 
-		turn.err = waitErr
-		now := time.Now().UTC()
+		inv, err := a.builder(contributor, harnessSpec, prompt)
+		if err != nil {
+			return adapter.DispatchOutcome{
+				Ref:    ref,
+				Status: adapter.DispatchRejected,
+				Reason: fmt.Sprintf("failed to build native invocation: %v", err),
+			}, fmt.Errorf("build native invocation: %w", err)
+		}
 
-		if waitErr != nil || code != 0 {
-			if turn.err == nil {
-				turn.err = fmt.Errorf("process failed with exit code %d", code)
+		toolAllowed := false
+		for _, t := range profile.Tooling {
+			if t == inv.Command {
+				toolAllowed = true
+				break
 			}
+		}
+		if !toolAllowed {
+			return adapter.DispatchOutcome{
+				Ref:    ref,
+				Status: adapter.DispatchRejected,
+				Reason: fmt.Sprintf("harness command %q is not in profile tooling allowlist", inv.Command),
+			}, fmt.Errorf("harness command %q is not in profile tooling allowlist", inv.Command)
+		}
+
+		launchReq := LaunchRequest{
+			RunID:             meta.RunID,
+			SessionID:         sessionID,
+			TurnKey:           ref.TurnKey,
+			AttemptID:         "1",
+			Command:           inv.Command,
+			Args:              inv.Args,
+			ExtraEnvAllowlist: inv.ExtraEnvAllowlist,
+			Paths:             paths,
+			Profile:           profile,
+		}
+
+		proc, err := a.executor.Start(ctx, launchReq)
+		if err != nil {
+			return adapter.DispatchOutcome{
+				Ref:    ref,
+				Status: adapter.DispatchRejected,
+				Reason: fmt.Sprintf("policy execution rejected: %v", err),
+			}, err
+		}
+
+		stream := adapter.NewBufferedStream(ref, 100)
+		turn := &managedTurn{
+			ref:     ref,
+			proc:    proc,
+			stream:  stream,
+			done:    make(chan struct{}),
+			outcome: adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchAccepted},
+		}
+
+		a.mu.Lock()
+		a.dispatches[ref] = turn
+		a.mu.Unlock()
+
+		go func() {
+			defer close(turn.done)
+			var copyWg sync.WaitGroup
+			var stdoutBuf bytes.Buffer
+			var stderrBuf bytes.Buffer
+
+			if stdout := proc.Stdout(); stdout != nil {
+				copyWg.Add(1)
+				go func() {
+					defer copyWg.Done()
+					_, _ = io.Copy(&stdoutBuf, stdout)
+				}()
+			}
+			if stderr := proc.Stderr(); stderr != nil {
+				copyWg.Add(1)
+				go func() {
+					defer copyWg.Done()
+					_, _ = io.Copy(&stderrBuf, stderr)
+				}()
+			}
+
+			// Drain stdout/stderr before calling proc.Wait().
+			// io.Copy blocks until the pipe write-end closes (process exits),
+			// so copyWg.Wait() implicitly waits for process completion.
+			// Calling proc.Wait() first causes cmd.Wait() to close the pipe
+			// readers before our goroutines finish reading, losing output under
+			// the race detector (and on any slow goroutine schedule).
+			copyWg.Wait()
+			code, waitErr := proc.Wait()
+
+			outStr := stdoutBuf.String()
+			errStr := stderrBuf.String()
+			fullOutput := outStr
+			if errStr != "" {
+				if fullOutput != "" {
+					fullOutput += "\n"
+				}
+				fullOutput += errStr
+			}
+
+			turn.err = waitErr
+			now := time.Now().UTC()
+
+			if waitErr != nil || code != 0 {
+				if turn.err == nil {
+					turn.err = fmt.Errorf("process failed with exit code %d", code)
+				}
+				_ = stream.Send(adapter.Event{
+					Ref:       ref,
+					Type:      adapter.EventTerminal,
+					Status:    council.TurnFailed,
+					Payload:   fmt.Sprintf("process failed with exit code %d: %s", code, fullOutput),
+					Timestamp: now,
+				})
+				_ = stream.Close()
+
+				turn.result = adapter.TurnResult{
+					Ref:          ref,
+					Status:       council.TurnFailed,
+					ResultStatus: adapter.ResultFailed,
+					Output:       fullOutput,
+					CompletedAt:  now,
+				}
+				return
+			}
+
+			_ = stream.Send(adapter.Event{
+				Ref:       ref,
+				Type:      adapter.EventProgress,
+				Status:    council.TurnRunning,
+				Payload:   fullOutput,
+				Timestamp: now,
+			})
 			_ = stream.Send(adapter.Event{
 				Ref:       ref,
 				Type:      adapter.EventTerminal,
-				Status:    council.TurnFailed,
-				Payload:   fmt.Sprintf("process failed with exit code %d: %s", code, fullOutput),
+				Status:    council.TurnCompleted,
+				Payload:   fmt.Sprintf("exit code %d", code),
 				Timestamp: now,
 			})
 			_ = stream.Close()
 
 			turn.result = adapter.TurnResult{
 				Ref:          ref,
-				Status:       council.TurnFailed,
-				ResultStatus: adapter.ResultFailed,
+				Status:       council.TurnCompleted,
+				ResultStatus: adapter.ResultAvailable,
 				Output:       fullOutput,
 				CompletedAt:  now,
 			}
-			return
-		}
-
-		_ = stream.Send(adapter.Event{
-			Ref:       ref,
-			Type:      adapter.EventProgress,
-			Status:    council.TurnRunning,
-			Payload:   fullOutput,
-			Timestamp: now,
-		})
-		_ = stream.Send(adapter.Event{
-			Ref:       ref,
-			Type:      adapter.EventTerminal,
-			Status:    council.TurnCompleted,
-			Payload:   fmt.Sprintf("exit code %d", code),
-			Timestamp: now,
-		})
-		_ = stream.Close()
-
-		turn.result = adapter.TurnResult{
-			Ref:          ref,
-			Status:       council.TurnCompleted,
-			ResultStatus: adapter.ResultAvailable,
-			Output:       fullOutput,
-			CompletedAt:  now,
-		}
+		}()
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchAccepted}, nil
 	}()
-
-	return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchAccepted}, nil
+	if launchErr != nil {
+		res.complete(outcome, launchErr)
+		a.mu.Lock()
+		delete(a.launching, ref)
+		a.mu.Unlock()
+		return outcome, launchErr
+	}
+	res.complete(outcome, nil)
+	a.mu.Lock()
+	delete(a.launching, ref)
+	a.mu.Unlock()
+	return outcome, nil
 }
 
 func (a *ManagedWorkerAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter.Stream, error) {
@@ -511,11 +551,43 @@ func (a *ManagedWorkerAdapter) Collect(ctx context.Context, ref adapter.TurnRef)
 	}
 }
 
+// Reconcile reports only what this adapter can actually verify (Gate 2
+// review finding 2): a live in-memory execution for the turn is
+// ReachableActive; a finished or in-flight-but-unverifiable execution is
+// reported as uncertain with host visibility lost; a turn this process
+// never dispatched is definitive absence — after a daemon restart the
+// in-process worker (and any native execution it owned) is genuinely gone,
+// and absence is never reported as a running worker.
 func (a *ManagedWorkerAdapter) Reconcile(ctx context.Context, ref adapter.RecoveryRef) (adapter.ReconciliationOutcome, error) {
-	return adapter.ReconciliationOutcome{
-		Ref:          ref,
-		Reachability: council.VisibilityReachable,
-		Status:       adapter.ReconciliationReachableActive,
-		Observed:     council.TurnRunning,
-	}, nil
+	a.mu.Lock()
+	turn, ok := a.dispatches[ref.TurnRef]
+	a.mu.Unlock()
+	if !ok {
+		return adapter.ReconciliationOutcome{
+			Ref:          ref,
+			Reachability: council.VisibilityReachable,
+			Status:       adapter.ReconciliationDefinitivelyMissing,
+			Observed:     council.TurnFailed,
+			Result:       "no in-memory execution record for this turn",
+		}, nil
+	}
+
+	select {
+	case <-turn.done:
+		// The execution finished (or was torn down) without this adapter
+		// being able to attribute a verified native outcome here.
+		return adapter.ReconciliationOutcome{
+			Ref:          ref,
+			Reachability: council.VisibilityHostLost,
+			Status:       adapter.ReconciliationUncertain,
+			Observed:     council.TurnRunning,
+		}, nil
+	default:
+		return adapter.ReconciliationOutcome{
+			Ref:          ref,
+			Reachability: council.VisibilityReachable,
+			Status:       adapter.ReconciliationReachableActive,
+			Observed:     council.TurnRunning,
+		}, nil
+	}
 }
