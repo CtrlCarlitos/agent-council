@@ -80,26 +80,33 @@ func NewServer(store *storage.Store, lock *ServiceLock, cfg ServerConfig) (*Serv
 }
 
 func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerConfig, adp adapter.Adapter) (*Server, error) {
-	// If no adapter is provided but OpenCode is configured, create shared
-	// dependencies once and construct the production OpenCode adapter with
-	// fail-closed seams backed by the same instances the service uses.
-	if adp == nil && strings.TrimSpace(cfg.OpenCodeBinaryPath) != "" {
-		wm, wmErr := workspace.NewWorkspaceManager(cfg.StateDir, cfg.WorkspaceBaseDir)
-		if wmErr != nil {
-			return nil, fmt.Errorf("workspace manager for OpenCode adapter: %w", wmErr)
+	// Create shared service dependencies once.
+	var wm *workspace.WorkspaceManager
+	if cfg.WorkspaceBaseDir != "" {
+		var err error
+		wm, err = workspace.NewWorkspaceManager(cfg.StateDir, cfg.WorkspaceBaseDir)
+		if err != nil {
+			return nil, fmt.Errorf("workspace manager: %w", err)
 		}
-		executor := execpolicy.New()
+	}
+	pe := execpolicy.New()
+
+	// If no adapter is provided but OpenCode is configured, construct the
+	// production OpenCode adapter with fail-closed seams backed by the same
+	// workspace manager and policy executor the service uses.
+	if adp == nil && strings.TrimSpace(cfg.OpenCodeBinaryPath) != "" {
 		probeTemplate := opencode.NewOperatorProbeLaunchTemplate(cfg.OpenCodeBinaryPath, filepath.Join(cfg.StateDir, "probe-scratch"))
 		var opErr error
-		adp, opErr = opencode.NewProductionOpenCodeAdapter(store, wm, executor, probeTemplate)
+		adp, opErr = opencode.NewProductionOpenCodeAdapter(store, wm, pe, probeTemplate)
 		if opErr != nil {
 			return nil, fmt.Errorf("OpenCode adapter construction: %w", opErr)
 		}
 	}
-	return newServerWithAdapter(store, lock, cfg, adp)
+
+	return newServerWithAdapter(store, lock, cfg, adp, wm, pe)
 }
 
-func newServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerConfig, adp adapter.Adapter) (*Server, error) {
+func newServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerConfig, adp adapter.Adapter, wm *workspace.WorkspaceManager, pe execpolicy.PolicyExecutor) (*Server, error) {
 	if store == nil {
 		return nil, errors.New("store cannot be nil")
 	}
@@ -118,16 +125,6 @@ func newServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 
 	socketPath := filepath.Join(cfg.StateDir, "council.sock")
 	tokenPath := filepath.Join(cfg.StateDir, "auth.token")
-
-	var wm *workspace.WorkspaceManager
-	if cfg.WorkspaceBaseDir != "" {
-		var err error
-		wm, err = workspace.NewWorkspaceManager(cfg.StateDir, cfg.WorkspaceBaseDir)
-		if err != nil {
-			return nil, fmt.Errorf("new workspace manager: %w", err)
-		}
-	}
-	pe := execpolicy.New()
 
 	if adp == nil && wm != nil {
 		adp = execpolicy.NewWorkerAdapter(wm, pe, store)
