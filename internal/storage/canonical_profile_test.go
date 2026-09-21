@@ -352,4 +352,33 @@ func TestStore_CreateRunWithProfile_And_GetRunProfile(t *testing.T) {
 	if !errors.Is(err, ErrRunNotFound) {
 		t.Fatalf("expected ErrRunNotFound, got: %v", err)
 	}
+
+	// Create session and test GetSessionMetadata
+	sessRec, err := store.CreateSession(ctx, "op-create-meta-sess", "lease-prof-1", SessionRecord{
+		ID:                  "session-meta-1",
+		RunID:               "run-with-profile-1",
+		Contributor:         "claude",
+		Role:                "coder",
+		IsActiveContributor: true,
+		State:               "parked",
+		Visibility:          "reachable",
+	})
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	_ = sessRec
+
+	meta, err := store.GetSessionMetadata(ctx, "session-meta-1")
+	if err != nil {
+		t.Fatalf("GetSessionMetadata failed: %v", err)
+	}
+	if meta.SessionID != "session-meta-1" || meta.RunID != "run-with-profile-1" || meta.Contributor != "claude" {
+		t.Fatalf("unexpected session metadata: %+v", meta)
+	}
+
+	// Non-existent session
+	_, err = store.GetSessionMetadata(ctx, "non-existent-session")
+	if !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("expected ErrSessionNotFound, got: %v", err)
+	}
 }

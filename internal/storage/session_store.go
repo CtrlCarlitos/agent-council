@@ -346,6 +346,28 @@ FROM run_profiles WHERE run_id = ?;`, runID)
 	return rec, nil
 }
 
+// SessionMetadata contains core identities for an existing session.
+type SessionMetadata struct {
+	SessionID   string
+	RunID       string
+	Contributor string
+}
+
+// GetSessionMetadata returns the metadata (run_id, contributor) for a session.
+func (s *Store) GetSessionMetadata(ctx context.Context, sessionID string) (SessionMetadata, error) {
+	var meta SessionMetadata
+	meta.SessionID = sessionID
+	err := s.readDB.QueryRowContext(ctx, "SELECT run_id, contributor FROM sessions WHERE session_id = ?;", sessionID).
+		Scan(&meta.RunID, &meta.Contributor)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return SessionMetadata{}, ErrSessionNotFound
+		}
+		return SessionMetadata{}, fmt.Errorf("query session metadata: %w", err)
+	}
+	return meta, nil
+}
+
 // GetSessionRunID returns the run_id associated with a session.
 func (s *Store) GetSessionRunID(ctx context.Context, sessionID string) (string, error) {
 	var runID string

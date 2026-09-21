@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,26 @@ func TestService_WorkerSeamEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	stateDir := t.TempDir()
 	workspaceBaseDir := t.TempDir()
+
+	// Install a controlled "claude" stub in a temp bin dir so the
+	// native invocation path exercises the real PolicyExecutor while
+	// remaining hermetic. The stub validates that the adapter selected
+	// the correct contributor CLI and supplied the prompt.
+	binDir := t.TempDir()
+	claudeStub := filepath.Join(binDir, "claude")
+	const stubScript = `#!/bin/sh
+# Controlled fixture: validate model and prompt are passed correctly.
+if [ "$1" != "--model" ] || [ "$2" != "claude-3-7-sonnet" ] || [ "$3" != "-p" ]; then
+    echo "STUB_ARG_ERROR: $@" >&2
+    exit 1
+fi
+echo "SEAM_FIXTURE_OK: model=$2 prompt=$4"
+exit 0
+`
+	if err := os.WriteFile(claudeStub, []byte(stubScript), 0755); err != nil {
+		t.Fatalf("write claude stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(filepath.ListSeparator)+os.Getenv("PATH"))
 
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		t.Fatalf("mkdir stateDir: %v", err)
@@ -48,12 +69,13 @@ func TestService_WorkerSeamEndToEnd(t *testing.T) {
 	}
 
 	// Create server with adp == nil; Server auto-wires ManagedWorkerAdapter
-	// using its initialized WorkspaceManager and PolicyExecutor!
+	// using its initialized WorkspaceManager and PolicyExecutor.
 	srv, err := service.NewServer(store, lock, cfg)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 
+	// Verify production seam components are wired.
 	if srv.WorkspaceManager() == nil {
 		t.Fatal("expected srv.WorkspaceManager to be non-nil")
 	}
@@ -64,7 +86,8 @@ func TestService_WorkerSeamEndToEnd(t *testing.T) {
 	server := httptest.NewServer(srv.Handler())
 	defer server.Close()
 
-	// 1. Create run via POST /v1/runs with canonical profile
+	// 1. Create run via POST /v1/runs with canonical profile including
+	//    the claude harness spec. The harness spec drives native invocation.
 	runID := "run-seam-1"
 	controllerLease := "lease-seam-1"
 	prof := storage.CanonicalProfile{
@@ -74,8 +97,14 @@ func TestService_WorkerSeamEndToEnd(t *testing.T) {
 		NetworkMode:         "unrestricted",
 		NetworkAllowlist:    []string{},
 		CodeIndexScope:      []string{},
-		Tooling:             []string{"echo"},
-		Harnesses:           map[string]storage.HarnessProfileSpec{},
+		Tooling:             []string{"claude"},
+		Harnesses: map[string]storage.HarnessProfileSpec{
+			"claude": {
+				Model:             "claude-3-7-sonnet",
+				NativeAuthMode:    "inherited_host_keychain",
+				ExtraEnvAllowlist: []string{},
+			},
+		},
 	}
 
 	createRunBody, _ := json.Marshal(service.CreateRunRequest{
@@ -99,7 +128,8 @@ func TestService_WorkerSeamEndToEnd(t *testing.T) {
 	}
 	defer runResp.Body.Close()
 	if runResp.StatusCode != http.StatusCreated {
-		t.Fatalf("expected 201 Created, got %d", runResp.StatusCode)
+		b, _ := io.ReadAll(runResp.Body)
+		t.Fatalf("expected 201 Created, got %d: %s", runResp.StatusCode, string(b))
 	}
 
 	// 2. Adopt controller lease
@@ -145,7 +175,7 @@ func TestService_WorkerSeamEndToEnd(t *testing.T) {
 		t.Fatalf("expected 200 OK on connect, got %d: %s", connResp.StatusCode, string(b))
 	}
 
-	// 3. Create session in store
+	// 3. Create session in store with contributor matching the harness profile
 	sessionID := "sess-seam-1"
 	sessRec, err := store.CreateSession(ctx, "op-create-sess", activeLease, storage.SessionRecord{
 		ID:                  sessionID,
@@ -162,7 +192,7 @@ func TestService_WorkerSeamEndToEnd(t *testing.T) {
 
 	// 4. Queue prompt
 	turnKey := "turn-seam-1"
-	queueBody := fmt.Sprintf(`{"op_id":"op-queue-1","controller_lease":%q,"expected_version":%d,"turn_key":%q,"prompt":"hello from test"}`,
+	queueBody := fmt.Sprintf(`{"op_id":"op-queue-1","controller_lease":%q,"expected_version":%d,"turn_key":%q,"prompt":"hello from seam test"}`,
 		activeLease, sessRec.CommittedVersion, turnKey)
 	queueReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/v1/runs/%s/sessions/%s/prompts/queue", server.URL, runID, sessionID), strings.NewReader(queueBody))
 	queueReq.Header.Set("Authorization", "Bearer "+authToken)
@@ -181,7 +211,7 @@ func TestService_WorkerSeamEndToEnd(t *testing.T) {
 	var queueResult service.QueuePromptResponse
 	_ = json.NewDecoder(queueResp.Body).Decode(&queueResult)
 
-	// 5. Release turn -> ExecutionSupervisor runs with ManagedWorkerAdapter
+	// 5. Release turn -> ExecutionSupervisor dispatches through ManagedWorkerAdapter
 	releaseBody := fmt.Sprintf(`{"op_id":"op-rel-1","controller_lease":%q,"expected_version":%d}`,
 		activeLease, queueResult.Receipt.CommittedVersion)
 	relReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/v1/runs/%s/sessions/%s/turns/%s/release", server.URL, runID, sessionID, turnKey), strings.NewReader(releaseBody))
@@ -194,30 +224,36 @@ func TestService_WorkerSeamEndToEnd(t *testing.T) {
 	}
 	defer relResp.Body.Close()
 	if relResp.StatusCode != http.StatusAccepted {
-		t.Fatalf("expected 202 Accepted on release, got %d", relResp.StatusCode)
+		b, _ := io.ReadAll(relResp.Body)
+		t.Fatalf("expected 202 Accepted on release, got %d: %s", relResp.StatusCode, string(b))
 	}
 
-	// 6. Wait for turn to complete in store
+	// 6. Wait for turn to reach a terminal status through the production seam
 	var finalTurn *storage.TurnDetails
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		td, err := store.GetTurnDetails(ctx, sessionID, turnKey)
-		if err == nil && td.Status == council.TurnCompleted {
-			finalTurn = td
+		if err == nil && td != nil {
+			switch td.Status {
+			case council.TurnCompleted, council.TurnFailed:
+				finalTurn = td
+			}
+		}
+		if finalTurn != nil {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	if finalTurn == nil || finalTurn.Status != council.TurnCompleted {
-		status := "nil"
-		if finalTurn != nil {
-			status = string(finalTurn.Status)
-		}
-		t.Fatalf("expected turn to reach completed status, got: %s", status)
+	if finalTurn == nil {
+		t.Fatalf("expected turn to reach a terminal status within deadline, but it did not")
+	}
+	if finalTurn.Status != council.TurnCompleted {
+		t.Fatalf("expected TurnCompleted (controlled claude stub succeeds), got: %s", finalTurn.Status)
 	}
 
-	// 7. Verify workspace manager allocated the paths
+	// 7. Verify workspace was allocated under workspaceBaseDir, NOT stateDir.
+	// This is the primary disjoint storage boundary invariant.
 	paths, ok := srv.WorkspaceManager().GetPaths(runID, sessionID)
 	if !ok {
 		t.Fatalf("expected workspace paths allocated for %s/%s", runID, sessionID)
@@ -227,5 +263,16 @@ func TestService_WorkerSeamEndToEnd(t *testing.T) {
 	}
 	if _, err := os.Stat(paths.Root); err != nil {
 		t.Fatalf("expected workspace root directory to exist: %v", err)
+	}
+
+	realWorkspaceBase, _ := filepath.EvalSymlinks(workspaceBaseDir)
+	realStateDir, _ := filepath.EvalSymlinks(stateDir)
+	realRoot, _ := filepath.EvalSymlinks(paths.Root)
+
+	if !strings.HasPrefix(realRoot, realWorkspaceBase) {
+		t.Fatalf("workspace root %s is not under workspaceBaseDir %s — disjointness boundary violated", realRoot, realWorkspaceBase)
+	}
+	if strings.HasPrefix(realRoot, realStateDir) {
+		t.Fatalf("workspace root %s must not be under stateDir %s — disjointness boundary violated", realRoot, realStateDir)
 	}
 }

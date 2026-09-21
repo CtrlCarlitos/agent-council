@@ -95,7 +95,7 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 	var wm *workspace.WorkspaceManager
 	if cfg.WorkspaceBaseDir != "" {
 		var err error
-		wm, err = workspace.NewWorkspaceManager(cfg.WorkspaceBaseDir, cfg.StateDir)
+		wm, err = workspace.NewWorkspaceManager(cfg.StateDir, cfg.WorkspaceBaseDir)
 		if err != nil {
 			return nil, fmt.Errorf("new workspace manager: %w", err)
 		}

@@ -1,6 +1,7 @@
 package execpolicy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -19,6 +20,59 @@ import (
 type RunProfileStore interface {
 	GetRunProfile(ctx context.Context, runID string) (storage.RunProfileRecord, error)
 	GetSessionRunID(ctx context.Context, sessionID string) (string, error)
+	GetSessionMetadata(ctx context.Context, sessionID string) (storage.SessionMetadata, error)
+}
+
+// NativeInvocation defines the command and arguments for invoking a native harness.
+type NativeInvocation struct {
+	Command           string
+	Args              []string
+	ExtraEnvAllowlist []string
+}
+
+// NativeInvocationBuilder constructs command line parameters for a native harness contributor.
+type NativeInvocationBuilder func(contrib council.Contributor, spec storage.HarnessProfileSpec, prompt string) (NativeInvocation, error)
+
+// BuildNativeInvocation determines the native CLI command and arguments for a contributor.
+func BuildNativeInvocation(contrib council.Contributor, spec storage.HarnessProfileSpec, prompt string) (NativeInvocation, error) {
+	if !council.ValidContributor(contrib) {
+		return NativeInvocation{}, fmt.Errorf("invalid contributor: %q", contrib)
+	}
+	if strings.TrimSpace(spec.Model) == "" {
+		return NativeInvocation{}, fmt.Errorf("missing model for contributor %q", contrib)
+	}
+	if strings.TrimSpace(spec.NativeAuthMode) == "" {
+		return NativeInvocation{}, fmt.Errorf("missing native auth mode for contributor %q", contrib)
+	}
+
+	switch contrib {
+	case council.Claude:
+		return NativeInvocation{
+			Command:           "claude",
+			Args:              []string{"--model", spec.Model, "-p", prompt},
+			ExtraEnvAllowlist: spec.ExtraEnvAllowlist,
+		}, nil
+	case council.Codex:
+		return NativeInvocation{
+			Command:           "codex",
+			Args:              []string{"exec", "--model", spec.Model, prompt},
+			ExtraEnvAllowlist: spec.ExtraEnvAllowlist,
+		}, nil
+	case council.OpenCode:
+		return NativeInvocation{
+			Command:           "opencode",
+			Args:              []string{"run", "--model", spec.Model, prompt},
+			ExtraEnvAllowlist: spec.ExtraEnvAllowlist,
+		}, nil
+	case council.Agy:
+		return NativeInvocation{
+			Command:           "agy",
+			Args:              []string{"--model", spec.Model, "-p", prompt},
+			ExtraEnvAllowlist: spec.ExtraEnvAllowlist,
+		}, nil
+	default:
+		return NativeInvocation{}, fmt.Errorf("unsupported native contributor: %q", contrib)
+	}
 }
 
 // ManagedWorkerAdapter connects Council's execution supervisor to native worker processes
@@ -27,6 +81,7 @@ type ManagedWorkerAdapter struct {
 	wm       *workspace.WorkspaceManager
 	executor PolicyExecutor
 	store    RunProfileStore
+	builder  NativeInvocationBuilder
 
 	mu         sync.Mutex
 	sessions   map[adapter.SessionID]adapter.SessionBinding
@@ -44,12 +99,26 @@ type managedTurn struct {
 }
 
 // NewWorkerAdapter constructs a production adapter backed by the isolated workspace manager
-// and unbypassable policy executor.
+// and unbypassable policy executor using standard native harness invocations.
 func NewWorkerAdapter(wm *workspace.WorkspaceManager, executor PolicyExecutor, store RunProfileStore) *ManagedWorkerAdapter {
+	return NewWorkerAdapterWithInvocation(wm, executor, store, BuildNativeInvocation)
+}
+
+// NewWorkerAdapterWithInvocation constructs a worker adapter with a custom native invocation builder.
+func NewWorkerAdapterWithInvocation(
+	wm *workspace.WorkspaceManager,
+	executor PolicyExecutor,
+	store RunProfileStore,
+	builder NativeInvocationBuilder,
+) *ManagedWorkerAdapter {
+	if builder == nil {
+		builder = BuildNativeInvocation
+	}
 	return &ManagedWorkerAdapter{
 		wm:         wm,
 		executor:   executor,
 		store:      store,
+		builder:    builder,
 		sessions:   make(map[adapter.SessionID]adapter.SessionBinding),
 		dispatches: make(map[adapter.TurnRef]*managedTurn),
 	}
@@ -77,26 +146,42 @@ func (a *ManagedWorkerAdapter) CreateSession(ctx context.Context, req adapter.Cr
 	}
 	a.mu.Unlock()
 
-	runID := "default"
-	sessionID := string(req.SessionID)
+	if a.store == nil {
+		return adapter.SessionBinding{}, errors.New("store is required for session creation")
+	}
 
-	// Allocate workspace through WorkspaceManager
+	sessionID := string(req.SessionID)
+	meta, err := a.store.GetSessionMetadata(ctx, sessionID)
+	if err != nil {
+		return adapter.SessionBinding{}, fmt.Errorf("lookup session %s: %w", sessionID, err)
+	}
+	if meta.Contributor != string(req.Contributor) {
+		return adapter.SessionBinding{}, fmt.Errorf("contributor mismatch for session %s: store has %s, req has %s", sessionID, meta.Contributor, req.Contributor)
+	}
+
+	rec, err := a.store.GetRunProfile(ctx, meta.RunID)
+	if err != nil {
+		return adapter.SessionBinding{}, fmt.Errorf("retrieve run profile for run %s: %w", meta.RunID, err)
+	}
+	profile := rec.Profile
+	if profile.AlgoVersion == "" || len(profile.Harnesses) == 0 {
+		return adapter.SessionBinding{}, errors.New("invalid or empty frozen run profile")
+	}
+
+	harnessSpec, ok := profile.Harnesses[string(req.Contributor)]
+	if !ok {
+		return adapter.SessionBinding{}, fmt.Errorf("contributor %s has no configured harness profile", req.Contributor)
+	}
+	if strings.TrimSpace(harnessSpec.Model) == "" {
+		return adapter.SessionBinding{}, fmt.Errorf("contributor %s missing model in harness profile", req.Contributor)
+	}
+	if strings.TrimSpace(harnessSpec.NativeAuthMode) == "" {
+		return adapter.SessionBinding{}, fmt.Errorf("contributor %s missing native auth mode in harness profile", req.Contributor)
+	}
+
 	var rootPath string
 	if a.wm != nil {
-		mode := "none"
-		commit := ""
-		sourceRepo := ""
-
-		if a.store != nil {
-			rec, err := a.store.GetRunProfile(ctx, runID)
-			if err == nil {
-				mode = rec.WorkspaceMode
-				commit = rec.SourceCommit
-				sourceRepo = rec.SourceRepoIdentity
-			}
-		}
-
-		paths, err := a.wm.AllocateWorkspace(runID, sessionID, mode, sourceRepo, commit)
+		paths, err := a.wm.AllocateWorkspace(meta.RunID, sessionID, profile.WorkspaceMode, rec.SourceRepoIdentity, rec.SourceCommit)
 		if err != nil {
 			return adapter.SessionBinding{}, fmt.Errorf("allocate workspace: %w", err)
 		}
@@ -107,11 +192,13 @@ func (a *ManagedWorkerAdapter) CreateSession(ctx context.Context, req adapter.Cr
 	if rootPath != "" {
 		cfg.WorkspaceRoot = rootPath
 	}
+	cfg.Model = harnessSpec.Model
+	cfg.Tooling = profile.Tooling
 
 	binding := adapter.SessionBinding{
 		SessionID:       req.SessionID,
 		Contributor:     req.Contributor,
-		NativeSessionID: fmt.Sprintf("managed://%s/%s", runID, sessionID),
+		NativeSessionID: fmt.Sprintf("managed://%s/%s", meta.RunID, sessionID),
 		Config:          cfg,
 	}
 
@@ -132,6 +219,10 @@ func (a *ManagedWorkerAdapter) ResumeSession(ctx context.Context, binding adapte
 }
 
 func (a *ManagedWorkerAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt string) (adapter.DispatchOutcome, error) {
+	if err := ref.Validate(); err != nil {
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: err.Error()}, err
+	}
+
 	a.mu.Lock()
 	if existing, ok := a.dispatches[ref]; ok {
 		a.mu.Unlock()
@@ -139,86 +230,135 @@ func (a *ManagedWorkerAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef
 	}
 	a.mu.Unlock()
 
+	if a.store == nil {
+		return adapter.DispatchOutcome{
+			Ref:    ref,
+			Status: adapter.DispatchRejected,
+			Reason: "store is required for dispatch",
+		}, errors.New("store is required")
+	}
+
 	sessionID := string(ref.SessionID)
-	runID := "default"
-	if a.store != nil {
-		if rID, err := a.store.GetSessionRunID(ctx, sessionID); err == nil && rID != "" {
-			runID = rID
-		}
-	}
-	if runID == "default" {
-		a.mu.Lock()
-		if b, ok := a.sessions[ref.SessionID]; ok {
-			parts := strings.Split(strings.TrimPrefix(b.NativeSessionID, "managed://"), "/")
-			if len(parts) >= 2 {
-				runID = parts[0]
-			}
-		}
-		a.mu.Unlock()
+	meta, err := a.store.GetSessionMetadata(ctx, sessionID)
+	if err != nil {
+		return adapter.DispatchOutcome{
+			Ref:    ref,
+			Status: adapter.DispatchRejected,
+			Reason: fmt.Sprintf("session lookup failed: %v", err),
+		}, fmt.Errorf("lookup session %s: %w", sessionID, err)
 	}
 
-	var profile storage.CanonicalProfile
-	sourceRepo := ""
-	sourceCommit := ""
-	if a.store != nil {
-		rec, err := a.store.GetRunProfile(ctx, runID)
-		if err == nil {
-			profile = rec.Profile
-			sourceRepo = rec.SourceRepoIdentity
-			sourceCommit = rec.SourceCommit
+	contributor := council.Contributor(meta.Contributor)
+	if !council.ValidContributor(contributor) {
+		return adapter.DispatchOutcome{
+			Ref:    ref,
+			Status: adapter.DispatchRejected,
+			Reason: fmt.Sprintf("invalid contributor %q", meta.Contributor),
+		}, fmt.Errorf("invalid contributor %q", meta.Contributor)
+	}
+
+	runProfileRec, err := a.store.GetRunProfile(ctx, meta.RunID)
+	if err != nil {
+		return adapter.DispatchOutcome{
+			Ref:    ref,
+			Status: adapter.DispatchRejected,
+			Reason: fmt.Sprintf("failed to retrieve run profile: %v", err),
+		}, fmt.Errorf("retrieve run profile for run %s: %w", meta.RunID, err)
+	}
+
+	profile := runProfileRec.Profile
+	if profile.AlgoVersion == "" || len(profile.Harnesses) == 0 {
+		return adapter.DispatchOutcome{
+			Ref:    ref,
+			Status: adapter.DispatchRejected,
+			Reason: "missing or empty frozen canonical profile",
+		}, errors.New("missing or empty frozen canonical profile")
+	}
+
+	harnessSpec, ok := profile.Harnesses[string(contributor)]
+	if !ok {
+		return adapter.DispatchOutcome{
+			Ref:    ref,
+			Status: adapter.DispatchRejected,
+			Reason: fmt.Sprintf("contributor %q has no configured harness profile", contributor),
+		}, fmt.Errorf("contributor %q has no configured harness profile in run %s", contributor, meta.RunID)
+	}
+	if strings.TrimSpace(harnessSpec.Model) == "" {
+		return adapter.DispatchOutcome{
+			Ref:    ref,
+			Status: adapter.DispatchRejected,
+			Reason: fmt.Sprintf("contributor %q has empty model", contributor),
+		}, fmt.Errorf("contributor %q has empty model in harness profile", contributor)
+	}
+	if strings.TrimSpace(harnessSpec.NativeAuthMode) == "" {
+		return adapter.DispatchOutcome{
+			Ref:    ref,
+			Status: adapter.DispatchRejected,
+			Reason: fmt.Sprintf("contributor %q has empty native auth mode", contributor),
+		}, fmt.Errorf("contributor %q has empty native auth mode in harness profile", contributor)
+	}
+
+	if a.wm == nil {
+		return adapter.DispatchOutcome{
+			Ref:    ref,
+			Status: adapter.DispatchRejected,
+			Reason: "workspace manager required",
+		}, errors.New("workspace manager required")
+	}
+
+	paths, ok := a.wm.GetPaths(meta.RunID, sessionID)
+	if !ok {
+		var err error
+		paths, err = a.wm.AllocateWorkspace(meta.RunID, sessionID, profile.WorkspaceMode, runProfileRec.SourceRepoIdentity, runProfileRec.SourceCommit)
+		if err != nil {
+			return adapter.DispatchOutcome{
+				Ref:    ref,
+				Status: adapter.DispatchRejected,
+				Reason: fmt.Sprintf("failed to allocate workspace: %v", err),
+			}, fmt.Errorf("allocate workspace: %w", err)
 		}
 	}
 
-	var paths workspace.WorkspacePaths
-	if a.wm != nil {
-		var ok bool
-		paths, ok = a.wm.GetPaths(runID, sessionID)
-		if !ok {
-			var err error
-			mode := profile.WorkspaceMode
-			if mode == "" {
-				mode = "none"
-			}
-			paths, err = a.wm.AllocateWorkspace(runID, sessionID, mode, sourceRepo, sourceCommit)
-			if err != nil {
-				return adapter.DispatchOutcome{
-					Ref:    ref,
-					Status: adapter.DispatchRejected,
-					Reason: fmt.Sprintf("failed to allocate workspace: %v", err),
-				}, err
-			}
-		}
-	}
-	if profile.AlgoVersion == "" {
-		profile = storage.CanonicalProfile{
-			AlgoVersion:         "cprof-v1",
-			WorkspaceMode:       paths.Mode,
-			IsolationStrictness: "permissive_dev",
-			NetworkMode:         "unrestricted",
-			Tooling:             []string{"sh", "echo", "cat", "git"},
-		}
+	inv, err := a.builder(contributor, harnessSpec, prompt)
+	if err != nil {
+		return adapter.DispatchOutcome{
+			Ref:    ref,
+			Status: adapter.DispatchRejected,
+			Reason: fmt.Sprintf("failed to build native invocation: %v", err),
+		}, fmt.Errorf("build native invocation: %w", err)
 	}
 
-	command := "echo"
-	var args []string
-	if len(profile.Tooling) > 0 {
-		command = profile.Tooling[0]
+	toolAllowed := false
+	for _, t := range profile.Tooling {
+		if t == inv.Command {
+			toolAllowed = true
+			break
+		}
+	}
+	if !toolAllowed {
+		return adapter.DispatchOutcome{
+			Ref:    ref,
+			Status: adapter.DispatchRejected,
+			Reason: fmt.Sprintf("harness command %q is not in profile tooling allowlist", inv.Command),
+		}, fmt.Errorf("harness command %q is not in profile tooling allowlist", inv.Command)
 	}
 
 	launchReq := LaunchRequest{
-		RunID:     runID,
-		SessionID: sessionID,
-		TurnKey:   ref.TurnKey,
-		AttemptID: "1",
-		Command:   command,
-		Args:      args,
-		Paths:     paths,
-		Profile:   profile,
+		RunID:             meta.RunID,
+		SessionID:         sessionID,
+		TurnKey:           ref.TurnKey,
+		AttemptID:         "1",
+		Command:           inv.Command,
+		Args:              inv.Args,
+		ExtraEnvAllowlist: inv.ExtraEnvAllowlist,
+		Paths:             paths,
+		Profile:           profile,
 	}
 
 	proc, err := a.executor.Start(ctx, launchReq)
 	if err != nil {
 		return adapter.DispatchOutcome{
+			Ref:    ref,
 			Status: adapter.DispatchRejected,
 			Reason: fmt.Sprintf("policy execution rejected: %v", err),
 		}, err
@@ -230,43 +370,92 @@ func (a *ManagedWorkerAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef
 		proc:    proc,
 		stream:  stream,
 		done:    make(chan struct{}),
-		outcome: adapter.DispatchOutcome{Status: adapter.DispatchAccepted},
+		outcome: adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchAccepted},
 	}
 
 	a.mu.Lock()
 	a.dispatches[ref] = turn
 	a.mu.Unlock()
 
-	if stdin := proc.Stdin(); stdin != nil {
-		_, _ = io.WriteString(stdin, prompt)
-		if closer, ok := stdin.(io.Closer); ok {
-			_ = closer.Close()
-		}
-	}
-
 	go func() {
 		defer close(turn.done)
-		var buf strings.Builder
-		stdout := proc.Stdout()
-		if stdout != nil {
-			b, _ := io.ReadAll(stdout)
-			buf.Write(b)
+		var copyWg sync.WaitGroup
+		var stdoutBuf bytes.Buffer
+		var stderrBuf bytes.Buffer
+
+		if stdout := proc.Stdout(); stdout != nil {
+			copyWg.Add(1)
+			go func() {
+				defer copyWg.Done()
+				_, _ = io.Copy(&stdoutBuf, stdout)
+			}()
+		}
+		if stderr := proc.Stderr(); stderr != nil {
+			copyWg.Add(1)
+			go func() {
+				defer copyWg.Done()
+				_, _ = io.Copy(&stderrBuf, stderr)
+			}()
 		}
 
+		// Drain stdout/stderr before calling proc.Wait().
+		// io.Copy blocks until the pipe write-end closes (process exits),
+		// so copyWg.Wait() implicitly waits for process completion.
+		// Calling proc.Wait() first causes cmd.Wait() to close the pipe
+		// readers before our goroutines finish reading, losing output under
+		// the race detector (and on any slow goroutine schedule).
+		copyWg.Wait()
 		code, waitErr := proc.Wait()
+
+		outStr := stdoutBuf.String()
+		errStr := stderrBuf.String()
+		fullOutput := outStr
+		if errStr != "" {
+			if fullOutput != "" {
+				fullOutput += "\n"
+			}
+			fullOutput += errStr
+		}
+
 		turn.err = waitErr
+		now := time.Now().UTC()
+
+		if waitErr != nil || code != 0 {
+			if turn.err == nil {
+				turn.err = fmt.Errorf("process failed with exit code %d", code)
+			}
+			_ = stream.Send(adapter.Event{
+				Ref:       ref,
+				Type:      adapter.EventTerminal,
+				Status:    council.TurnFailed,
+				Payload:   fmt.Sprintf("process failed with exit code %d: %s", code, fullOutput),
+				Timestamp: now,
+			})
+			_ = stream.Close()
+
+			turn.result = adapter.TurnResult{
+				Ref:          ref,
+				Status:       council.TurnFailed,
+				ResultStatus: adapter.ResultFailed,
+				Output:       fullOutput,
+				CompletedAt:  now,
+			}
+			return
+		}
 
 		_ = stream.Send(adapter.Event{
-			Ref:     ref,
-			Type:    adapter.EventProgress,
-			Status:  council.TurnRunning,
-			Payload: buf.String(),
+			Ref:       ref,
+			Type:      adapter.EventProgress,
+			Status:    council.TurnRunning,
+			Payload:   fullOutput,
+			Timestamp: now,
 		})
 		_ = stream.Send(adapter.Event{
-			Ref:     ref,
-			Type:    adapter.EventTerminal,
-			Status:  council.TurnCompleted,
-			Payload: fmt.Sprintf("exit code %d", code),
+			Ref:       ref,
+			Type:      adapter.EventTerminal,
+			Status:    council.TurnCompleted,
+			Payload:   fmt.Sprintf("exit code %d", code),
+			Timestamp: now,
 		})
 		_ = stream.Close()
 
@@ -274,8 +463,8 @@ func (a *ManagedWorkerAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef
 			Ref:          ref,
 			Status:       council.TurnCompleted,
 			ResultStatus: adapter.ResultAvailable,
-			Output:       buf.String(),
-			CompletedAt:  time.Now().UTC(),
+			Output:       fullOutput,
+			CompletedAt:  now,
 		}
 	}()
 
@@ -318,7 +507,7 @@ func (a *ManagedWorkerAdapter) Collect(ctx context.Context, ref adapter.TurnRef)
 	case <-turn.done:
 		return turn.result, turn.err
 	case <-ctx.Done():
-		return adapter.TurnResult{}, ctx.Err()
+		return adapter.TurnResult{Ref: ref, Status: council.TurnRunning, ResultStatus: adapter.ResultPending}, ctx.Err()
 	}
 }
 
