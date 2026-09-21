@@ -563,3 +563,18 @@ type fakeProbeError struct {
 	Name    string `json:"name"`
 	Message string `json:"message"`
 }
+
+// NewOpenCodeAdapterWithLaunch is like NewOpenCodeAdapter but accepts an
+// explicit SessionLaunchSource (the production storage-backed
+// implementation).
+func NewOpenCodeAdapterWithLaunch(
+	executor execpolicy.PolicyExecutor,
+	probeTemplate ProbeLaunchTemplate,
+	identity DispatchIdentitySource,
+	launch SessionLaunchSource,
+	opts ...OpenCodeAdapterOption,
+) *OpenCodeAdapter {
+	a := NewOpenCodeAdapter(executor, probeTemplate, identity, opts...)
+	a.servers = newServerManager(executor, launch)
+	return a
+}
