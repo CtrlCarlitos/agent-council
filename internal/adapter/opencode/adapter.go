@@ -209,7 +209,7 @@ func (a *OpenCodeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, pro
 func (a *OpenCodeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter.Stream, error) {
 	stream := adapter.NewBufferedStream(ref, 64)
 	go func() {
-		ticker := time.NewTicker(100 * time.Millisecond)
+		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
@@ -217,11 +217,36 @@ func (a *OpenCodeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (ada
 				return
 			case <-ticker.C:
 				a.mu.Lock()
-				_, ok := a.dispatches[ref]
+				d, ok := a.dispatches[ref]
 				a.mu.Unlock()
 				if !ok {
 					return
 				}
+				// Poll for assistant reply via parentID correlation.
+				msg, found := a.findAssistantByParentID(ctx, ref.SessionID, d.userMessageID)
+				if !found {
+					continue
+				}
+				text := ""
+				for _, p := range msg.Parts {
+					if p.Type == "text" {
+						text = p.Text
+						break
+					}
+				}
+				now := time.Now().UTC()
+				if msg.Error != nil {
+					_ = stream.Send(adapter.Event{
+						Ref: ref, Type: adapter.EventTerminal,
+						Status: council.TurnFailed, Payload: msg.Error.Message, Timestamp: now,
+					})
+					return
+				}
+				_ = stream.Send(adapter.Event{
+					Ref: ref, Type: adapter.EventTerminal,
+					Status: council.TurnCompleted, Payload: text, Timestamp: now,
+				})
+				return
 			}
 		}
 	}()
@@ -231,23 +256,152 @@ func (a *OpenCodeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (ada
 // ── Cancel ──────────────────────────────────────────────────────────────
 
 func (a *OpenCodeAdapter) Cancel(ctx context.Context, ref adapter.TurnRef) (adapter.CancelOutcome, error) {
-	return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelConfirmed}, nil
+	a.mu.Lock()
+	d, ok := a.dispatches[ref]
+	a.mu.Unlock()
+	if !ok {
+		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelRejected, Reason: "turn not dispatched"}, nil
+	}
+
+	ep, err := a.endpointFor(adapter.SessionID(d.nativeSessionID))
+	if err != nil {
+		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelRejected, Reason: err.Error()}, err
+	}
+
+	url := fmt.Sprintf("%s/session/%s/abort", ep, d.nativeSessionID)
+	req, reqErr := http.NewRequestWithContext(ctx, "POST", url, nil)
+	if reqErr != nil {
+		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelRejected, Reason: reqErr.Error()}, reqErr
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelRejected, Reason: err.Error()}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelConfirmed}, nil
+	}
+	return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown, Reason: fmt.Sprintf("abort returned %d", resp.StatusCode)}, nil
 }
 
 // ── Collect ─────────────────────────────────────────────────────────────
 
 func (a *OpenCodeAdapter) Collect(ctx context.Context, ref adapter.TurnRef) (adapter.TurnResult, error) {
-	return adapter.TurnResult{Ref: ref, Status: council.TurnRunning, ResultStatus: adapter.ResultPending}, nil
+	a.mu.Lock()
+	d, ok := a.dispatches[ref]
+	a.mu.Unlock()
+	if !ok {
+		return adapter.TurnResult{
+			Ref: ref, Status: council.TurnRunning, ResultStatus: adapter.ResultPending,
+		}, errors.New("turn not dispatched")
+	}
+
+	msg, found := a.findAssistantByParentID(ctx, ref.SessionID, d.userMessageID)
+	if !found {
+		return adapter.TurnResult{
+			Ref: ref, Status: council.TurnRunning, ResultStatus: adapter.ResultPending,
+		}, nil
+	}
+
+	text := ""
+	for _, p := range msg.Parts {
+		if p.Type == "text" {
+			text = p.Text
+			break
+		}
+	}
+	if text == "" {
+		text = "(assistant message has no text content)"
+	}
+
+	now := time.Now().UTC()
+	return adapter.TurnResult{
+		Ref: ref, Status: council.TurnCompleted, ResultStatus: adapter.ResultAvailable,
+		Output: text, CompletedAt: now,
+	}, nil
 }
 
 // ── Reconcile ───────────────────────────────────────────────────────────
 
 func (a *OpenCodeAdapter) Reconcile(ctx context.Context, ref adapter.RecoveryRef) (adapter.ReconciliationOutcome, error) {
+	a.mu.Lock()
+	d, hasDispatch := a.dispatches[ref.TurnRef]
+	a.mu.Unlock()
+
+	// Resolve the server endpoint for this session.
+	ep, epErr := a.endpointFor(ref.TurnRef.SessionID)
+	if epErr != nil {
+		// No server for this session: we cannot observe the worker.
+		return adapter.ReconciliationOutcome{
+			Ref: ref, Reachability: council.VisibilityHostLost,
+			Status: adapter.ReconciliationUncertain, Observed: council.TurnRunning,
+		}, nil
+	}
+
+	// Check if the native session exists.
+	req, reqErr := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/session/%s", ep, ref.TurnRef.SessionID), nil)
+	if reqErr != nil {
+		return adapter.ReconciliationOutcome{Ref: ref}, reqErr
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return adapter.ReconciliationOutcome{
+			Ref: ref, Reachability: council.VisibilityHostLost,
+			Status: adapter.ReconciliationUncertain, Observed: council.TurnRunning,
+		}, nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		// Session 404 after a possibly-accepted dispatch proves nothing about
+		// the native execution — the worker may still be running as an orphan.
+		return adapter.ReconciliationOutcome{
+			Ref: ref, Reachability: council.VisibilityHostLost,
+			Status: adapter.ReconciliationUncertain, Observed: council.TurnRunning,
+		}, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return adapter.ReconciliationOutcome{
+			Ref: ref, Reachability: council.VisibilityHostLost,
+			Status: adapter.ReconciliationUncertain, Observed: council.TurnRunning,
+		}, nil
+	}
+
+	if !hasDispatch {
+		return adapter.ReconciliationOutcome{
+			Ref: ref, Reachability: council.VisibilityHostLost,
+			Status: adapter.ReconciliationUncertain, Observed: council.TurnRunning,
+		}, nil
+	}
+
+	// Look for the assistant reply correlated by parentID.
+	msg, found := a.findAssistantByParentID(ctx, ref.TurnRef.SessionID, d.userMessageID)
+	if !found {
+		// Session is reachable but the native execution has not produced a
+		// verified outcome yet.
+		return adapter.ReconciliationOutcome{
+			Ref: ref, Reachability: council.VisibilityReachable,
+			Status: adapter.ReconciliationUncertain, Observed: council.TurnRunning,
+		}, nil
+	}
+
+	// The native execution has produced a verified terminal outcome.
+	text := ""
+	for _, p := range msg.Parts {
+		if p.Type == "text" {
+			text = p.Text
+			break
+		}
+	}
+	observed := council.TurnCompleted
+	if msg.Error != nil {
+		observed = council.TurnFailed
+	}
 	return adapter.ReconciliationOutcome{
-		Ref:          ref,
-		Reachability: council.VisibilityHostLost,
-		Status:       adapter.ReconciliationUncertain,
-		Observed:     council.TurnRunning,
+		Ref: ref, Reachability: council.VisibilityReachable,
+		Status:   adapter.ReconciliationReachableTerminal,
+		Observed: observed, Result: text,
 	}, nil
 }
 
@@ -257,18 +411,119 @@ func (a *OpenCodeAdapter) CreateSession(ctx context.Context, req adapter.CreateS
 	if err := req.Validate(); err != nil {
 		return adapter.SessionBinding{}, err
 	}
+	// Create a fresh session via POST /session on the server.
+	ep, epErr := a.endpointFor(req.SessionID)
+	if epErr != nil {
+		// No server yet; return the binding — the server will be started
+		// lazily when the first dispatch or connect occurs.
+		return adapter.SessionBinding{
+			SessionID:       req.SessionID,
+			Contributor:     req.Contributor,
+			NativeSessionID: fmt.Sprintf("ses_council_%s", req.SessionID),
+			Config:          req.Config,
+		}, nil
+	}
+
+	payload := map[string]any{
+		"title": fmt.Sprintf("council %s", req.SessionID),
+		"agent": string(req.Contributor),
+	}
+	body, _ := json.Marshal(payload)
+	httpReq, httpErr := http.NewRequestWithContext(ctx, "POST", ep+"/session", strings.NewReader(string(body)))
+	if httpErr != nil {
+		return adapter.SessionBinding{}, httpErr
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return adapter.SessionBinding{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return adapter.SessionBinding{}, fmt.Errorf("session create returned %d", resp.StatusCode)
+	}
+	var result struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return adapter.SessionBinding{}, err
+	}
 	return adapter.SessionBinding{
 		SessionID:       req.SessionID,
 		Contributor:     req.Contributor,
-		NativeSessionID: fmt.Sprintf("ses_council_%s", req.SessionID),
+		NativeSessionID: result.ID,
 		Config:          req.Config,
 	}, nil
 }
 
 func (a *OpenCodeAdapter) ResumeSession(ctx context.Context, binding adapter.SessionBinding) error {
+	ep, epErr := a.endpointFor(binding.SessionID)
+	if epErr != nil {
+		return fmt.Errorf("%w: no server for session %s", ErrNativeSessionMissing, binding.SessionID)
+	}
+	url := fmt.Sprintf("%s/session/%s", ep, binding.NativeSessionID)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return ErrNativeSessionMissing
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("resume check returned %d", resp.StatusCode)
+	}
 	return nil
 }
 
+// findAssistantByParentID polls the server for an assistant message whose
+// parentID matches the given ID. Returns the message and true when found.
+func (a *OpenCodeAdapter) findAssistantByParentID(ctx context.Context, sessionID adapter.SessionID, parentID string) (*fakeAssistantMsg, bool) {
+	ep, err := a.endpointFor(sessionID)
+	if err != nil {
+		return nil, false
+	}
+	url := fmt.Sprintf("%s/session/%s/message", ep, sessionID)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	var msgs []struct {
+		Info struct {
+			ID       string `json:"id"`
+			Role     string `json:"role"`
+			ParentID string `json:"parentID"`
+		} `json:"info"`
+		Parts []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"parts"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&msgs); err != nil {
+		return nil, false
+	}
+	for _, m := range msgs {
+		if m.Info.Role == "assistant" && m.Info.ParentID == parentID {
+			result := &fakeAssistantMsg{ID: m.Info.ID, Role: "assistant", ParentID: m.Info.ParentID}
+			for _, p := range m.Parts {
+				result.Parts = append(result.Parts, fakePart{Type: p.Type, Text: p.Text})
+			}
+			return result, true
+		}
+	}
+	return nil, false
+}
+
+// ── Internal helpers ────────────────────────────────────────────────────
 // ── Internal helpers ────────────────────────────────────────────────────
 
 func (a *OpenCodeAdapter) endpointFor(sessionID adapter.SessionID) (string, error) {
@@ -283,4 +538,28 @@ func (a *OpenCodeAdapter) endpointFor(sessionID adapter.SessionID) (string, erro
 // called before any session operation.
 func (a *OpenCodeAdapter) SetSessionLaunchSource(src SessionLaunchSource) {
 	a.servers.launch = src
+}
+
+// ErrNativeSessionMissing reports that the referenced native session does
+// not exist on the server (a missing persisted binding).
+var ErrNativeSessionMissing = errors.New("native session not found on server")
+
+// fakeAssistantMsg mirrors the assistant message shape returned by the
+// fake server for testing correlation.
+type fakeAssistantMsg struct {
+	ID       string          `json:"id"`
+	Role     string          `json:"role"`
+	ParentID string          `json:"parentID"`
+	Parts    []fakePart      `json:"parts"`
+	Error    *fakeProbeError `json:"error"`
+}
+
+type fakePart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type fakeProbeError struct {
+	Name    string `json:"name"`
+	Message string `json:"message"`
 }

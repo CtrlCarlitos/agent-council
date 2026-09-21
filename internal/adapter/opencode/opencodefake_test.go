@@ -33,16 +33,6 @@ type fakeMessage struct {
 	Error    *fakeProbeError `json:"error,omitempty"`
 }
 
-type fakePart struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
-}
-
-type fakeProbeError struct {
-	Name    string `json:"name"`
-	Message string `json:"message"`
-}
-
 func (f *fakeOpenCodeServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
