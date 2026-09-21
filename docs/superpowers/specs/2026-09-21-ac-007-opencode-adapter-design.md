@@ -95,31 +95,68 @@ Read-only inspection commands used (no provider calls): `--help` on
 contributor session's project scoping depends on it. Council cannot share
 one server across workspaces. Therefore: **one adapter-owned
 `opencode serve` child per contributor session** (`OpenCodeServer`,
-`internal/adapter/opencode/server.go`):
+`internal/adapter/opencode/server.go`).
 
-- Spawned lazily on first CreateSession/ResumeSession for that session,
-  as a child of the Council service (AC-003 ownership rule), with:
-  - Working directory: that session's isolated AC-005 workspace root
-    (project scoping is inherited from the process cwd — no per-request
-    directory selector is trusted).
-  - `--hostname 127.0.0.1 --port 0` (random port; parsed from startup
-    output and verified by listener inspection).
-  - `OPENCODE_SERVER_USERNAME`/`OPENCODE_SERVER_PASSWORD` set to a generated
-    ephemeral pair, never persisted beyond the process env.
-  - stdout/stderr drained and captured (termination-evidence pattern from
-    AC-005).
+**Launch is inside the AC-005 execution policy — never `os/exec` directly.**
+`OpenCodeServer` launches through the session's `PolicyExecutor`
+(`executor.Start`), with a `LaunchRequest` that carries:
+
+- `Command: "opencode"`, `Args: ["serve", "--hostname", "127.0.0.1",
+  "--port", "0"]` — authorized by the frozen profile's `opencode`
+  tooling entry (the executor's command allowlist gates this like any
+  managed process; the permissive_dev/test profiles used in fixtures
+  scope accordingly).
+- Working directory: that session's isolated AC-005 workspace root
+  (project scoping is inherited from the process cwd — no per-request
+  directory selector is trusted).
+- **Server credentials via a new `LaunchRequest.SetEnv map[string]string`**
+  (narrow AC-005 executor extension): explicit env vars set directly into
+  the child environment (`OPENCODE_SERVER_USERNAME`/`OPENCODE_SERVER_PASSWORD`,
+  generated ephemeral pair). `SetEnv` vars are Council-generated transport
+  credentials, NOT inherited environment — the frozen inherited-env
+  allowlist does not apply to them and they never appear in the frozen
+  profile. The executor injects them verbatim after allowlist
+  construction, and they are redacted from all captured output. Nothing
+  else may use `SetEnv` in this task.
+- Loopback listen plus the run's outbound network policy: the server must
+  listen on `127.0.0.1`; provider egress follows the run's network mode.
+- **Honest strict-isolation behavior:** under a network mode that cannot
+  permit both a loopback listener and provider egress, the server still
+  launches (loopback is local), but provider calls fail natively —
+  dispatches surface honest native failures. If the platform/network
+  enforcement cannot guarantee loopback listening at all, the launch is
+  rejected fail-closed with an explicit unsupported-capability error.
+- stdout/stderr drained and captured (termination-evidence pattern from
+  AC-005); captured output is scanned for redaction (the server never
+  receives provider keys from Council).
 - Waits for `GET /api/health` → `healthy:true` within a startup deadline;
-  failure ⇒ error (fail closed) and child termination.
+  failure ⇒ error (fail closed) and child termination with recorded
+  evidence.
 - `Close()`: graceful `POST /global/dispose` if available, then
   `terminateGracefully` → force-kill (AC-005 terminate split), drain pipes
   before Wait, record exit evidence.
 - Records child PID + exit status for Reconcile honesty (no fabricated
   liveness).
 
-Cost: one small headless process per active contributor session
-(bounded by concurrent sessions; contributors park after turns). Benefit:
-hard workspace/project isolation without trusting an experimental
-per-request directory selector, and a single tenant per server.
+**Parked-session lifecycle (bounded accumulation):**
+
+- The server runs while its contributor session is attached and working.
+- When the contributor session **parks** (turn terminal, no queued
+  follow-up released to it, no in-flight dispatch), the adapter stops the
+  server after a short idle grace (default 30s, config), freeing the
+  process and port.
+- On **service shutdown**, all live servers terminate with the standard
+  teardown ordering (AC-005 terminate split; pipes drained before Wait).
+- **ResumeSession after parking** starts a replacement server with the
+  SAME workspace root as its working directory. OpenCode persists sessions
+  per project directory, so the replacement server resolves the exact
+  native session ID; `ResumeSession` verifies `GET /session/{nativeID}`
+  (200 + project match) before reporting success — a 404 raises
+  `ErrNativeSessionMissing` (binding gone, never silently re-created).
+- Cost: one small headless process per active contributor session
+  (bounded by concurrent sessions; terminated at park + grace). Benefit:
+  hard workspace/project isolation without trusting an experimental
+  per-request directory selector, and a single tenant per server.
 
 ### 3.2 Adapter (`internal/adapter/opencode/adapter.go`)
 
@@ -139,31 +176,69 @@ minimal typed client (`httpclient.go`):
 
 ### 3.3 Turn identity and dispatch idempotency
 
-- **Native message ID is adapter-generated and deterministic per attempt:**
-  `msg_council_<sessionID>_<turnKey>_<attempt>`. It is passed as
-  `prompt_async.messageID`, so OpenCode addressability and Council identity
-  coincide: resubmission with the same identity upserts the same message
-  instead of duplicating the prompt.
+- **Native message ID is adapter-generated, deterministic per attempt, and
+  a fixed-length digest.** The AC-006 `Dispatch(ctx, ref, prompt)` receives
+  only `TurnRef{SessionID, TurnKey}` — no attempt identity — so the adapter
+  takes a **trusted identity seam** at construction:
+  `DispatchIdentitySource.AttemptFor(ctx, ref) (attempt string, ok bool)`,
+  wired by the service to the persisted dispatch intent (storage
+  `dispatch_intents.attempt_id`); the adapter never reads storage directly
+  and never invents `"1"`. The native message ID is then
+  `msg_council_` + hex(SHA-256(sessionID ∥ turnKey ∥ attempt))[:32]:
+  a fixed-length, fixed-charset digest that cannot exceed or violate the
+  native `^msg` ID pattern, cannot collide across sessions/turns in
+  practice, and leaks no identifiers. The attempt appears in the hash
+  input, so distinct attempts get distinct native messages.
 - **Single flight per native session.** OpenCode sessions are single
   conversation streams. The adapter keeps an in-flight map keyed by native
   session ID; a second Dispatch on the same native session is rejected
   (`session busy`) rather than interleaved. One TurnRef ↔ at most one
   in-flight native message.
-- **Pre-acceptance failure vs DispatchUnknown.** Evidence boundary is the
-  HTTP response: connection refused, TLS/setup error, or a timeout that
-  elapsed before any response byte ⇒ `DispatchRejected` (definitely not
-  accepted). A timeout or transport error after the request was fully
-  written, or an ambiguous 5xx ⇒ `DispatchUnknown` (may or may not be
-  accepted). 2xx ⇒ `DispatchAccepted` with the native message ID recorded.
+- **Pre-acceptance failure vs DispatchUnknown.** `DispatchRejected`
+  requires transport evidence that the request was **never written**:
+  connection refused, dial/setup failure, or write failure before the
+  request body transmission began. Any timeout or disconnect **after
+  transmission begins** — regardless of whether response bytes arrived — is
+  `DispatchUnknown`: the native side may have fully processed the prompt.
+  "No response byte received" alone is not pre-acceptance evidence.
 - **Retry without double submission.** Retry resolves in this order:
   (1) `GET /session/{id}/message/{messageID}` — if the deterministic message
   exists, the dispatch was accepted; do not resubmit; collect or observe it.
   (2) If absent and the previous attempt was `DispatchRejected` with
-  pre-acceptance evidence, resubmit with the same message ID (same attempt)
-  — safe upsert. (3) If the previous attempt was `DispatchUnknown`,
-  resubmission is forbidden at the same attempt: the turn goes to
-  reconciliation (uncertain), and only an explicit operator reconcile that
-  positively resolves absence may clear it for a new attempt.
+  never-written evidence, resubmit with the same message ID (same attempt).
+  (3) If the previous attempt was `DispatchUnknown`, resubmission is
+  forbidden at the same attempt: the turn goes to reconciliation
+  (uncertain), and only a reconcile that positively resolves absence may
+  clear it for a new attempt.
+
+### 3.3.1 Verified messageID semantics (live-server experiment, provider-free)
+
+Experiment against the installed 1.18.31 headless server, using an
+invalid/unauthenticated provider+model so **no provider call and no quota
+consumption** occurs; sanitized evidence retained in this section:
+
+| Step | Request | Observed |
+|---|---|---|
+| Submit | `POST /session/{id}/prompt_async` with `"messageID":"msg_council_test_attempt_1"` and an invalid provider/model | `204 No Content` — accepted for async processing |
+| Address | `GET /session/{id}/message/msg_council_test_attempt_1` | `200` — the supplied ID IS the native message ID; record carries `role:"user"`, the submitted model, and the text part |
+| Repeat | Same request resubmitted | `204`; message list still contains **exactly one** message with that ID — no duplicate message, no second user message |
+| Part caveat | Inspect parts after repeat | The repeat **appended** its text as a second part on the same user message (`['capability probe', 'capability probe REPEAT']`) — upsert-with-part-append, NOT a pure no-op |
+| Async honesty | Session status / error fields after the invalid-model dispatch | Accepted ≠ executed: the invalid provider failed natively with no fabricated error message; failure surfaces asynchronously |
+
+Design conclusions (binding for implementation):
+
+1. `prompt_async.messageID` is accepted and becomes the addressable native
+   message identity — the §3.3 deterministic-ID contract is implementable.
+2. **Same-ID resubmission is only performed when `GET` by that ID returns
+   404.** If the message exists, never resubmit — collect or reconcile
+   instead (the append-parts behavior makes blind resubmission observable
+   in the transcript).
+3. A new attempt uses a new attempt-scoped message ID (digest input
+   changes); a natively failed attempt cannot double-execute a later
+   attempt.
+4. `DispatchAccepted` (204) means natively queued, not executed: native
+   failures surface asynchronously through events/collect, which the
+   adapter records honestly.
 - **Baseline cursor.** Before submission the adapter records the session's
   current last-message ID (from `GET /session/{id}/message`). Collect selects
   the assistant response with message ID == the adapter-generated
@@ -210,15 +285,6 @@ binding: it routes through the uncertain rule above unless the turn was
 never dispatched (then DefinitivelyMissing with the pre-acceptance
 evidence).
 
-
-- OpenCode surfaces a permission request as an event + a pending entry on the
-  permission endpoints while the turn stalls.
-- The adapter maintains a permission responder: on every request it replies
-  **deny** and mirrors a tool-denial event into the turn's stream, so the
-  transcript records the denial honestly. No allowlist inference: see §3.6
-  for the policy boundary and the future narrow approval-policy seam.
-- The adapter never enables `--auto`, never edits global permission config,
-  never widens any allowlist.
 
 ### 3.6 Permission (approval/denial) semantics
 
@@ -283,4 +349,5 @@ evidence).
 | Load approved dotfiles tools/skills, guardrails enabled | Agent/permission config passed at session create; permission-responder deny-by-default test; `--auto` absence asserted in invocation builder test |
 | Resume exact native session | ResumeSession 200-path + 404-path tests; no newest-session selection (verified: `--continue` never used) |
 | Async result, approval wait, tool denial, usage, abort semantics | Fake-server scripted tests per semantic + event stream mapping |
+| Server launch inside AC-005 policy; SetEnv credentials; parked-session server stop; resume replacement server | Fake-executor launch request assertions (command/cwd/SetEnv/network honesty) + park/resume lifecycle tests |
 | Close/reopen/recovery with real installation, sanitized, no quota-bypass | Manual integration script + sanitized transcript in PR evidence; CI uses fixtures only |
