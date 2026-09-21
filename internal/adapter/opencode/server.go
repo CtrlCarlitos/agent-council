@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -47,7 +48,20 @@ type serverManager struct {
 	launch   SessionLaunchSource
 	children map[string]*serverProcess // native session ID → child
 	starting map[string]chan struct{}  // session ID → in-flight launch
+	parked   map[string]parkedServer   // native session ID → parked record
 }
+
+// parkedServer records a session whose serve child was parked after idle
+// grace. Resume relaunches against the same workspace and verifies the
+// exact native session survived.
+type parkedServer struct {
+	workspace string
+	parkedAt  time.Time
+}
+
+// healthTimeout bounds how long a freshly launched serve child has to
+// become healthy. Package-level so tests can shorten it.
+var healthTimeout = 15 * time.Second
 
 func newServerManager(executor execpolicy.PolicyExecutor, launch SessionLaunchSource) *serverManager {
 	return &serverManager{
@@ -55,6 +69,7 @@ func newServerManager(executor execpolicy.PolicyExecutor, launch SessionLaunchSo
 		launch:   launch,
 		children: make(map[string]*serverProcess),
 		starting: make(map[string]chan struct{}),
+		parked:   make(map[string]parkedServer),
 	}
 }
 
@@ -115,8 +130,13 @@ func (m *serverManager) start(ctx context.Context, sessionID adapter.SessionID) 
 		return nil, fmt.Errorf("start opencode serve: %w", err)
 	}
 
-	// Wait for the health endpoint.
-	endpoint, err := m.waitForHealthy(ctx, proc, 15*time.Second)
+	// Drain stderr for the child's lifetime: an undrained pipe eventually
+	// blocks the child. Discard is safe here; stdout carries the endpoint.
+	go func() { _, _ = io.Copy(io.Discard, proc.Stderr()) }()
+
+	// Wait for the health endpoint (authenticated with the generated
+	// credentials, mirroring the real server's Basic-auth requirement).
+	endpoint, err := m.waitForHealthy(ctx, proc, healthTimeout, username, password)
 	if err != nil {
 		termCtx, termCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer termCancel()
@@ -124,11 +144,29 @@ func (m *serverManager) start(ctx context.Context, sessionID adapter.SessionID) 
 		return nil, fmt.Errorf("opencode serve health: %w", err)
 	}
 
+	// Resume semantics: when this session was parked, the replacement
+	// server must still expose the exact native session.
+	m.mu.Lock()
+	_, wasParked := m.parked[string(sessionID)]
+	m.mu.Unlock()
+	if wasParked {
+		if err := m.verifyNativeSession(ctx, endpoint, username, password, string(sessionID)); err != nil {
+			termCtx, termCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer termCancel()
+			_ = proc.Terminate(termCtx)
+			return nil, fmt.Errorf("resume verification for %s: %w", sessionID, err)
+		}
+		m.mu.Lock()
+		delete(m.parked, string(sessionID))
+		m.mu.Unlock()
+	}
+
 	sp := &serverProcess{
 		proc:      proc,
 		endpoint:  endpoint,
 		workspace: launchReq.Paths.Root,
-
+		username:  username,
+		password:  password,
 		startedAt: time.Now().UTC(),
 	}
 
@@ -137,6 +175,52 @@ func (m *serverManager) start(ctx context.Context, sessionID adapter.SessionID) 
 	m.mu.Unlock()
 
 	return sp, nil
+}
+
+// park stops the session's serve child after idle grace and records the
+// parked session so the next start relaunches against the same workspace
+// and verifies the native session still exists.
+func (m *serverManager) park(ctx context.Context, sessionID adapter.SessionID) error {
+	m.mu.Lock()
+	sp, ok := m.children[string(sessionID)]
+	if ok {
+		delete(m.children, string(sessionID))
+		m.parked[string(sessionID)] = parkedServer{
+			workspace: sp.workspace,
+			parkedAt:  time.Now().UTC(),
+		}
+	}
+	m.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("no serve child to park for session %s", sessionID)
+	}
+	termCtx, termCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer termCancel()
+	return sp.proc.Terminate(termCtx)
+}
+
+// verifyNativeSession checks that the resumed server still exposes the
+// exact native session. A verified 404 is a hard resume failure.
+func (m *serverManager) verifyNativeSession(ctx context.Context, endpoint, username, password, nativeID string) error {
+	hc := &http.Client{Timeout: 2 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/session/"+nativeID, nil)
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(username, password)
+	resp, err := hc.Do(req)
+	if err != nil {
+		return fmt.Errorf("native session lookup: %w", err)
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		return nil
+	case resp.StatusCode == http.StatusNotFound:
+		return fmt.Errorf("native session %s is missing after resume", nativeID)
+	default:
+		return fmt.Errorf("native session lookup returned HTTP %d", resp.StatusCode)
+	}
 }
 
 // stop terminates a specific session's serve child.
@@ -194,8 +278,9 @@ func (m *serverManager) endpoint(sessionID adapter.SessionID) (string, error) {
 }
 
 // waitForHealthy polls the child's stdout for the printed listen address,
-// then verifies GET /api/health. Returns the endpoint and PID.
-func (m *serverManager) waitForHealthy(ctx context.Context, proc execpolicy.ManagedProcess, timeout time.Duration) (string, error) {
+// then verifies GET /api/health with the generated credentials. Returns the
+// endpoint.
+func (m *serverManager) waitForHealthy(ctx context.Context, proc execpolicy.ManagedProcess, timeout time.Duration, username, password string) (string, error) {
 	var buf syncBuffer
 	done := make(chan struct{})
 	go func() {
@@ -209,21 +294,19 @@ func (m *serverManager) waitForHealthy(ctx context.Context, proc execpolicy.Mana
 	deadline := time.After(timeout)
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
-	healthyOnce := false
 	for {
 		out := buf.string()
 		ep := scanEndpoint(out)
-		if ep != "" && !healthyOnce {
-			if m.checkHealth(ctx, ep) {
-				healthyOnce = true
+		if ep != "" {
+			if m.checkHealth(ctx, ep, username, password) {
 				return ep, nil
 			}
 		}
 		select {
 		case <-done:
 			// Child exited; check one last time.
-			if ep := scanEndpoint(buf.string()); ep != "" && !healthyOnce {
-				return "", fmt.Errorf("opencode serve exited before printing a healthy endpoint")
+			if ep := scanEndpoint(buf.string()); ep != "" && m.checkHealth(ctx, ep, username, password) {
+				return ep, nil
 			}
 			return "", fmt.Errorf("opencode serve exited before becoming healthy")
 		case <-deadline:
@@ -233,12 +316,13 @@ func (m *serverManager) waitForHealthy(ctx context.Context, proc execpolicy.Mana
 	}
 }
 
-func (m *serverManager) checkHealth(ctx context.Context, endpoint string) bool {
+func (m *serverManager) checkHealth(ctx context.Context, endpoint, username, password string) bool {
 	hc := &http.Client{Timeout: 2 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/api/health", nil)
 	if err != nil {
 		return false
 	}
+	req.SetBasicAuth(username, password)
 	resp, err := hc.Do(req)
 	if err != nil {
 		return false
