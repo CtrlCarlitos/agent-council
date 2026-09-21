@@ -307,3 +307,66 @@ func (s *Server) writeGrantAdminError(w http.ResponseWriter, err error, opID str
 		writeError(w, http.StatusBadRequest, "grant_admin_failed", err.Error(), opID)
 	}
 }
+
+type ReleaseArtifactsRequest struct {
+	OpID            string                      `json:"op_id"`
+	ControllerLease string                      `json:"controller_lease"`
+	Members         []storage.ProposalMemberRef `json:"members"`
+}
+
+type ReleaseArtifactsResponse struct {
+	Receipt storage.ProposalSetReceipt `json:"receipt"`
+}
+
+func (s *Server) handleReleaseArtifacts(w http.ResponseWriter, r *http.Request) {
+	runID := strings.TrimSpace(r.PathValue("run_id"))
+	if runID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_path", "run_id is required", "")
+		return
+	}
+	var req ReleaseArtifactsRequest
+	if err := decodeStrictJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error(), "")
+		return
+	}
+	if req.OpID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "op_id is required", req.OpID)
+		return
+	}
+	if req.ControllerLease == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "controller_lease is required", req.OpID)
+		return
+	}
+	if len(req.Members) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "members must not be empty", req.OpID)
+		return
+	}
+
+	doneControl, err := s.coordinator.TrackControl()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "service_stopping", "service is stopping", req.OpID)
+		return
+	}
+	defer doneControl()
+
+	receipt, err := s.store.ReleaseArtifacts(r.Context(), req.OpID, req.ControllerLease, runID, req.Members)
+	if err != nil {
+		if writeControllerAuthError(w, err, req.OpID) {
+			return
+		}
+		switch {
+		case errors.Is(err, storage.ErrArtifactNotFound):
+			writeError(w, http.StatusNotFound, "artifact_not_found", err.Error(), req.OpID)
+		case errors.Is(err, storage.ErrIdempotencyConflict):
+			writeError(w, http.StatusConflict, "idempotency_conflict", err.Error(), req.OpID)
+		default:
+			writeError(w, http.StatusBadRequest, "release_failed", err.Error(), req.OpID)
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(ReleaseArtifactsResponse{
+		Receipt: receipt,
+	})
+}

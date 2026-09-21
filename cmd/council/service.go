@@ -48,6 +48,7 @@ func handleServiceCommand(args []string) error {
 func runServiceCmd(args []string) error {
 	fs := flag.NewFlagSet("service run", flag.ContinueOnError)
 	stateDirFlag := fs.String("state-dir", defaultStateDir(), "path to state directory")
+	workspaceBaseDirFlag := fs.String("workspace-base-dir", "", "path to workspace base directory")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -57,10 +58,24 @@ func runServiceCmd(args []string) error {
 		return fmt.Errorf("abs state-dir: %w", err)
 	}
 
+	workspaceBaseDir := *workspaceBaseDirFlag
+	if workspaceBaseDir == "" {
+		workspaceBaseDir = filepath.Join(filepath.Dir(stateDir), "workspaces")
+	}
+	workspaceBaseDir, err = filepath.Abs(workspaceBaseDir)
+	if err != nil {
+		return fmt.Errorf("abs workspace-base-dir: %w", err)
+	}
+
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return fmt.Errorf("mkdir state-dir: %w", err)
 	}
 	_ = os.Chmod(stateDir, 0700)
+
+	if err := os.MkdirAll(workspaceBaseDir, 0700); err != nil {
+		return fmt.Errorf("mkdir workspace-base-dir: %w", err)
+	}
+	_ = os.Chmod(workspaceBaseDir, 0700)
 
 	lock, err := service.AcquireServiceLock(stateDir)
 	if err != nil {
@@ -81,9 +96,10 @@ func runServiceCmd(args []string) error {
 	}
 
 	cfg := service.ServerConfig{
-		StateDir:   stateDir,
-		InstanceID: instanceID,
-		AuthToken:  authToken,
+		StateDir:         stateDir,
+		InstanceID:       instanceID,
+		AuthToken:        authToken,
+		WorkspaceBaseDir: workspaceBaseDir,
 	}
 
 	srv, err := service.NewServer(store, lock, cfg)

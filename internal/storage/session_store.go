@@ -138,6 +138,17 @@ VALUES (?, ?, ?, ?, ?, 'active', ?, ?);`, runID, briefDigest, sourceDigest, prof
 		return OperationReceipt{}, fmt.Errorf("insert run provenance: %w", err)
 	}
 
+	_, err = tx.Tx().ExecContext(ctx, `
+INSERT INTO run_profiles (
+	run_id, profile_digest, algorithm_version, workspace_mode,
+	isolation_strictness, network_mode, canonical_profile_json,
+	source_repo_identity, source_commit, source_tree, brief_artifact_digest, created_at
+) VALUES (?, ?, 'legacy-unverified', 'none', 'permissive_dev', 'unrestricted', '', 'legacy', '', '', '', ?)
+ON CONFLICT(run_id) DO NOTHING;`, runID, profileDigest, now)
+	if err != nil {
+		return OperationReceipt{}, fmt.Errorf("insert legacy run profile: %w", err)
+	}
+
 	receipt := OperationReceipt{
 		OpID:             opID,
 		CommandType:      "create_run",
@@ -153,6 +164,221 @@ VALUES (?, ?, ?, ?, ?, 'active', ?, ?);`, runID, briefDigest, sourceDigest, prof
 		return OperationReceipt{}, err
 	}
 	return receipt, nil
+}
+
+// CreateRunWithProfileRequest contains all inputs necessary to create a run with frozen canonical inputs.
+type CreateRunWithProfileRequest struct {
+	OpID               string           `json:"op_id"`
+	ControllerLease    string           `json:"controller_lease"`
+	RunID              string           `json:"run_id"`
+	Brief              string           `json:"brief"`
+	SourceRepoIdentity string           `json:"source_repo_identity"`
+	SourceCommit       string           `json:"source_commit"`
+	SourceTree         string           `json:"source_tree"`
+	Profile            CanonicalProfile `json:"profile"`
+}
+
+// CreateRunWithProfileResult contains the receipt and the calculated canonical digests for the created run.
+type CreateRunWithProfileResult struct {
+	Receipt       OperationReceipt `json:"receipt"`
+	BriefDigest   string           `json:"brief_digest"`
+	SourceDigest  string           `json:"source_digest"`
+	ProfileDigest string           `json:"profile_digest"`
+}
+
+// CreateRunWithProfile creates a new run with immutable canonical inputs:
+// 1. Computes canonical brief_digest (cbrief-v1), source_digest (csource-v1), and profile_digest (cprof-v1).
+// 2. Stores the raw brief in CAS blob storage.
+// 3. Atomically inserts the run into runs, run_profiles, controller_leases (provenance), and journal_entries.
+func (s *Store) CreateRunWithProfile(ctx context.Context, req CreateRunWithProfileRequest) (CreateRunWithProfileResult, error) {
+	if strings.TrimSpace(req.OpID) == "" {
+		return CreateRunWithProfileResult{}, errors.New("empty op_id")
+	}
+	if strings.TrimSpace(req.ControllerLease) == "" {
+		return CreateRunWithProfileResult{}, errors.New("empty controller_lease")
+	}
+	if strings.TrimSpace(req.RunID) == "" {
+		return CreateRunWithProfileResult{}, errors.New("empty run_id")
+	}
+	if strings.TrimSpace(req.Brief) == "" {
+		return CreateRunWithProfileResult{}, errors.New("empty brief")
+	}
+
+	briefDigest, err := ComputeBriefDigest(req.Brief)
+	if err != nil {
+		return CreateRunWithProfileResult{}, fmt.Errorf("compute brief digest: %w", err)
+	}
+
+	sourceDigest, err := ComputeSourceDigest(req.Profile.WorkspaceMode, req.SourceRepoIdentity, req.SourceCommit, req.SourceTree)
+	if err != nil {
+		return CreateRunWithProfileResult{}, fmt.Errorf("compute source digest: %w", err)
+	}
+
+	profileDigest, canonicalProfileJSON, err := ComputeProfileDigest(req.Profile)
+	if err != nil {
+		return CreateRunWithProfileResult{}, fmt.Errorf("compute profile digest: %w", err)
+	}
+
+	// Persist the brief in CAS storage (hex sha256)
+	briefSum := sha256.Sum256([]byte(req.Brief))
+	briefRawHex := fmt.Sprintf("%x", briefSum)
+	if err := s.writeCASBlob([]byte(req.Brief), briefRawHex); err != nil {
+		return CreateRunWithProfileResult{}, fmt.Errorf("store brief in cas: %w", err)
+	}
+
+	fp := computeFingerprint("create_run_with_profile", req.RunID, briefDigest, sourceDigest, profileDigest, req.ControllerLease)
+
+	tx, err := s.BeginWrite(ctx)
+	if err != nil {
+		return CreateRunWithProfileResult{}, err
+	}
+	defer tx.Rollback()
+
+	if receipt, err := checkOrRecordIdempotency(tx.Tx(), req.OpID, req.ControllerLease, "create_run_with_profile", fp); err != nil {
+		return CreateRunWithProfileResult{}, err
+	} else if receipt != nil {
+		return CreateRunWithProfileResult{
+			Receipt:       *receipt,
+			BriefDigest:   briefDigest,
+			SourceDigest:  sourceDigest,
+			ProfileDigest: profileDigest,
+		}, nil
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err = tx.Tx().ExecContext(ctx, `
+INSERT INTO runs (run_id, brief_digest, source_digest, profile_digest, controller_lease, lifecycle, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, 'active', ?, ?);`, req.RunID, briefDigest, sourceDigest, profileDigest, req.ControllerLease, now, now)
+	if err != nil {
+		return CreateRunWithProfileResult{}, fmt.Errorf("insert run: %w", err)
+	}
+
+	_, err = tx.Tx().ExecContext(ctx, `
+INSERT INTO run_profiles (
+	run_id, profile_digest, algorithm_version, workspace_mode,
+	isolation_strictness, network_mode, canonical_profile_json,
+	source_repo_identity, source_commit, source_tree, brief_artifact_digest, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+		req.RunID, profileDigest, req.Profile.AlgoVersion, req.Profile.WorkspaceMode,
+		req.Profile.IsolationStrictness, req.Profile.NetworkMode, string(canonicalProfileJSON),
+		req.SourceRepoIdentity, req.SourceCommit, req.SourceTree, briefDigest, now)
+	if err != nil {
+		return CreateRunWithProfileResult{}, fmt.Errorf("insert run profile: %w", err)
+	}
+
+	// Generation-0 provenance
+	_, err = tx.Tx().ExecContext(ctx, `INSERT INTO controller_leases
+		(run_id, generation, harness, controller_ref, lease, status, granted_by_op_id, attached_at, updated_at)
+		VALUES (?, 0, NULL, 'create-run-provenance', ?, 'legacy', ?, ?, ?);`,
+		req.RunID, req.ControllerLease, req.OpID, now, now)
+	if err != nil {
+		return CreateRunWithProfileResult{}, fmt.Errorf("insert run provenance: %w", err)
+	}
+
+	receipt := OperationReceipt{
+		OpID:             req.OpID,
+		CommandType:      "create_run_with_profile",
+		CommittedVersion: 1,
+		CreatedAt:        time.Now().UTC(),
+	}
+
+	if err := recordJournalEntry(tx.Tx(), req.OpID, "create_run_with_profile", fp, req.RunID, "", "", "run_created", receipt, req.ControllerLease); err != nil {
+		return CreateRunWithProfileResult{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return CreateRunWithProfileResult{}, err
+	}
+
+	return CreateRunWithProfileResult{
+		Receipt:       receipt,
+		BriefDigest:   briefDigest,
+		SourceDigest:  sourceDigest,
+		ProfileDigest: profileDigest,
+	}, nil
+}
+
+// RunProfileRecord holds a persisted run_profiles database row.
+type RunProfileRecord struct {
+	RunID                string           `json:"run_id"`
+	ProfileDigest        string           `json:"profile_digest"`
+	AlgorithmVersion     string           `json:"algorithm_version"`
+	WorkspaceMode        string           `json:"workspace_mode"`
+	IsolationStrictness  string           `json:"isolation_strictness"`
+	NetworkMode          string           `json:"network_mode"`
+	CanonicalProfileJSON string           `json:"canonical_profile_json"`
+	SourceRepoIdentity   string           `json:"source_repo_identity"`
+	SourceCommit         string           `json:"source_commit"`
+	SourceTree           string           `json:"source_tree"`
+	BriefArtifactDigest  string           `json:"brief_artifact_digest"`
+	Profile              CanonicalProfile `json:"profile"`
+	CreatedAt            time.Time        `json:"created_at"`
+}
+
+// GetRunProfile retrieves the frozen profile record for a run.
+func (s *Store) GetRunProfile(ctx context.Context, runID string) (RunProfileRecord, error) {
+	row := s.readDB.QueryRowContext(ctx, `
+SELECT run_id, profile_digest, algorithm_version, workspace_mode,
+       isolation_strictness, network_mode, canonical_profile_json,
+       source_repo_identity, source_commit, source_tree, brief_artifact_digest, created_at
+FROM run_profiles WHERE run_id = ?;`, runID)
+
+	var rec RunProfileRecord
+	var createdAtStr string
+	if err := row.Scan(
+		&rec.RunID, &rec.ProfileDigest, &rec.AlgorithmVersion, &rec.WorkspaceMode,
+		&rec.IsolationStrictness, &rec.NetworkMode, &rec.CanonicalProfileJSON,
+		&rec.SourceRepoIdentity, &rec.SourceCommit, &rec.SourceTree, &rec.BriefArtifactDigest, &createdAtStr,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return RunProfileRecord{}, ErrRunNotFound
+		}
+		return RunProfileRecord{}, fmt.Errorf("query run profile: %w", err)
+	}
+
+	rec.CreatedAt = parseTime(createdAtStr)
+	if rec.CanonicalProfileJSON != "" {
+		prof, err := ParseCanonicalProfileJSON([]byte(rec.CanonicalProfileJSON))
+		if err == nil {
+			rec.Profile = prof
+		}
+	}
+	return rec, nil
+}
+
+// SessionMetadata contains core identities for an existing session.
+type SessionMetadata struct {
+	SessionID   string
+	RunID       string
+	Contributor string
+}
+
+// GetSessionMetadata returns the metadata (run_id, contributor) for a session.
+func (s *Store) GetSessionMetadata(ctx context.Context, sessionID string) (SessionMetadata, error) {
+	var meta SessionMetadata
+	meta.SessionID = sessionID
+	err := s.readDB.QueryRowContext(ctx, "SELECT run_id, contributor FROM sessions WHERE session_id = ?;", sessionID).
+		Scan(&meta.RunID, &meta.Contributor)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return SessionMetadata{}, ErrSessionNotFound
+		}
+		return SessionMetadata{}, fmt.Errorf("query session metadata: %w", err)
+	}
+	return meta, nil
+}
+
+// GetSessionRunID returns the run_id associated with a session.
+func (s *Store) GetSessionRunID(ctx context.Context, sessionID string) (string, error) {
+	var runID string
+	err := s.readDB.QueryRowContext(ctx, "SELECT run_id FROM sessions WHERE session_id = ?;", sessionID).Scan(&runID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrSessionNotFound
+		}
+		return "", fmt.Errorf("query session run_id: %w", err)
+	}
+	return runID, nil
 }
 
 func (s *Store) CreateSession(ctx context.Context, opID string, callerLease string, session SessionRecord) (OperationReceipt, error) {

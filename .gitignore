@@ -19,3 +19,7 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# Local tooling state (never repository content)
+.serena/
+graft/

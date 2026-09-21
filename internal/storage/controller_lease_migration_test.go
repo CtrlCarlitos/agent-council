@@ -173,8 +173,8 @@ func TestAC004_Migration_UpgradesVerifiedV1Database(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schema version: %v", err)
 	}
-	if ver != 2 {
-		t.Fatalf("expected schema version 2, got %d", ver)
+	if ver != 3 {
+		t.Fatalf("expected schema version 3, got %d", ver)
 	}
 
 	// Generation-0 provenance row: legacy credential preserved as
@@ -296,8 +296,8 @@ func TestAC004_Migration_FreshDatabaseSequential(t *testing.T) {
 	defer store.Close()
 
 	ver, err := store.CurrentSchemaVersion()
-	if err != nil || ver != 2 {
-		t.Fatalf("expected fresh database at version 2, got %d err=%v", ver, err)
+	if err != nil || ver != 3 {
+		t.Fatalf("expected fresh database at version 3, got %d err=%v", ver, err)
 	}
 	var count int
 	if err := store.readDB.QueryRow(`SELECT count(*) FROM controller_leases;`).Scan(&count); err != nil {
@@ -307,8 +307,8 @@ func TestAC004_Migration_FreshDatabaseSequential(t *testing.T) {
 		t.Fatalf("fresh database must have no provenance rows, got %d", count)
 	}
 	var rows int
-	if err := store.readDB.QueryRow(`SELECT count(*) FROM schema_migrations;`).Scan(&rows); err != nil || rows != 2 {
-		t.Fatalf("expected both migration rows recorded, got %d err=%v", rows, err)
+	if err := store.readDB.QueryRow(`SELECT count(*) FROM schema_migrations;`).Scan(&rows); err != nil || rows != 3 {
+		t.Fatalf("expected all migration rows recorded, got %d err=%v", rows, err)
 	}
 }
 
@@ -339,7 +339,7 @@ func TestAC004_Migration_RepeatOpenIdempotent(t *testing.T) {
 	if err := store.readDB.QueryRow(`SELECT count(*) FROM schema_migrations;`).Scan(&migrationCount); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if provCount != 1 || migrationCount != 2 {
+	if provCount != 1 || migrationCount != 3 {
 		t.Fatalf("repeat-open duplicated state: provenance=%d migrations=%d", provCount, migrationCount)
 	}
 }
@@ -378,8 +378,8 @@ func TestAC004_Migration_ConcurrentInitialization(t *testing.T) {
 	}
 	defer store.Close()
 	var migrationCount int
-	if err := store.readDB.QueryRow(`SELECT count(*) FROM schema_migrations;`).Scan(&migrationCount); err != nil || migrationCount != 2 {
-		t.Fatalf("expected exactly 2 migration rows after concurrency, got %d err=%v", migrationCount, err)
+	if err := store.readDB.QueryRow(`SELECT count(*) FROM schema_migrations;`).Scan(&migrationCount); err != nil || migrationCount != 3 {
+		t.Fatalf("expected exactly 3 migration rows after concurrency, got %d err=%v", migrationCount, err)
 	}
 }
 
@@ -420,8 +420,8 @@ func TestAC004_Migration_RollbackAfterV2Begins(t *testing.T) {
 	}
 	defer store.Close()
 	ver, err := store.CurrentSchemaVersion()
-	if err != nil || ver != 2 {
-		t.Fatalf("expected completed upgrade to v2, got %d err=%v", ver, err)
+	if err != nil || ver != 3 {
+		t.Fatalf("expected completed upgrade to v3, got %d err=%v", ver, err)
 	}
 }
 
