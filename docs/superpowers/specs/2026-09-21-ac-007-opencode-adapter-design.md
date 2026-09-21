@@ -174,14 +174,38 @@ minimal typed client (`httpclient.go`):
 
 | AC-006 method | Behavior |
 |---|---|
-| `Probe` | `GET /api/health` + credential-free `GET /api/model` (model ids only; native auth status is **unknown** to Council). Server version. Streaming supported via SSE. |
+| `Probe` | Executable capability check via a **short-lived probe server** in an adapter-owned scratch workspace (§3.2.1): binary/version verification through the PolicyExecutor, `GET /api/health` + credential-free `GET /api/model` on the probe server only, then terminate. No native sessions created or inspected; native auth status is **unknown**. The probe server is never registered as a contributor server and is terminated before Probe returns. |
 | `CreateSession` | Spawn the session's `opencode serve` child (§3.1), then `POST /session` with `{title: "council <sessionID>", agent, model: HarnessProfileSpec.Model}`. Model presence is validated against `GET /api/model` (credential-free; fail closed on unknown model). Native authentication status is unknown to Council — an unauthenticated native side fails at first prompt, honestly. Records `NativeSessionID = ses_…`. Fresh session in the session's own project: no history copy. |
 | `ResumeSession` | `GET /session/{nativeSessionID}`: 200 with matching project ⇒ verified; 404 ⇒ typed **`ErrNativeSessionMissing`** (a missing persisted binding — distinct from uncertain creation, which remains `ErrSessionCreationUncertain`'s role). Never falls back to newest-session selection. |
-| `Dispatch` | See §3.3 turn-identity contract: baseline cursor, adapter-generated deterministic native message ID, single-flight per native session, explicit pre-acceptance vs unknown classification, and turn/session single-flight enforcement. |
+| `Dispatch` | See §3.3 turn-identity contract: deterministic native message ID (baseline cursor retained only as a routing/dedup aid), single-flight per native session, explicit pre-acceptance vs unknown classification, and turn/session single-flight enforcement. |
 | `Observe` | Taps the session's adapter-owned event pump (§3.4): buffered, cursor-tracked, deduplicated; caller detach never closes the native stream. |
 | `Cancel` | `POST /session/{id}/abort`; verifies via status/events; maps to `CancelConfirmed` (turn ends aborted), `CancelAlreadyTerminal`, or `CancelUnknown` per response. |
-| `Collect` | Selects the assistant reply for THIS turn by the recorded native message ID and baseline cursor (§3.3) — never "latest session message": text output, usage (tokens/cost) when present, `CompletedAt`. `ResultUnavailable` while pending. |
-| `Reconcile` | Evidence rules per §3.5: verified active ⇒ ReachableActive; verified terminal message ⇒ ReachableTerminal; transport loss / missing session after possible acceptance / ambiguous idle ⇒ Uncertain; DefinitivelyMissing only with positive never-accepted evidence. |
+| `Collect` | Selects the assistant message whose **`parentID` equals the deterministic user-message ID** for this turn (§3.3) — never "latest session message": text output, usage (tokens/cost) when present, `CompletedAt`. `ResultUnavailable` while pending. |
+| `Reconcile` | Evidence rules per §3.5, correlated by `AssistantMessage.parentID == <the deterministic user-message ID>`: verified active native work ⇒ ReachableActive; verified terminal message ⇒ ReachableTerminal; transport loss / missing session after possible acceptance / ambiguous idle ⇒ Uncertain; DefinitivelyMissing only with positive never-accepted evidence. |
+
+#### 3.2.1 Probe: executable capability check (provider-free)
+
+`Probe(ctx)` requires neither a contributor session nor a contributor
+workspace, so it runs against a **short-lived probe server** in an
+adapter-owned scratch directory:
+
+1. Verify the installed `opencode` binary and version through the
+   `PolicyExecutor` (the executor launches `opencode --version` under the
+   same policy gating as any managed process).
+2. Start a probe `opencode serve` child with an **adapter-owned scratch
+   directory** as its working directory — never a contributor workspace,
+   never the Council state dir, never any real project directory.
+3. Call only `GET /api/health` and credential-free `GET /api/model` on the
+   probe server.
+4. Terminate the probe server (graceful → force, pipes drained) before
+   Probe returns.
+5. Report: server version, model inventory (credential-free), capability
+   flags (streaming via SSE). Native authentication status: **unknown**.
+
+Invariants: the probe server is never registered in the adapter's
+session-server map; it cannot be mistaken for or reused as a contributor
+server; no native sessions are created or inspected; no provider calls
+occur.
 
 ### 3.3 Turn identity and dispatch idempotency
 
@@ -199,8 +223,8 @@ minimal typed client (`httpclient.go`):
   produce identical input bytes. NUL bytes in any identifier are rejected
   before encoding. The native message ID is
   `msg_council_` + hex(SHA-256(canonical-input))[:32]: fixed-length,
-  fixed-charset, satisfying the native `^msg` ID pattern, collision-free
-  across distinct tuples, and leaking no identifiers.
+  fixed-charset, satisfying the native `^msg` ID pattern, collision-resistant
+  (128-bit truncated digest) across distinct tuples, and leaking no identifiers.
 - **Single flight per native session.** OpenCode sessions are single
   conversation streams. The adapter keeps an in-flight map keyed by native
   session ID; a second Dispatch on the same native session is rejected
