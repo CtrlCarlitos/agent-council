@@ -1,6 +1,6 @@
 # AC-005: Freeze Tooling/Source Profiles and Prove Independent Worker Isolation — Design
 
-- **Status:** Proposed
+- **Status:** Approved
 - **Date:** 2026-09-20
 - **Issue:** [#5 (AC-005)](https://github.com/CtrlCarlitos/agent-council/issues/5)
 - **Dependencies:** AC-001 (#1, closed), AC-002 (#2, closed), AC-003 (#3, closed), AC-004 (#4, closed)
