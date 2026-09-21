@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS proposal_set_members (
     PRIMARY KEY (proposal_set_digest, artifact_id, revision)
 );
 
-CREATE INDEX IF NOT EXISTS idx_artifact_revisions_lookup 
+CREATE INDEX IF NOT EXISTS idx_artifact_revisions_lookup
     ON artifact_revisions(run_id, released, proposal_set_digest);
 `
 
