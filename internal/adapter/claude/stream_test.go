@@ -305,3 +305,127 @@ func TestStreamParser_MissingInitPoisons(t *testing.T) {
 		t.Fatalf("missing init must poison, got %+v", out)
 	}
 }
+
+// Session correlation: every correlated event must carry the expected
+// native session id; a result before init poisons.
+func TestStreamParser_SessionCorrelation(t *testing.T) {
+	wrong := strings.Replace(baseInitJSON, testNativeID, "99999999-9999-4999-8999-999999999999", 1)
+
+	t.Run("wrong session id on init", func(t *testing.T) {
+		cfg := streamConfig(t)
+		cfg.ExpectedSessionID = testNativeID
+		out, _ := ParseStream(strings.NewReader(hookStartedJSON+"\n"+wrong+"\n"+okResultJSON+"\n"), cfg, nil)
+		if !out.Poisoned || !strings.Contains(out.PoisonReason, "does not match the expected native session") {
+			t.Fatalf("wrong init session must poison, got %+v", out)
+		}
+	})
+	t.Run("wrong session id on result", func(t *testing.T) {
+		cfg := streamConfig(t)
+		cfg.ExpectedSessionID = testNativeID
+		wrongResult := strings.Replace(okResultJSON, testNativeID, "99999999-9999-4999-8999-999999999999", 1)
+		out, _ := ParseStream(strings.NewReader(hookStartedJSON+"\n"+baseInitJSON+"\n"+wrongResult+"\n"), cfg, nil)
+		if !out.Poisoned || !strings.Contains(out.PoisonReason, "does not match the expected native session") {
+			t.Fatalf("wrong result session must poison, got %+v", out)
+		}
+	})
+	t.Run("assistant before init", func(t *testing.T) {
+		cfg := streamConfig(t)
+		cfg.ExpectedSessionID = testNativeID
+		assistant := `{"type":"assistant","message":{"content":[{"type":"text","text":"early"}]},"session_id":"` + testNativeID + `"}`
+		out, _ := ParseStream(strings.NewReader(assistant+"\n"), cfg, nil)
+		if !out.Poisoned || !strings.Contains(out.PoisonReason, "before system/init") {
+			t.Fatalf("assistant before init must poison, got %+v", out)
+		}
+	})
+	t.Run("result before init", func(t *testing.T) {
+		cfg := streamConfig(t)
+		cfg.ExpectedSessionID = testNativeID
+		out, _ := ParseStream(strings.NewReader(okResultJSON+"\n"), cfg, nil)
+		if !out.Poisoned || !strings.Contains(out.PoisonReason, "before system/init") {
+			t.Fatalf("result before init must poison, got %+v", out)
+		}
+	})
+	t.Run("init after evidence", func(t *testing.T) {
+		cfg := streamConfig(t)
+		cfg.ExpectedSessionID = testNativeID
+		stream := hookStartedJSON + "\n" + baseInitJSON + "\n" + okResultJSON + "\n" + baseInitJSON + "\n"
+		out, _ := ParseStream(strings.NewReader(stream), cfg, nil)
+		if !out.Poisoned || !strings.Contains(out.PoisonReason, "after turn evidence") {
+			t.Fatalf("init after evidence must poison, got %+v", out)
+		}
+	})
+	t.Run("matching ids accepted", func(t *testing.T) {
+		cfg := streamConfig(t)
+		cfg.ExpectedSessionID = testNativeID
+		stream := basePrefix + okResultJSON + "\n"
+		out, _ := ParseStream(strings.NewReader(stream), cfg, nil)
+		if out.Poisoned {
+			t.Fatalf("matching ids must pass, got %s", out.PoisonReason)
+		}
+		if !out.Terminal {
+			t.Fatal("stream must reach terminal")
+		}
+	})
+}
+
+// Terminal events are emitted only after the stream completes cleanly,
+// and the usage/cost payload is retained for persistence.
+func TestStreamParser_UsageCostRetained(t *testing.T) {
+	cfg := streamConfig(t)
+	usage := `{"input_tokens":10,"output_tokens":101,"cache_read_input_tokens":25106}`
+	resultJSON := `{"type":"result","subtype":"success","is_error":false,` +
+		`"session_id":"` + testNativeID + `","result":"done","total_cost_usd":0.0303,` +
+		`"duration_api_ms":1958,"usage":` + usage + `}`
+	stream := basePrefix + resultJSON + "\n"
+
+	var terminals []StreamEvent
+	out, err := ParseStream(strings.NewReader(stream), cfg, func(ev StreamEvent) {
+		if ev.Type == EventTerminal {
+			terminals = append(terminals, ev)
+		}
+	})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if out.ResultUsage == nil {
+		t.Fatal("usage payload must be retained")
+	}
+	if out.ResultUsage.TotalCostUSD != 0.0303 || out.ResultUsage.DurationAPIms != 1958 {
+		t.Fatalf("usage numbers must be retained, got %+v", out.ResultUsage)
+	}
+	if !strings.Contains(out.ResultUsage.Raw, "total_cost_usd") {
+		t.Fatal("raw usage JSON must be retained")
+	}
+	if len(terminals) != 1 {
+		t.Fatalf("exactly one terminal event expected, got %d", len(terminals))
+	}
+}
+
+// Tool denial events carry the ACTUAL tool name via tool_use_id
+// correlation, not an empty field.
+func TestStreamParser_ToolNameCorrelation(t *testing.T) {
+	cfg := streamConfig(t)
+	toolUse := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_42","name":"WebSearch","input":{}}]},"session_id":"` + testNativeID + `"}`
+	toolResult := `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_42","is_error":true,` +
+		`"content":[{"type":"text","text":"Claude requested permissions to use WebSearch, but you haven't granted it yet."}]}]},"session_id":"` + testNativeID + `"}`
+	stream := hookStartedJSON + "\n" + baseInitJSON + "\n" + toolUse + "\n" + toolResult + "\n" + okResultJSON + "\n"
+
+	var denials []StreamEvent
+	out, err := ParseStream(strings.NewReader(stream), cfg, func(ev StreamEvent) {
+		if ev.Type == EventToolDenied {
+			denials = append(denials, ev)
+		}
+	})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(denials) != 1 {
+		t.Fatalf("expected 1 denial, got %d", len(denials))
+	}
+	if denials[0].ToolName != "WebSearch" {
+		t.Fatalf("denial must carry the actual tool name, got %q", denials[0].ToolName)
+	}
+	if !out.Terminal {
+		t.Fatalf("stream should reach terminal, got %+v", out)
+	}
+}

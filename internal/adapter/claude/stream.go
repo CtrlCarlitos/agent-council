@@ -38,13 +38,14 @@ const (
 // StreamConfig carries the frozen expectations the stream is validated
 // against.
 type StreamConfig struct {
-	WorkspaceRoot   string
-	ExpectedVersion string // probed CLI version from the manifest
-	ExpectedModel   string // frozen model alias from the harness spec
-	Manifest        storage.ToolkitManifest
-	UniverseTools   []string // pinned native tool universe
-	MaxLineBytes    int
-	MaxTotalBytes   int
+	WorkspaceRoot     string
+	ExpectedVersion   string // probed CLI version from the manifest
+	ExpectedModel     string // frozen model alias from the harness spec
+	ExpectedSessionID string // the native session this stream must belong to
+	Manifest          storage.ToolkitManifest
+	UniverseTools     []string // pinned native tool universe
+	MaxLineBytes      int
+	MaxTotalBytes     int
 }
 
 // StreamEvent is one observable event on the turn stream.
@@ -71,14 +72,26 @@ type InitReport struct {
 }
 
 // StreamOutcome is the parser's terminal verdict for one invocation.
+// ResultUsage carries the verified terminal usage/cost payload for
+// persistence (AC-008 §3.11 result_usage).
+type ResultUsage struct {
+	Subtype       string
+	IsError       bool
+	DurationAPIms int64
+	TotalCostUSD  float64
+	Raw           string // canonical JSON of the usage block
+}
+
 type StreamOutcome struct {
-	Terminal     bool
-	Completed    bool
-	ResultText   string
-	SessionID    string
-	Poisoned     bool
-	PoisonReason string
-	Init         *InitReport
+	Terminal             bool
+	Completed            bool
+	ResultText           string
+	ResultUsage          *ResultUsage
+	SessionID            string
+	Poisoned             bool
+	PoisonReason         string
+	Init                 *InitReport
+	TerminalEventEmitted bool
 }
 
 // ParsedToolResult is a structured tool_result from the native stream.
@@ -90,21 +103,23 @@ type ParsedToolResult struct {
 
 // nativeEvent is the raw per-line envelope.
 type nativeEvent struct {
-	Type      string          `json:"type"`
-	Subtype   string          `json:"subtype"`
-	SessionID string          `json:"session_id"`
-	HookName  string          `json:"hook_name"`
-	Cwd       string          `json:"cwd"`
-	Version   string          `json:"claude_code_version"`
-	Model     string          `json:"model"`
-	PermMode  string          `json:"permissionMode"`
-	APIKeySrc string          `json:"apiKeySource"`
-	Tools     []string        `json:"tools"`
-	Skills    []string        `json:"skills"`
-	Plugins   []pluginRef     `json:"plugins"`
-	Message   messageEnvelope `json:"message"`
-	Result    string          `json:"result"`
-	IsError   bool            `json:"is_error"`
+	Type          string          `json:"type"`
+	Subtype       string          `json:"subtype"`
+	SessionID     string          `json:"session_id"`
+	HookName      string          `json:"hook_name"`
+	Cwd           string          `json:"cwd"`
+	Version       string          `json:"claude_code_version"`
+	Model         string          `json:"model"`
+	PermMode      string          `json:"permissionMode"`
+	APIKeySrc     string          `json:"apiKeySource"`
+	Tools         []string        `json:"tools"`
+	Skills        []string        `json:"skills"`
+	Plugins       []pluginRef     `json:"plugins"`
+	Message       messageEnvelope `json:"message"`
+	Result        string          `json:"result"`
+	IsError       bool            `json:"is_error"`
+	DurationAPIMs int64           `json:"duration_api_ms"`
+	TotalCostUSD  float64         `json:"total_cost_usd"`
 }
 
 type pluginRef struct {
@@ -118,11 +133,13 @@ type messageEnvelope struct {
 }
 
 type contentBlock struct {
-	Type    string          `json:"type"`
-	Text    string          `json:"text"`
-	Name    string          `json:"name"`
-	IsError bool            `json:"is_error"`
-	Content json.RawMessage `json:"content"`
+	Type      string          `json:"type"`
+	Text      string          `json:"text"`
+	Name      string          `json:"name"`
+	ID        string          `json:"id"`
+	ToolUseID string          `json:"tool_use_id"`
+	IsError   bool            `json:"is_error"`
+	Content   json.RawMessage `json:"content"`
 }
 
 // ParseStream reads one invocation's NDJSON stdout, validates it against
@@ -139,11 +156,29 @@ func ParseStream(r io.Reader, cfg StreamConfig, onEvent func(StreamEvent)) (Stre
 
 	var initReport *InitReport
 	var hooksSeen []string
+	pendingTool := make(map[string]string) // tool_use_id -> tool name
+	sawEvidence := false                   // assistant/user/result observed
 	resultCount := 0
 	totalBytes := 0
 	reader := bufio.NewReader(r)
 
-	var tornTail string
+	// orderingAndCorrelation enforces: evidence events require init
+	// first and a matching session id.
+	check := func(ev nativeEvent) bool {
+		if initReport == nil {
+			out.Poisoned, out.PoisonReason = true, fmt.Sprintf(
+				"%s event before system/init", ev.Type)
+			return false
+		}
+		if cfg.ExpectedSessionID != "" && ev.SessionID != cfg.ExpectedSessionID {
+			out.Poisoned, out.PoisonReason = true, fmt.Sprintf(
+				"%s session_id %q does not match the expected native session %q",
+				ev.Type, ev.SessionID, cfg.ExpectedSessionID)
+			return false
+		}
+		return true
+	}
+
 	for {
 		line, more, readErr := readBoundedLine(reader, cfg.MaxLineBytes, &totalBytes)
 		if totalBytes > cfg.MaxTotalBytes {
@@ -158,11 +193,8 @@ func ParseStream(r io.Reader, cfg StreamConfig, onEvent func(StreamEvent)) (Stre
 			return out, nil
 		}
 		if !more {
-			// Unterminated final line: torn tail. Tolerated — but only as
-			// a non-evidence tail. Parsed content from it is discarded.
-			if utf8.ValidString(line) {
-				tornTail = line
-			}
+			// Unterminated final line: torn tail, tolerated as a
+			// non-evidence tail. The partial line is discarded.
 			break
 		}
 		trimmed := strings.TrimSpace(line)
@@ -180,6 +212,16 @@ func ParseStream(r io.Reader, cfg StreamConfig, onEvent func(StreamEvent)) (Stre
 		case "system":
 			switch ev.Subtype {
 			case "init":
+				if sawEvidence {
+					out.Poisoned, out.PoisonReason = true, "system/init after turn evidence"
+					return out, nil
+				}
+				if cfg.ExpectedSessionID != "" && ev.SessionID != cfg.ExpectedSessionID {
+					out.Poisoned, out.PoisonReason = true, fmt.Sprintf(
+						"init session_id %q does not match the expected native session %q",
+						ev.SessionID, cfg.ExpectedSessionID)
+					return out, nil
+				}
 				rep, reason := validateInit(ev, cfg, hooksSeen)
 				if reason != "" {
 					out.Poisoned, out.PoisonReason = true, reason
@@ -193,6 +235,10 @@ func ParseStream(r io.Reader, cfg StreamConfig, onEvent func(StreamEvent)) (Stre
 				}
 			}
 		case "assistant":
+			sawEvidence = true
+			if !check(ev) {
+				return out, nil
+			}
 			var blocks []contentBlock
 			if len(ev.Message.Content) > 0 {
 				if err := json.Unmarshal(ev.Message.Content, &blocks); err != nil {
@@ -204,11 +250,18 @@ func ParseStream(r io.Reader, cfg StreamConfig, onEvent func(StreamEvent)) (Stre
 						emit(StreamEvent{Type: EventProgress, Text: b.Text})
 					}
 					if b.Type == "tool_use" {
+						// Correlate tool_use_id -> tool name so the
+						// matching tool_result can name the actual tool.
+						pendingTool[b.ID] = b.Name
 						emit(StreamEvent{Type: EventToolRequested, ToolName: b.Name})
 					}
 				}
 			}
 		case "user":
+			sawEvidence = true
+			if !check(ev) {
+				return out, nil
+			}
 			var blocks []contentBlock
 			if len(ev.Message.Content) > 0 {
 				if err := json.Unmarshal(ev.Message.Content, &blocks); err != nil {
@@ -219,16 +272,33 @@ func ParseStream(r io.Reader, cfg StreamConfig, onEvent func(StreamEvent)) (Stre
 					if b.Type != "tool_result" {
 						continue
 					}
+					toolName := pendingTool[b.ToolUseID]
 					if b.IsError {
 						if class, isDenial := classifyDenial(textOf(b.Content)); isDenial {
-							emit(StreamEvent{Type: EventToolDenied, DeniedClass: class, Text: textOf(b.Content)})
+							emit(StreamEvent{Type: EventToolDenied, DeniedClass: class,
+								ToolName: toolName, Text: textOf(b.Content)})
 							continue
 						}
-						emit(StreamEvent{Type: EventProgress, Text: "tool error: " + textOf(b.Content)})
+						emit(StreamEvent{Type: EventProgress,
+							Text: "tool error: " + textOf(b.Content)})
+						continue
 					}
+					emit(StreamEvent{Type: EventProgress, ToolName: toolName,
+						Text: textOf(b.Content)})
 				}
 			}
 		case "result":
+			sawEvidence = true
+			if initReport == nil {
+				out.Poisoned, out.PoisonReason = true, "result before system/init"
+				return out, nil
+			}
+			if cfg.ExpectedSessionID != "" && ev.SessionID != cfg.ExpectedSessionID {
+				out.Poisoned, out.PoisonReason = true, fmt.Sprintf(
+					"result session_id %q does not match the expected native session %q",
+					ev.SessionID, cfg.ExpectedSessionID)
+				return out, nil
+			}
 			resultCount++
 			if resultCount > 1 {
 				out.Poisoned, out.PoisonReason = true, "multiple result events (protocol drift)"
@@ -238,12 +308,15 @@ func ParseStream(r io.Reader, cfg StreamConfig, onEvent func(StreamEvent)) (Stre
 			out.SessionID = ev.SessionID
 			out.ResultText = ev.Result
 			out.Completed = !ev.IsError && ev.Subtype == "success"
-		case "rate_limit_event", "system_thinking":
+			out.ResultUsage = &ResultUsage{
+				Subtype:       ev.Subtype,
+				IsError:       ev.IsError,
+				DurationAPIms: ev.DurationAPIMs,
+				TotalCostUSD:  ev.TotalCostUSD,
+				Raw:           trimmed,
+			}
+		case "rate_limit_event":
 			// advisory; ignored
-		}
-
-		if readErr != nil {
-			break
 		}
 	}
 
@@ -253,10 +326,8 @@ func ParseStream(r io.Reader, cfg StreamConfig, onEvent func(StreamEvent)) (Stre
 	}
 	out.Init = initReport
 	out.Init.HooksSeen = hooksSeen
-	if tornTail != "" {
-		// Diagnostics only; never evidence.
-		out.PoisonReason = ""
-	}
+	emit(StreamEvent{Type: EventTerminal, Text: out.ResultText})
+	out.TerminalEventEmitted = true
 	return out, nil
 }
 
