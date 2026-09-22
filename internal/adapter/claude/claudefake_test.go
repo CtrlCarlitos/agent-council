@@ -180,7 +180,7 @@ func TestClaudeFixture_ReplayThroughParser(t *testing.T) {
 		ExpectedVersion:       "2.1.278",
 		ExpectedModelIdentity: "claude-haiku-4-5-20251001",
 		ExpectedSessionID:     testNativeID,
-		Manifest:              toolkitManifestFixture([]string{"SessionStart:startup"}, []string{"s"}, nil),
+		Manifest:              toolkitManifestFixture(nil, nil, nil),
 		UniverseTools:         []string{"Read", "Glob", "Grep"},
 		MaxLineBytes:          1 << 20,
 		MaxTotalBytes:         8 << 20,

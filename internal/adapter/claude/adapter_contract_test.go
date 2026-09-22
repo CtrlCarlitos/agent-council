@@ -106,7 +106,7 @@ func newAdapterHarness(t *testing.T) *adapterHarness {
 
 	executor := execpolicy.New()
 	launchSrc := NewClaudeTurnLaunchSource(store, wm, configBase, evidenceRoot)
-	adp := NewClaudeAdapter(store, wm, executor, launchSrc, testIdentitySource{})
+	adp := NewClaudeAdapter(store, wm, executor, launchSrc, testIdentitySource{}, configBase)
 
 	ws, err := wm.AllocateWorkspace("run-adapter", "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", "none", "example/repo",
 		"0123456789012345678901234567890123456789")
@@ -114,8 +114,7 @@ func newAdapterHarness(t *testing.T) *adapterHarness {
 		t.Fatalf("allocate workspace: %v", err)
 	}
 
-	// Materialize the per-session config root (normally done by
-	// CreateSession at session birth).
+	// Materialize the per-session config root and persist the binding.
 	tmpl := filepath.Join(dir, "template")
 	os.MkdirAll(filepath.Join(tmpl, "skills"), 0o700)
 	os.WriteFile(filepath.Join(tmpl, "settings.json"), []byte("{}"), 0o600)
@@ -123,6 +122,17 @@ func newAdapterHarness(t *testing.T) *adapterHarness {
 
 	if _, _, err := MaterializeConfigRoot(tmpl, configBase, "run-adapter", "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"); err != nil {
 		t.Fatalf("materialize config root: %v", err)
+	}
+	if err := store.InsertClaudeSessionBinding(ctx, storage.ClaudeSessionBinding{
+		SessionID: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+		NativeID:  "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+		Model:     "claude-haiku-4-5-20251001",
+		Workspace: ws.Root,
+	}); err != nil {
+		t.Fatalf("insert binding: %v", err)
+	}
+	if err := store.MarkClaudeSessionMaterialized(ctx, "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"); err != nil {
+		t.Fatalf("mark materialized: %v", err)
 	}
 
 	return &adapterHarness{

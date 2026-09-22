@@ -1,11 +1,5 @@
 package claude
 
-// AC-006 adapter contract over the Claude Code CLI process-per-turn
-// model (AC-008 spec §3.3–§3.10). Dispatch runs one bounded `claude -p`
-// process through the AC-005 executor, classifies its NDJSON stream per
-// §3.9, and persists durable attempt/launch state via the AC-004
-// storage layer.
-
 import (
 	"context"
 	"crypto/rand"
@@ -47,24 +41,23 @@ type ClaudeAdapter struct {
 	executor     execpolicy.PolicyExecutor
 	launchSource *ClaudeTurnLaunchSource
 	identity     DispatchIdentitySource
+	configBase   string
 
 	mu        sync.Mutex
 	turns     map[adapter.TurnRef]*turnRun
-	singleFlt map[string]*claudeSlot // native session id → slot
+	singleFlt map[string]*claudeSlot
 }
 
-// turnRun carries the live state of one dispatched turn: its stream
-// (fed by the parser), the managed process, and exactly-once guards.
-type claudeTurnRunX struct {
-	ref       adapter.TurnRef
-	attemptID string
-	nativeID  string
-	stream    *adapter.BufferedStream
-
-	mu         sync.Mutex
-	proc       execpolicy.ManagedProcess
-	cancel     context.CancelFunc
-	terminalMu sync.Once
+type turnRun struct {
+	ref           adapter.TurnRef
+	attemptID     string
+	nativeID      string
+	workspaceRoot string
+	manifest      storage.ToolkitManifest
+	universeTools []string
+	stream        *adapter.BufferedStream
+	proc          execpolicy.ManagedProcess
+	cancel        context.CancelFunc
 }
 
 type claudeSlot struct {
@@ -72,15 +65,13 @@ type claudeSlot struct {
 	owner    string
 }
 
-// NewClaudeAdapter constructs the adapter. configBase must already be
-// validated by the service (disjoint from state/workspace). identity is
-// the trusted attempt-identity seam.
 func NewClaudeAdapter(
 	store *storage.Store,
 	wm *workspace.WorkspaceManager,
 	executor execpolicy.PolicyExecutor,
 	launchSource *ClaudeTurnLaunchSource,
 	identity DispatchIdentitySource,
+	configBase string,
 ) *ClaudeAdapter {
 	return &ClaudeAdapter{
 		store:        store,
@@ -88,12 +79,12 @@ func NewClaudeAdapter(
 		executor:     executor,
 		launchSource: launchSource,
 		identity:     identity,
+		configBase:   configBase,
 		turns:        make(map[adapter.TurnRef]*turnRun),
 		singleFlt:    make(map[string]*claudeSlot),
 	}
 }
 
-// sessionUUID generates a cryptographically random RFC 4122 UUIDv4.
 func sessionUUID() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -104,9 +95,6 @@ func sessionUUID() (string, error) {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }
 
-// acquireSlot blocks until the native session's dispatch slot is free,
-// then holds it for the given owner. The owner re-enters without
-// blocking (retry semantics).
 func (a *ClaudeAdapter) acquireSlot(ctx context.Context, nativeID, owner string) error {
 	for {
 		a.mu.Lock()
@@ -125,15 +113,11 @@ func (a *ClaudeAdapter) acquireSlot(ctx context.Context, nativeID, owner string)
 		select {
 		case <-released:
 		case <-ctx.Done():
-			return fmt.Errorf("single-flight wait cancelled for %s: %w", nativeID, ctx.Err())
+			return fmt.Errorf("single-flight wait cancelled: %w", ctx.Err())
 		}
 	}
 }
 
-// releaseSlot frees the slot only when the given owner holds it;
-// ownership check and deletion happen in ONE critical section, and the
-// channel is closed after unlocking (stale releases can never free a
-// replacement's slot).
 func (a *ClaudeAdapter) releaseSlot(nativeID, owner string) {
 	a.mu.Lock()
 	slot, ok := a.singleFlt[nativeID]
@@ -150,9 +134,6 @@ func (a *ClaudeAdapter) releaseSlot(nativeID, owner string) {
 
 // ── CreateSession ───────────────────────────────────────────────────────
 
-// CreateSession returns the binding shell; the native UUID is generated
-// and the per-session config root materialized by the adapter when the
-// service calls MaterializeSession.
 func (a *ClaudeAdapter) CreateSession(ctx context.Context, req adapter.CreateSessionRequest) (adapter.SessionBinding, error) {
 	if err := req.Validate(); err != nil {
 		return adapter.SessionBinding{}, err
@@ -164,11 +145,17 @@ func (a *ClaudeAdapter) CreateSession(ctx context.Context, req adapter.CreateSes
 	}, nil
 }
 
-// GenerateNativeSessionID produces a cryptographically random UUIDv4
-// native identity and materializes the per-session config root from the
-// operator template.
-func (a *ClaudeAdapter) GenerateNativeSessionID(templateDir, base string) (string, error) {
-	return sessionUUID()
+// GenerateNativeSessionID produces a crypto/rand UUIDv4 native identity
+// and materializes the per-session config root.
+func (a *ClaudeAdapter) GenerateNativeSessionID(templateDir string) (string, error) {
+	nativeID, err := sessionUUID()
+	if err != nil {
+		return "", err
+	}
+	if _, _, err := MaterializeConfigRoot(templateDir, a.configBase, nativeID, nativeID); err != nil {
+		return "", fmt.Errorf("materialize config root: %w", err)
+	}
+	return nativeID, nil
 }
 
 // ── ResumeSession ───────────────────────────────────────────────────────
@@ -185,22 +172,6 @@ func (a *ClaudeAdapter) ResumeSession(ctx context.Context, binding adapter.Sessi
 
 // ── Dispatch ────────────────────────────────────────────────────────────
 
-type turnRun struct {
-	ref           adapter.TurnRef
-	attemptID     string
-	nativeID      string
-	workspaceRoot string
-	manifest      storage.ToolkitManifest
-	universeTools []string
-	stream        *adapter.BufferedStream
-	proc          execpolicy.ManagedProcess
-	cancel        context.CancelFunc
-}
-
-// Dispatch runs one bounded claude -p process for the turn. The launch
-// reservation is durably recorded BEFORE executor.Start; the process is
-// started, stdin transmitted, and the stream parsed in a goroutine whose
-// terminal outcome is persisted exactly once (spec §3.5, §3.9, §3.11).
 func (a *ClaudeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt string) (adapter.DispatchOutcome, error) {
 	attempt, ok := a.identity.AttemptFor(ctx, ref)
 	if !ok {
@@ -209,72 +180,78 @@ func (a *ClaudeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, promp
 	}
 	promptDigest := PromptDigest(prompt, attempt)
 
-	nativeID := string(ref.SessionID)
-	if err := validateNativeID(nativeID); err != nil {
-		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
-			Reason: err.Error()}, err
-	}
-
-	// Per-native-session single-flight.
-	if err := a.acquireSlot(ctx, nativeID, attempt); err != nil {
-		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
-			Reason: err.Error()}, err
-	}
-	owner := attempt
-	accepted := false
-	defer func() {
-		if !accepted {
-			a.releaseSlot(nativeID, owner)
-		}
-	}()
-
-	launch, err := a.launchSource.ClaudeTurnLaunch(ctx, ref.SessionID, nativeID, false, promptDigest)
+	binding, err := a.store.GetClaudeSessionBinding(ctx, string(ref.SessionID))
 	if err != nil {
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
 			Reason: err.Error()}, err
 	}
+	if binding == nil {
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
+			Reason: "no claude session binding for " + string(ref.SessionID)}, nil
+	}
+	nativeID := binding.NativeID
 
-	// Durable attempt record with pre-launch baseline (advisory: the
-	// first turn has no transcript to measure; subsequent turns use the
-	// previous baseline).
+	if err := a.acquireSlot(ctx, nativeID, attempt); err != nil {
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
+			Reason: err.Error()}, err
+	}
+	accepted := false
+	releaseIfRejected := func(stage string) {
+		if !accepted {
+			a.releaseSlot(nativeID, attempt)
+		}
+	}
+
+	launch, err := a.launchSource.ClaudeTurnLaunch(ctx, ref.SessionID, nativeID, false, promptDigest)
+	if err != nil {
+		releaseIfRejected("launch source")
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
+			Reason: err.Error()}, err
+	}
+
 	baseline := storage.ClaudeTurnAttempt{
 		AttemptID: attempt, SessionID: string(ref.SessionID),
 		TurnKey: ref.TurnKey, NativeID: nativeID, PromptDigest: promptDigest,
 		BaselineMaterialized: false, TranscriptProtection: "advisory",
 	}
 	if err := a.store.InsertClaudeTurnAttempt(ctx, baseline); err != nil {
+		releaseIfRejected("baseline")
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
 			Reason: err.Error()}, err
 	}
 
-	// Durable launch reservation BEFORE executor.Start.
 	seq, resErr := a.store.ReserveClaudeLaunch(ctx, attempt, "claude-turn")
 	if resErr != nil {
+		releaseIfRejected("reservation")
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
 			Reason: resErr.Error()}, resErr
 	}
 
-	proc, startErr := a.executor.Start(ctx, launch)
+	// Adapter-owned detached context: the caller's HTTP context must
+	// not kill an accepted turn.
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
+	proc, startErr := a.executor.Start(lifecycleCtx, launch)
 	if startErr != nil {
+		lifecycleCancel()
 		_ = a.store.RecordClaudeLaunchState(ctx, attempt, int64(seq), "start_failed", nil)
+		a.releaseSlot(nativeID, attempt)
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
 			Reason: "start failed: " + startErr.Error()}, startErr
 	}
 	if err := a.store.RecordClaudeLaunchState(ctx, attempt, int64(seq), "started", nil); err != nil {
-		termCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = proc.Terminate(termCtx)
+		_ = proc.Terminate(lifecycleCtx)
+		lifecycleCancel()
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown,
 			Reason: "started but could not record launch state"}, nil
 	}
 
-	// Stdin transport (prompt never in argv).
+	go drainReader(proc.Stderr())
+
 	stdin := NewStdinWriter(proc.Stdin())
 	if stdinErr := stdin.WritePrompt([]byte(prompt)); stdinErr != nil {
-		termCtx, termCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer termCancel()
-		_ = proc.Terminate(termCtx)
-		a.releaseSlot(nativeID, owner)
+		_ = proc.Terminate(lifecycleCtx)
+		lifecycleCancel()
+		a.releaseSlot(nativeID, attempt)
 		if stdin.TransmissionBegan() {
 			return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown,
 				Reason: "prompt transmission began but failed: " + stdinErr.Error()}, nil
@@ -282,37 +259,36 @@ func (a *ClaudeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, promp
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
 			Reason: "stdin rejected before transmission: " + stdinErr.Error()}, nil
 	}
-
-	// Close stdin: the fixture reads the prompt via ReadAll(Stdin).
 	if err := proc.Stdin().Close(); err != nil {
-		a.releaseSlot(nativeID, owner)
+		lifecycleCancel()
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown,
-			Reason: "stdin close: " + err.Error()}, nil
+			Reason: "stdin close failed: " + err.Error()}, nil
 	}
 
-	// Turn stream: one per turn, fed by the parser.
+	if err := a.store.RecordClaudeStdinTransmitted(ctx, attempt, int64(seq)); err != nil {
+		// Non-fatal: the turn may still succeed.
+		_ = err
+	}
+
 	stream := adapter.NewBufferedStream(ref, 64)
 	run := &turnRun{
 		ref: ref, attemptID: attempt, nativeID: nativeID,
 		workspaceRoot: launch.Paths.Root,
 		manifest:      launch.Profile.ToolkitManifest.ToolkitManifest,
 		universeTools: launch.UniverseTools,
-		stream:        stream, proc: proc,
+		stream:        stream, proc: proc, cancel: lifecycleCancel,
 	}
 	a.mu.Lock()
 	a.turns[ref] = run
 	a.mu.Unlock()
 
 	accepted = true
-	go a.runTurn(run, stdin)
+	go a.runTurn(run, lifecycleCtx, lifecycleCancel)
 
 	return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchAccepted}, nil
 }
 
-// runTurn consumes the process stdout through the parser, persists the
-// terminal outcome exactly once, and releases the slot. A stream poison
-// or non-terminal EOF leaves the attempt Uncertain (never Failed).
-func (a *ClaudeAdapter) runTurn(run *turnRun, stdin *StdinWriter) {
+func (a *ClaudeAdapter) runTurn(run *turnRun, lifecycleCtx context.Context, lifecycleCancel context.CancelFunc) {
 	cfg := StreamConfig{
 		WorkspaceRoot:         run.workspaceRoot,
 		ExpectedVersion:       run.manifest.ProbedCLIVersion,
@@ -339,19 +315,20 @@ func (a *ClaudeAdapter) runTurn(run *turnRun, stdin *StdinWriter) {
 		}
 	})
 
+	go drainReader(run.proc.Stderr())
 	_, _ = run.proc.Wait()
 
 	if out.Poisoned || !out.Terminal {
-		// Uncertain: no verified terminal proof.
+		// Uncertain: no verified terminal proof. The slot is NOT
+		// released: the native session is blocked until the controller
+		// disposes the uncertain attempt.
 		a.mu.Lock()
 		delete(a.turns, run.ref)
 		a.mu.Unlock()
-		a.releaseSlot(run.nativeID, run.attemptID)
-		run.stream.CloseWithErr(fmt.Errorf("stream ended without verified result"))
+		run.stream.CloseWithErr(fmt.Errorf("stream ended without verified result: %s", out.PoisonReason))
 		return
 	}
 
-	// Exactly-once terminal persistence.
 	usageJSON := ""
 	if out.ResultUsage != nil {
 		usageJSON = out.ResultUsage.Raw
@@ -369,21 +346,28 @@ func (a *ClaudeAdapter) runTurn(run *turnRun, stdin *StdinWriter) {
 	a.releaseSlot(run.nativeID, run.attemptID)
 }
 
-// ── Observe ─────────────────────────────────────────────────────────────
+func drainReader(r interface{ Read([]byte) (int, error) }) {
+	buf := make([]byte, 4096)
+	for {
+		if _, err := r.Read(buf); err != nil {
+			return
+		}
+	}
+}
 
-// Observe returns the turn's buffered stream. Detaching does not affect
-// the underlying launch.
 func (a *ClaudeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter.Stream, error) {
 	a.mu.Lock()
-	stream := a.turns[ref].stream
+	run, ok := a.turns[ref]
+	var stream *adapter.BufferedStream
+	if ok {
+		stream = run.stream
+	}
 	a.mu.Unlock()
-	if stream == nil {
-		return nil, errors.New("turn not dispatched")
+	if !ok || stream == nil {
+		return nil, errors.New("turn not dispatched or already completed")
 	}
 	return stream, nil
 }
-
-// ── Cancel ──────────────────────────────────────────────────────────────
 
 func (a *ClaudeAdapter) Cancel(ctx context.Context, ref adapter.TurnRef) (adapter.CancelOutcome, error) {
 	a.mu.Lock()
@@ -399,10 +383,9 @@ func (a *ClaudeAdapter) Cancel(ctx context.Context, ref adapter.TurnRef) (adapte
 		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown,
 			Reason: err.Error()}, err
 	}
-	return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelConfirmed}, nil
+	return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown,
+		Reason: "process terminated; no terminal result observed"}, nil
 }
-
-// ── Collect ─────────────────────────────────────────────────────────────
 
 func (a *ClaudeAdapter) Collect(ctx context.Context, ref adapter.TurnRef) (adapter.TurnResult, error) {
 	attempt, err := a.store.GetLatestClaudeTurnAttempt(ctx, string(ref.SessionID), ref.TurnKey)
@@ -425,8 +408,6 @@ func (a *ClaudeAdapter) Collect(ctx context.Context, ref adapter.TurnRef) (adapt
 	return adapter.TurnResult{Ref: ref, Status: council.TurnRunning,
 		ResultStatus: adapter.ResultPending}, nil
 }
-
-// ── Reconcile ───────────────────────────────────────────────────────────
 
 func (a *ClaudeAdapter) Reconcile(ctx context.Context, ref adapter.RecoveryRef) (adapter.ReconciliationOutcome, error) {
 	attempt, err := a.store.GetLatestClaudeTurnAttempt(ctx, string(ref.TurnRef.SessionID), ref.TurnRef.TurnKey)
@@ -452,8 +433,6 @@ func (a *ClaudeAdapter) Reconcile(ctx context.Context, ref adapter.RecoveryRef) 
 			Result:       ptrDeref(attempt.ResultPayload),
 		}, nil
 	}
-	// Advisory default: accepted-without-terminal or started-without-
-	// accepted are both Uncertain (never fabricated as terminal).
 	return adapter.ReconciliationOutcome{Ref: ref,
 		Reachability: council.VisibilityHostLost,
 		Status:       adapter.ReconciliationUncertain,
@@ -466,22 +445,6 @@ func ptrDeref(s *string) string {
 		return ""
 	}
 	return *s
-}
-
-func validateNativeID(id string) error {
-	if strings.TrimSpace(id) == "" {
-		return fmt.Errorf("native session id is empty")
-	}
-	return nil
-}
-
-func drainReader(r interface{ Read([]byte) (int, error) }) {
-	buf := make([]byte, 4096)
-	for {
-		if _, err := r.Read(buf); err != nil {
-			return
-		}
-	}
 }
 
 func isValidUUIDv4(s string) bool {
