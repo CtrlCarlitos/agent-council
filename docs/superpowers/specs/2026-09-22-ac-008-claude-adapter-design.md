@@ -1,6 +1,6 @@
 # AC-008 Design — Claude persistent contributor adapter
 
-Status: DRAFT v6 for review
+Status: DRAFT v7 for review
 Date: 2026-09-22
 Issue: #8
 Depends on: AC-003 (controller grants), AC-005 (workspaces/execution policy),
@@ -430,33 +430,55 @@ claude_attempt_launches              -- one row per process launch
   attempt_id         FK
   launch_index       INTEGER (1|2)
   UNIQUE(attempt_id, launch_index)
-  started_at         TIMESTMP
+  state              TEXT (reserved|started|start_failed|dead)
+                      -- RESERVED before executor.Start is invoked
+  started_at         TIMESTMP NULL  -- set only on confirmed Start success
+  start_failed_at    TIMESTMP NULL  -- executor proved no process was created
   first_stdin_byte_at TIMESTMP NULL
   known_dead_at      TIMESTMP NULL
   exit_code          INTEGER NULL
   executor_identity  TEXT            -- policy fingerprint of the launch
 ```
 
+**Launches are durably RESERVED before Start (finding 1).** A crash
+between process creation and any later bookkeeping must never yield
+`launch_count = 0` with an orphan possibly running. Each launch is a
+child row inserted (RESERVED) in the SAME transaction that increments
+`launch_count`, BEFORE `executor.Start` is called; `started_at` is
+nullable and recorded only afterwards.
+
 **Crash-safe ordering** (each step durable before the next):
 1. persist attempt with baseline (materialized flag or cursor) — before
-   launch;
-2. `launch_count 0→1` + insert launch row + mark `started_at` — after
-   executor Start returns;
-3. mark `first_stdin_byte_at` — after the prompt write begins;
-4. acceptance (`accepted`, prompt digest match) — protected mode only,
+   any launch;
+2. **launch reservation**: `launch_count 0→1` + insert launch row
+   (`launch_index 1`, `started_at NULL`) in ONE transaction — before
+   `executor.Start`. A crash here leaves a RESERVED row with
+   `started_at NULL`: an orphan is possible, so the attempt is treated
+   as possibly-running (uncertain path; no third reservation);
+3. after `Start` returns:
+   - success → mark `started_at` on the launch row;
+   - definitive start FAILURE (executor proves no process was created) →
+     mark `start_failed_at` and release the reservation
+     (`launch_count` decremented, row kept for evidence) — pre-acceptance,
+     safe to relaunch as a new reservation;
+   - ambiguous Start outcome (daemon crash mid-call) → reservation stays,
+     `started_at` stays NULL: possibly-running ⇒ Uncertain;
+4. mark `first_stdin_byte_at` — after the prompt write begins;
+5. acceptance (`accepted`, prompt digest match) — protected mode only,
    from transcript;
-5. terminal (`terminal`, `result_payload`, `result_usage`) — only from an
+6. terminal (`terminal`, `result_payload`, `result_usage`) — only from an
    observed `result` event;
-6. `observed_status` — automatically from evidence (completed/failed/
+7. `observed_status` — automatically from evidence (completed/failed/
    missing/uncertain);
-7. **redispatch consumption** — the single protected-mode verified-
+8. **redispatch reservation** — the single protected-mode verified-
    absence redispatch is an atomic transition: precondition (protection
-   attestation valid for this attempt, verified absence recorded, launch
-   count = 1) sets `launch_count 1→2` and inserts the second launch row
-   in ONE transaction; a crash between decision and consumption leaves
-   launch_count = 1, and the transition is re-derived — it can never
-   authorize a third launch;
-8. `uncertainty_disposition` — ONLY by explicit controller decision
+   attestation valid for this attempt, verified absence recorded,
+   `launch_count = 1`, prior launch `known_dead_at` set) sets
+   `launch_count 1→2` and inserts the RESERVED second launch row in ONE
+   transaction — before the second `Start`. A crash between decision and
+   reservation leaves `launch_count = 1` and re-derives; it can never
+   authorize a third launch (max 2 enforced by the count constraint);
+9. `uncertainty_disposition` — ONLY by explicit controller decision
    (AC-004 authority), recorded as a journal entry with actor,
    generation, and operation ID; it resolves an uncertain attempt and
    unblocks the native session.
@@ -478,16 +500,43 @@ claude_protection_attestations
   platform           TEXT        -- os/arch
   manifest_digest    TEXT        -- toolkit manifest digest in force
   template_digest    TEXT        -- ctmpl-v1 digest in force
-  probe_results      TEXT (JSON) -- per-path: tool, target, denied bool,
-                                 -- enforcing capability, denial text
-  probed_at          TIMESTMP
+  probe_results      TEXT        -- CANONICALLY ENCODED record list
+                                 -- (framing below), never free-form JSON
+  probed_at          TIMESTMP    -- RFC3339 UTC
   actor              TEXT        -- operator identity (journal-linked)
 ```
 
-- Canonical attestation payload: the fields above framed like the
-  template digest (length-prefixed UTF-8, fixed field order), digest
-  prefix `cprot-v1:sha256:`; the attestation row is created only by an
-  operator-authorized journal operation (AC-004 authority).
+**Canonical probe-record encoding (finding 2).** `probe_results` is a
+typed record list, not free-form JSON. Each record:
+
+```
+tool_class            enum, in this fixed order:
+                      read(1), glob(2), grep(3), bash_absolute(4),
+                      mcp(5), plugin(6)
+tool_name             exact native tool name, UTF-8, trimmed,
+                      case-preserved
+target                literal "sibling-transcript"
+denied                bool — MUST be true for the attestation to be
+                      valid; any false record invalidates it
+enforcing_capability  enum: cwd_boundary | guardrail_hook | deny_list |
+                      permission_denial
+denial_text_excerpt   UTF-8, trimmed, internal whitespace collapsed,
+                      max 256 bytes (longer text truncated)
+```
+
+Canonicalization: records are sorted by `(tool_class enum order,
+tool_name byte-wise UTF-8)`; duplicate `(tool_class, tool_name)` pairs
+are REJECTED (the probe suite is invalid, not deduplicated); the list
+is encoded with the same framing family as `ctmpl-v1` —
+`uint32-BE(record-count)` then per record
+`uint32-BE(len(field)) || field-bytes` for the six fields in the fixed
+order above (bools as one 0/1 byte). The attestation payload is then the
+fixed-field-order length-prefixed frame: claude_version, platform,
+manifest_digest, template_digest, framed probe_records, probed_at
+(RFC3339 UTC), actor — digest prefix `cprot-v1:sha256:`. Semantically
+identical probe runs therefore produce identical digests; the
+attestation row is created only by an operator-authorized journal
+operation (AC-004 authority).
 - Attempts freeze `protection_attestation_id` at launch: the governing
   attestation is whichever record was valid for (claude version,
   manifest digest, template digest, platform) AT LAUNCH. A later
@@ -505,7 +554,7 @@ claude_protection_attestations
   ```json
   "toolkit_manifest": {
     "probed_cli_version": "2.1.278",
-    "universe_evidence_digest": "<sha256 of the committed universe file>",
+    "universe_evidence_digest": "sha256:<lowercase-hex>",
     "approved_tools": ["..."],
     "denied_complement": ["..."],
     "expected_hooks": ["..."],
@@ -513,6 +562,16 @@ claude_protection_attestations
     "expected_plugins": ["..."]
   }
   ```
+  **Manifest normalization (finding 3)**: every array field is normalized
+  before the profile is frozen — entries are trimmed; empty entries
+  rejected; duplicates rejected; ordering is byte-wise lexicographic over
+  UTF-8 (case-sensitive, no folding). Tool names in the arrays must match
+  the native spelling verified from `system/init`.
+  `universe_evidence_digest` is exactly `sha256:<lowercase-hex>` over the
+  committed universe evidence file's RAW bytes (the file identity, not a
+  re-serialization); its name field records the evidence file path. The
+  profile digest is computed over the canonical JSON serialization of the
+  complete v2 object.
 - **AC-007 compatibility**: `cprof-v2` is purely additive — every
   `cprof-v1` field is present with identical semantics. The OpenCode
   adapter (AC-007) accepts BOTH `cprof-v1` and `cprof-v2` and ignores
