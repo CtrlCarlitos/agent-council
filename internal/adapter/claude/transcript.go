@@ -1,31 +1,72 @@
 package claude
 
-// §3.6 transcript path derivation and local integrity inspection. The
-// path is derived ONLY from the binding's own fields — never accepted
-// from the native side or callers. Inspection is local evidence for
-// ResumeSession (§3.4): the transcript must exist and pass integrity
-// checks for a materialized binding. Prompt-digest correlation against
-// the attempt record (§3.4 step 3) requires the §3.5 acceptance
-// machinery and lands with the protected-mode work.
+// §3.6 transcript path derivation and local trust inspection. The path
+// is derived ONLY from the binding's own fields — never accepted from
+// the native side or callers. Inspection is local evidence for
+// ResumeSession (§3.4): for a materialized binding the transcript must
+// exist, pass integrity checks (containment across ALL path
+// components, regular-file mode, ownership, size bounds), carry a user
+// entry, and correlate with the attempt records' prompt digests —
+// proof THIS transcript is THIS session's.
 
 import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
+
+	"github.com/CtrlCarlitos/agent-council/internal/storage"
+)
+
+// verifyPathComponentSymlinks rejects symlink components anywhere on
+// the transcript's path — from the file itself up through every parent
+// directory, including the config root and its ancestors (§3.6
+// containment). The transcript is trusted only if every component is a
+// real directory or the final regular file.
+func verifyPathComponentSymlinks(path string) error {
+	current := path
+	for {
+		st, err := os.Lstat(current)
+		if err != nil {
+			return fmt.Errorf("bound transcript path component %s is missing: %w", current, err)
+		}
+		if st.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("bound transcript path component %s is a symlink; containment violated", current)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil
+		}
+		current = parent
+	}
+}
+
+var (
+	// MaxTranscriptFileBytes bounds the transcript file size; larger
+	// files fail closed rather than being parsed.
+	MaxTranscriptFileBytes = int64(64 << 20)
+	// MaxTranscriptLineBytes bounds a single NDJSON entry; the tail
+	// beyond the bound fails closed.
+	MaxTranscriptLineBytes = 1 << 20
 )
 
 // TranscriptPath derives the bound transcript path for a session:
 // <config-root>/projects/<munged-cwd>/<native-id>.jsonl (spec §3.6).
 // The native ID must be a valid UUIDv4; the workspace is munged with
-// the native rule (every non-alphanumeric byte becomes '-').
+// the native rule (every non-alphanumeric byte becomes '-'). The rule
+// itself is fixture-verified only until Task 7's operator-run
+// integration evidence.
 func TranscriptPath(configRoot, workspace, nativeID string) (string, error) {
 	if !isValidUUIDv4(nativeID) {
 		return "", fmt.Errorf("transcript path requires a valid UUIDv4 native id, got %q", nativeID)
 	}
-	if filepath.Base(configRoot) == "" || configRoot == "" {
+	if configRoot == "" {
 		return "", fmt.Errorf("transcript path requires a config root")
 	}
 	if workspace == "" {
@@ -51,15 +92,27 @@ func mungeCWD(p string) string {
 type TranscriptInspection struct {
 	Path      string
 	Entries   int
-	UserEntry bool
+	UserTexts []string
 }
 
-// InspectTranscript validates the local transcript: it must exist as a
-// regular file (symlinks rejected), contain only valid NDJSON entries
-// (a torn final line is tolerated and discarded, per §3.9), and carry
-// at least one `user` entry proving the prompt crossed the native
-// session.
+// InspectTranscript validates the bound transcript end to end:
+//
+//   - every path component from the config root down is a real
+//     directory/file, never a symlink (§3.6 containment);
+//   - the transcript is a regular file owned by the current user with
+//     no group/other permission bits (0600 family); on Windows the
+//     inspection fails closed (no ACL-equivalent capability yet);
+//   - the file and each NDJSON entry are within the size bounds;
+//   - every complete entry is valid JSON; a torn FINAL line without a
+//     newline is a tolerated tail (§3.9);
+//   - at least one `user` entry carries prompt text.
 func InspectTranscript(path string) (*TranscriptInspection, error) {
+	if !transcriptTrustSupported() {
+		return nil, fmt.Errorf("transcript trust inspection is not supported on %s; failing closed (§3.6)", runtime.GOOS)
+	}
+	if err := verifyPathComponentSymlinks(path); err != nil {
+		return nil, err
+	}
 	st, err := os.Lstat(path)
 	if err != nil {
 		return nil, fmt.Errorf("bound transcript is missing: %w", err)
@@ -67,6 +120,16 @@ func InspectTranscript(path string) (*TranscriptInspection, error) {
 	if st.Mode()&os.ModeSymlink != 0 || !st.Mode().IsRegular() {
 		return nil, fmt.Errorf("bound transcript %s is not a regular file", path)
 	}
+	if err := verifyTranscriptOwnership(st); err != nil {
+		return nil, err
+	}
+	if st.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("bound transcript %s must not be readable by group or others (mode %o)", path, st.Mode().Perm())
+	}
+	if st.Size() > MaxTranscriptFileBytes {
+		return nil, fmt.Errorf("bound transcript %s exceeds the %d-byte file bound", path, MaxTranscriptFileBytes)
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open bound transcript: %w", err)
@@ -74,35 +137,120 @@ func InspectTranscript(path string) (*TranscriptInspection, error) {
 	defer f.Close()
 
 	ins := &TranscriptInspection{Path: path}
-	reader := bufio.NewReader(f)
+	reader := bufio.NewReader(io.LimitReader(f, MaxTranscriptFileBytes+1))
+	total := int64(0)
 	for {
-		line, err := reader.ReadBytes('\n')
+		line, readErr := readBoundedTranscriptLine(reader, &total, path)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			// Size-bound violation: fail closed, never tolerate.
+			return nil, readErr
+		}
 		trimmed := bytes.TrimSpace(line)
 		if len(trimmed) > 0 {
 			var entry struct {
-				Type string `json:"type"`
+				Type    string `json:"type"`
+				Message struct {
+					Role    string          `json:"role"`
+					Content json.RawMessage `json:"content"`
+				} `json:"message"`
 			}
 			if jsonErr := json.Unmarshal(trimmed, &entry); jsonErr != nil {
-				if err == nil {
-					return nil, fmt.Errorf("bound transcript has a malformed entry")
+				if readErr == nil {
+					return nil, fmt.Errorf("bound transcript %s has a malformed entry", path)
 				}
 				// Torn final line without newline: tolerated tail.
 				break
 			}
 			ins.Entries++
 			if entry.Type == "user" {
-				ins.UserEntry = true
+				if text := userEntryText(entry.Message); strings.TrimSpace(text) != "" {
+					ins.UserTexts = append(ins.UserTexts, text)
+				}
 			}
 		}
-		if err != nil {
+		if readErr != nil {
 			break
 		}
 	}
 	if ins.Entries == 0 {
 		return nil, fmt.Errorf("bound transcript %s carries no entries", path)
 	}
-	if !ins.UserEntry {
+	if len(ins.UserTexts) == 0 {
 		return nil, fmt.Errorf("bound transcript %s carries no user entry", path)
 	}
 	return ins, nil
+}
+
+// readBoundedTranscriptLine reads one newline-terminated entry,
+// failing closed when a single entry exceeds MaxTranscriptLineBytes or
+// the file exceeds MaxTranscriptFileBytes.
+func readBoundedTranscriptLine(reader *bufio.Reader, total *int64, path string) ([]byte, error) {
+	var line []byte
+	for {
+		chunk, err := reader.ReadSlice('\n')
+		line = append(line, chunk...)
+		*total += int64(len(chunk))
+		if *total > MaxTranscriptFileBytes {
+			return nil, fmt.Errorf("bound transcript %s exceeds the %d-byte file bound", path, MaxTranscriptFileBytes)
+		}
+		if len(line) > MaxTranscriptLineBytes {
+			return nil, fmt.Errorf("bound transcript %s has an entry exceeding the %d-byte line bound", path, MaxTranscriptLineBytes)
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		if len(line) > 0 && line[len(line)-1] != '\n' && (err == nil || err == io.EOF) {
+			// Torn tail: return what exists; the caller tolerates it.
+			return line, err
+		}
+		return line, err
+	}
+}
+
+// userEntryText extracts the prompt text from a transcript user
+// entry's message content: either a plain string or an array of
+// content blocks (first text block wins).
+func userEntryText(msg struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}) string {
+	var text string
+	if err := json.Unmarshal(msg.Content, &text); err == nil {
+		return text
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(msg.Content, &blocks); err == nil {
+		for _, b := range blocks {
+			if b.Type == "text" {
+				return b.Text
+			}
+		}
+	}
+	return ""
+}
+
+// CorrelateTranscriptPrompt proves THIS transcript is THIS session's
+// (§3.4 step 3): some recorded attempt of this session must have a
+// user entry in the transcript whose prompt text hashes — under that
+// attempt's identity — to the attempt's stored prompt digest.
+func CorrelateTranscriptPrompt(path string, attempts []*storage.ClaudeTurnAttempt) error {
+	ins, err := InspectTranscript(path)
+	if err != nil {
+		return err
+	}
+	for _, attempt := range attempts {
+		if strings.TrimSpace(attempt.PromptDigest) == "" {
+			continue
+		}
+		for _, text := range ins.UserTexts {
+			if PromptDigest(text, attempt.AttemptID) == attempt.PromptDigest {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf(
+		"bound transcript %s carries no accepted user entry matching any recorded prompt digest of this session", path)
 }

@@ -458,6 +458,72 @@ func asConfigMismatch(err error, target **ErrSessionConfigMismatch) bool {
 	return false
 }
 
+// A failed creation shares its typed failure with every concurrent
+// waiting caller; later callers may retry independently.
+func TestClaudeAdapter_ConcurrentCreationFailureShared(t *testing.T) {
+	h := newAdapterHarness(t)
+	ctx := context.Background()
+
+	failSession := "c3d4e5f6-a7b8-4c9d-8e0f-1a2b3c4d5e6f"
+	failRun := "run-adapter-fail"
+	universeDoc := `{"claude_code_version":"2.1.278","tools":["Read","Glob","Grep","Bash","Write","WebSearch"]}`
+	if _, err := h.store.CreateRunWithProfile(ctx, storage.CreateRunWithProfileRequest{
+		OpID: "op-run-adapter-fail", ControllerLease: "lease-adapter-fail", RunID: failRun,
+		Brief: "adapter failure-sharing test", SourceRepoIdentity: "example/repo",
+		SourceCommit: "0123456789012345678901234567890123456789",
+		SourceTree:   "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+		Profile:      claudeProfile("sha256:"+sha256Sum(universeDoc), primaryModel),
+	}); err != nil {
+		t.Fatalf("create failure-run: %v", err)
+	}
+	if _, err := h.store.CreateSession(ctx, "op-sess-fail", "lease-adapter-fail", storage.SessionRecord{
+		ID: failSession, RunID: failRun, Contributor: "claude", Role: "reviewer",
+		IsActiveContributor: true, State: "parked", Visibility: "reachable",
+	}); err != nil {
+		t.Fatalf("create failing session record: %v", err)
+	}
+	// Pre-create the config root so materialization fails closed.
+	existing := ConfigRootPath(h.configBase, failRun, failSession)
+	if err := os.MkdirAll(existing, 0o700); err != nil {
+		t.Fatalf("pre-create config root: %v", err)
+	}
+
+	const n = 3
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(slot int) {
+			defer wg.Done()
+			_, errs[slot] = h.adapter.CreateSession(ctx, adapter.CreateSessionRequest{
+				SessionID:   adapter.SessionID(failSession),
+				Contributor: "claude",
+				Config: adapter.SessionConfig{
+					WorkspaceRoot: h.wsRoot,
+					Model:         primaryModel,
+				},
+			})
+		}(i)
+	}
+	wg.Wait()
+	for i := 0; i < n; i++ {
+		if errs[i] == nil || !strings.Contains(errs[i].Error(), "materialize config root") {
+			t.Fatalf("concurrent caller %d must share the creation failure, got %v", i, errs[i])
+		}
+	}
+
+	// A later caller (after the failed reservation was retired) retries
+	// independently and receives the same deterministic failure — the
+	// stale typed failure is not replayed as cached success or error.
+	if _, err := h.adapter.CreateSession(ctx, adapter.CreateSessionRequest{
+		SessionID:   adapter.SessionID(failSession),
+		Contributor: "claude",
+		Config:      adapter.SessionConfig{WorkspaceRoot: h.wsRoot, Model: primaryModel},
+	}); err == nil || !strings.Contains(err.Error(), "materialize config root") {
+		t.Fatalf("independent retry must fail on its own while the root exists, got %v", err)
+	}
+}
+
 // After the service persists the binding, a duplicate CreateSession
 // must match the persisted frozen config and share its native id.
 func TestClaudeAdapter_CreateSessionMatchesPersistedBinding(t *testing.T) {
@@ -553,7 +619,15 @@ func TestClaudeAdapter_ResumeSessionInspection(t *testing.T) {
 		t.Fatal("materialized binding without its transcript must fail")
 	}
 
-	// Materialized binding with a valid transcript at the derived path.
+	// Materialized binding whose transcript carries the accepted user
+	// entry correlating with the recorded attempt's prompt digest.
+	if err := h.store.InsertClaudeTurnAttempt(ctx, storage.ClaudeTurnAttempt{
+		AttemptID: "att_resume", SessionID: string(h.sessionID), TurnKey: "t-resume",
+		NativeID: stored.NativeID, PromptDigest: PromptDigest("the resume prompt", "att_resume"),
+		TranscriptProtection: "advisory",
+	}); err != nil {
+		t.Fatalf("insert attempt: %v", err)
+	}
 	path, err := TranscriptPath(stored.ConfigRoot, stored.Workspace, stored.NativeID)
 	if err != nil {
 		t.Fatalf("transcript path: %v", err)
@@ -561,17 +635,27 @@ func TestClaudeAdapter_ResumeSessionInspection(t *testing.T) {
 	if os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatalf("mkdir projects: %v", err)
 	}
-	transcript := strings.Join([]string{
-		`{"type":"user","message":{"role":"user","content":"prompt"}}`,
-		`{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}`,
-		"",
-	}, "\n")
-	if err := os.WriteFile(path, []byte(transcript), 0o600); err != nil {
-		t.Fatalf("write transcript: %v", err)
+	writeTranscript := func(userText string) {
+		t.Helper()
+		transcript := fmt.Sprintf(`{"type":"user","message":{"role":"user","content":%q}}`+"\n"+
+			`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}`+"\n", userText)
+		if err := os.WriteFile(path, []byte(transcript), 0o600); err != nil {
+			t.Fatalf("write transcript: %v", err)
+		}
 	}
+	writeTranscript("the resume prompt")
 	if err := h.adapter.ResumeSession(ctx, binding); err != nil {
-		t.Fatalf("materialized resume with transcript must succeed: %v", err)
+		t.Fatalf("materialized resume with correlating transcript must succeed: %v", err)
 	}
+
+	// A user entry that matches no recorded prompt digest fails the
+	// session-identity proof.
+	writeTranscript("a different prompt entirely")
+	if err := h.adapter.ResumeSession(ctx, binding); err == nil ||
+		!strings.Contains(err.Error(), "matching any recorded prompt digest") {
+		t.Fatalf("uncorrelatable transcript must fail, got %v", err)
+	}
+	writeTranscript("the resume prompt")
 
 	// Corrupt transcript: integrity failure.
 	if err := os.WriteFile(path, []byte("{\"type\":\"user\"\nNOT JSON\n"), 0o600); err != nil {
@@ -585,7 +669,7 @@ func TestClaudeAdapter_ResumeSessionInspection(t *testing.T) {
 	if err := os.Remove(path); err != nil {
 		t.Fatalf("remove transcript: %v", err)
 	}
-	if err := os.WriteFile(path+"-real", []byte(transcript), 0o600); err != nil {
+	if err := os.WriteFile(path+"-real", []byte(fmt.Sprintf(`{"type":"user","message":{"role":"user","content":%q}}`+"\n", "the resume prompt")), 0o600); err != nil {
 		t.Fatalf("write real transcript: %v", err)
 	}
 	if err := os.Symlink(path+"-real", path); err != nil {
@@ -695,6 +779,18 @@ func TestClaudeAdapter_FirstTurnThenResumeSelection(t *testing.T) {
 		t.Fatal("binding must be materialized after the verified first-turn terminal")
 	}
 
+	// §3.4 step 3 end-to-end: the fixture wrote the accepted user
+	// entry with the dispatched prompt, so the materialized binding
+	// resumes against its own transcript.
+	resumeReq := adapter.SessionBinding{
+		SessionID:       h.sessionID,
+		NativeSessionID: binding.NativeID,
+		Config:          adapter.SessionConfig{Model: primaryModel, WorkspaceRoot: h.wsRoot},
+	}
+	if err := h.adapter.ResumeSession(ctx, resumeReq); err != nil {
+		t.Fatalf("resume must correlate the transcript's accepted user entry: %v", err)
+	}
+
 	if _, err := h.adapter.Dispatch(ctx, adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-2"}, "prompt two"); err != nil {
 		t.Fatalf("dispatch t-2: %v", err)
 	}
@@ -708,6 +804,38 @@ func TestClaudeAdapter_FirstTurnThenResumeSelection(t *testing.T) {
 	}
 	if !argInvoked(invocations[1], "--resume") {
 		t.Fatalf("second turn must resume with --resume, got %v", invocations[1])
+	}
+}
+
+// Materialization follows the transcript evidence boundary, not the
+// result event: a verified terminal without an observed bound
+// transcript leaves the binding unmaterialized.
+func TestClaudeAdapter_MaterializationRequiresTranscriptObservation(t *testing.T) {
+	h := newAdapterHarness(t)
+	ctx := context.Background()
+	binding := h.createSession(t, string(h.sessionID))
+
+	// The child emits a verified success but writes no transcript.
+	writeKnob(t, h.wsRoot, ".claude-fixture-no-transcript", "")
+	writeKnob(t, h.wsRoot, ".claude-fixture", fixtureStream(h.wsRoot, binding.NativeSessionID, primaryModel,
+		fmt.Sprintf(`{"type":"result","subtype":"success","is_error":false,"session_id":%q,"result":"fixture response"}`, binding.NativeSessionID),
+	))
+
+	ref := adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-no-transcript"}
+	if _, err := h.adapter.Dispatch(ctx, ref, "prompt"); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	result := waitTerminal(t, h, ref)
+	if result.Status != council.TurnCompleted {
+		t.Fatalf("verified result must complete the turn, got %+v", result)
+	}
+
+	after, err := h.store.GetClaudeSessionBinding(ctx, string(h.sessionID))
+	if err != nil || after == nil {
+		t.Fatalf("get binding: %v", err)
+	}
+	if after.Materialized {
+		t.Fatal("binding must stay unmaterialized without an observed bound transcript")
 	}
 }
 
@@ -1061,4 +1189,27 @@ func TestClaudeAdapter_ReconcileTerminalAndMissingStates(t *testing.T) {
 		rec.Reachability != council.VisibilityReachable {
 		t.Fatalf("start_failed evidence must reconcile definitively-missing, got %+v", rec)
 	}
+
+	// A definitive start failure is a safe pre-start failure, not an
+	// unresolved uncertainty: the attempt is observed_status='missing'
+	// and does NOT block the session.
+	missingAttempt, err := h.store.GetLatestClaudeTurnAttempt(ctx, string(h.sessionID), "t-missing")
+	if err != nil || missingAttempt == nil {
+		t.Fatalf("get missing attempt: %v", err)
+	}
+	if missingAttempt.ObservedStatus != "missing" {
+		t.Fatalf("start failure must classify missing, got %q", missingAttempt.ObservedStatus)
+	}
+	if blocked, _ := h.store.HasClaudeUnresolvedAttempts(ctx, missingAttempt.NativeID); blocked {
+		t.Fatal("a missing attempt must not block the native session")
+	}
+
+	os.Setenv("PATH", origPath)
+	afterRef := adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-after-missing"}
+	outcome, err = h.adapter.Dispatch(ctx, afterRef, "prompt")
+	if err != nil || outcome.Status != adapter.DispatchAccepted {
+		t.Fatalf("session must not be blocked after a definitive start failure, got %v (%s) err=%v",
+			outcome.Status, outcome.Reason, err)
+	}
+	waitTerminal(t, h, afterRef)
 }

@@ -332,12 +332,17 @@ WHERE attempt_id = ? AND reservation_seq = ?`, now, attemptID, seq); err != nil 
 			return err
 		}
 		// No process was created: release the launch slot so a new
-		// reservation is possible. The launch row is retained as
-		// evidence. Both the launch-row state change and the slot
-		// release are one atomic transaction.
+		// reservation is possible, and classify the attempt as
+		// definitively missing — positive pre-start evidence, NOT an
+		// unresolved uncertainty. The attempt never blocks the native
+		// session (only 'uncertain' rows do), and the launch row is
+		// retained as evidence. All three writes are one atomic
+		// transaction; the status guard never downgrades a resolved
+		// attempt.
 		if _, err := tx.ExecContext(ctx, `
-UPDATE claude_turn_attempts SET launch_count = launch_count - 1
-WHERE attempt_id = ? AND launch_count > 0`, attemptID); err != nil {
+UPDATE claude_turn_attempts SET launch_count = launch_count - 1,
+	observed_status = 'missing'
+WHERE attempt_id = ? AND launch_count > 0 AND observed_status = 'uncertain'`, attemptID); err != nil {
 			return err
 		}
 		return tx.Commit()
@@ -490,14 +495,61 @@ ORDER BY created_at DESC LIMIT 1`, sessionID, turnKey)
 	return scanClaudeAttempt(row)
 }
 
+// ClaudeSessionTurnAttempts returns every attempt recorded for a
+// session in creation order — the attempt records against which a
+// materialized transcript's user entry is correlated (§3.4 step 3).
+func (s *Store) ClaudeSessionTurnAttempts(ctx context.Context, sessionID string) ([]*ClaudeTurnAttempt, error) {
+	rows, err := s.DB().QueryContext(ctx, `
+SELECT attempt_id, session_id, turn_key, native_id, prompt_digest,
+       baseline_file_identity, baseline_size, baseline_entries, materialized_baseline,
+       transcript_protection, protection_attestation_id, launch_count, absence_redispatch_consumed,
+       accepted, terminal, result_payload, result_usage, observed_status,
+       uncertainty_disposition, disposition_actor, disposition_generation,
+       disposition_op_id, disposition_at,
+       transition_version, created_at, updated_at
+FROM claude_turn_attempts
+WHERE session_id = ? ORDER BY created_at, attempt_id`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("query claude session attempts: %w", err)
+	}
+	defer rows.Close()
+	var attempts []*ClaudeTurnAttempt
+	for rows.Next() {
+		a, err := scanClaudeAttemptRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		attempts = append(attempts, a)
+	}
+	return attempts, rows.Err()
+}
+
 func scanClaudeAttempt(row *sql.Row) (*ClaudeTurnAttempt, error) {
 	var a ClaudeTurnAttempt
+	if err := scanClaudeAttemptInto(row.Scan, &a); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &a, nil
+}
+
+func scanClaudeAttemptRow(rows *sql.Rows) (*ClaudeTurnAttempt, error) {
+	var a ClaudeTurnAttempt
+	if err := scanClaudeAttemptInto(rows.Scan, &a); err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+func scanClaudeAttemptInto(scan func(dest ...any) error, a *ClaudeTurnAttempt) error {
 	var createdAt, updatedAt string
 	var terminal, consumed, matBaseline int
 	var acceptedNull sql.NullInt64
 	var disposition, dispositionActor, dispositionOpID, dispositionAt sql.NullString
 	var dispositionGen sql.NullInt64
-	if err := row.Scan(
+	if err := scan(
 		&a.AttemptID, &a.SessionID, &a.TurnKey, &a.NativeID, &a.PromptDigest,
 		&a.BaselineIdentity, &a.BaselineSize, &a.BaselineEntries, &matBaseline,
 		&a.TranscriptProtection, &a.AttestationID, &a.LaunchCount, &consumed,
@@ -505,10 +557,7 @@ func scanClaudeAttempt(row *sql.Row) (*ClaudeTurnAttempt, error) {
 		&disposition, &dispositionActor, &dispositionGen, &dispositionOpID, &dispositionAt,
 		&a.TransitionVersion, &createdAt, &updatedAt,
 	); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, err
+		return err
 	}
 	a.BaselineMaterialized = matBaseline != 0
 	a.AbsenceRedispatch = consumed != 0
@@ -521,7 +570,7 @@ func scanClaudeAttempt(row *sql.Row) (*ClaudeTurnAttempt, error) {
 	a.DispositionActor = nullStr(dispositionActor)
 	a.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	a.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
-	return &a, nil
+	return nil
 }
 
 func nullStr(ns sql.NullString) *string {

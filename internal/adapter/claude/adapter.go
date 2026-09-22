@@ -69,33 +69,39 @@ type ClaudeAdapter struct {
 	singleFlt map[string]*claudeSlot
 
 	createMu  sync.Mutex
-	creations map[adapter.SessionID]*creationRecord
+	creations map[adapter.SessionID]*creationCall
 }
 
-// creationRecord is the per-logical-session creation reservation
-// (§3.3): the native identity is generated once and shared with
-// concurrent callers, including typed failures for mismatched configs.
-type creationRecord struct {
-	nativeID       string
-	templateDigest string
+// creationCall is the per-logical-session creation reservation (§3.3):
+// the caller that installs the call performs the creation; concurrent
+// callers wait on done and share the outcome — the same native
+// identity on success, the same typed failure otherwise.
+type creationCall struct {
+	done chan struct{}
+
+	binding        adapter.SessionBinding
+	err            error
+	contributor    council.Contributor
 	model          string
 	workspace      string
-	contributor    council.Contributor
+	templateDigest string
 }
 
 type turnRun struct {
-	ref           adapter.TurnRef
-	attemptID     string
-	nativeID      string
-	launchSeq     int64
-	firstTurn     bool
-	model         string
-	workspaceRoot string
-	manifest      storage.ToolkitManifest
-	universeTools []string
-	stream        *adapter.BufferedStream
-	proc          execpolicy.ManagedProcess
-	cancel        context.CancelFunc
+	ref            adapter.TurnRef
+	attemptID      string
+	nativeID       string
+	launchSeq      int64
+	firstTurn      bool
+	model          string
+	workspaceRoot  string
+	configRoot     string
+	boundWorkspace string
+	manifest       storage.ToolkitManifest
+	universeTools  []string
+	stream         *adapter.BufferedStream
+	proc           execpolicy.ManagedProcess
+	cancel         context.CancelFunc
 }
 
 type claudeSlot struct {
@@ -122,7 +128,7 @@ func NewClaudeAdapter(
 		templateDir:  templateDir,
 		turns:        make(map[adapter.TurnRef]*turnRun),
 		singleFlt:    make(map[string]*claudeSlot),
-		creations:    make(map[adapter.SessionID]*creationRecord),
+		creations:    make(map[adapter.SessionID]*creationCall),
 	}
 }
 
@@ -185,9 +191,10 @@ func (a *ClaudeAdapter) removeTurn(ref adapter.TurnRef) {
 // native ID once inside the per-logical-session creation reservation,
 // materializes the per-session config root, and returns the binding
 // with materialized=false. The adapter does NOT persist (§3.3): the
-// service/storage layer persists the returned binding. Duplicate
-// requests share the reserved native identity; mismatched callers fail
-// closed with a typed error.
+// service/storage layer persists the returned binding. Concurrent and
+// duplicate requests share the reserved outcome — one native identity
+// on success, the creator's typed failure otherwise — and mismatched
+// callers fail closed.
 func (a *ClaudeAdapter) CreateSession(ctx context.Context, req adapter.CreateSessionRequest) (adapter.SessionBinding, error) {
 	if err := req.Validate(); err != nil {
 		return adapter.SessionBinding{}, err
@@ -198,68 +205,96 @@ func (a *ClaudeAdapter) CreateSession(ctx context.Context, req adapter.CreateSes
 	if strings.TrimSpace(req.Config.WorkspaceRoot) == "" {
 		return adapter.SessionBinding{}, fmt.Errorf("session %s requires a workspace root", req.SessionID)
 	}
+
+	a.createMu.Lock()
+	if call, ok := a.creations[req.SessionID]; ok {
+		a.createMu.Unlock()
+		<-call.done
+		if call.err != nil {
+			// Shared typed failure: the waiting caller receives the
+			// creator's outcome, it does not retry independently.
+			return adapter.SessionBinding{}, call.err
+		}
+		frozenDigest, derr := TemplateDigest(a.templateDir)
+		if derr != nil {
+			return adapter.SessionBinding{}, fmt.Errorf("frozen template digest: %w", derr)
+		}
+		if err := compareConfig(req, call.contributor, call.model, call.workspace, call.templateDigest, frozenDigest); err != nil {
+			return adapter.SessionBinding{}, err
+		}
+		return call.binding, nil
+	}
+	call := &creationCall{done: make(chan struct{})}
+	a.creations[req.SessionID] = call
+	a.createMu.Unlock()
+
+	binding, digest, err := a.createBinding(ctx, req)
+	if err != nil {
+		// The failed reservation is removed so a LATER caller may
+		// retry; everyone who waited on THIS call shares the failure.
+		a.createMu.Lock()
+		if a.creations[req.SessionID] == call {
+			delete(a.creations, req.SessionID)
+		}
+		a.createMu.Unlock()
+	}
+	call.binding = binding
+	call.err = err
+	call.contributor = req.Contributor
+	call.model = req.Config.Model
+	call.workspace = req.Config.WorkspaceRoot
+	call.templateDigest = digest
+	close(call.done)
+	return binding, err
+}
+
+// createBinding performs the validated creation: session metadata
+// gate, persisted-binding mismatch checks, UUIDv4 generation, and
+// atomic config-root materialization. No persistence happens here.
+func (a *ClaudeAdapter) createBinding(ctx context.Context, req adapter.CreateSessionRequest) (adapter.SessionBinding, string, error) {
 	meta, err := a.store.GetSessionMetadata(ctx, string(req.SessionID))
 	if err != nil {
-		return adapter.SessionBinding{}, fmt.Errorf("session metadata lookup: %w", err)
+		return adapter.SessionBinding{}, "", fmt.Errorf("session metadata lookup: %w", err)
 	}
 	if meta.Contributor != "claude" {
-		return adapter.SessionBinding{}, fmt.Errorf(
+		return adapter.SessionBinding{}, "", fmt.Errorf(
 			"session %s contributor is %q; refusing to create a Claude binding",
 			req.SessionID, meta.Contributor)
 	}
 
 	templateDigest, err := TemplateDigest(a.templateDir)
 	if err != nil {
-		return adapter.SessionBinding{}, fmt.Errorf("frozen template digest: %w", err)
-	}
-
-	a.createMu.Lock()
-	defer a.createMu.Unlock()
-
-	// In-flight creation reservation: one native identity, shared
-	// result, mismatched callers fail closed.
-	if rec, ok := a.creations[req.SessionID]; ok {
-		if err := compareConfig(req, rec.contributor, rec.model, rec.workspace, rec.templateDigest, templateDigest); err != nil {
-			return adapter.SessionBinding{}, err
-		}
-		return a.reservedBinding(req, rec.nativeID), nil
+		return adapter.SessionBinding{}, "", fmt.Errorf("frozen template digest: %w", err)
 	}
 
 	// An already-persisted binding is authoritative; requests must
 	// match its frozen config.
 	if existing, err := a.store.GetClaudeSessionBinding(ctx, string(req.SessionID)); err != nil {
-		return adapter.SessionBinding{}, err
+		return adapter.SessionBinding{}, "", err
 	} else if existing != nil {
 		if err := compareConfig(req, "claude", existing.Model, existing.Workspace, existing.TemplateDigest, templateDigest); err != nil {
-			return adapter.SessionBinding{}, err
+			return adapter.SessionBinding{}, "", err
 		}
-		return a.reservedBinding(req, existing.NativeID), nil
+		return a.reservedBinding(req, existing.NativeID), existing.TemplateDigest, nil
 	}
 
 	runID, err := a.store.GetSessionRunID(ctx, string(req.SessionID))
 	if err != nil {
-		return adapter.SessionBinding{}, fmt.Errorf("session run lookup: %w", err)
+		return adapter.SessionBinding{}, "", fmt.Errorf("session run lookup: %w", err)
 	}
 	if req.Contributor != "claude" {
-		return adapter.SessionBinding{}, &ErrSessionConfigMismatch{SessionID: req.SessionID,
+		return adapter.SessionBinding{}, "", &ErrSessionConfigMismatch{SessionID: req.SessionID,
 			Field: "contributor", Want: string(req.Contributor), Have: "claude"}
 	}
 	nativeID, err := sessionUUID()
 	if err != nil {
-		return adapter.SessionBinding{}, err
+		return adapter.SessionBinding{}, "", err
 	}
 	_, materializedDigest, err := MaterializeConfigRoot(a.templateDir, a.configBase, runID, string(req.SessionID))
 	if err != nil {
-		return adapter.SessionBinding{}, fmt.Errorf("materialize config root: %w", err)
+		return adapter.SessionBinding{}, "", fmt.Errorf("materialize config root: %w", err)
 	}
-	a.creations[req.SessionID] = &creationRecord{
-		nativeID:       nativeID,
-		templateDigest: materializedDigest,
-		model:          req.Config.Model,
-		workspace:      req.Config.WorkspaceRoot,
-		contributor:    req.Contributor,
-	}
-	return a.reservedBinding(req, nativeID), nil
+	return a.reservedBinding(req, nativeID), materializedDigest, nil
 }
 
 func (a *ClaudeAdapter) reservedBinding(req adapter.CreateSessionRequest, nativeID string) adapter.SessionBinding {
@@ -341,9 +376,14 @@ func (a *ClaudeAdapter) ResumeSession(ctx context.Context, binding adapter.Sessi
 		if err != nil {
 			return err
 		}
-		if _, err := InspectTranscript(path); err != nil {
+		attempts, err := a.store.ClaudeSessionTurnAttempts(ctx, string(binding.SessionID))
+		if err != nil {
 			return err
 		}
+		// §3.4 step 3: the transcript must carry the accepted user
+		// entry matching the attempt records' prompt digests — proof
+		// THIS transcript is THIS session's.
+		return CorrelateTranscriptPrompt(path, attempts)
 	}
 	return nil
 }
@@ -499,12 +539,14 @@ func (a *ClaudeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, promp
 	stream := adapter.NewBufferedStream(ref, 64)
 	run := &turnRun{
 		ref: ref, attemptID: attempt, nativeID: nativeID, launchSeq: seq,
-		firstTurn:     firstTurn,
-		model:         launch.Model,
-		workspaceRoot: launch.Paths.Root,
-		manifest:      launch.Profile.ToolkitManifest.ToolkitManifest,
-		universeTools: launch.UniverseTools,
-		stream:        stream, proc: proc, cancel: lifecycleCancel,
+		firstTurn:      firstTurn,
+		model:          launch.Model,
+		workspaceRoot:  launch.Paths.Root,
+		configRoot:     binding.ConfigRoot,
+		boundWorkspace: binding.Workspace,
+		manifest:       launch.Profile.ToolkitManifest.ToolkitManifest,
+		universeTools:  launch.UniverseTools,
+		stream:         stream, proc: proc, cancel: lifecycleCancel,
 	}
 	a.mu.Lock()
 	a.turns[ref] = run
@@ -551,11 +593,15 @@ func (a *ClaudeAdapter) runTurn(run *turnRun) {
 	exitCode, _ := run.proc.Wait()
 	_ = a.store.RecordClaudeLaunchState(context.Background(), run.attemptID, run.launchSeq, "dead", &exitCode)
 
+	// The turn is no longer active the moment its stdout has ended:
+	// later Observe calls fail and Reconcile no longer reports it as
+	// reachable-active, regardless of how the verdict lands below.
+	a.removeTurn(run.ref)
+
 	if out.Poisoned || !out.Terminal {
 		// Uncertain: no verified terminal proof. The attempt stays
 		// uncertain and blocks the native session until the controller
 		// records a disposition.
-		a.removeTurn(run.ref)
 		run.stream.CloseWithErr(fmt.Errorf("stream ended without verified result: %s", out.PoisonReason))
 		return
 	}
@@ -576,22 +622,19 @@ func (a *ClaudeAdapter) runTurn(run *turnRun) {
 	if err := a.store.SetClaudeAttemptTerminal(context.Background(), run.attemptID, status, out.ResultText, usageJSON); err != nil {
 		// Terminal persistence failed: the outcome cannot be resolved,
 		// so the attempt stays uncertain and the block persists.
-		a.removeTurn(run.ref)
 		run.stream.CloseWithErr(fmt.Errorf("terminal persistence: %w", err))
 		return
 	}
 	if run.firstTurn {
-		if err := a.store.MarkClaudeSessionMaterialized(context.Background(), string(run.ref.SessionID)); err != nil {
-			a.removeTurn(run.ref)
+		if err := a.observeAndMarkMaterialized(run); err != nil {
 			run.stream.SendOrOverflow(adapter.Event{
 				Ref: run.ref, Type: adapter.EventTerminal,
 				Status: turnStatus, Payload: out.ResultText,
 			})
-			run.stream.CloseWithErr(fmt.Errorf("mark session materialized: %w", err))
+			run.stream.CloseWithErr(fmt.Errorf("materialization: %w", err))
 			return
 		}
 	}
-	a.removeTurn(run.ref)
 	run.stream.SendOrOverflow(adapter.Event{
 		Ref: run.ref, Type: adapter.EventTerminal,
 		Status: turnStatus, Payload: out.ResultText,
@@ -606,6 +649,27 @@ func drainReader(r interface{ Read([]byte) (int, error) }) {
 			return
 		}
 	}
+}
+
+// observeAndMarkMaterialized enforces the §3.3 evidence boundary: the
+// binding flips to materialized only after the bound transcript —
+// derived from the binding's own fields — is affirmatively observed to
+// exist as a regular file. A verified stdout result alone proves the
+// turn outcome, never that the transcript exists or belongs to this
+// session.
+func (a *ClaudeAdapter) observeAndMarkMaterialized(run *turnRun) error {
+	path, err := TranscriptPath(run.configRoot, run.boundWorkspace, run.nativeID)
+	if err != nil {
+		return err
+	}
+	st, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("bound transcript was not observed after the first turn: %w", err)
+	}
+	if st.Mode()&os.ModeSymlink != 0 || !st.Mode().IsRegular() {
+		return fmt.Errorf("observed transcript %s is not a regular file", path)
+	}
+	return a.store.MarkClaudeSessionMaterialized(context.Background(), string(run.ref.SessionID))
 }
 
 // boundaryWriter persists the first-byte transmission boundary at the
