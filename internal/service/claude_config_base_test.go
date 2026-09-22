@@ -82,6 +82,62 @@ func TestClaudeConfigBase_RejectsSymlinkIntoStateDir(t *testing.T) {
 	}
 }
 
+// Inverse containment: the state directory must not live inside the
+// claude base.
+func TestClaudeConfigBase_RejectsStateDirInsideBase(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "claude-config")
+	os.MkdirAll(filepath.Join(base, "state"), 0o700)
+	cfg := ServerConfig{
+		StateDir:            filepath.Join(base, "state"),
+		WorkspaceBaseDir:    filepath.Join(dir, "workspaces"),
+		ClaudeBinaryPath:    "claude",
+		ClaudeConfigBaseDir: base,
+	}
+	_, err := resolveClaudeConfigBaseDir(cfg)
+	if err == nil || !strings.Contains(err.Error(), "overlaps") {
+		t.Fatalf("state inside the claude base must be rejected, got %v", err)
+	}
+}
+
+// Inverse containment: the workspace base must not live inside the
+// claude base — including through a symlink.
+func TestClaudeConfigBase_RejectsWorkspaceInsideBase(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "claude-config")
+	wsBase := filepath.Join(base, "workspaces")
+	os.MkdirAll(wsBase, 0o700)
+	cfg := ServerConfig{
+		StateDir:            filepath.Join(dir, "state"),
+		WorkspaceBaseDir:    wsBase,
+		ClaudeBinaryPath:    "claude",
+		ClaudeConfigBaseDir: base,
+	}
+	_, err := resolveClaudeConfigBaseDir(cfg)
+	if err == nil || !strings.Contains(err.Error(), "overlaps") {
+		t.Fatalf("workspace inside the claude base must be rejected, got %v", err)
+	}
+
+	// Symlink flavor: the base resolves to a directory that CONTAINS the
+	// workspace base.
+	outer := t.TempDir()
+	hidden := filepath.Join(outer, "hidden")
+	os.MkdirAll(filepath.Join(hidden, "workspaces"), 0o700)
+	symlinkedBase := filepath.Join(dir, "base-link")
+	if err := os.Symlink(hidden, symlinkedBase); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	cfg2 := ServerConfig{
+		StateDir:            filepath.Join(dir, "state"),
+		WorkspaceBaseDir:    filepath.Join(hidden, "workspaces"),
+		ClaudeBinaryPath:    "claude",
+		ClaudeConfigBaseDir: symlinkedBase,
+	}
+	if _, err := resolveClaudeConfigBaseDir(cfg2); err == nil {
+		t.Fatal("symlinked base containing the workspace must be rejected")
+	}
+}
+
 // A valid base is created securely.
 func TestClaudeConfigBase_CreatedSecure(t *testing.T) {
 	dir := t.TempDir()

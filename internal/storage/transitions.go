@@ -35,6 +35,27 @@ type decisionJournalPayload struct {
 }
 
 var safeProfileIdentifierRegex = regexp.MustCompile(`^[a-zA-Z0-9_\-\.]+$`)
+
+// ValidateSafeIdentifier enforces the repository identifier rule:
+// non-empty, only [A-Za-z0-9_.-] (no path separators on any platform,
+// no traversal), length-bounded. "." and ".." are rejected.
+func ValidateSafeIdentifier(kind, id string) error {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" {
+		return fmt.Errorf("%s is empty", kind)
+	}
+	if len(trimmed) > 128 {
+		return fmt.Errorf("%s exceeds 128 bytes", kind)
+	}
+	if !safeProfileIdentifierRegex.MatchString(trimmed) {
+		return fmt.Errorf("%s %q contains characters outside [A-Za-z0-9_.-]", kind, id)
+	}
+	if trimmed == "." || trimmed == ".." {
+		return fmt.Errorf("%s %q is a reserved path component", kind, id)
+	}
+	return nil
+}
+
 var envAssignmentRegex = regexp.MustCompile(`(?i)[a-z0-9_]*(key|token|secret|password|bearer|auth)[a-z0-9_]*\s*=`)
 var envVarNameRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 

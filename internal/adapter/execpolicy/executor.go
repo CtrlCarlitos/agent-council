@@ -50,6 +50,10 @@ type LaunchRequest struct {
 	// shape, injects it as CLAUDE_CONFIG_DIR after the scrub pass, and
 	// keeps it out of captured event payloads.
 	ClaudeConfigDir string
+	// ClaudeConfigBaseDir is the trusted base the config dir must be
+	// contained in (service-validated). Required whenever
+	// ClaudeConfigDir is set; verified symlink-safe before injection.
+	ClaudeConfigBaseDir string
 }
 
 // CapabilityChecker verifies whether the host environment supports required isolation capabilities.

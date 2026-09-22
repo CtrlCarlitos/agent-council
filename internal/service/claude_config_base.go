@@ -70,8 +70,12 @@ func checkClaudeBaseContainment(cfg ServerConfig, candidate string) error {
 		if err != nil {
 			return fmt.Errorf("resolve %s: %w", name, err)
 		}
-		if pathContains(resolvedBase, candidate) {
-			return fmt.Errorf("%s is inside %s (%s): the claude config base must be outside both the state directory and the workspace base", candidate, name, base)
+		// Both directions: the claude base must not live inside the
+		// protected tree, and the protected tree must not live inside
+		// the claude base (a Claude process escaping its root could
+		// otherwise reach service state).
+		if pathContains(resolvedBase, candidate) || pathContains(candidate, resolvedBase) {
+			return fmt.Errorf("%s overlaps %s (%s): the claude config base must be outside both the state directory and the workspace base", candidate, name, base)
 		}
 	}
 	return nil

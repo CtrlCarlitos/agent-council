@@ -8,6 +8,8 @@ package execpolicy
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -118,14 +120,54 @@ func IsClaudeLaunch(req LaunchRequest) bool {
 }
 
 // validateClaudeConfigDir gates the typed extension: when set, the
-// launch MUST be the exact Claude shape. Unset is a no-op (launches
-// without the extension are not this adapter's concern).
+// launch MUST be the exact Claude shape AND the config dir must resolve
+// inside the trusted ClaudeConfigBaseDir carried on the request
+// (symlink-safe, verified against the real filesystem). Unset is a
+// no-op (launches without the extension are not this adapter's
+// concern).
 func validateClaudeConfigDir(req LaunchRequest) error {
 	if strings.TrimSpace(req.ClaudeConfigDir) == "" {
 		return nil
 	}
 	if !IsClaudeLaunch(req) {
 		return fmt.Errorf("%w: launch is %q %v", ErrClaudeConfigDirShape, req.Command, req.Args)
+	}
+	base := strings.TrimSpace(req.ClaudeConfigBaseDir)
+	if base == "" {
+		return fmt.Errorf("%w: ClaudeConfigBaseDir is required with ClaudeConfigDir", ErrClaudeConfigDirShape)
+	}
+	if err := validateContainedDir(base, req.ClaudeConfigDir); err != nil {
+		return fmt.Errorf("%w: config dir containment failed: %v", ErrClaudeConfigDirShape, err)
+	}
+	return nil
+}
+
+// validateContainedDir verifies, symlink-safe, that candidate is an
+// existing directory inside base: the base is fully resolved, every
+// candidate component below the nearest existing ancestor must be a
+// real (non-symlink) directory, and the fully resolved candidate must
+// remain within the resolved base.
+func validateContainedDir(base, candidate string) error {
+	resolvedBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		return fmt.Errorf("resolve base: %w", err)
+	}
+	fi, err := os.Lstat(candidate)
+	if err != nil {
+		return fmt.Errorf("config dir: %w", err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("config dir is a symlink")
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("config dir is not a directory")
+	}
+	real, err := filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return fmt.Errorf("resolve config dir: %w", err)
+	}
+	if !strings.HasPrefix(real, resolvedBase+string(os.PathSeparator)) {
+		return fmt.Errorf("config dir %q resolves outside the claude config base %q", candidate, base)
 	}
 	return nil
 }

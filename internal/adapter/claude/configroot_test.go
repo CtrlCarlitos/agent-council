@@ -1,9 +1,11 @@
 package claude
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -121,6 +123,100 @@ func TestMaterializeConfigRoot_SecurePermissions(t *testing.T) {
 	}
 	if perm := permOf(t, filepath.Join(root, "settings.json")); perm != 0o600 {
 		t.Fatalf("copied files must be 0600, got %v", perm)
+	}
+}
+
+// Concurrent materializations of the SAME session: exactly one wins,
+// the rest fail closed, and no temporary directories are left behind.
+func TestMaterializeConfigRoot_ConcurrentSameSessionSingleWinner(t *testing.T) {
+	tmpl := writeTemplate(t, map[string]string{"settings.json": "{}"})
+	base := t.TempDir()
+
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, _, errs[i] = MaterializeConfigRoot(tmpl, base, "run-c", "sess-c")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	winners := 0
+	for _, err := range errs {
+		if err == nil {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("exactly one concurrent materialization must win, got %d", winners)
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		t.Fatalf("read base: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".config-tmp-") {
+			t.Fatalf("temporary directories must be cleaned up, found %q", e.Name())
+		}
+	}
+}
+
+// Concurrent materializations of DIFFERENT sessions all succeed.
+func TestMaterializeConfigRoot_ConcurrentDistinctSessionsAllSucceed(t *testing.T) {
+	tmpl := writeTemplate(t, map[string]string{"settings.json": "{}"})
+	base := t.TempDir()
+
+	const n = 6
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	failures := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, _, err := MaterializeConfigRoot(tmpl, base, "run-d", fmt.Sprintf("sess-%d", i))
+			if err != nil {
+				failures[i] = err
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range failures {
+		if err != nil {
+			t.Fatalf("session %d: %v", i, err)
+		}
+	}
+}
+
+// A post-rename verification failure removes the published root.
+func TestMaterializeConfigRoot_PostRenameVerificationFailureCleansUp(t *testing.T) {
+	tmpl := writeTemplate(t, map[string]string{"settings.json": "{}"})
+	base := t.TempDir()
+
+	orig := digestTree
+	calls := 0
+	digestTree = func(dir string) (string, error) {
+		calls++
+		if calls == 2 { // the post-rename verification
+			return "", fmt.Errorf("injected verification failure")
+		}
+		return orig(dir)
+	}
+	defer func() { digestTree = orig }()
+
+	if _, _, err := MaterializeConfigRoot(tmpl, base, "run-1", "sess-1"); err == nil {
+		t.Fatal("post-rename verification failure must fail the materialization")
+	}
+	if _, err := os.Stat(filepath.Join(base, "run-1", "sess-1", "config")); !os.IsNotExist(err) {
+		t.Fatal("failed post-rename verification must remove the published root")
 	}
 }
 

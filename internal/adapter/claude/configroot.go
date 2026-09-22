@@ -11,7 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
+
+	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
 const (
@@ -22,10 +23,16 @@ const (
 
 var runtimeGOOSWindows = runtime.GOOS == "windows"
 
+// digestTree is an indirection so tests can inject a post-rename
+// verification failure.
+var digestTree = TemplateDigest
+
 // MaterializeConfigRoot copies the operator template into
-// <base>/<runID>/<sessionID>/config atomically (temporary directory plus
-// rename) and returns the materialized root with its ctmpl-v1 digest.
-// Fail closed: invalid templates leave nothing behind.
+// <base>/<runID>/<sessionID>/config atomically (uniquely named temporary
+// directory plus rename, reserved under the destination's parent so the
+// rename stays on one filesystem) and returns the materialized root with
+// its ctmpl-v1 digest. Fail closed: invalid templates and post-rename
+// verification failures leave nothing published.
 func MaterializeConfigRoot(templateDir, base, runID, sessionID string) (string, string, error) {
 	// Validate the template before touching the destination.
 	wantDigest, err := TemplateDigest(templateDir)
@@ -33,12 +40,11 @@ func MaterializeConfigRoot(templateDir, base, runID, sessionID string) (string, 
 		return "", "", fmt.Errorf("validate template: %w", err)
 	}
 
-	if strings.TrimSpace(runID) == "" || strings.TrimSpace(sessionID) == "" {
-		return "", "", fmt.Errorf("run and session IDs are required to materialize a config root")
+	if err := storage.ValidateSafeIdentifier("run ID", runID); err != nil {
+		return "", "", fmt.Errorf("invalid run ID: %w", err)
 	}
-	if strings.Contains(runID, "/") || strings.Contains(sessionID, "/") ||
-		runID == "." || runID == ".." || sessionID == "." || sessionID == ".." {
-		return "", "", fmt.Errorf("run/session IDs must be plain path components")
+	if err := storage.ValidateSafeIdentifier("session ID", sessionID); err != nil {
+		return "", "", fmt.Errorf("invalid session ID: %w", err)
 	}
 
 	finalRoot := filepath.Join(base, runID, sessionID, "config")
@@ -47,18 +53,25 @@ func MaterializeConfigRoot(templateDir, base, runID, sessionID string) (string, 
 	} else if !os.IsNotExist(err) {
 		return "", "", fmt.Errorf("stat config root: %w", err)
 	}
-
-	tmpRoot := finalRoot + ".tmp"
-	_ = os.RemoveAll(tmpRoot)
-	if err := os.MkdirAll(filepath.Dir(tmpRoot), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(finalRoot), 0o700); err != nil {
 		return "", "", fmt.Errorf("create parent directories: %w", err)
 	}
-	if err := os.Mkdir(tmpRoot, 0o700); err != nil {
+
+	// UNIQUE per-call temporary directory under the destination's parent:
+	// concurrent materializations never share or delete each other's
+	// work, and the rename stays on one filesystem.
+	tmpRoot, err := os.MkdirTemp(filepath.Dir(finalRoot), ".config-tmp-")
+	if err != nil {
 		return "", "", fmt.Errorf("create temporary root: %w", err)
 	}
+	published := false
+	defer func() {
+		if !published {
+			_ = os.RemoveAll(tmpRoot)
+		}
+	}()
 
 	if err := copyTree(templateDir, tmpRoot); err != nil {
-		_ = os.RemoveAll(tmpRoot)
 		return "", "", fmt.Errorf("copy template: %w", err)
 	}
 	if runtimeGOOSWindows {
@@ -67,21 +80,33 @@ func MaterializeConfigRoot(templateDir, base, runID, sessionID string) (string, 
 		// unverified (spec §3.6 fail-closed statement).
 		_ = os.Chmod(tmpRoot, 0o700)
 	} else if err := os.Chmod(tmpRoot, 0o700); err != nil {
-		_ = os.RemoveAll(tmpRoot)
 		return "", "", fmt.Errorf("secure temporary root: %w", err)
 	}
 
-	if err := os.Rename(tmpRoot, finalRoot); err != nil {
-		_ = os.RemoveAll(tmpRoot)
-		return "", "", fmt.Errorf("publish config root: %w", err)
-	}
-
-	digest, err := TemplateDigest(finalRoot)
+	// Pre-rename verification: the temporary tree must already match.
+	digest, err := digestTree(tmpRoot)
 	if err != nil {
-		return "", "", fmt.Errorf("digest materialized root: %w", err)
+		return "", "", fmt.Errorf("digest temporary root: %w", err)
 	}
 	if digest != wantDigest {
 		return "", "", fmt.Errorf("materialized root digest %q does not match the template %q", digest, wantDigest)
+	}
+
+	if err := os.Rename(tmpRoot, finalRoot); err != nil {
+		return "", "", fmt.Errorf("publish config root: %w", err)
+	}
+	published = true
+
+	// Defensive post-rename re-verification: a failure removes the
+	// published root rather than leaving a bad tree in place.
+	digest, err = digestTree(finalRoot)
+	if err != nil {
+		_ = os.RemoveAll(finalRoot)
+		return "", "", fmt.Errorf("verify published config root: %w", err)
+	}
+	if digest != wantDigest {
+		_ = os.RemoveAll(finalRoot)
+		return "", "", fmt.Errorf("published root digest %q does not match the template %q; removed", digest, wantDigest)
 	}
 	return finalRoot, digest, nil
 }

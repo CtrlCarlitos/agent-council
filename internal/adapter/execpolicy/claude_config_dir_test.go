@@ -2,6 +2,8 @@ package execpolicy
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -28,11 +30,29 @@ func claudeArgs() []string {
 	}...)
 }
 
-// The typed extension is accepted only on the exact Claude launch shape.
+// containedConfigRoot builds a REAL config root inside a temporary base
+// and returns both paths.
+func containedConfigRoot(t *testing.T) (base, dir string) {
+	t.Helper()
+	base = t.TempDir()
+	dir = filepath.Join(base, "run-cl", "sess-cl", "config")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir config root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	return base, dir
+}
+
+// The typed extension is accepted only on the exact Claude launch shape
+// with the config dir contained in the trusted base.
 func TestClaudeConfigDir_AcceptedOnExactClaudeShape(t *testing.T) {
-	req := claudeLaunch("/svc/claude/run-cl/sess-cl/config")
+	base, dir := containedConfigRoot(t)
+	req := claudeLaunch(dir)
+	req.ClaudeConfigBaseDir = base
 	if err := validateClaudeConfigDir(req); err != nil {
-		t.Fatalf("exact claude shape must accept the config dir: %v", err)
+		t.Fatalf("exact claude shape must accept a contained config dir: %v", err)
 	}
 	if !IsClaudeLaunch(req) {
 		t.Fatal("sanity: exact shape must be recognized")
@@ -40,6 +60,7 @@ func TestClaudeConfigDir_AcceptedOnExactClaudeShape(t *testing.T) {
 }
 
 func TestClaudeConfigDir_RejectedOnOtherLaunches(t *testing.T) {
+	base, dir := containedConfigRoot(t)
 	cases := []struct {
 		name string
 		mut  func(*LaunchRequest)
@@ -71,7 +92,8 @@ func TestClaudeConfigDir_RejectedOnOtherLaunches(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			req := claudeLaunch("/svc/claude/config")
+			req := claudeLaunch(dir)
+			req.ClaudeConfigBaseDir = base
 			tc.mut(&req)
 			err := validateClaudeConfigDir(req)
 			if err == nil {
@@ -94,8 +116,12 @@ func TestClaudeConfigDir_UnsetIsNoOp(t *testing.T) {
 	if err := validateClaudeConfigDir(whitespace); err != nil {
 		t.Fatalf("whitespace-only extension must be treated as unset, got %v", err)
 	}
-	// Set on a claude launch: accepted.
-	if err := validateClaudeConfigDir(claudeLaunch("/svc/config")); err != nil {
+	// Set on a claude launch: accepted when the dir is contained in a
+	// real base.
+	b, d := containedConfigRoot(t)
+	withBase := claudeLaunch(d)
+	withBase.ClaudeConfigBaseDir = b
+	if err := validateClaudeConfigDir(withBase); err != nil {
 		t.Fatalf("set extension on an exact claude launch must validate: %v", err)
 	}
 }
@@ -132,11 +158,58 @@ func TestIsClaudeLaunch_ExactContract(t *testing.T) {
 
 // ErrClaudeConfigDirShape must be the typed rejection.
 func TestClaudeConfigDir_TypedError(t *testing.T) {
-	req := claudeLaunch("/svc/config")
+	base, dir := containedConfigRoot(t)
+	req := claudeLaunch(dir)
+	req.ClaudeConfigBaseDir = base
 	req.Command = "opencode"
 	req.Args = []string{"serve", "--hostname", "127.0.0.1", "--port", "0"}
 	err := validateClaudeConfigDir(req)
 	if !errors.Is(err, ErrClaudeConfigDirShape) {
 		t.Fatalf("expected ErrClaudeConfigDirShape, got %v", err)
 	}
+}
+
+func TestClaudeConfigDir_ContainmentRules(t *testing.T) {
+	base, dir := containedConfigRoot(t)
+	launchWith := func(configDir, configBase string) LaunchRequest {
+		req := claudeLaunch(configDir)
+		req.ClaudeConfigBaseDir = configBase
+		return req
+	}
+
+	t.Run("missing base", func(t *testing.T) {
+		req := launchWith(dir, "")
+		err := validateClaudeConfigDir(req)
+		if err == nil || !strings.Contains(err.Error(), "ClaudeConfigBaseDir is required") {
+			t.Fatalf("missing base must be rejected, got %v", err)
+		}
+	})
+	t.Run("config dir outside base", func(t *testing.T) {
+		outside := t.TempDir()
+		insideOutside := filepath.Join(outside, "config")
+		os.MkdirAll(insideOutside, 0o700)
+		err := validateClaudeConfigDir(launchWith(insideOutside, base))
+		if err == nil || !strings.Contains(err.Error(), "outside the claude config base") {
+			t.Fatalf("config dir outside the base must be rejected, got %v", err)
+		}
+	})
+	t.Run("config dir is symlink", func(t *testing.T) {
+		outside := t.TempDir()
+		target := filepath.Join(outside, "real-config")
+		os.MkdirAll(target, 0o700)
+		link := filepath.Join(base, "link-config")
+		if err := os.Symlink(target, link); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		err := validateClaudeConfigDir(launchWith(link, base))
+		if err == nil {
+			t.Fatal("symlinked config dir must be rejected")
+		}
+	})
+	t.Run("config dir does not exist", func(t *testing.T) {
+		err := validateClaudeConfigDir(launchWith(filepath.Join(base, "run-x", "sess-x", "config"), base))
+		if err == nil {
+			t.Fatal("non-existent config dir must be rejected")
+		}
+	})
 }
