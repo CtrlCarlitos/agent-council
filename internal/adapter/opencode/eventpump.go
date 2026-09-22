@@ -218,13 +218,13 @@ func (p *sessionPump) handleEvent(payload string) {
 			Payload: text,
 		})
 	case "message.error":
-		p.route(parentID, adapter.Event{
+		p.routeAndFinish(parentID, adapter.Event{
 			Type:    adapter.EventTerminal,
 			Status:  council.TurnFailed,
 			Payload: errorMessage(ev.Error),
 		})
 	case "message.completed":
-		p.route(parentID, adapter.Event{
+		p.routeAndFinish(parentID, adapter.Event{
 			Type:   adapter.EventTerminal,
 			Status: council.TurnCompleted,
 		})
@@ -261,6 +261,15 @@ func (p *sessionPump) handlePermission(perm *struct {
 		denied.Payload = fmt.Sprintf("deny reply failed: %v", replyErr)
 	}
 	p.route(parentID, denied)
+}
+
+// routeAndFinish routes a terminal event and ends the turn's tap: the
+// stream closes for the consumer while the native pump keeps draining
+// (the session stays alive for follow-up turns).
+func (p *sessionPump) routeAndFinish(parentID string, ev adapter.Event) {
+	if p.route(parentID, ev) {
+		p.detach(parentID)
+	}
 }
 
 // resyncFromHistory reconstructs terminal state from message history after
@@ -311,6 +320,10 @@ func (p *sessionPump) resyncFromHistory() {
 				d.terminal = true
 			}
 			tap.owner.mu.Unlock()
+			_ = tap.stream.Close()
+			p.mu.Lock()
+			delete(p.turns, userMsgID)
+			p.mu.Unlock()
 		}
 	}
 }

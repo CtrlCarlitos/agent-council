@@ -31,6 +31,11 @@ type ServerConfig struct {
 	// it.
 	OpenCodeProbeProfile storage.CanonicalProfile
 
+	// OpenCodeIdleGrace, when positive, configures how long the OpenCode
+	// adapter keeps a contributor server alive after its last terminal
+	// turn before parking it. Zero uses the adapter default.
+	OpenCodeIdleGrace time.Duration
+
 	// OpenCodeProbeScratchRoot is the operator-provisioned directory for
 	// probe scratch directories. Required when OpenCodeBinaryPath is set;
 	// it must lie outside both StateDir and WorkspaceBaseDir. The service
@@ -113,8 +118,12 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 			return nil, fmt.Errorf("OpenCode probe scratch root: %w", scratchErr)
 		}
 		probeTemplate := opencode.NewOperatorProbeLaunchTemplate(cfg.OpenCodeBinaryPath, scratchRoot, cfg.OpenCodeProbeProfile)
+		opts := []opencode.OpenCodeAdapterOption{}
+		if cfg.OpenCodeIdleGrace > 0 {
+			opts = append(opts, opencode.WithIdleGrace(cfg.OpenCodeIdleGrace))
+		}
 		var opErr error
-		adp, opErr = opencode.NewProductionOpenCodeAdapter(store, wm, pe, probeTemplate)
+		adp, opErr = opencode.NewProductionOpenCodeAdapter(store, wm, pe, probeTemplate, opts...)
 		if opErr != nil {
 			return nil, fmt.Errorf("OpenCode adapter construction: %w", opErr)
 		}

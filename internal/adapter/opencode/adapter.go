@@ -618,6 +618,18 @@ func (a *OpenCodeAdapter) ensurePumpLocked(nativeID string, client *NativeClient
 	return p
 }
 
+// IdleParkedSessions reports how many sessions currently have a parked
+// serve child (stopped after idle grace, resumable). Evidence helper for
+// lifecycle acceptance.
+func (a *OpenCodeAdapter) IdleParkedSessions() int {
+	if a.servers == nil {
+		return 0
+	}
+	a.servers.mu.Lock()
+	defer a.servers.mu.Unlock()
+	return len(a.servers.parked)
+}
+
 // stopPump ends the drain loop for a native session and drops its taps.
 func (a *OpenCodeAdapter) stopPump(nativeID string) {
 	a.mu.Lock()
