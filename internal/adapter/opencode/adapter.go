@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,7 +47,30 @@ type OpenCodeAdapter struct {
 	dispatches map[adapter.TurnRef]*managedDispatch
 	launching  map[adapter.TurnRef]*launchReservation
 	unknown    map[adapter.TurnRef]string // ref → messageID of an ambiguous attempt
+	verdicts   map[adapter.TurnRef]adapter.DispatchStatus
+	bindings   map[adapter.SessionID]*sessionBinding
+	pumps      map[string]*sessionPump // native session ID → event pump
 	parkTimers map[adapter.SessionID]*time.Timer
+}
+
+// sessionBinding records the server-assigned native session for a logical
+// session, established by CreateSession and re-established by
+// ResumeSession. The native ID is never synthesized by the adapter.
+type sessionBinding struct {
+	nativeID string
+	model    string
+}
+
+// ErrNativeSessionMissing reports a persisted binding whose native session
+// no longer exists on the harness server (verified 404). Distinct from
+// ErrSessionCreationUncertain: the binding is missing, not uncertain.
+type ErrNativeSessionMissing struct {
+	SessionID       adapter.SessionID
+	NativeSessionID string
+}
+
+func (e *ErrNativeSessionMissing) Error() string {
+	return fmt.Sprintf("native session %s is missing for session %s", e.NativeSessionID, e.SessionID)
 }
 
 // OpenCodeAdapterOption configures an OpenCodeAdapter.
@@ -72,6 +96,9 @@ func NewOpenCodeAdapter(
 		dispatches:    make(map[adapter.TurnRef]*managedDispatch),
 		launching:     make(map[adapter.TurnRef]*launchReservation),
 		unknown:       make(map[adapter.TurnRef]string),
+		verdicts:      make(map[adapter.TurnRef]adapter.DispatchStatus),
+		bindings:      make(map[adapter.SessionID]*sessionBinding),
+		pumps:         make(map[string]*sessionPump),
 		parkTimers:    make(map[adapter.SessionID]*time.Timer),
 	}
 	for _, opt := range opts {
@@ -103,17 +130,99 @@ func (a *OpenCodeAdapter) CreateSession(ctx context.Context, req adapter.CreateS
 	if err := req.Validate(); err != nil {
 		return adapter.SessionBinding{}, err
 	}
-	return adapter.SessionBinding{
-		SessionID:       req.SessionID,
-		Contributor:     req.Contributor,
-		NativeSessionID: fmt.Sprintf("ses_council_%s", req.SessionID),
-		Config:          req.Config,
-	}, nil
+
+	// Idempotent on matching configuration: one native session per
+	// logical session.
+	a.mu.Lock()
+	if existing, ok := a.bindings[req.SessionID]; ok {
+		a.mu.Unlock()
+		return adapter.SessionBinding{
+			SessionID:       req.SessionID,
+			Contributor:     req.Contributor,
+			NativeSessionID: existing.nativeID,
+			Config:          req.Config,
+		}, nil
+	}
+	a.mu.Unlock()
+
+	binding := adapter.SessionBinding{
+		SessionID:   req.SessionID,
+		Contributor: req.Contributor,
+		Config:      req.Config,
+	}
+
+	// Model validation fails closed BEFORE any native resource is
+	// created: the configured provider/model must be present in the
+	// credential-free model inventory.
+	client, err := a.clientForOrResume(ctx, req.SessionID)
+	if err != nil {
+		return adapter.SessionBinding{}, &adapter.ErrSessionCreationUncertain{
+			SessionID: req.SessionID, Contributor: req.Contributor, Err: err,
+		}
+	}
+	models, err := client.Models(ctx)
+	if err != nil {
+		return adapter.SessionBinding{}, &adapter.ErrSessionCreationUncertain{
+			SessionID: req.SessionID, Contributor: req.Contributor, Err: err,
+		}
+	}
+	model := strings.TrimSpace(req.Config.Model)
+	modelKnown := false
+	for _, m := range models {
+		if m == model {
+			modelKnown = true
+			break
+		}
+	}
+	if model == "" || !modelKnown {
+		return adapter.SessionBinding{}, fmt.Errorf(
+			"model %q is not present in the native model inventory; session creation fails closed", model)
+	}
+
+	// The native session ID is assigned by the server, never synthesized.
+	nativeID, err := client.CreateSession(ctx, fmt.Sprintf("council %s", req.SessionID), req.Config.WorkspaceRoot)
+	if err != nil {
+		if IsPostWriteError(err) {
+			return adapter.SessionBinding{}, &adapter.ErrSessionCreationUncertain{
+				SessionID: req.SessionID, Contributor: req.Contributor, Err: err,
+			}
+		}
+		return adapter.SessionBinding{}, err
+	}
+
+	a.mu.Lock()
+	a.bindings[req.SessionID] = &sessionBinding{nativeID: nativeID, model: model}
+	a.mu.Unlock()
+	binding.NativeSessionID = nativeID
+	return binding, nil
 }
 
 // ── ResumeSession ───────────────────────────────────────────────────────
 
 func (a *OpenCodeAdapter) ResumeSession(ctx context.Context, binding adapter.SessionBinding) error {
+	if strings.TrimSpace(binding.NativeSessionID) == "" {
+		return fmt.Errorf("resume requires a persisted native session binding")
+	}
+	client, err := a.clientForOrResume(ctx, binding.SessionID)
+	if err != nil {
+		return err
+	}
+	exists, err := client.GetSession(ctx, binding.NativeSessionID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return &ErrNativeSessionMissing{
+			SessionID:       binding.SessionID,
+			NativeSessionID: binding.NativeSessionID,
+		}
+	}
+	a.mu.Lock()
+	a.bindings[binding.SessionID] = &sessionBinding{
+		nativeID: binding.NativeSessionID,
+		model:    binding.Config.Model,
+	}
+	a.mu.Unlock()
 	return nil
 }
 
@@ -131,6 +240,7 @@ func (a *OpenCodeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, pro
 
 	msgID, err := NativeMessageID(string(ref.SessionID), ref.TurnKey, attempt)
 	if err != nil {
+		a.recordVerdict(ref, adapter.DispatchRejected)
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: err.Error()}, err
 	}
 
@@ -138,8 +248,19 @@ func (a *OpenCodeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, pro
 
 	client, err := a.clientForOrResume(ctx, ref.SessionID)
 	if err != nil {
+		a.recordVerdict(ref, adapter.DispatchRejected)
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: err.Error()}, err
 	}
+
+	// The native session comes from the persisted binding when one
+	// exists; direct-dispatch (fixture/embedded) paths address the child
+	// session directly.
+	nativeID := string(ref.SessionID)
+	a.mu.Lock()
+	if b, ok := a.bindings[ref.SessionID]; ok {
+		nativeID = b.nativeID
+	}
+	a.mu.Unlock()
 
 	// Reservation: concurrent Dispatch calls for the same ref share one
 	// native attempt and the launcher's verdict.
@@ -157,14 +278,17 @@ func (a *OpenCodeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, pro
 	a.launching[ref] = res
 	a.mu.Unlock()
 
-	outcome, err := a.dispatchNative(ctx, ref, client, msgID, prompt)
+	outcome, err := a.dispatchNative(ctx, ref, client, nativeID, msgID, prompt)
 
 	a.mu.Lock()
 	delete(a.launching, ref)
+	a.verdicts[ref] = outcome.Status
 	switch outcome.Status {
 	case adapter.DispatchAccepted:
 		delete(a.unknown, ref)
-		a.dispatches[ref] = &managedDispatch{userMessageID: msgID, nativeSessionID: string(ref.SessionID)}
+		a.dispatches[ref] = &managedDispatch{userMessageID: msgID, nativeSessionID: nativeID}
+		pump := a.ensurePumpLocked(nativeID, client)
+		pump.register(msgID, &turnTap{ref: ref, stream: adapter.NewBufferedStream(ref, 64), owner: a})
 	case adapter.DispatchUnknown:
 		a.unknown[ref] = msgID
 	}
@@ -179,13 +303,13 @@ func (a *OpenCodeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, pro
 // ref with a prior ambiguous attempt it first verifies by GET-by-message-ID:
 // only a verified 404 authorizes resubmission; an already-recorded message is
 // accepted without a second prompt_async.
-func (a *OpenCodeAdapter) dispatchNative(ctx context.Context, ref adapter.TurnRef, client *NativeClient, msgID, prompt string) (adapter.DispatchOutcome, error) {
+func (a *OpenCodeAdapter) dispatchNative(ctx context.Context, ref adapter.TurnRef, client *NativeClient, nativeID, msgID, prompt string) (adapter.DispatchOutcome, error) {
 	a.mu.Lock()
 	_, priorUnknown := a.unknown[ref]
 	a.mu.Unlock()
 
 	if priorUnknown {
-		_, recorded, verifyErr := client.GetMessage(ctx, string(ref.SessionID), msgID)
+		_, recorded, verifyErr := client.GetMessage(ctx, nativeID, msgID)
 		if verifyErr != nil {
 			return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown, Reason: "retry verification failed: " + verifyErr.Error()}, verifyErr
 		}
@@ -194,7 +318,7 @@ func (a *OpenCodeAdapter) dispatchNative(ctx context.Context, ref adapter.TurnRe
 		}
 	}
 
-	if err := client.PromptAsync(ctx, string(ref.SessionID), msgID, prompt); err != nil {
+	if err := client.PromptAsync(ctx, nativeID, msgID, prompt); err != nil {
 		if IsPostWriteError(err) {
 			return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown, Reason: "post-write transport failure: " + err.Error()}, err
 		}
@@ -205,25 +329,42 @@ func (a *OpenCodeAdapter) dispatchNative(ctx context.Context, ref adapter.TurnRe
 
 // ── Observe ─────────────────────────────────────────────────────────────
 
+// Observe attaches a buffered tap to the session's adapter-owned event
+// pump. Cancelling ctx detaches the tap only: the native stream keeps
+// draining and events keep flowing into the pump's turn registry.
 func (a *OpenCodeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter.Stream, error) {
-	stream := adapter.NewBufferedStream(ref, 64)
-	go func() {
-		ticker := time.NewTicker(200 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				a.mu.Lock()
-				_, ok := a.dispatches[ref]
-				a.mu.Unlock()
-				if !ok {
-					return
-				}
-			}
+	a.mu.Lock()
+	d, ok := a.dispatches[ref]
+	var pump *sessionPump
+	if ok {
+		pump = a.pumps[d.nativeSessionID]
+	}
+	a.mu.Unlock()
+	if !ok {
+		return nil, errors.New("turn not dispatched")
+	}
+	if pump == nil {
+		client, err := a.clientFor(ref.SessionID)
+		if err != nil {
+			return nil, err
 		}
-	}()
+		a.mu.Lock()
+		pump = a.ensurePumpLocked(d.nativeSessionID, client)
+		a.mu.Unlock()
+	}
+	stream := adapter.NewBufferedStream(ref, 64)
+	tap := &turnTap{ref: ref, stream: stream, owner: a, done: ctx.Done()}
+	pump.register(d.userMessageID, tap)
+
+	// Detach on caller cancellation: the tap ends, the native stream and
+	// the pump continue. A nil Done channel (caller passed a context
+	// without cancellation) simply never detaches.
+	if tap.done != nil {
+		go func() {
+			<-tap.done
+			pump.detach(d.userMessageID)
+		}()
+	}
 	return stream, nil
 }
 
@@ -281,24 +422,123 @@ func (a *OpenCodeAdapter) Collect(ctx context.Context, ref adapter.TurnRef) (ada
 
 // ── Reconcile ───────────────────────────────────────────────────────────
 
+// Reconcile applies the spec §3.5 evidence rules, correlating the exact
+// native message — never the bare session: a verified assistant reply
+// (parentID == deterministic user-message ID) is a terminal outcome; a
+// verified live submission is reachable-active; transport loss, 404 after
+// a possible acceptance, and ambiguous idle are uncertain; a recorded
+// pre-acceptance failure with the message provably absent is
+// definitively missing.
 func (a *OpenCodeAdapter) Reconcile(ctx context.Context, ref adapter.RecoveryRef) (adapter.ReconciliationOutcome, error) {
-	msg, found := a.findAssistantByParentID(ctx, string(ref.TurnRef.SessionID), "")
-	if !found {
-		// No assistant message yet: the native execution may still be running
-		// or the process may have died. Uncertain.
+	a.mu.Lock()
+	verdict := a.verdicts[ref.TurnRef]
+	msgID := ""
+	if d, ok := a.dispatches[ref.TurnRef]; ok {
+		msgID = d.userMessageID
+	}
+	if msgID == "" {
+		msgID = a.unknown[ref.TurnRef]
+	}
+	nativeID := string(ref.TurnRef.SessionID)
+	if b, ok := a.bindings[ref.TurnRef.SessionID]; ok {
+		nativeID = b.nativeID
+	}
+	a.mu.Unlock()
+
+	// Positive pre-acceptance evidence: the dispatch was rejected before
+	// the server could accept it.
+	neverAccepted := verdict == adapter.DispatchRejected
+	definitivelyMissing := func() adapter.ReconciliationOutcome {
+		return adapter.ReconciliationOutcome{
+			Ref: ref, Reachability: council.VisibilityReachable,
+			Status: adapter.ReconciliationDefinitivelyMissing, Observed: council.TurnFailed,
+		}
+	}
+	uncertain := func() adapter.ReconciliationOutcome {
 		return adapter.ReconciliationOutcome{
 			Ref: ref, Reachability: council.VisibilityHostLost,
 			Status: adapter.ReconciliationUncertain, Observed: council.TurnRunning,
+		}
+	}
+
+	client, err := a.clientFor(ref.TurnRef.SessionID)
+	if err != nil {
+		if neverAccepted {
+			return definitivelyMissing(), nil
+		}
+		return uncertain(), nil
+	}
+
+	exists, err := client.GetSession(ctx, nativeID)
+	if err != nil {
+		// Transport loss to the server: 404-proof is unavailable, and a
+		// lost connection proves nothing about an orphan worker's work.
+		if neverAccepted {
+			return definitivelyMissing(), nil
+		}
+		return uncertain(), nil
+	}
+	if !exists {
+		// Session 404 after a possibly-accepted dispatch proves nothing
+		// about the work.
+		if neverAccepted {
+			return definitivelyMissing(), nil
+		}
+		return uncertain(), nil
+	}
+
+	if msgID == "" {
+		// Ambiguous idle: nothing correlates this turn to native state.
+		return uncertain(), nil
+	}
+
+	_, found, err := client.GetMessage(ctx, nativeID, msgID)
+	if err != nil {
+		if neverAccepted {
+			return definitivelyMissing(), nil
+		}
+		return uncertain(), nil
+	}
+	if !found {
+		if neverAccepted {
+			return definitivelyMissing(), nil
+		}
+		return uncertain(), nil
+	}
+
+	// The submission is on the server: answered?
+	msgs, err := client.ListMessages(ctx, nativeID)
+	if err != nil {
+		return adapter.ReconciliationOutcome{
+			Ref: ref, Reachability: council.VisibilityReachable,
+			Status: adapter.ReconciliationReachableActive, Observed: council.TurnRunning,
 		}, nil
 	}
-	observed := council.TurnCompleted
-	if msg.Error != nil {
-		observed = council.TurnFailed
+	for i := range msgs {
+		m := &msgs[i]
+		if m.Role == "assistant" && m.ParentID == msgID {
+			observed := council.TurnCompleted
+			result := ""
+			for _, part := range m.Parts {
+				if part.Type == "text" {
+					result = part.Text
+					break
+				}
+			}
+			if m.Error != nil {
+				observed = council.TurnFailed
+				result = m.Error.Message
+			}
+			return adapter.ReconciliationOutcome{
+				Ref: ref, Reachability: council.VisibilityReachable,
+				Status:   adapter.ReconciliationReachableTerminal,
+				Observed: observed, Result: result,
+			}, nil
+		}
 	}
 	return adapter.ReconciliationOutcome{
 		Ref: ref, Reachability: council.VisibilityReachable,
-		Status:   adapter.ReconciliationReachableTerminal,
-		Observed: observed,
+		Status: adapter.ReconciliationReachableActive, Observed: council.TurnRunning,
 	}, nil
 }
 
@@ -359,6 +599,36 @@ func (a *OpenCodeAdapter) clientForOrResume(ctx context.Context, sessionID adapt
 	return a.clientFor(sessionID)
 }
 
+// recordVerdict stores the latest dispatch verdict for reconciliation
+// evidence rules.
+func (a *OpenCodeAdapter) recordVerdict(ref adapter.TurnRef, status adapter.DispatchStatus) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.verdicts[ref] = status
+}
+
+// ensurePumpLocked returns the pump for a native session, creating it if
+// absent. Callers must hold a.mu.
+func (a *OpenCodeAdapter) ensurePumpLocked(nativeID string, client *NativeClient) *sessionPump {
+	if p, ok := a.pumps[nativeID]; ok {
+		return p
+	}
+	p := newSessionPump(nativeID, client)
+	a.pumps[nativeID] = p
+	return p
+}
+
+// stopPump ends the drain loop for a native session and drops its taps.
+func (a *OpenCodeAdapter) stopPump(nativeID string) {
+	a.mu.Lock()
+	p, ok := a.pumps[nativeID]
+	delete(a.pumps, nativeID)
+	a.mu.Unlock()
+	if ok {
+		p.stop()
+	}
+}
+
 // cancelIdleParkTimer stops any pending idle park for the session.
 func (a *OpenCodeAdapter) cancelIdleParkTimer(sessionID adapter.SessionID) {
 	a.mu.Lock()
@@ -398,6 +668,10 @@ func (a *OpenCodeAdapter) scheduleIdleParkIfIdle(sessionID adapter.SessionID) {
 		a.mu.Unlock()
 		parkCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_ = a.servers.park(parkCtx, sessionID)
+		if err := a.servers.park(parkCtx, sessionID); err == nil {
+			// The child is gone; its pump must not reconnect to a dead
+			// endpoint. Resume re-registers a fresh pump.
+			a.stopPump(string(sessionID))
+		}
 	})
 }

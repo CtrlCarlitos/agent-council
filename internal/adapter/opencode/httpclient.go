@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -82,13 +83,19 @@ func newNativeClient(endpoint, username, password string) *NativeClient {
 // refused, connect reset) is returned as a plain error (rejection); a
 // failure after body transmission began — including a partial body write
 // — is returned as *ErrPostWrite (ambiguous).
-func (c *NativeClient) do(ctx context.Context, method, path, contentType string, payload []byte) (*http.Response, error) {
+// nilHeaders is the empty header set for requests without extras.
+var nilHeaders [][2]string
+
+func (c *NativeClient) do(ctx context.Context, method, path, contentType string, payload []byte, extraHeaders ...[2]string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, c.endpoint+path, nil)
 	if err != nil {
 		return nil, err
 	}
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
+	}
+	for _, h := range extraHeaders {
+		req.Header.Set(h[0], h[1])
 	}
 	req.SetBasicAuth(c.username, c.password)
 
@@ -328,11 +335,16 @@ func (c *NativeClient) GetMessage(ctx context.Context, sessionID, messageID stri
 }
 
 // Events opens the native per-session SSE stream at the approved
-// endpoint GET /session/{id}/event. The caller must close the response
+// endpoint GET /session/{id}/event, resuming from lastEventID when the
+// server supports Last-Event-ID. The caller must close the response
 // body. Connection-refused is a pre-write error; a failure after body
 // transmission classifies as post-write.
-func (c *NativeClient) Events(ctx context.Context, sessionID string) (*bufio.Scanner, *http.Response, error) {
-	resp, err := c.do(ctx, http.MethodGet, "/session/"+sessionID+"/event", "", nil)
+func (c *NativeClient) Events(ctx context.Context, sessionID string, lastEventID int64) (*bufio.Scanner, *http.Response, error) {
+	headers := nilHeaders
+	if lastEventID > 0 {
+		headers = [][2]string{{"Last-Event-ID", strconv.FormatInt(lastEventID, 10)}}
+	}
+	resp, err := c.do(ctx, http.MethodGet, "/session/"+sessionID+"/event", "", nil, headers...)
 	if err != nil {
 		return nil, nil, err
 	}

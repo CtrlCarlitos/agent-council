@@ -528,3 +528,165 @@ func TestGate1Review_MidBodyDropIsAmbiguous(t *testing.T) {
 		t.Fatalf("expected 1 recorded native request, got %d", got)
 	}
 }
+
+// CreateSession validates the configured model against the native model
+// inventory BEFORE creating any native resource, then records the
+// server-assigned native session ID.
+func TestAdapterContract_CreateSessionModelValidation(t *testing.T) {
+	adp, fake := gate1Fixture(t)
+	ctx := context.Background()
+
+	// Model not in the inventory: rejected, no native session created.
+	_, err := adp.CreateSession(ctx, adapter.CreateSessionRequest{
+		SessionID:   gate1Session,
+		Contributor: "opencode",
+		Config:      adapter.SessionConfig{Model: "missing/model"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "model inventory") {
+		t.Fatalf("unknown model must fail closed, got %v", err)
+	}
+	if got := fake.ledger.authFailureCount(); got != 0 {
+		t.Fatalf("inventory lookup must authenticate, failures: %d", got)
+	}
+
+	// Known model: binding carries the server-assigned native session ID.
+	binding, err := adp.CreateSession(ctx, adapter.CreateSessionRequest{
+		SessionID:   gate1Session,
+		Contributor: "opencode",
+		Config:      adapter.SessionConfig{Model: "fake/model"},
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if binding.NativeSessionID == "" || !strings.HasPrefix(binding.NativeSessionID, "ses_fake_") {
+		t.Fatalf("native session ID must be server-assigned, got %q", binding.NativeSessionID)
+	}
+
+	// Idempotent on matching configuration.
+	again, err := adp.CreateSession(ctx, adapter.CreateSessionRequest{
+		SessionID:   gate1Session,
+		Contributor: "opencode",
+		Config:      adapter.SessionConfig{Model: "fake/model"},
+	})
+	if err != nil || again.NativeSessionID != binding.NativeSessionID {
+		t.Fatalf("duplicate create must return the existing binding, got %+v err=%v", again, err)
+	}
+}
+
+// ResumeSession verifies the persisted native session on the server: a
+// verified 404 raises ErrNativeSessionMissing.
+func TestAdapterContract_ResumeSessionVerifiesNative(t *testing.T) {
+	adp, _ := gate1Fixture(t)
+	ctx := context.Background()
+
+	if err := adp.ResumeSession(ctx, adapter.SessionBinding{
+		SessionID: gate1Session, Contributor: "opencode", NativeSessionID: gate1Session,
+	}); err != nil {
+		t.Fatalf("resume of an existing native session must succeed: %v", err)
+	}
+
+	err := adp.ResumeSession(ctx, adapter.SessionBinding{
+		SessionID: gate1Session, Contributor: "opencode", NativeSessionID: "sess-gone",
+	})
+	if err == nil {
+		t.Fatal("resume of a missing native session must fail")
+	}
+	var missing *ErrNativeSessionMissing
+	if !errorsAs(err, &missing) {
+		t.Fatalf("expected ErrNativeSessionMissing, got %T: %v", err, err)
+	}
+	if missing.NativeSessionID != "sess-gone" {
+		t.Fatalf("missing binding must carry the native ID, got %+v", missing)
+	}
+}
+
+// Reconciliation with the submission recorded but unanswered is
+// reachable-active.
+func TestAdapterContract_ReconcileReachableActive(t *testing.T) {
+	adp, fake := gate1Fixture(t)
+	ctx := context.Background()
+
+	ref := adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-active"}
+	fake.armSuppressAssistant()
+	if outcome, err := adp.Dispatch(ctx, ref, "prompt"); err != nil || outcome.Status != adapter.DispatchAccepted {
+		t.Fatalf("dispatch: status=%v err=%v", outcome.Status, err)
+	}
+
+	out, err := adp.Reconcile(ctx, adapter.RecoveryRef{TurnRef: ref, Generation: 1})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if out.Status != adapter.ReconciliationReachableActive || out.Reachability != council.VisibilityReachable {
+		t.Fatalf("unanswered recorded turn must be reachable-active, got %+v", out)
+	}
+	if out.Observed != council.TurnRunning {
+		t.Fatalf("reachable-active must observe running, got %v", out.Observed)
+	}
+}
+
+// A recorded pre-acceptance rejection with the message provably absent is
+// definitively missing, not uncertain.
+func TestAdapterContract_ReconcileDefinitivelyMissingAfterRejection(t *testing.T) {
+	// Reserve a port and close it: the dispatch is rejected pre-write.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	unreachable := fmt.Sprintf("http://%s", ln.Addr().String())
+	_ = ln.Close()
+
+	adp := NewOpenCodeAdapter(nil, nil, &fakeGate1Identity{}, func(a *OpenCodeAdapter) {
+		a.servers = newServerManager(nil, nil)
+		a.servers.mu.Lock()
+		a.servers.children[gate1Session] = &serverProcess{
+			endpoint: unreachable,
+			username: gate1User,
+			password: gate1Password,
+		}
+		a.servers.mu.Unlock()
+	})
+	ctx := context.Background()
+
+	ref := adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-missing"}
+	outcome, err := adp.Dispatch(ctx, ref, "prompt")
+	if outcome.Status != adapter.DispatchRejected {
+		t.Fatalf("pre-write refusal must be rejected, got %v (err: %v)", outcome.Status, err)
+	}
+
+	rec, err := adp.Reconcile(ctx, adapter.RecoveryRef{TurnRef: ref, Generation: 1})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if rec.Status != adapter.ReconciliationDefinitivelyMissing {
+		t.Fatalf("rejected pre-acceptance dispatch must be definitively missing, got %+v", rec)
+	}
+	if rec.Observed != council.TurnFailed || rec.Reachability != council.VisibilityReachable {
+		t.Fatalf("definitively missing requires failed+reachable, got %+v", rec)
+	}
+}
+
+// A post-write ambiguity with no verified native record stays uncertain:
+// 404 or transport loss proves nothing about an orphan worker's work.
+func TestAdapterContract_ReconcileUncertainAfterPossibleAcceptance(t *testing.T) {
+	adp, fake := gate1Fixture(t)
+	ctx := context.Background()
+
+	ref := adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-ambiguous"}
+	fake.armFlakyPromptAsync("drop-mid-body")
+	if outcome, err := adp.Dispatch(ctx, ref, "prompt"); outcome.Status != adapter.DispatchUnknown {
+		t.Fatalf("mid-body drop must be unknown, got %v (err: %v)", outcome.Status, err)
+	}
+
+	rec, err := adp.Reconcile(ctx, adapter.RecoveryRef{TurnRef: ref, Generation: 1})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if rec.Status != adapter.ReconciliationUncertain || rec.Reachability != council.VisibilityHostLost {
+		t.Fatalf("ambiguous outcome must stay uncertain, got %+v", rec)
+	}
+}
+
+// errorsAs mirrors errors.As locally to keep test imports tidy.
+func errorsAs(err error, target any) bool {
+	return errors.As(err, target)
+}

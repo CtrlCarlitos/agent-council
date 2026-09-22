@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -24,6 +25,14 @@ type fakeOpenCodeServer struct {
 	// recorded in the ledger and rejected with 401.
 	expectedUser string
 	expectedPass string
+
+	// suppressAssistant, when armed, makes the next prompt_async record
+	// only the user message (the turn stays unanswered — active).
+	suppressAssistant bool
+
+	// dropEvents, when armed, makes the SSE handler return after writing
+	// pending events: a one-shot server-side native stream drop.
+	dropEvents bool
 
 	// flakyPromptAsync is a one-shot fault injected into the next
 	// prompt_async call. "" disables it. "drop-before-record" hijacks the
@@ -282,15 +291,18 @@ func (f *fakeOpenCodeServer) handler() http.Handler {
 			}
 			return
 		}
-		// Script an assistant reply with parentID linkage.
-		asstID := fmt.Sprintf("msg_asst_%d", len(sess.messages)+1000)
-		asstMsg := fakeMessage{
-			ID:       asstID,
-			Role:     "assistant",
-			ParentID: body.MessageID,
-			Parts:    []fakePart{{Type: "text", Text: "fake assistant response"}},
+		if !f.suppressAssistant {
+			// Script an assistant reply with parentID linkage.
+			f.suppressAssistant = false
+			asstID := fmt.Sprintf("msg_asst_%d", len(sess.messages)+1000)
+			asstMsg := fakeMessage{
+				ID:       asstID,
+				Role:     "assistant",
+				ParentID: body.MessageID,
+				Parts:    []fakePart{{Type: "text", Text: "fake assistant response"}},
+			}
+			sess.messages = append(sess.messages, asstMsg)
 		}
-		sess.messages = append(sess.messages, asstMsg)
 		w.WriteHeader(204)
 	})
 	mux.HandleFunc("GET /session/{sessionID}/message", func(w http.ResponseWriter, r *http.Request) {
@@ -361,21 +373,52 @@ func (f *fakeOpenCodeServer) handler() http.Handler {
 		f.mu.Unlock()
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
-		flusher, _ := w.(http.Flusher)
-		if flusher != nil {
+		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
+		}
+		// Scripted events stream live: tests can append events while the
+		// connection is open. The response body terminates on handler
+		// return (until-close framing), which is the native stream drop.
+		var lastID int64
+		if v := r.Header.Get("Last-Event-ID"); v != "" {
+			lastID, _ = strconv.ParseInt(v, 10, 64)
 		}
 		if delay := sess.eventDelay; delay > 0 {
 			time.Sleep(delay)
 		}
-		for _, ev := range sess.scriptedEvents {
-			fmt.Fprintf(w, "data: %s\n\n", ev)
+		flusher, _ := w.(http.Flusher)
+		seq := lastID
+		written := 0
+		for {
+			f.mu.Lock()
+			events := append([]string(nil), sess.scriptedEvents...)
+			f.mu.Unlock()
+			for written < len(events) {
+				ev := events[written]
+				written++
+				seq++
+				if seq <= lastID {
+					continue
+				}
+				fmt.Fprintf(w, "id: %d\n", seq)
+				fmt.Fprintf(w, "data: %s\n\n", ev)
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			f.mu.Lock()
+			drop := f.dropEvents
+			f.dropEvents = false
+			f.mu.Unlock()
+			if drop {
+				return // server-side native stream drop
+			}
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
 		}
-		if flusher != nil {
-			flusher.Flush()
-		}
-		// Hold the stream open until the client disconnects.
-		<-r.Context().Done()
 	})
 	mux.HandleFunc("GET /session/{sessionID}/permission", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -454,6 +497,23 @@ func (f *fakeOpenCodeServer) allowCredentials(user, pass string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.extraCreds = append(f.extraCreds, [2]string{user, pass})
+}
+
+// armFlakyEvents arms a one-shot server-side native stream drop: the
+// next SSE handler pass returns after writing pending events. The pump
+// must reconnect with its cursor.
+func (f *fakeOpenCodeServer) armFlakyEvents() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dropEvents = true
+}
+
+// armSuppressAssistant makes the next prompt_async leave the turn
+// unanswered (no scripted assistant reply).
+func (f *fakeOpenCodeServer) armSuppressAssistant() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.suppressAssistant = true
 }
 
 // armFlakyPromptAsync injects a one-shot post-write disconnect into the next

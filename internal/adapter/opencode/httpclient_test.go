@@ -130,7 +130,7 @@ func TestNativeClient_SSEScriptedEventsWithTiming(t *testing.T) {
 	)
 
 	start := time.Now()
-	sc, resp, err := client.Events(ctx, gate1Session)
+	sc, resp, err := client.Events(ctx, gate1Session, 0)
 	if err != nil {
 		t.Fatalf("events: %v", err)
 	}
