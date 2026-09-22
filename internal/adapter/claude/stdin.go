@@ -48,11 +48,11 @@ func asPostTransmission(err error, target **ErrPostTransmission) bool {
 // transmission began. The flag is atomic: observers may read it while a
 // write is in flight.
 type StdinWriter struct {
-	w     io.WriteCloser
+	w     io.Writer
 	began atomic.Bool
 }
 
-func NewStdinWriter(w io.WriteCloser) *StdinWriter {
+func NewStdinWriter(w io.Writer) *StdinWriter {
 	return &StdinWriter{w: w}
 }
 
