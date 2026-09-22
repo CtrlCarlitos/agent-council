@@ -125,7 +125,7 @@
 
 **Interfaces:**
 - Full AC-006 contract per spec §3.3–§3.10: CreateSession (UUIDv4 `crypto/rand`, creation reservation, materialize config root, `materialized=false`), ResumeSession (local inspection; typed `ErrNativeSessionMissing` deferred to dispatch; unmaterialized never "lost"), Dispatch (identity seam, per-native-session single-flight, reserved-before-Start launches, stdin transport, verdict recording), Observe (taps, detach-safe), Collect (single verified `result` correlation), Cancel (terminate; uncertain without result), Reconcile (§3.10 — advisory default ⇒ uncertain-until-disposed; probe = separate attempt).
-- Storage transitions: baseline/launch-reservation/start/stdin/dead/accepted/terminal/observed_status — each atomic with `transition_version`; redispatch consumption transition (attestation-valid + verified absence + count=1 + not consumed ⇒ count=2, one-time).
+- Storage transitions: baseline/launch-reservation/start/stdin/dead/accepted/terminal/observed_status — each atomic with `transition_version`; redispatch consumption is the v8 transition (preconditions: valid attestation, verified absence, `absence_redispatch_consumed=false`, fewer than two started/dead launches, prior launch known dead ⇒ atomically set the flag, count 1→2, insert the next reservation_seq row).
 
 **Steps:**
 - [ ] 5.1 Failing contract tests (cross-platform unless process-bound):
