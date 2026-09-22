@@ -299,6 +299,34 @@ func TestStreamParser_HooksSeenRecorded(t *testing.T) {
 	}
 }
 
+// Init-only clean EOF: exactly one init, no result. The stream ends
+// without a terminal event and without a terminal outcome.
+func TestStreamParser_InitOnlyCleanEoFEmitsNoTerminal(t *testing.T) {
+	cfg := streamConfig(t)
+	stream := basePrefix + "\n"
+	var terminals []StreamEvent
+	out, err := ParseStream(strings.NewReader(stream), cfg, func(ev StreamEvent) {
+		if ev.Type == EventTerminal {
+			terminals = append(terminals, ev)
+		}
+	})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if out.Poisoned {
+		t.Fatalf("init-only clean EOF is not a poison, got %q", out.PoisonReason)
+	}
+	if out.Terminal {
+		t.Fatal("no result observed: outcome must not be terminal")
+	}
+	if out.TerminalEventEmitted || len(terminals) != 0 {
+		t.Fatal("terminal event must NOT be emitted for an init-only stream")
+	}
+	if out.Init == nil || out.Init.SessionID != testNativeID {
+		t.Fatalf("init must still be reported, got %+v", out.Init)
+	}
+}
+
 // Empty model in init is a mismatch (covered above); a missing init
 // entirely (no init before result) poisons.
 func TestStreamParser_MissingInitPoisons(t *testing.T) {

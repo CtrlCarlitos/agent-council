@@ -334,8 +334,13 @@ func ParseStream(r io.Reader, cfg StreamConfig, onEvent func(StreamEvent)) (Stre
 	}
 	out.Init = initReport
 	out.Init.HooksSeen = hooksSeen
-	emit(StreamEvent{Type: EventTerminal, Text: out.ResultText})
-	out.TerminalEventEmitted = true
+	// The terminal event is emitted ONLY when exactly one verified
+	// result was observed: a clean EOF without a result is an
+	// uncertain end, never a terminal.
+	if resultCount == 1 && out.Terminal {
+		emit(StreamEvent{Type: EventTerminal, Text: out.ResultText})
+		out.TerminalEventEmitted = true
+	}
 	return out, nil
 }
 

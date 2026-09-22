@@ -67,7 +67,7 @@ func v2ClaudeProfile(universeDigest string) storage.CanonicalProfile {
 		NetworkMode:         "unrestricted",
 		Tooling:             []string{"claude", "git", "go"},
 		Harnesses: map[string]storage.HarnessProfileSpec{
-			"claude": {Model: "haiku", NativeAuthMode: "inherited_host_keychain"},
+			"claude": {Model: "claude-haiku-4-5-20251001", NativeAuthMode: "inherited_host_keychain"},
 		},
 	}
 	p.ToolkitManifest = &storage.ToolkitManifestSpec{ToolkitManifest: storage.ToolkitManifest{
@@ -141,8 +141,8 @@ func TestClaudeTurnLaunch_FirstTurnSessionIDContract(t *testing.T) {
 	if got := argValue(req.Args, "--session-id"); got != testNativeID {
 		t.Fatalf("first turn must use --session-id with the native ID, got %q", got)
 	}
-	if got := argValue(req.Args, "--model"); got != "haiku" {
-		t.Fatalf("frozen model expected, got %q", got)
+	if got := argValue(req.Args, "--model"); got != "claude-haiku-4-5-20251001" {
+		t.Fatalf("frozen native model identity expected, got %q", got)
 	}
 	if got := argValue(req.Args, "--max-turns"); got != "8" {
 		t.Fatalf("frozen max-turns bound expected, got %q", got)
