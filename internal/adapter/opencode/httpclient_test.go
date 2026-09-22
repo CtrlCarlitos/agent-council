@@ -8,8 +8,11 @@ package opencode
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -154,8 +157,60 @@ func TestNativeClient_SSEScriptedEventsWithTiming(t *testing.T) {
 		t.Fatalf("unexpected first event payload: %q", first)
 	}
 
-	if got := fake.ledger.sseConnects; len(got) != 1 || got[0] != gate1Session {
-		t.Fatalf("expected 1 SSE connection for the session, got %v", got)
+	// The ledger must record the exact approved native endpoint path.
+	if got := fake.ledger.sseConnects; len(got) != 1 || got[0] != "/session/"+gate1Session+"/event" {
+		t.Fatalf("SSE must use the native /event endpoint, ledger: %v", got)
+	}
+}
+
+// A body that begins transmitting and then fails mid-write classifies as
+// post-write ambiguity, not as a safe retry.
+func TestNativeClient_PartialBodyTransmissionIsPostWrite(t *testing.T) {
+	// Simulate the transport consuming one body byte and then failing:
+	// transmission has begun, so the outcome is ambiguous regardless of
+	// how much of the body reached the server.
+	tb := newTransmissionBody(io.MultiReader(
+		strings.NewReader("x"),
+		errReader{},
+	))
+	buf := make([]byte, 8)
+	n, err := tb.Read(buf)
+	if n != 1 || err != nil {
+		t.Fatalf("first read must succeed with 1 byte, got n=%d err=%v", n, err)
+	}
+	if !tb.began.Load() {
+		t.Fatal("first successful read must mark transmission begun")
+	}
+	if _, err := tb.Read(buf); err == nil {
+		t.Fatal("second read must surface the transport error")
+	}
+	if !tb.began.Load() {
+		t.Fatal("transmission state must remain set")
+	}
+}
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("connection reset mid-body") }
+
+// A connection that dies before any body byte is transmitted remains a
+// rejection: the server cannot have seen the turn.
+func TestNativeClient_PreBodyFailureIsRejected(t *testing.T) {
+	// Reserve a port and close it: dial fails before any write.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	endpoint := fmt.Sprintf("http://%s", ln.Addr().String())
+	_ = ln.Close()
+
+	client := newNativeClient(endpoint, gate1User, gate1Password)
+	err = client.PromptAsync(context.Background(), gate1Session, "msg_x", "hi")
+	if err == nil {
+		t.Fatal("dial failure must fail the request")
+	}
+	if IsPostWriteError(err) {
+		t.Fatalf("failure before body transmission must not be post-write, got %v", err)
 	}
 }
 

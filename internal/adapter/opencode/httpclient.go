@@ -16,14 +16,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptrace"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
-// ErrPostWrite marks a transport failure that occurred after the request
-// body was fully written: the server may have processed the turn, so the
-// outcome is ambiguous (unknown), never rejected.
+// ErrPostWrite marks a transport failure that occurred after request body
+// transmission began: the server may have received part or all of the
+// turn, so the outcome is ambiguous (unknown), never rejected.
 type ErrPostWrite struct{ Cause error }
 
 func (e *ErrPostWrite) Error() string { return e.Cause.Error() }
@@ -34,6 +34,28 @@ func (e *ErrPostWrite) Unwrap() error { return e.Cause }
 func IsPostWriteError(err error) bool {
 	var pw *ErrPostWrite
 	return errors.As(err, &pw)
+}
+
+// transmissionBody wraps a request body and records whether any byte of
+// it was handed to the transport. The first successful read marks
+// transmission as begun: from that point a transport failure is
+// ambiguous, even if only a prefix of the body reached the server.
+type transmissionBody struct {
+	reader io.Reader
+	began  *atomic.Bool
+}
+
+func newTransmissionBody(r io.Reader) *transmissionBody {
+	b := &atomic.Bool{}
+	return &transmissionBody{reader: r, began: b}
+}
+
+func (t *transmissionBody) Read(p []byte) (int, error) {
+	n, err := t.reader.Read(p)
+	if n > 0 {
+		t.began.Store(true)
+	}
+	return n, err
 }
 
 // NativeClient is an authenticated typed client for one serve child.
@@ -56,11 +78,12 @@ func newNativeClient(endpoint, username, password string) *NativeClient {
 }
 
 // do performs an authenticated request and classifies transport failures:
-// anything before the request body was fully written (dial refused,
-// connect reset) is returned as a plain error (pre-write rejection); a
-// failure after the write completes is returned as *ErrPostWrite.
-func (c *NativeClient) do(ctx context.Context, method, path, contentType string, body io.Reader) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, method, c.endpoint+path, body)
+// any failure before the first request-body byte is transmitted (dial
+// refused, connect reset) is returned as a plain error (rejection); a
+// failure after body transmission began — including a partial body write
+// — is returned as *ErrPostWrite (ambiguous).
+func (c *NativeClient) do(ctx context.Context, method, path, contentType string, payload []byte) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, c.endpoint+path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -69,18 +92,22 @@ func (c *NativeClient) do(ctx context.Context, method, path, contentType string,
 	}
 	req.SetBasicAuth(c.username, c.password)
 
-	wrote := false
-	trace := &httptrace.ClientTrace{
-		WroteRequest: func(httptrace.WroteRequestInfo) { wrote = true },
+	var tb *transmissionBody
+	if payload != nil {
+		tb = newTransmissionBody(bytes.NewReader(payload))
+		req.Body = io.NopCloser(tb)
+		req.ContentLength = int64(len(payload))
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(payload)), nil
+		}
 	}
-	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		if !wrote {
-			return nil, err
+		if tb != nil && tb.began.Load() {
+			return nil, &ErrPostWrite{Cause: err}
 		}
-		return nil, &ErrPostWrite{Cause: err}
+		return nil, err
 	}
 	return resp, nil
 }
@@ -178,7 +205,7 @@ func (c *NativeClient) CreateSession(ctx context.Context, title, directory strin
 	if err != nil {
 		return "", err
 	}
-	resp, err := c.do(ctx, http.MethodPost, "/session", "application/json", bytes.NewReader(payload))
+	resp, err := c.do(ctx, http.MethodPost, "/session", "application/json", payload)
 	if err != nil {
 		return "", err
 	}
@@ -222,7 +249,7 @@ func (c *NativeClient) PromptAsync(ctx context.Context, sessionID, messageID, te
 		return err
 	}
 	resp, err := c.do(ctx, http.MethodPost,
-		"/session/"+sessionID+"/prompt_async", "application/json", bytes.NewReader(payload))
+		"/session/"+sessionID+"/prompt_async", "application/json", payload)
 	if err != nil {
 		return err
 	}
@@ -300,11 +327,12 @@ func (c *NativeClient) GetMessage(ctx context.Context, sessionID, messageID stri
 	}
 }
 
-// Events opens the per-session SSE stream. The caller must close the
-// response body. Connection-refused is a pre-write error; a failure after
-// the (empty) request write classifies as post-write.
+// Events opens the native per-session SSE stream at the approved
+// endpoint GET /session/{id}/event. The caller must close the response
+// body. Connection-refused is a pre-write error; a failure after body
+// transmission classifies as post-write.
 func (c *NativeClient) Events(ctx context.Context, sessionID string) (*bufio.Scanner, *http.Response, error) {
-	resp, err := c.do(ctx, http.MethodGet, "/session/"+sessionID+"/events", "", nil)
+	resp, err := c.do(ctx, http.MethodGet, "/session/"+sessionID+"/event", "", nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -349,7 +377,7 @@ func (c *NativeClient) PermissionReply(ctx context.Context, sessionID, permissio
 	}
 	resp, err := c.do(ctx, http.MethodPost,
 		"/session/"+sessionID+"/permission/"+permissionID+"/reply",
-		"application/json", bytes.NewReader(payload))
+		"application/json", payload)
 	if err != nil {
 		return err
 	}

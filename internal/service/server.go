@@ -25,6 +25,12 @@ type ServerConfig struct {
 	InstanceID       string
 	AuthToken        string
 	WorkspaceBaseDir string
+	// OpenCodeProbeProfile is the operator-approved canonical profile the
+	// OpenCode capability probe launches carry. Required when
+	// OpenCodeBinaryPath is set: the probe template fails closed without
+	// it.
+	OpenCodeProbeProfile storage.CanonicalProfile
+
 	// OpenCodeBinaryPath, when set, enables the OpenCode persistent
 	// contributor adapter via production seams backed by the storage
 	// store and AC-005 workspace manager. Empty means no OpenCode
@@ -95,7 +101,7 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 	// production OpenCode adapter with fail-closed seams backed by the same
 	// workspace manager and policy executor the service uses.
 	if adp == nil && strings.TrimSpace(cfg.OpenCodeBinaryPath) != "" {
-		probeTemplate := opencode.NewOperatorProbeLaunchTemplate(cfg.OpenCodeBinaryPath, filepath.Join(cfg.StateDir, "probe-scratch"))
+		probeTemplate := opencode.NewOperatorProbeLaunchTemplate(cfg.OpenCodeBinaryPath, filepath.Join(cfg.StateDir, "probe-scratch"), cfg.OpenCodeProbeProfile)
 		var opErr error
 		adp, opErr = opencode.NewProductionOpenCodeAdapter(store, wm, pe, probeTemplate)
 		if opErr != nil {

@@ -90,7 +90,7 @@ func seedWiredRun(t *testing.T, stateDir, wsBase string) (*storage.Store, *works
 	// Production construction: the test only supplies operator
 	// configuration (binary path + scratch root).
 	adp, err := NewProductionOpenCodeAdapter(store, wm, execpolicy.New(),
-		NewOperatorProbeLaunchTemplate("opencode", t.TempDir()))
+		NewOperatorProbeLaunchTemplate("opencode", t.TempDir(), lifecycleProfile()))
 	if err != nil {
 		t.Fatalf("production construction: %v", err)
 	}

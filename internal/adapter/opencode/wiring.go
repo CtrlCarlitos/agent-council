@@ -109,11 +109,26 @@ func (t *operatorProbeLaunchTemplate) VersionLaunch(ctx context.Context) (execpo
 	if strings.TrimSpace(t.binaryPath) == "" {
 		return execpolicy.LaunchRequest{}, errors.New("opencode binary path is required for version check")
 	}
+	if err := t.requireProfile(); err != nil {
+		return execpolicy.LaunchRequest{}, err
+	}
 	return execpolicy.LaunchRequest{
-		Command: t.binaryPath,
-		Args:    []string{"--version"},
-		Profile: t.profile,
+		RunID:     "run-probe",
+		SessionID: "sess-probe-version",
+		Command:   t.binaryPath,
+		Args:      []string{"--version"},
+		Paths:     workspace.WorkspacePaths{Root: t.scratchRoot, Config: t.scratchRoot},
+		Profile:   t.profile,
 	}, nil
+}
+
+// requireProfile fails closed: the executor only launches requests
+// carrying the operator-approved canonical profile.
+func (t *operatorProbeLaunchTemplate) requireProfile() error {
+	if t.profile.AlgoVersion == "" || len(t.profile.Harnesses) == 0 {
+		return errors.New("operator probe template requires a non-empty canonical profile")
+	}
+	return nil
 }
 
 func (t *operatorProbeLaunchTemplate) ProbeServeLaunch(ctx context.Context) (execpolicy.LaunchRequest, error) {
@@ -123,6 +138,9 @@ func (t *operatorProbeLaunchTemplate) ProbeServeLaunch(ctx context.Context) (exe
 	if strings.TrimSpace(t.scratchRoot) == "" {
 		return execpolicy.LaunchRequest{}, errors.New("scratchRoot is required for probe serve launch")
 	}
+	if err := t.requireProfile(); err != nil {
+		return execpolicy.LaunchRequest{}, err
+	}
 	// The operator-owned template allocates the scratch directory; the
 	// adapter never creates directories itself.
 	scratchDir, err := os.MkdirTemp(t.scratchRoot, "ac-opencode-probe-")
@@ -130,10 +148,12 @@ func (t *operatorProbeLaunchTemplate) ProbeServeLaunch(ctx context.Context) (exe
 		return execpolicy.LaunchRequest{}, fmt.Errorf("allocate probe scratch dir: %w", err)
 	}
 	return execpolicy.LaunchRequest{
-		Command: t.binaryPath,
-		Args:    []string{"serve", "--hostname", "127.0.0.1", "--port", "0"},
-		Paths:   workspace.WorkspacePaths{Root: scratchDir, Config: filepath.Join(scratchDir, "config")},
-		Profile: t.profile,
+		RunID:     "run-probe",
+		SessionID: "sess-probe-serve",
+		Command:   t.binaryPath,
+		Args:      []string{"serve", "--hostname", "127.0.0.1", "--port", "0"},
+		Paths:     workspace.WorkspacePaths{Root: scratchDir, Config: filepath.Join(scratchDir, "config")},
+		Profile:   t.profile,
 	}, nil
 }
 
@@ -192,7 +212,9 @@ func buildProductionOpenCodeAdapter(
 }
 
 // NewOperatorProbeLaunchTemplate creates an operator-owned probe launch
-// template from explicit configuration.
-func NewOperatorProbeLaunchTemplate(binaryPath, scratchRoot string) *operatorProbeLaunchTemplate {
-	return &operatorProbeLaunchTemplate{binaryPath: binaryPath, scratchRoot: scratchRoot}
+// template from explicit configuration, including the operator-approved
+// canonical probe profile required by the PolicyExecutor. Fail closed: a
+// template without a profile rejects every launch.
+func NewOperatorProbeLaunchTemplate(binaryPath, scratchRoot string, profile storage.CanonicalProfile) *operatorProbeLaunchTemplate {
+	return &operatorProbeLaunchTemplate{binaryPath: binaryPath, scratchRoot: scratchRoot, profile: profile}
 }

@@ -3,6 +3,7 @@ package opencode
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -116,10 +117,10 @@ func (l *fakeRequestLedger) recordModel() {
 	l.modelCalls++
 }
 
-func (l *fakeRequestLedger) recordSSE(sessionID string) {
+func (l *fakeRequestLedger) recordSSE(path string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.sseConnects = append(l.sseConnects, sessionID)
+	l.sseConnects = append(l.sseConnects, path)
 }
 
 func (l *fakeRequestLedger) recordPermissionReply(sessionID, permissionID string) {
@@ -239,6 +240,18 @@ func (f *fakeOpenCodeServer) handler() http.Handler {
 		f.ledger.recordPromptAsync(sessionID, body.MessageID)
 		mode := f.flakyPromptAsync
 		f.flakyPromptAsync = ""
+		if mode == "drop-mid-body" {
+			// Consume only a prefix of the request body, then close the
+			// connection: the client must classify the failure as
+			// ambiguous, never as a safe retry.
+			prefix := make([]byte, 10)
+			_, _ = io.ReadFull(r.Body, prefix)
+			conn, _, _ := w.(http.Hijacker).Hijack()
+			if conn != nil {
+				conn.Close()
+			}
+			return
+		}
 		if mode == "drop-before-record" {
 			// Simulate a post-write disconnect: the request was fully
 			// read but the connection dies before any response.
@@ -335,7 +348,7 @@ func (f *fakeOpenCodeServer) handler() http.Handler {
 			"data": []map[string]string{{"id": "model", "providerID": "fake"}},
 		})
 	})
-	mux.HandleFunc("GET /session/{sessionID}/events", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /session/{sessionID}/event", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		sess := f.sessions[r.PathValue("sessionID")]
 		f.mu.Unlock()
@@ -344,7 +357,7 @@ func (f *fakeOpenCodeServer) handler() http.Handler {
 			return
 		}
 		f.mu.Lock()
-		f.ledger.recordSSE(sess.id)
+		f.ledger.recordSSE(r.URL.Path)
 		f.mu.Unlock()
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)

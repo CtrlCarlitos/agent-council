@@ -17,12 +17,17 @@ import (
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/execpolicy"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/workspace"
+	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
 // stubProbeTemplate is a test operator-owned template: it allocates its
 // own scratch directories and produces the exact approved serve shape.
+// keepScratch preserves the scratch directory after the run so tests can
+// inspect child-side evidence files; production cleanup is asserted by
+// TestProbe_ProductionTemplateEndToEndCleansScratch.
 type stubProbeTemplate struct {
-	base string
+	base        string
+	keepScratch bool
 }
 
 func (t *stubProbeTemplate) VersionLaunch(_ context.Context) (execpolicy.LaunchRequest, error) {
@@ -37,9 +42,27 @@ func (t *stubProbeTemplate) VersionLaunch(_ context.Context) (execpolicy.LaunchR
 }
 
 func (t *stubProbeTemplate) ProbeServeLaunch(_ context.Context) (execpolicy.LaunchRequest, error) {
-	scratch, err := os.MkdirTemp(t.base, "probe-scratch-")
-	if err != nil {
-		return execpolicy.LaunchRequest{}, err
+	var scratch string
+	if t.keepScratch {
+		// Preserve child-side evidence: Root is a symlink to a target
+		// outside Probe's RemoveAll reach (RemoveAll unlinks the symlink,
+		// never the target).
+		target, err := os.MkdirTemp(t.base, "kept-target-")
+		if err != nil {
+			return execpolicy.LaunchRequest{}, err
+		}
+		link := filepath.Join(t.base, "probe-scratch-linked")
+		if err := os.Symlink(target, link); err != nil {
+			return execpolicy.LaunchRequest{}, err
+		}
+		_ = os.WriteFile(filepath.Join(t.base, "kept-scratch"), []byte(target), 0o600)
+		scratch = link
+	} else {
+		dir, err := os.MkdirTemp(t.base, "probe-scratch-")
+		if err != nil {
+			return execpolicy.LaunchRequest{}, err
+		}
+		scratch = dir
 	}
 	return execpolicy.LaunchRequest{
 		RunID:     "run-probe",
@@ -61,7 +84,7 @@ func TestProbe_SuccessWithRealChild(t *testing.T) {
 	binDir := compileStubOpencode(t)
 	t.Setenv("PATH", binDir+string(filepath.ListSeparator)+os.Getenv("PATH"))
 
-	adp := NewOpenCodeAdapterWithLaunch(execpolicy.New(), &stubProbeTemplate{base: dir}, nil, nil)
+	adp := NewOpenCodeAdapterWithLaunch(execpolicy.New(), &stubProbeTemplate{base: dir, keepScratch: true}, nil, nil)
 	report, err := adp.Probe(context.Background())
 	if err != nil {
 		t.Fatalf("probe: %v", err)
@@ -83,28 +106,32 @@ func TestProbe_SuccessWithRealChild(t *testing.T) {
 		t.Fatalf("model inventory must include stub/model, got %v", report.ModelInventory.Value)
 	}
 
-	// The scratch directory is inside the template's base.
+	// The scratch directory is preserved by the fixture so child-side
+	// evidence survives Probe's cleanup.
+	kept, err := os.ReadFile(filepath.Join(dir, "kept-scratch"))
+	if err != nil {
+		t.Fatalf("fixture scratch path: %v", err)
+	}
+	scratch := string(kept)
+	if fails := readStubFile(t, scratch, ".stub-authfail"); len(fails) != 0 {
+		t.Fatalf("probe calls must authenticate, auth failures: %v", fails)
+	}
+	for _, hit := range readStubFile(t, scratch, ".stub-hits") {
+		if hit != "GET /api/health" && hit != "GET /api/model" {
+			t.Fatalf("probe may only call health and model endpoints, saw: %q", hit)
+		}
+	}
+	_ = scratch
+
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatalf("read template base: %v", err)
 	}
-	var sawScratch bool
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "probe-scratch-") {
-			sawScratch = true
-			scratch := filepath.Join(dir, e.Name())
-			if fails := readStubFile(t, scratch, ".stub-authfail"); len(fails) != 0 {
-				t.Fatalf("probe calls must authenticate, auth failures: %v", fails)
-			}
-			for _, hit := range readStubFile(t, scratch, ".stub-hits") {
-				if hit != "GET /api/health" && hit != "GET /api/model" {
-					t.Fatalf("probe may only call health and model endpoints, saw: %q", hit)
-				}
-			}
+		if e.Name() == "kept-scratch" || strings.HasPrefix(e.Name(), "kept-target-") {
+			continue
 		}
-	}
-	if !sawScratch {
-		t.Fatal("probe scratch directory must be allocated by the template")
+		t.Fatalf("fixture probe run must leave only preserved evidence, found %q", e.Name())
 	}
 
 	// The probe child must never be registered as a contributor server.
@@ -175,4 +202,44 @@ func (t shapeViolationTemplate) ProbeServeLaunch(_ context.Context) (execpolicy.
 		Paths:     workspace.WorkspacePaths{Root: scratch, Config: scratch},
 		Profile:   lifecycleProfile(),
 	}, nil
+}
+
+// The exported production template constructor must run a real probe
+// end-to-end with an operator-approved profile and must remove the
+// template-created scratch directory when Probe finishes.
+func TestProbe_ProductionTemplateEndToEndCleansScratch(t *testing.T) {
+	dir := t.TempDir()
+	binDir := compileStubOpencode(t)
+	t.Setenv("PATH", binDir+string(filepath.ListSeparator)+os.Getenv("PATH"))
+
+	scratchRoot := filepath.Join(dir, "operator-scratch")
+	if err := os.MkdirAll(scratchRoot, 0o700); err != nil {
+		t.Fatalf("mkdir scratch root: %v", err)
+	}
+	profile := lifecycleProfile()
+	profile.Harnesses = map[string]storage.HarnessProfileSpec{
+		"opencode": {Model: "stub/model", NativeAuthMode: "managed_by_council"},
+	}
+	tpl := NewOperatorProbeLaunchTemplate("opencode", scratchRoot, profile)
+	adp := NewOpenCodeAdapterWithLaunch(execpolicy.New(), tpl, nil, nil)
+
+	report, err := adp.Probe(context.Background())
+	if err != nil {
+		t.Fatalf("probe through production template: %v", err)
+	}
+	if !report.HarnessVersion.Available || !strings.Contains(report.HarnessVersion.Value, "1.18.31-stub") {
+		t.Fatalf("probe must capture the stub version, got %+v", report.HarnessVersion)
+	}
+
+	entries, err := os.ReadDir(scratchRoot)
+	if err != nil {
+		t.Fatalf("read scratch root: %v", err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("template-created scratch must be removed after Probe, remaining: %v", names)
+	}
 }

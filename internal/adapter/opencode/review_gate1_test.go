@@ -509,3 +509,22 @@ func TestGate1Review_NoIdleParkWhileTurnInFlight(t *testing.T) {
 	}
 	_ = fake
 }
+
+// A server that closes the connection after consuming only a prefix of
+// the request body produces an ambiguous outcome: body transmission had
+// begun, so the dispatch is unknown and must never be retried blindly.
+func TestGate1Review_MidBodyDropIsAmbiguous(t *testing.T) {
+	adp, fake := gate1Fixture(t)
+	ctx := context.Background()
+
+	ref := adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-midbody"}
+	fake.armFlakyPromptAsync("drop-mid-body")
+
+	outcome, err := adp.Dispatch(ctx, ref, "prompt")
+	if outcome.Status != adapter.DispatchUnknown {
+		t.Fatalf("mid-body drop must be unknown, got %v (err: %v)", outcome.Status, err)
+	}
+	if got := fake.ledger.promptAsyncCount(); got != 1 {
+		t.Fatalf("expected 1 recorded native request, got %d", got)
+	}
+}

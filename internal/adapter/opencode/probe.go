@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -110,6 +111,9 @@ func (a *OpenCodeAdapter) Probe(ctx context.Context) (adapter.ProbeReport, error
 	if err != nil {
 		return report, fmt.Errorf("probe serve start: %w", err)
 	}
+	// The template-created scratch directory exists only for this probe
+	// run: remove it once the probe child is terminated.
+	defer func() { _ = os.RemoveAll(serveReq.Paths.Root) }()
 
 	// Drain the child's stdout into a buffer while polling for the printed
 	// listen address; drain stderr for the child's lifetime.
