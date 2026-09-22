@@ -5,127 +5,147 @@ import (
 	"testing"
 )
 
-func validRecords() []ProbeRecord {
-	return append([]ProbeRecord{}, []ProbeRecord{
-		{ToolClass: ProbeBash, ToolName: "Bash", Denied: true,
-			EnforcingCapability: CapGuardrailHook, DenialText: "guardrail denied"},
-		{ToolClass: ProbeRead, ToolName: "Read", Denied: true,
-			EnforcingCapability: CapCwdBoundary, DenialText: "outside allowed directories"},
-		{ToolClass: ProbeMCP, ToolName: "mcp__serena__find_symbol", Denied: true,
-			EnforcingCapability: CapPermissionDenial, DenialText: "permission denied by policy"},
-	}...)
+func validAttestation() ProtectionAttestation {
+	return ProtectionAttestation{
+		ClaudeVersion:  "2.1.278",
+		Platform:       "linux/amd64",
+		ManifestDigest: "cprof-v2:sha256:def",
+		TemplateDigest: "ctmpl-v1:sha256:abc",
+		Records: []ProbeRecord{
+			{ToolClass: ProbeBash, ToolName: "Bash", Denied: true,
+				EnforcingCapability: CapGuardrailHook, DenialText: "guardrail denied"},
+			{ToolClass: ProbeRead, ToolName: "Read", Denied: true,
+				EnforcingCapability: CapCwdBoundary, DenialText: "outside allowed directories"},
+			{ToolClass: ProbeMCP, ToolName: "mcp__serena__find_symbol", Denied: true,
+				EnforcingCapability: CapPermissionDenial, DenialText: "permission denied by policy"},
+		},
+		ProbedAt: "2026-09-22T00:00:00Z",
+		Actor:    "operator",
+	}
 }
 
-func TestProtectionAttestation_DigestGoldenAndDeterminism(t *testing.T) {
-	a, err := AttestationDigest("2.1.278", "linux/amd64",
-		"ctmpl-v1:sha256:abc", "cprof-v2:sha256:def", validRecords(),
-		"2026-09-22T00:00:00Z", "operator")
+// Independently computed fixed vector (python3 framing, spec §3.6 field
+// order: version, platform, manifest digest, template digest, framed
+// records with class/name/target/denied/capability/excerpt, probed_at,
+// actor). The encoder must reproduce THIS digest, not merely a stable
+// one.
+func TestProtectionAttestation_FixedGoldenVector(t *testing.T) {
+	want := "cprot-v1:sha256:eb783f24c4fe2edced1b9b66e577abc61596b8f5bce73d84f3cb80dd968284f3"
+	a := validAttestation()
+	got, err := a.Digest()
 	if err != nil {
 		t.Fatalf("digest: %v", err)
 	}
-	if !strings.HasPrefix(a, "cprot-v1:sha256:") {
-		t.Fatalf("prefix, got %q", a)
+	if got != want {
+		t.Fatalf("fixed golden vector mismatch:\n got %q\nwant %q", got, want)
 	}
-	b, err := AttestationDigest("2.1.278", "linux/amd64",
-		"ctmpl-v1:sha256:abc", "cprof-v2:sha256:def", validRecords(),
-		"2026-09-22T00:00:00Z", "operator")
+}
+
+func TestProtectionAttestation_CanonicalOrderAndDeterminism(t *testing.T) {
+	a := validAttestation()
+	d1, err := a.Digest()
 	if err != nil {
-		t.Fatalf("digest 2: %v", err)
+		t.Fatalf("digest: %v", err)
 	}
-	// Record ORDER in the input must not matter (canonical sort).
-	reordered := []ProbeRecord{validRecords()[2], validRecords()[0], validRecords()[1]}
-	c, err := AttestationDigest("2.1.278", "linux/amd64",
-		"ctmpl-v1:sha256:abc", "cprof-v2:sha256:def", reordered,
-		"2026-09-22T00:00:00Z", "operator")
+
+	// Reordering the input records must not change the digest.
+	reordered := a
+	reordered.Records = []ProbeRecord{a.Records[2], a.Records[0], a.Records[1]}
+	d2, err := reordered.Digest()
 	if err != nil {
-		t.Fatalf("digest 3: %v", err)
+		t.Fatalf("reordered digest: %v", err)
 	}
-	if a != b || a != c {
-		t.Fatalf("attestation digest must be canonical: %q %q %q", a, b, c)
+	if d1 != d2 {
+		t.Fatalf("record order must be canonicalized: %q vs %q", d1, d2)
 	}
 
 	// Any binding-field change changes the digest.
-	if d, _ := AttestationDigest("2.1.279", "linux/amd64",
-		"ctmpl-v1:sha256:abc", "cprof-v2:sha256:def", validRecords(),
-		"2026-09-22T00:00:00Z", "operator"); d == a {
+	changedVersion := a
+	changedVersion.ClaudeVersion = "2.1.279"
+	if d, _ := changedVersion.Digest(); d == d1 {
 		t.Fatal("version change must change the attestation digest")
 	}
-	if d, _ := AttestationDigest("2.1.278", "linux/amd64",
-		"ctmpl-v1:sha256:different", "cprof-v2:sha256:def", validRecords(),
-		"2026-09-22T00:00:00Z", "operator"); d == a {
+	changedTemplate := a
+	changedTemplate.TemplateDigest = "ctmpl-v1:sha256:different"
+	if d, _ := changedTemplate.Digest(); d == d1 {
 		t.Fatal("template change must change the attestation digest")
+	}
+	changedPlatform := a
+	changedPlatform.Platform = "windows/amd64"
+	if d, _ := changedPlatform.Digest(); d == d1 {
+		t.Fatal("platform change must change the attestation digest")
 	}
 }
 
 func TestProtectionAttestation_ExcerptNormalizationAndTruncation(t *testing.T) {
 	long := strings.Repeat("é", 200) // 400 bytes of valid UTF-8
-	records := []ProbeRecord{
-		{ToolClass: ProbeRead, ToolName: " Read ", Denied: true,
-			EnforcingCapability: CapCwdBoundary,
-			DenialText:          "  outside   allowed\tdirectories  "},
-		{ToolClass: ProbeGrep, ToolName: "Grep", Denied: true,
-			EnforcingCapability: CapGuardrailHook, DenialText: long},
-	}
-	a1, err := AttestationDigest("2.1.278", "linux/amd64",
-		"t", "m", records, "2026-09-22T00:00:00Z", "op")
+
+	// Raw inputs: untrimmed whitespace and an over-length excerpt whose
+	// 256-byte truncation lands mid-code-point.
+	raw := validAttestation()
+	raw.Records[1].ToolName = " Read "
+	raw.Records[1].DenialText = "  outside   allowed\tdirectories  "
+	raw.Records[2].DenialText = long
+	d1, err := raw.Digest()
 	if err != nil {
 		t.Fatalf("digest: %v", err)
 	}
-	// The trimmed record must produce the same digest as the pre-trimmed
-	// equivalent.
-	normalized := []ProbeRecord{
-		{ToolClass: ProbeRead, ToolName: "Read", Denied: true,
-			EnforcingCapability: CapCwdBoundary,
-			DenialText:          "outside allowed directories"},
-		{ToolClass: ProbeGrep, ToolName: "Grep", Denied: true,
-			EnforcingCapability: CapGuardrailHook,
-			DenialText:          strings.Repeat("é", 128)}, // 256 bytes exactly
-	}
-	a2, err := AttestationDigest("2.1.278", "linux/amd64",
-		"t", "m", normalized, "2026-09-22T00:00:00Z", "op")
+
+	// The equivalent normalized inputs must produce the same digest.
+	normalized := validAttestation()
+	normalized.Records[1].ToolName = "Read"
+	normalized.Records[1].DenialText = "outside allowed directories"
+	normalized.Records[2].DenialText = strings.Repeat("é", 128) // exactly 256 bytes
+	d2, err := normalized.Digest()
 	if err != nil {
-		t.Fatalf("digest 2: %v", err)
+		t.Fatalf("normalized digest: %v", err)
 	}
-	if a1 != a2 {
-		t.Fatalf("normalized inputs must be canonical: %q vs %q", a1, a2)
+	if d1 != d2 {
+		t.Fatalf("normalized inputs must be canonical: %q vs %q", d1, d2)
 	}
 }
 
 func TestProtectionAttestation_Rejections(t *testing.T) {
-	denied := false
-	base := validRecords()
+	notDenied := validAttestation()
+	notDenied.Records[0].Denied = false
+
+	duplicate := validAttestation()
+	duplicate.Records = append(duplicate.Records, ProbeRecord{
+		ToolClass: ProbeRead, ToolName: "Read", Denied: true,
+		EnforcingCapability: CapCwdBoundary, DenialText: "dup",
+	})
 
 	cases := []struct {
 		name    string
-		records []ProbeRecord
+		mutate  func(*ProtectionAttestation)
 		wantErr string
 	}{
-		{"not denied", func() []ProbeRecord {
-			r := append([]ProbeRecord{}, base...) // deep copy: no shared backing array
-			r[0].Denied = denied
-			return r
-		}(), "denied"},
-		{"duplicate class+name", append(append([]ProbeRecord{}, base...), ProbeRecord{
-			ToolClass: ProbeRead, ToolName: "Read", Denied: true,
-			EnforcingCapability: CapCwdBoundary, DenialText: "dup"},
-		), "duplicate"},
-		{"empty tool name", []ProbeRecord{
-			{ToolClass: ProbeRead, ToolName: "  ", Denied: true,
-				EnforcingCapability: CapCwdBoundary},
-		}, "tool name"},
-		{"empty excerpt", []ProbeRecord{
-			{ToolClass: ProbeRead, ToolName: "Read", Denied: true,
-				EnforcingCapability: CapCwdBoundary, DenialText: "   "},
-		}, "denial text"},
-		{"unknown capability", []ProbeRecord{
-			{ToolClass: ProbeRead, ToolName: "Read", Denied: true,
-				EnforcingCapability: "vibes", DenialText: "x"},
-		}, "enforcing capability"},
+		{"not denied", func(a *ProtectionAttestation) { a.Records[0].Denied = false }, "invalidates protected evidence"},
+		{"duplicate class+name", func(a *ProtectionAttestation) {
+			a.Records = append(a.Records, ProbeRecord{ToolClass: ProbeRead, ToolName: "Read",
+				Denied: true, EnforcingCapability: CapCwdBoundary, DenialText: "dup"})
+		}, "duplicate"},
+		{"empty tool name", func(a *ProtectionAttestation) {
+			a.Records[0].ToolName = "  "
+		}, "empty tool name"},
+		{"empty excerpt", func(a *ProtectionAttestation) {
+			a.Records[0].DenialText = "   "
+		}, "empty denial text"},
+		{"unknown capability", func(a *ProtectionAttestation) {
+			a.Records[0].EnforcingCapability = "vibes"
+		}, "unknown enforcing capability"},
+		{"unknown tool class", func(a *ProtectionAttestation) {
+			a.Records[0].ToolClass = ProbeToolClass(99)
+		}, "unknown probe tool class"},
+		{"missing version", func(a *ProtectionAttestation) { a.ClaudeVersion = " " }, "probed CLI version"},
+		{"missing actor", func(a *ProtectionAttestation) { a.Actor = "" }, "operator actor"},
+		{"missing probed time", func(a *ProtectionAttestation) { a.ProbedAt = "" }, "probe timestamp"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := AttestationDigest("2.1.278", "linux/amd64",
-				"t", "m", tc.records, "2026-09-22T00:00:00Z", "op")
+			a := validAttestation()
+			tc.mutate(&a)
+			_, err := a.Digest()
 			if err == nil {
 				t.Fatal("expected rejection")
 			}

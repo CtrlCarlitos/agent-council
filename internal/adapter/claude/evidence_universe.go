@@ -26,6 +26,9 @@ type Universe struct {
 // containment, re-hashes the raw bytes against wantDigest
 // ("sha256:<lowercase-hex>"), and parses the typed universe.
 func ResolveUniverseEvidence(evidenceRoot, universeEvidencePath, wantDigest string) (*Universe, error) {
+	if !strings.HasPrefix(wantDigest, "sha256:") || len(wantDigest) != len("sha256:")+64 {
+		return nil, fmt.Errorf("universe evidence digest must be sha256:<64 lowercase hex>")
+	}
 	rel := strings.TrimSpace(universeEvidencePath)
 	if rel == "" {
 		return nil, fmt.Errorf("universe_evidence_path is empty")
@@ -84,7 +87,7 @@ func ResolveUniverseEvidence(evidenceRoot, universeEvidencePath, wantDigest stri
 		return nil, fmt.Errorf("read evidence file: %w", err)
 	}
 	got := fmt.Sprintf("sha256:%x", sha256.Sum256(raw))
-	if got != strings.ToLower(wantDigest) {
+	if got != wantDigest {
 		return nil, fmt.Errorf("universe evidence digest mismatch: got %s want %s", got, wantDigest)
 	}
 

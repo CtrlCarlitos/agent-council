@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 func u32be(n uint32) []byte {
@@ -57,6 +58,9 @@ func TemplateDigest(dir string) (string, error) {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
+		if !utf8.ValidString(rel) {
+			return fmt.Errorf("template path is not valid UTF-8: %q", path)
+		}
 		if rel == "." || rel == "" || strings.HasPrefix(rel, "../") {
 			return fmt.Errorf("template path escapes the tree: %s", rel)
 		}

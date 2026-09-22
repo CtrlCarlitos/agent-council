@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -57,6 +58,9 @@ func (p CanonicalProfile) ValidateForClaude() error {
 	if strings.TrimSpace(m.ProbedCLIVersion) == "" {
 		return &ErrUnsupportedProfile{AlgoVersion: p.AlgoVersion, Reason: "manifest lacks the probed CLI version"}
 	}
+	if err := validateUniverseEvidencePath(m.UniverseEvidencePath); err != nil {
+		return &ErrUnsupportedProfile{AlgoVersion: p.AlgoVersion, Reason: err.Error()}
+	}
 	if err := validateManifestList("approved_tools", m.ApprovedTools, true); err != nil {
 		return &ErrUnsupportedProfile{AlgoVersion: p.AlgoVersion, Reason: err.Error()}
 	}
@@ -72,9 +76,46 @@ func (p CanonicalProfile) ValidateForClaude() error {
 	if err := validateManifestList("expected_plugins", m.ExpectedPlugins, false); err != nil {
 		return &ErrUnsupportedProfile{AlgoVersion: p.AlgoVersion, Reason: err.Error()}
 	}
-	if !strings.HasPrefix(m.UniverseEvidenceDigest, "sha256:") ||
-		len(m.UniverseEvidenceDigest) != len("sha256:"+strings.Repeat("0", 64)) {
-		return &ErrUnsupportedProfile{AlgoVersion: p.AlgoVersion, Reason: "universe_evidence_digest must be sha256:<64 lowercase hex>"}
+	if err := validateSHA256Digest(m.UniverseEvidenceDigest); err != nil {
+		return &ErrUnsupportedProfile{AlgoVersion: p.AlgoVersion, Reason: "universe_evidence_digest: " + err.Error()}
+	}
+	return nil
+}
+
+// validateUniverseEvidencePath enforces the repo-relative provenance
+// path form: forward slashes, no leading ./ or /, no .. components,
+// trimmed, non-empty.
+func validateUniverseEvidencePath(p string) error {
+	s := strings.TrimSpace(p)
+	if s == "" {
+		return fmt.Errorf("universe_evidence_path is required")
+	}
+	if filepath.IsAbs(s) || strings.HasPrefix(s, "/") || strings.HasPrefix(s, "./") ||
+		strings.HasPrefix(s, "../") || s == ".." || strings.Contains(s, `\`) {
+		return fmt.Errorf("universe_evidence_path %q must be repo-relative with forward slashes", p)
+	}
+	for _, part := range strings.Split(s, "/") {
+		if part == "" || part == "." || part == ".." {
+			return fmt.Errorf("universe_evidence_path %q contains invalid path components", p)
+		}
+	}
+	return nil
+}
+
+// validateSHA256Digest requires the exact form sha256:<64 lowercase hex>.
+func validateSHA256Digest(d string) error {
+	const prefix = "sha256:"
+	if !strings.HasPrefix(d, prefix) {
+		return fmt.Errorf("must be %s<64 lowercase hex>", prefix)
+	}
+	hex := strings.TrimPrefix(d, prefix)
+	if len(hex) != 64 {
+		return fmt.Errorf("must be %s<64 lowercase hex>", prefix)
+	}
+	for _, c := range hex {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return fmt.Errorf("must be %s<64 lowercase hex>, found %q", prefix, c)
+		}
 	}
 	return nil
 }

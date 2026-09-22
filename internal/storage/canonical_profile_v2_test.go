@@ -114,6 +114,28 @@ func TestCanonicalProfileV2_RequiresCompleteManifest(t *testing.T) {
 	if _, _, err := ComputeProfileDigest(p); err == nil {
 		t.Fatal("malformed universe digest must be rejected")
 	}
+
+	// Uppercase hex and non-hex content are rejected: the frozen form is
+	// exactly sha256:<64 lowercase hex>.
+	p.ToolkitManifest.ToolkitManifest.UniverseEvidenceDigest = "sha256:" + strings.Repeat("A", 64)
+	if _, _, err := ComputeProfileDigest(p); err == nil {
+		t.Fatal("uppercase universe digest must be rejected")
+	}
+	p.ToolkitManifest.ToolkitManifest.UniverseEvidenceDigest = "sha256:" + strings.Repeat("g", 64)
+	if _, _, err := ComputeProfileDigest(p); err == nil {
+		t.Fatal("non-hex universe digest must be rejected")
+	}
+
+	// The evidence path is required and must be repo-relative.
+	p.ToolkitManifest.ToolkitManifest.UniverseEvidenceDigest = "sha256:" + strings.Repeat("a", 64)
+	p.ToolkitManifest.ToolkitManifest.UniverseEvidencePath = ""
+	if _, _, err := ComputeProfileDigest(p); err == nil {
+		t.Fatal("missing universe evidence path must be rejected")
+	}
+	p.ToolkitManifest.ToolkitManifest.UniverseEvidencePath = "../outside/universe.json"
+	if _, _, err := ComputeProfileDigest(p); err == nil {
+		t.Fatal("escaping universe evidence path must be rejected")
+	}
 }
 
 // Claude eligibility: v2 + complete manifest passes; v1 (or v2 without a

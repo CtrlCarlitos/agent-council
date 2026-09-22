@@ -90,6 +90,17 @@ func TestTemplateDigest_EmptyFileAndEmptyTree(t *testing.T) {
 	}
 }
 
+func TestTemplateDigest_RejectsNonUTF8Path(t *testing.T) {
+	dir := t.TempDir()
+	bad := filepath.Join(dir, "bad\xff.txt") // 0xff is never valid UTF-8
+	if err := os.WriteFile(bad, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := TemplateDigest(dir); err == nil {
+		t.Fatal("non-UTF-8 template paths must be rejected")
+	}
+}
+
 func TestTemplateDigest_RejectsSymlinkAndDuplicateNormalizedPaths(t *testing.T) {
 	dir := writeTree(t, map[string]string{"real.txt": "x"})
 	if err := os.Symlink(filepath.Join(dir, "real.txt"), filepath.Join(dir, "link.txt")); err != nil {
