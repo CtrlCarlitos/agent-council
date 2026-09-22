@@ -44,11 +44,17 @@
 - `storage.ParseCanonicalProfileV2(canonicalJSON) (CanonicalProfile, error)` — accepts v1 fields + requires `toolkit_manifest` completeness for Claude eligibility; normalization per spec §3.11 (trim/reject-empty/reject-duplicate/byte-wise sort).
 - `claude.TemplateDigest(dir string) (string, error)` — `ctmpl-v1:sha256:<hex>` with the exact framing (uint32-BE count, length-prefixed UTF-8 paths + raw bytes, byte-wise path order, duplicate-normalized-path rejection, symlink/non-regular rejection).
 - `claude.ResolveUniverseEvidence(profile, evidenceRoot) (Universe, error)` — resolves `universe_evidence_path` against the trusted service-owned evidence root with symlink-safe containment (no `..`, no escaping the root, no symlink components), re-hashes raw bytes against `sha256:<hex>`, parses the typed universe.
+- **`claude.ProtectionAttestation` canonical encoding (cprot-v1)** — typed probe-record list (fixed tool_class enum order, trimmed case-preserved tool names, UTF-8-safe ≤256-byte denial excerpts, enforcing-capability enum, denied-must-be-true), byte-wise sorted with (tool_class, tool_name) duplicate rejection, uint32-BE framed encoding, then the fixed-field-order attestation frame (version, platform, manifest digest, template digest, framed records, RFC3339-UTC probed_at, actor) → `cprot-v1:sha256:<hex>`; any `denied=false` record invalidates the attestation.
 
 **Steps:**
-- [ ] 1.1 Failing tests: cprof-v2 digest vectors (golden), normalization rejections (duplicate/empty/untrimmed entries), v1/v2 acceptance matrix (OpenCode accepts both; Claude requires v2 → typed `ErrUnsupportedProfile`), `ctmpl-v1` golden vectors (empty file, unicode paths, duplicate rejection, symlink rejection), evidence containment (escape attempts: `../`, symlinked root, symlinked file, wrong digest).
+- [ ] 1.1 Failing tests: cprof-v2 digest vectors (golden), normalization rejections (duplicate/empty/untrimmed entries), v1/v2 acceptance matrix (OpenCode accepts both; Claude requires v2 → typed `ErrUnsupportedProfile`) **exercised through the OpenCode eligibility path with a cprof-v2 profile** (`internal/adapter/opencode` launch-source/eligibility test — OpenCode builds its launch from a v2 profile unchanged), `ctmpl-v1` golden vectors (empty file, unicode paths, duplicate rejection, symlink rejection), evidence containment (escape attempts: `../`, symlinked root, symlinked file, wrong digest).
 - [ ] 1.2 Implement.
-- [ ] 1.3 Suite green (cross-platform); commit `feat(storage,adapter/claude): cprof-v2 toolkit manifest, template digest, evidence containment`.
+- [ ] 1.3 Suite green (cross-platform); commit `feat(storage,adapter/claude): cprof-v2 toolkit manifest, template digest, evidence containment, cprot-v1 encoding`.
+
+**Task 1b (same task, cprot-v1 canonical encoding + tests):**
+- [ ] 1.4 Failing tests: probe-record normalization (enum order, trimmed names, UTF-8-safe ≤256-byte excerpt truncation at code-point boundaries), sort/duplicate rejection ((tool_class, tool_name) pairs), `denied=false` record invalidates the attestation, framing golden vectors, full-attestation digest golden vector.
+- [ ] 1.5 Implement the canonical encoder in `internal/adapter/claude/protection_attestation.go`.
+- [ ] 1.6 Attestation-freezing tests (which attestation governs an attempt is frozen at launch; later attestations never upgrade) land with Task 5's storage transitions; the journal-authority operation lands in Task 6.
 
 ### Task 2: Config base dir validation + per-session config-root materialization + typed config-dir extension
 
@@ -126,7 +132,8 @@
   - create/resume/idempotency/concurrency (AC-007 carry-over + unmaterialized-binding rule);
   - dispatch accepted/rejected/unknown via fixture faults (pre-write refusal; stdin transmission begun then failure ⇒ unknown);
   - per-native-session single-flight across distinct turns;
-  - **crash boundaries (plan requirement):** (a) crash after launch-reservation transaction, before Start ⇒ recovered state is `reserved, started_at NULL` ⇒ possibly-running ⇒ Uncertain, no redispatch; (b) crash after Start, before `started_at` ⇒ same classification; (c) crash after stdin-byte, before acceptance ⇒ unknown stands; (d) crash between redispatch decision and consumption ⇒ flag unset, re-derived, never a third launch; (e) crash after consumption before second Start ⇒ reserved row blocks;
+  - **crash boundaries (plan requirement):** (a) crash after launch-reservation transaction, before Start ⇒ recovered state is `reserved, started_at NULL` ⇒ possibly-running ⇒ Uncertain, no redispatch; (b) crash after Start, before `started_at` ⇒ same classification; (c) crash after stdin-byte, before acceptance ⇒ unknown stands; (d) crash between redispatch decision and consumption ⇒ `absence_redispatch_consumed` stays false, the v8 transition re-derives (next reservation_seq + flag set + count 1→2 in one transaction; preconditions: fewer than two started/dead launches, prior launch known dead), never a third launch; (e) crash after consumption before second Start ⇒ reserved row blocks;
+  - **retained start_failed rows:** a definitive start failure keeps its row (state=start_failed) and releases its slot; a subsequent reservation takes the next reservation_seq without colliding, and the retained row neither consumes the two-started-launch cap nor resurrects the redispatch authorization;
   - Collect/Observe/Cancel semantics incl. terminal-close and detach;
   - Reconcile: advisory default ⇒ uncertain-until-disposed; in-life result ⇒ terminal; probe attempt = separate identity/cost, never attributed;
   - transcript trust: path derivation golden, symlink/torn-tail/ownership rejections (POSIX-gated), Windows fail-closed behavior (fixture-simulated).
@@ -142,8 +149,10 @@
 - Test: `internal/service/review_ac008_wiring_test.go` (POSIX — real stub child)
 - Test: `internal/adapter/claude/probe_wiring_test.go` (portable rejection + POSIX e2e)
 
+The cprot-v1 canonical ENCODING is built and tested in Task 1; this task owns only the durable attestation records and their journal authority.
+
 **Steps:**
-- [ ] 6.1 Failing tests: construction requires the Claude config (binary path, disjoint base dir, probe profile) or fails closed; probe runs `--version` + `--help` contract assertions against the stub; attestation journal operation requires operator authority and freezes the binding fields.
+- [ ] 6.1 Failing tests: construction requires the Claude config (binary path, disjoint base dir, probe profile) or fails closed; probe runs `--version` + `--help` contract assertions against the stub; the attestation journal operation requires operator authority, persists the cprot-v1 row, and attempt freezing is verified (launch-time attestation id; later attestations never upgrade old attempts).
 - [ ] 6.2 Implement wiring.
 - [ ] 6.3 Commit `feat(service): wire Claude adapter construction and probe attestation`.
 
