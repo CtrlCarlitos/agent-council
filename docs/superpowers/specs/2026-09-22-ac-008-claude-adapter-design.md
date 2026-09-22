@@ -1,6 +1,6 @@
 # AC-008 Design — Claude persistent contributor adapter
 
-Status: DRAFT v7 for review
+Status: DRAFT v8 for review
 Date: 2026-09-22
 Issue: #8
 Depends on: AC-003 (controller grants), AC-005 (workspaces/execution policy),
@@ -410,8 +410,12 @@ claude_turn_attempts
                       -- newer attestation never upgrades old attempts
   prompt_digest       TEXT
   launch_count        INTEGER (0..2)
-                      -- 1 = initial launch; 2 = the single protected-
-                      -- verified-absence redispatch was consumed
+                      -- currently held/reached reservations that count
+                      -- against the cap: rows in state reserved or
+                      -- started or dead (start_failed rows release)
+  absence_redispatch_consumed BOOL
+                      -- the single protected verified-absence
+                      -- redispatch authorization; one-time per attempt
   accepted            BOOL NULL    -- known only in protected mode
   terminal            BOOL
   result_payload      TEXT NULL    -- verified terminal result text
@@ -426,10 +430,11 @@ claude_turn_attempts
                       -- entry, not a bare column write
   updated_at
 
-claude_attempt_launches              -- one row per process launch
+claude_attempt_launches              -- one row per launch RESERVATION
   attempt_id         FK
-  launch_index       INTEGER (1|2)
-  UNIQUE(attempt_id, launch_index)
+  reservation_seq    INTEGER        -- per-attempt, monotonically
+                                    -- increasing; rows are never reused
+  UNIQUE(attempt_id, reservation_seq)
   state              TEXT (reserved|started|start_failed|dead)
                       -- RESERVED before executor.Start is invoked
   started_at         TIMESTMP NULL  -- set only on confirmed Start success
@@ -438,6 +443,11 @@ claude_attempt_launches              -- one row per process launch
   known_dead_at      TIMESTMP NULL
   exit_code          INTEGER NULL
   executor_identity  TEXT            -- policy fingerprint of the launch
+
+  A definitive start failure RETAINS its row (state=start_failed) as
+  evidence and releases its slot; a subsequent reservation takes the
+  NEXT reservation_seq — the UNIQUE key is never violated, and the
+  failed row is never deleted or reused.
 ```
 
 **Launches are durably RESERVED before Start (finding 1).** A crash
@@ -451,16 +461,17 @@ nullable and recorded only afterwards.
 1. persist attempt with baseline (materialized flag or cursor) — before
    any launch;
 2. **launch reservation**: `launch_count 0→1` + insert launch row
-   (`launch_index 1`, `started_at NULL`) in ONE transaction — before
-   `executor.Start`. A crash here leaves a RESERVED row with
-   `started_at NULL`: an orphan is possible, so the attempt is treated
-   as possibly-running (uncertain path; no third reservation);
+   (next `reservation_seq`, `state=reserved`, `started_at NULL`) in ONE
+   transaction — before `executor.Start`. A crash here leaves a RESERVED
+   row with `started_at NULL`: an orphan is possible, so the attempt is
+   treated as possibly-running (uncertain path);
 3. after `Start` returns:
    - success → mark `started_at` on the launch row;
    - definitive start FAILURE (executor proves no process was created) →
      mark `start_failed_at` and release the reservation
-     (`launch_count` decremented, row kept for evidence) — pre-acceptance,
-     safe to relaunch as a new reservation;
+     (`launch_count` decremented; the row is RETAINED as evidence with
+     its own reservation_seq) — pre-acceptance, safe to relaunch as a
+     new reservation;
    - ambiguous Start outcome (daemon crash mid-call) → reservation stays,
      `started_at` stays NULL: possibly-running ⇒ Uncertain;
 4. mark `first_stdin_byte_at` — after the prompt write begins;
@@ -473,11 +484,13 @@ nullable and recorded only afterwards.
 8. **redispatch reservation** — the single protected-mode verified-
    absence redispatch is an atomic transition: precondition (protection
    attestation valid for this attempt, verified absence recorded,
-   `launch_count = 1`, prior launch `known_dead_at` set) sets
-   `launch_count 1→2` and inserts the RESERVED second launch row in ONE
-   transaction — before the second `Start`. A crash between decision and
-   reservation leaves `launch_count = 1` and re-derives; it can never
-   authorize a third launch (max 2 enforced by the count constraint);
+   `absence_redispatch_consumed = false`, fewer than two launches have
+   reached `started`/`dead`, the prior launch is `known_dead`) sets
+   `absence_redispatch_consumed = true`, `launch_count 1→2`, and inserts
+   the RESERVED next-reservation-seq launch row in ONE transaction —
+   before the second `Start`. A crash between decision and reservation
+   leaves the flag unset and re-derives; the boolean plus the
+   two-started-launches cap can never authorize a third launch;
 9. `uncertainty_disposition` — ONLY by explicit controller decision
    (AC-004 authority), recorded as a journal entry with actor,
    generation, and operation ID; it resolves an uncertain attempt and
@@ -520,8 +533,12 @@ denied                bool — MUST be true for the attestation to be
                       valid; any false record invalidates it
 enforcing_capability  enum: cwd_boundary | guardrail_hook | deny_list |
                       permission_denial
-denial_text_excerpt   UTF-8, trimmed, internal whitespace collapsed,
-                      max 256 bytes (longer text truncated)
+denial_text_excerpt   UTF-8, trimmed, internal whitespace collapsed;
+                      excerpts longer than 256 BYTES are truncated at
+                      the last valid UTF-8 code-point boundary that
+                      keeps the result <= 256 bytes (the encoding always
+                      remains valid UTF-8; byte-level truncation that
+                      would split a code point is prohibited)
 ```
 
 Canonicalization: records are sorted by `(tool_class enum order,
@@ -554,6 +571,7 @@ operation (AC-004 authority).
   ```json
   "toolkit_manifest": {
     "probed_cli_version": "2.1.278",
+    "universe_evidence_path": "docs/superpowers/evidence/ac008-native-tool-universe-2.1.278.json",
     "universe_evidence_digest": "sha256:<lowercase-hex>",
     "approved_tools": ["..."],
     "denied_complement": ["..."],
@@ -562,6 +580,11 @@ operation (AC-004 authority).
     "expected_plugins": ["..."]
   }
   ```
+  `universe_evidence_path` is the repo-relative evidence file path:
+  forward slashes, no leading `./` or `/`, no `..` components, trimmed;
+  it is provenance only — **the digest is authoritative**. At validation
+  time the adapter re-hashes the file at that path and requires the
+  digest to match (mismatch or unresolvable path ⇒ profile rejected).
   **Manifest normalization (finding 3)**: every array field is normalized
   before the profile is frozen — entries are trimmed; empty entries
   rejected; duplicates rejected; ordering is byte-wise lexicographic over
