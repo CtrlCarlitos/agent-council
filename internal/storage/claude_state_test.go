@@ -45,9 +45,9 @@ func claudeAttemptFixture(attemptID, sessionID, turnKey, nativeID string) Claude
 	}
 }
 
-// Crash boundary (a): attempt persisted (baseline) but process never
-// started — no launch row. On reopen the attempt is queryable with
-// launch_count 0 and observed_status uncertain.
+// Crash before launch reservation: durable state proves no process was
+// authorized — this is pre-start evidence, so the attempt remains safely
+// dispatchable (not uncertain-blocked).
 func TestClaudeState_CrashBeforeLaunchReservation(t *testing.T) {
 	store := openClaudeStore(t)
 	ctx := context.Background()
@@ -66,8 +66,10 @@ func TestClaudeState_CrashBeforeLaunchReservation(t *testing.T) {
 	if a.LaunchCount != 0 {
 		t.Fatalf("launch_count must be 0 (process never started), got %d", a.LaunchCount)
 	}
-	if a.ObservedStatus != "uncertain" {
-		t.Fatalf("observed_status must be uncertain, got %q", a.ObservedStatus)
+	// Pre-start evidence: a fresh reservation is safely authorized.
+	seq, err := reopened.ReserveClaudeLaunch(ctx, "att-a", "fixture")
+	if err != nil || seq != 1 {
+		t.Fatalf("pre-start attempt must remain safely dispatchable, got seq=%d err=%v", seq, err)
 	}
 }
 
@@ -211,6 +213,78 @@ func TestClaudeState_RedispatchConsumedCannotAuthorizeThird(t *testing.T) {
 	}
 }
 
+// Crash boundary (b): Start succeeds but started_at never persists —
+// the reserved row with started_at NULL means possibly-running; the
+// attempt must remain uncertain and no redispatch is authorized.
+func TestClaudeState_CrashAfterStartBeforeStartedAt(t *testing.T) {
+	store := openClaudeStore(t)
+	ctx := context.Background()
+
+	if err := store.InsertClaudeTurnAttempt(ctx, claudeAttemptFixture("att-d", "sess-d", "t-d", "nat-d")); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if _, err := store.ReserveClaudeLaunch(ctx, "att-d", "fixture"); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	// Simulate crash AFTER executor.Start but BEFORE started_at was
+	// recorded: the reservation exists (count=1) but started_at is NULL.
+
+	// Reopen and verify: the attempt is possibly-running.
+	reopened := reopenStore(t, store)
+	a, err := reopened.GetClaudeTurnAttempt(ctx, "att-d")
+	if err != nil || a == nil {
+		t.Fatalf("attempt must survive: %v", err)
+	}
+	if a.LaunchCount != 1 {
+		t.Fatalf("launch_count must be 1, got %d", a.LaunchCount)
+	}
+	if a.ObservedStatus != "uncertain" {
+		t.Fatalf("possibly-running attempt must be uncertain, got %q", a.ObservedStatus)
+	}
+
+	// No redispatch is authorized: the process is possibly running.
+	_, err = reopened.ReserveClaudeLaunch(ctx, "att-d", "fixture")
+	if err == nil {
+		t.Fatal("redispatch must not authorize while the process is possibly running")
+	}
+}
+
+// Crash boundary (d): after verified absence is recorded but before the
+// redispatch consumption transaction, a crash leaves the consumed flag
+// unset. On reopen the decision re-derives: exactly one new reservation.
+func TestClaudeState_RedispatchDecisionBeforeConsumption(t *testing.T) {
+	store := openClaudeStore(t)
+	ctx := context.Background()
+
+	if err := store.InsertClaudeTurnAttempt(ctx, claudeAttemptFixture("att-e", "sess-e", "t-e", "nat-e")); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	// Launch 1: started then dead (verified absence).
+	if _, err := store.ReserveClaudeLaunch(ctx, "att-e", "fixture"); err != nil {
+		t.Fatalf("reserve 1: %v", err)
+	}
+	exit := 0
+	if err := store.RecordClaudeLaunchState(ctx, "att-e", 1, "started", nil); err != nil {
+		t.Fatalf("started: %v", err)
+	}
+	if err := store.RecordClaudeLaunchState(ctx, "att-e", 1, "dead", &exit); err != nil {
+		t.Fatalf("dead: %v", err)
+	}
+
+	// Reopen: the redispatch decision re-derives exactly one reservation.
+	reopened := reopenStore(t, store)
+	seq2, err := reopened.ReserveClaudeLaunch(ctx, "att-e", "fixture")
+	if err != nil || seq2 != 2 {
+		t.Fatalf("redispatch decision must re-derive after crash, got seq=%d err=%v", seq2, err)
+	}
+
+	// The consumed authorization cannot produce a third launch.
+	_, err = reopened.ReserveClaudeLaunch(ctx, "att-e", "fixture")
+	if err == nil {
+		t.Fatal("third launch must be rejected")
+	}
+}
+
 // Terminal persistence is exactly-once: the second call cannot
 // overwrite the first.
 func TestClaudeState_TerminalPersistenceExactlyOnce(t *testing.T) {
@@ -257,5 +331,31 @@ func TestClaudeState_UnresolvedAttemptsReported(t *testing.T) {
 	}
 	if !unresolved {
 		t.Fatal("started-without-result attempt must be unresolved")
+	}
+}
+
+// The schema-v4 migration must be asserted exactly: at least one test
+// pins the version to 4 to prevent v4 migration omission from passing.
+func TestClaudeState_SchemaVersionIsExactly4(t *testing.T) {
+	store := openClaudeStore(t)
+	ver, err := store.CurrentSchemaVersion()
+	if err != nil {
+		t.Fatalf("schema version: %v", err)
+	}
+	if ver != 4 {
+		t.Fatalf("expected schema version exactly 4, got %d", ver)
+	}
+	// The AC-008 tables must exist.
+	for _, table := range []string{
+		"claude_session_bindings", "claude_turn_attempts",
+		"claude_attempt_launches", "claude_protection_attestations",
+	} {
+		var name string
+		err := store.DB().QueryRow(
+			`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table,
+		).Scan(&name)
+		if err != nil {
+			t.Fatalf("table %s must exist: %v", table, err)
+		}
 	}
 }
