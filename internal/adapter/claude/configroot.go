@@ -27,6 +27,12 @@ var runtimeGOOSWindows = runtime.GOOS == "windows"
 // verification failure.
 var digestTree = TemplateDigest
 
+// ConfigRootPath derives the per-session config root path from the base
+// (spec §3.2 layout: <base>/<run-id>/<session-id>/config).
+func ConfigRootPath(base, runID, sessionID string) string {
+	return filepath.Join(base, runID, sessionID, "config")
+}
+
 // MaterializeConfigRoot copies the operator template into
 // <base>/<runID>/<sessionID>/config atomically (uniquely named temporary
 // directory plus rename, reserved under the destination's parent so the
