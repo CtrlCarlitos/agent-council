@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -477,5 +478,269 @@ func TestGate2_ReconcileUncertainOnMessageTransportLoss(t *testing.T) {
 	}
 	if rec.Status != adapter.ReconciliationUncertain || rec.Reachability != council.VisibilityHostLost {
 		t.Fatalf("transport loss must reconcile uncertain, got %+v", rec)
+	}
+}
+
+// A stale terminal must not release a replacement turn's slot: the
+// ownership check and deletion are atomic, so turn A's second terminal
+// event cannot free the slot turn B legitimately holds.
+func TestGate2_StaleTerminalCannotReleaseReplacementSlot(t *testing.T) {
+	adp, fake := gate2Fixture(t)
+	ctx := context.Background()
+
+	// Turn A: dispatch, then a terminal arrives via the pump.
+	refA := adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-stale-a"}
+	if outcome, err := adp.Dispatch(ctx, refA, "first"); err != nil || outcome.Status != adapter.DispatchAccepted {
+		t.Fatalf("dispatch A: status=%v err=%v", outcome.Status, err)
+	}
+	msgA := adp.dispatches[refA].userMessageID
+	fake.mu.Lock()
+	fake.sessions[gate2NativeSession].scriptedEvents = append(fake.sessions[gate2NativeSession].scriptedEvents,
+		`{"type":"message.completed","parentID":"`+msgA+`"}`)
+	fake.mu.Unlock()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		adp.mu.Lock()
+		held := len(adp.slots)
+		adp.mu.Unlock()
+		if held == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("turn A's terminal must release its slot")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Turn B acquires the same native session's slot.
+	refB := adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-stale-b"}
+	if outcome, err := adp.Dispatch(ctx, refB, "second"); err != nil || outcome.Status != adapter.DispatchAccepted {
+		t.Fatalf("dispatch B: status=%v err=%v", outcome.Status, err)
+	}
+
+	// A stale duplicate terminal for A arrives while B owns the slot.
+	fake.mu.Lock()
+	fake.sessions[gate2NativeSession].scriptedEvents = append(fake.sessions[gate2NativeSession].scriptedEvents,
+		`{"type":"message.completed","parentID":"`+msgA+`"}`)
+	fake.mu.Unlock()
+	time.Sleep(150 * time.Millisecond)
+
+	// Turn C must still be blocked by B: the stale release was rejected.
+	refC := adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-stale-c"}
+	cDone := make(chan adapter.DispatchOutcome, 1)
+	go func() {
+		outcome, _ := adp.Dispatch(ctx, refC, "third")
+		cDone <- outcome
+	}()
+	select {
+	case out := <-cDone:
+		t.Fatalf("stale terminal must not release B's slot, C dispatched with %v", out.Status)
+	case <-time.After(300 * time.Millisecond):
+		// still blocked — correct
+	}
+
+	// B reaches a terminal outcome via Collect: the slot frees and C
+	// proceeds.
+	resultB, err := adp.Collect(ctx, refB)
+	if err != nil || resultB.Status != council.TurnCompleted {
+		t.Fatalf("collect B must be terminal, got %+v err=%v", resultB, err)
+	}
+	select {
+	case out := <-cDone:
+		if out.Status != adapter.DispatchAccepted {
+			t.Fatalf("turn C must proceed after B is terminal, got %v", out.Status)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("turn C must dispatch once B releases the slot")
+	}
+}
+
+// ResumeSession carries the complete frozen configuration: an exactly
+// matching CreateSession after resume is idempotent, not a mismatch.
+func TestGate2_ResumePreservesConfigurationIdentity(t *testing.T) {
+	adp, fake := gate2Fixture(t)
+	ctx := context.Background()
+
+	const fresh = "sess-fresh-resume"
+	fake.mu.Lock()
+	fake.sessions[fresh] = &fakeSession{id: fresh, directory: gate2Workspace}
+	adp.servers.children[fresh] = &serverProcess{
+		endpoint: fake.endpoint,
+		username: gate1User,
+		password: gate1Password,
+	}
+	fake.mu.Unlock()
+
+	created, err := adp.CreateSession(ctx, adapter.CreateSessionRequest{
+		SessionID:   fresh,
+		Contributor: "opencode",
+		Config: adapter.SessionConfig{
+			Model: "fake/model", WorkspaceRoot: gate2Workspace, Tooling: []string{"opencode"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("initial create: %v", err)
+	}
+
+	// Resume with the full binding identity.
+	binding := adapter.SessionBinding{
+		SessionID:       fresh,
+		Contributor:     "opencode",
+		NativeSessionID: created.NativeSessionID,
+		Config: adapter.SessionConfig{
+			Model: "fake/model", WorkspaceRoot: gate2Workspace, Tooling: []string{"opencode"},
+		},
+	}
+	if err := adp.ResumeSession(ctx, binding); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+
+	// The resumed binding must satisfy an exactly matching idempotent
+	// create.
+	again, err := adp.CreateSession(ctx, adapter.CreateSessionRequest{
+		SessionID:   fresh,
+		Contributor: "opencode",
+		Config: adapter.SessionConfig{
+			Model: "fake/model", WorkspaceRoot: gate2Workspace, Tooling: []string{"opencode"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("matching create after resume must be idempotent, got %v", err)
+	}
+	if again.NativeSessionID != created.NativeSessionID {
+		t.Fatalf("idempotent create must return the original native session, got %q", again.NativeSessionID)
+	}
+}
+
+// Concurrent CreateSession calls create exactly one native session:
+// matching callers share the result.
+func TestGate2_ConcurrentCreateSessionCreatesOneNativeSession(t *testing.T) {
+	adp, fake := gate2Fixture(t)
+	ctx := context.Background()
+
+	const fresh = "sess-fresh-concurrent"
+	fake.mu.Lock()
+	fake.sessions[fresh] = &fakeSession{id: fresh}
+	adp.servers.children[fresh] = &serverProcess{
+		endpoint: fake.endpoint,
+		username: gate1User,
+		password: gate1Password,
+	}
+	fake.mu.Unlock()
+
+	const callers = 6
+	var wg sync.WaitGroup
+	results := make([]adapter.SessionBinding, callers)
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i], errs[i] = adp.CreateSession(ctx, adapter.CreateSessionRequest{
+				SessionID:   fresh,
+				Contributor: "opencode",
+				Config:      adapter.SessionConfig{Model: "fake/model", WorkspaceRoot: gate2Workspace},
+			})
+		}()
+	}
+	wg.Wait()
+
+	var nativeIDs []string
+	for i := range results {
+		if errs[i] != nil {
+			t.Fatalf("caller %d: %v", i, errs[i])
+		}
+		nativeIDs = append(nativeIDs, results[i].NativeSessionID)
+	}
+	unique := map[string]bool{}
+	for _, id := range nativeIDs {
+		unique[id] = true
+	}
+	if len(unique) != 1 {
+		t.Fatalf("all callers must share one native session, got %v", nativeIDs)
+	}
+
+	// Exactly one native session was created on the server.
+	fake.mu.Lock()
+	created := 0
+	for id := range fake.sessions {
+		if strings.HasPrefix(id, "ses_fake_") {
+			created++
+		}
+	}
+	fake.mu.Unlock()
+	if created != 1 {
+		t.Fatalf("concurrent creates must produce exactly one native session, got %d", created)
+	}
+}
+
+// Concurrent mismatched CreateSession calls fail closed and still create
+// exactly one native session.
+func TestGate2_ConcurrentMismatchedCreateSessionFailsClosed(t *testing.T) {
+	adp, fake := gate2Fixture(t)
+	ctx := context.Background()
+
+	const fresh = "sess-fresh-mismatch"
+	fake.mu.Lock()
+	fake.sessions[fresh] = &fakeSession{id: fresh}
+	adp.servers.children[fresh] = &serverProcess{
+		endpoint: fake.endpoint,
+		username: gate1User,
+		password: gate1Password,
+	}
+	fake.mu.Unlock()
+
+	workspaces := []string{gate2Workspace, "/elsewhere", gate2Workspace, "/also-elsewhere", gate2Workspace}
+	var wg sync.WaitGroup
+	errs := make([]error, len(workspaces))
+	for i, wsRoot := range workspaces {
+		wg.Add(1)
+		go func(i int, wsRoot string) {
+			defer wg.Done()
+			_, errs[i] = adp.CreateSession(ctx, adapter.CreateSessionRequest{
+				SessionID:   fresh,
+				Contributor: "opencode",
+				Config:      adapter.SessionConfig{Model: "fake/model", WorkspaceRoot: wsRoot},
+			})
+		}(i, wsRoot)
+	}
+	wg.Wait()
+
+	// Matching callers share ONE result; mismatched callers fail closed.
+	succeeded, failed := 0, 0
+	var succeededWorkspaces []string
+	for i, err := range errs {
+		if err == nil {
+			succeeded++
+			succeededWorkspaces = append(succeededWorkspaces, workspaces[i])
+			continue
+		}
+		failed++
+		if !strings.Contains(err.Error(), "different configuration") {
+			t.Fatalf("mismatched caller must fail closed, got %v", err)
+		}
+	}
+	// All successes must agree on one workspace — a single native
+	// session cannot serve two.
+	uniqueWorkspaces := map[string]bool{}
+	for _, wsRoot := range succeededWorkspaces {
+		uniqueWorkspaces[wsRoot] = true
+	}
+	if len(uniqueWorkspaces) != 1 {
+		t.Fatalf("successful callers must agree on one workspace, got %v", succeededWorkspaces)
+	}
+	if failed != len(workspaces)-succeeded || failed == 0 {
+		t.Fatalf("mismatched callers must fail closed, got %d succeeded / %d failed", succeeded, failed)
+	}
+	fake.mu.Lock()
+	created := 0
+	for id := range fake.sessions {
+		if strings.HasPrefix(id, "ses_fake_") {
+			created++
+		}
+	}
+	fake.mu.Unlock()
+	if created != 1 {
+		t.Fatalf("mismatched concurrent creates must not create extra native sessions, got %d", created)
 	}
 }

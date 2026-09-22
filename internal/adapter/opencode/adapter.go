@@ -53,6 +53,17 @@ type OpenCodeAdapter struct {
 	pumps      map[string]*sessionPump // native session ID → event pump
 	parkTimers map[adapter.SessionID]*time.Timer
 	slots      map[string]*sessionSlot // native session ID → single-flight slot
+	creating   map[adapter.SessionID]*createReservation
+}
+
+// createReservation serializes concurrent CreateSession calls for one
+// logical session: matching callers share one result, mismatched callers
+// fail closed against the stored binding — only one native session is
+// ever created.
+type createReservation struct {
+	ready   chan struct{}
+	binding adapter.SessionBinding
+	err     error
 }
 
 // sessionSlot enforces the per-NATIVE-SESSION single-flight rule: at most
@@ -73,6 +84,15 @@ type sessionBinding struct {
 	directory   string              // expected project directory of the native session
 	contributor council.Contributor // bound contributor identity
 	tooling     []string            // bound tooling allowlist
+}
+
+// bindingMismatch reports whether an existing binding differs from the
+// incoming create configuration.
+func bindingMismatch(existing *sessionBinding, contributor council.Contributor, model string, config adapter.SessionConfig) bool {
+	return existing.contributor != contributor ||
+		existing.model != model ||
+		existing.directory != config.WorkspaceRoot ||
+		!slices.Equal(existing.tooling, config.Tooling)
 }
 
 // parseNativeModel splits the frozen "provider/model" identifier into the
@@ -132,6 +152,7 @@ func NewOpenCodeAdapter(
 		pumps:         make(map[string]*sessionPump),
 		parkTimers:    make(map[adapter.SessionID]*time.Timer),
 		slots:         make(map[string]*sessionSlot),
+		creating:      make(map[adapter.SessionID]*createReservation),
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -170,7 +191,7 @@ func (a *OpenCodeAdapter) resolveNativeID(sessionID adapter.SessionID) string {
 
 // ── CreateSession ───────────────────────────────────────────────────────
 
-func (a *OpenCodeAdapter) CreateSession(ctx context.Context, req adapter.CreateSessionRequest) (adapter.SessionBinding, error) {
+func (a *OpenCodeAdapter) CreateSession(ctx context.Context, req adapter.CreateSessionRequest) (sb adapter.SessionBinding, err error) {
 	if err := req.Validate(); err != nil {
 		return adapter.SessionBinding{}, err
 	}
@@ -187,16 +208,12 @@ func (a *OpenCodeAdapter) CreateSession(ctx context.Context, req adapter.CreateS
 		return adapter.SessionBinding{}, err
 	}
 
-	// Idempotent ONLY on matching configuration: contributor, model,
-	// workspace, and tooling must all match the existing binding — a
-	// mismatched duplicate is rejected, never relabelled onto the old
-	// native session.
+	// Idempotent ONLY on matching configuration; concurrent callers are
+	// serialized by a per-logical-session creation reservation so exactly
+	// one native session is ever created.
 	a.mu.Lock()
 	if existing, ok := a.bindings[req.SessionID]; ok {
-		mismatch := existing.contributor != req.Contributor ||
-			existing.model != model ||
-			existing.directory != req.Config.WorkspaceRoot ||
-			!slices.Equal(existing.tooling, req.Config.Tooling)
+		mismatch := bindingMismatch(existing, req.Contributor, model, req.Config)
 		a.mu.Unlock()
 		if mismatch {
 			return adapter.SessionBinding{}, fmt.Errorf(
@@ -210,7 +227,37 @@ func (a *OpenCodeAdapter) CreateSession(ctx context.Context, req adapter.CreateS
 			Config:          req.Config,
 		}, nil
 	}
+	if res, ok := a.creating[req.SessionID]; ok {
+		a.mu.Unlock()
+		<-res.ready
+		// Another caller created the binding: this request still must
+		// match its configuration.
+		a.mu.Lock()
+		stored, ok := a.bindings[req.SessionID]
+		a.mu.Unlock()
+		if !ok {
+			return adapter.SessionBinding{}, fmt.Errorf(
+				"concurrent session creation for %s did not produce a binding", req.SessionID)
+		}
+		if bindingMismatch(stored, req.Contributor, model, req.Config) {
+			return adapter.SessionBinding{}, fmt.Errorf(
+				"session %s is already bound with a different configuration; duplicate create fails closed",
+				req.SessionID)
+		}
+		return res.binding, res.err
+	}
+	res := &createReservation{ready: make(chan struct{})}
+	a.creating[req.SessionID] = res
 	a.mu.Unlock()
+	defer func() {
+		// Share the final result with waiting callers before releasing
+		// the reservation.
+		res.binding, res.err = sb, err
+		a.mu.Lock()
+		delete(a.creating, req.SessionID)
+		a.mu.Unlock()
+		close(res.ready)
+	}()
 
 	// Model validation fails closed BEFORE any native resource is
 	// created: the configured provider/model must be present in the
@@ -301,9 +348,11 @@ func (a *OpenCodeAdapter) ResumeSession(ctx context.Context, binding adapter.Ses
 	}
 	a.mu.Lock()
 	a.bindings[binding.SessionID] = &sessionBinding{
-		nativeID:  binding.NativeSessionID,
-		model:     binding.Config.Model,
-		directory: binding.Config.WorkspaceRoot,
+		nativeID:    binding.NativeSessionID,
+		model:       strings.TrimSpace(binding.Config.Model),
+		directory:   binding.Config.WorkspaceRoot,
+		contributor: binding.Contributor,
+		tooling:     append([]string(nil), binding.Config.Tooling...),
 	}
 	a.mu.Unlock()
 	return nil
@@ -768,12 +817,20 @@ func (a *OpenCodeAdapter) releaseNativeSlot(nativeID string) {
 }
 
 // releaseNativeSlotFor frees the slot only when the given ref owns it.
+// Ownership comparison and deletion happen in ONE critical section so a
+// stale terminal can never delete a replacement turn's slot; the channel
+// is closed after unlocking.
 func (a *OpenCodeAdapter) releaseNativeSlotFor(nativeID string, ref adapter.TurnRef) {
 	a.mu.Lock()
 	slot, ok := a.slots[nativeID]
-	a.mu.Unlock()
 	if ok && slot.owner == ref {
-		a.releaseNativeSlot(nativeID)
+		delete(a.slots, nativeID)
+	} else {
+		ok = false
+	}
+	a.mu.Unlock()
+	if ok {
+		close(slot.released)
 	}
 }
 
