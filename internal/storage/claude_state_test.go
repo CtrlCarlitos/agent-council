@@ -405,6 +405,38 @@ func TestClaudeState_LaunchStatesInReservationOrder(t *testing.T) {
 	}
 }
 
+// A definitive start failure classifies the attempt as missing —
+// positive pre-start evidence — which never blocks the native session.
+func TestClaudeState_StartFailedClassifiesMissing(t *testing.T) {
+	store := openClaudeStore(t)
+	ctx := context.Background()
+
+	if err := store.InsertClaudeTurnAttempt(ctx, claudeAttemptFixture("att-miss", "sess-miss", "t-miss", "nat-miss")); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	seq, err := store.ReserveClaudeLaunch(ctx, "att-miss", "fixture")
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if err := store.RecordClaudeLaunchState(ctx, "att-miss", seq, "start_failed", nil); err != nil {
+		t.Fatalf("start_failed: %v", err)
+	}
+	a, err := store.GetClaudeTurnAttempt(ctx, "att-miss")
+	if err != nil || a == nil {
+		t.Fatalf("get: %v", err)
+	}
+	if a.ObservedStatus != "missing" || a.Terminal {
+		t.Fatalf("start failure must classify missing, got status=%q terminal=%v", a.ObservedStatus, a.Terminal)
+	}
+	blocked, err := store.HasClaudeUnresolvedAttempts(ctx, "nat-miss")
+	if err != nil {
+		t.Fatalf("unresolved query: %v", err)
+	}
+	if blocked {
+		t.Fatal("a missing attempt must not count as unresolved")
+	}
+}
+
 // Unresolved uncertain attempts without a disposition are reported.
 func TestClaudeState_UnresolvedAttemptsReported(t *testing.T) {
 	store := openClaudeStore(t)
