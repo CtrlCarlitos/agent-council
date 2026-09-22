@@ -52,9 +52,9 @@ type fixtureProcess struct {
 	done chan struct{}
 }
 
-func (p *fixtureProcess) Stdin() io.Writer  { return io.Discard }
-func (p *fixtureProcess) Stdout() io.Reader { return p.out }
-func (p *fixtureProcess) Stderr() io.Reader { return strings.NewReader("") }
+func (p *fixtureProcess) Stdin() io.WriteCloser { return nopWriteCloser{} }
+func (p *fixtureProcess) Stdout() io.Reader     { return p.out }
+func (p *fixtureProcess) Stderr() io.Reader     { return strings.NewReader("") }
 
 func (p *fixtureProcess) Wait() (int, error) { <-p.done; return 0, nil }
 
@@ -63,6 +63,11 @@ func (p *fixtureProcess) Terminate(ctx context.Context) error {
 	p.in.Close()
 	return nil
 }
+
+type nopWriteCloser struct{}
+
+func (nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (nopWriteCloser) Close() error                { return nil }
 
 // gate1LaunchSource produces the exact approved serve shape.
 type gate1LaunchSource struct{}
