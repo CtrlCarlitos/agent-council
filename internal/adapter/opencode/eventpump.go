@@ -35,6 +35,9 @@ type sessionPump struct {
 	// callers attaching before or after the event still receive it
 	// exactly once, and reattachment replays it.
 	terminals map[string]adapter.Event
+	// onTerminal, when set, reports verified terminal evidence to the
+	// adapter (slot release, terminal marking) independent of taps.
+	onTerminal func(userMessageID string)
 
 	loopOnce sync.Once
 
@@ -292,6 +295,9 @@ func (p *sessionPump) routeAndFinish(parentID string, ev adapter.Event) {
 	p.mu.Lock()
 	p.terminals[parentID] = ev
 	p.mu.Unlock()
+	if p.onTerminal != nil {
+		p.onTerminal(parentID)
+	}
 	if p.route(parentID, ev) {
 		p.detach(parentID)
 	}
@@ -342,6 +348,9 @@ func (p *sessionPump) resyncFromHistory() {
 		p.mu.Lock()
 		p.terminals[userMsgID] = ev
 		p.mu.Unlock()
+		if p.onTerminal != nil {
+			p.onTerminal(userMsgID)
+		}
 		if p.route(userMsgID, ev) {
 			tap.owner.mu.Lock()
 			if d, ok := tap.owner.dispatches[tap.ref]; ok {

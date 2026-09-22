@@ -57,8 +57,8 @@ func TestNativeClient_CreateSessionAndDirectoryRejection(t *testing.T) {
 	ctx := context.Background()
 
 	id, err := client.CreateSession(ctx, NativeCreateSession{
-		Title: "council test", Directory: "/allowed/dir", Model: "fake/model",
-		Agent: "council", Permission: "deny",
+		Title: "council test", Directory: "/allowed/dir",
+		Model: NativeModel{ProviderID: "fake", ID: "model"}, Agent: "council", Permission: "deny",
 	})
 	if err != nil {
 		t.Fatalf("create session: %v", err)
@@ -71,8 +71,8 @@ func TestNativeClient_CreateSessionAndDirectoryRejection(t *testing.T) {
 	// must refuse sessions for another.
 	fake.setWorkspaceDir("/allowed/dir")
 	if _, err := client.CreateSession(ctx, NativeCreateSession{
-		Title: "council test", Directory: "/elsewhere", Model: "fake/model",
-		Agent: "council", Permission: "deny",
+		Title: "council test", Directory: "/elsewhere",
+		Model: NativeModel{ProviderID: "fake", ID: "model"}, Agent: "council", Permission: "deny",
 	}); err == nil {
 		t.Fatal("mismatched directory context must be rejected")
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -67,9 +68,23 @@ type sessionSlot struct {
 // session, established by CreateSession and re-established by
 // ResumeSession. The native ID is never synthesized by the adapter.
 type sessionBinding struct {
-	nativeID  string
-	model     string
-	directory string // expected project directory of the native session
+	nativeID    string
+	model       string
+	directory   string              // expected project directory of the native session
+	contributor council.Contributor // bound contributor identity
+	tooling     []string            // bound tooling allowlist
+}
+
+// parseNativeModel splits the frozen "provider/model" identifier into the
+// structured native model reference and rejects malformed identifiers.
+func parseNativeModel(model string) (NativeModel, error) {
+	provider, id, ok := strings.Cut(model, "/")
+	provider, id = strings.TrimSpace(provider), strings.TrimSpace(id)
+	if !ok || provider == "" || id == "" || strings.Contains(provider, "/") || strings.Contains(id, "/") {
+		return NativeModel{}, fmt.Errorf(
+			"model identifier %q is malformed; expected provider/model for the native session", model)
+	}
+	return NativeModel{ProviderID: provider, ID: id}, nil
 }
 
 // nativeAgentPreset is the agent preset Council requests for contributor
@@ -160,11 +175,34 @@ func (a *OpenCodeAdapter) CreateSession(ctx context.Context, req adapter.CreateS
 		return adapter.SessionBinding{}, err
 	}
 
-	// Idempotent on matching configuration: one native session per
-	// logical session.
+	binding := adapter.SessionBinding{
+		SessionID:   req.SessionID,
+		Contributor: req.Contributor,
+		Config:      req.Config,
+	}
+
+	model := strings.TrimSpace(req.Config.Model)
+	nativeModel, err := parseNativeModel(model)
+	if err != nil {
+		return adapter.SessionBinding{}, err
+	}
+
+	// Idempotent ONLY on matching configuration: contributor, model,
+	// workspace, and tooling must all match the existing binding — a
+	// mismatched duplicate is rejected, never relabelled onto the old
+	// native session.
 	a.mu.Lock()
 	if existing, ok := a.bindings[req.SessionID]; ok {
+		mismatch := existing.contributor != req.Contributor ||
+			existing.model != model ||
+			existing.directory != req.Config.WorkspaceRoot ||
+			!slices.Equal(existing.tooling, req.Config.Tooling)
 		a.mu.Unlock()
+		if mismatch {
+			return adapter.SessionBinding{}, fmt.Errorf(
+				"session %s is already bound with a different configuration; duplicate create fails closed",
+				req.SessionID)
+		}
 		return adapter.SessionBinding{
 			SessionID:       req.SessionID,
 			Contributor:     req.Contributor,
@@ -173,12 +211,6 @@ func (a *OpenCodeAdapter) CreateSession(ctx context.Context, req adapter.CreateS
 		}, nil
 	}
 	a.mu.Unlock()
-
-	binding := adapter.SessionBinding{
-		SessionID:   req.SessionID,
-		Contributor: req.Contributor,
-		Config:      req.Config,
-	}
 
 	// Model validation fails closed BEFORE any native resource is
 	// created: the configured provider/model must be present in the
@@ -195,7 +227,6 @@ func (a *OpenCodeAdapter) CreateSession(ctx context.Context, req adapter.CreateS
 			SessionID: req.SessionID, Contributor: req.Contributor, Err: err,
 		}
 	}
-	model := strings.TrimSpace(req.Config.Model)
 	modelKnown := false
 	for _, m := range models {
 		if m == model {
@@ -215,7 +246,7 @@ func (a *OpenCodeAdapter) CreateSession(ctx context.Context, req adapter.CreateS
 	nativeID, err := client.CreateSession(ctx, NativeCreateSession{
 		Title:      fmt.Sprintf("council %s", req.SessionID),
 		Directory:  req.Config.WorkspaceRoot,
-		Model:      model,
+		Model:      nativeModel,
 		Agent:      nativeAgentPreset,
 		Permission: "deny",
 	})
@@ -230,9 +261,11 @@ func (a *OpenCodeAdapter) CreateSession(ctx context.Context, req adapter.CreateS
 
 	a.mu.Lock()
 	a.bindings[req.SessionID] = &sessionBinding{
-		nativeID:  nativeID,
-		model:     model,
-		directory: req.Config.WorkspaceRoot,
+		nativeID:    nativeID,
+		model:       model,
+		directory:   req.Config.WorkspaceRoot,
+		contributor: req.Contributor,
+		tooling:     append([]string(nil), req.Config.Tooling...),
 	}
 	a.mu.Unlock()
 	binding.NativeSessionID = nativeID
@@ -262,7 +295,7 @@ func (a *OpenCodeAdapter) ResumeSession(ctx context.Context, binding adapter.Ses
 	// Fail closed on project-context mismatch: a native session that
 	// belongs to a different directory is not this session's runtime.
 	if expected := strings.TrimSpace(binding.Config.WorkspaceRoot); expected != "" &&
-		strings.TrimSpace(meta.Directory) != "" && meta.Directory != expected {
+		strings.TrimSpace(meta.Directory) != expected {
 		return fmt.Errorf("native session %s belongs to directory %q, expected %q; resume fails closed",
 			binding.NativeSessionID, meta.Directory, expected)
 	}
@@ -488,7 +521,7 @@ func (a *OpenCodeAdapter) Collect(ctx context.Context, ref adapter.TurnRef) (ada
 		}, nil
 	}
 	d.terminal = true
-	a.releaseNativeSlot(d.nativeSessionID)
+	a.releaseNativeSlotFor(d.nativeSessionID, ref)
 	a.scheduleIdleParkIfIdle(ref.SessionID)
 	text := ""
 	for _, p := range msg.Parts {
@@ -618,6 +651,9 @@ func (a *OpenCodeAdapter) Reconcile(ctx context.Context, ref adapter.RecoveryRef
 				observed = council.TurnFailed
 				result = m.Error.Message
 			}
+			// Verified terminal evidence releases the owning dispatch
+			// slot even without a Collect call.
+			a.markTurnTerminal(nativeID, msgID)
 			return adapter.ReconciliationOutcome{
 				Ref: ref, Reachability: council.VisibilityReachable,
 				Status:   adapter.ReconciliationReachableTerminal,
@@ -731,6 +767,36 @@ func (a *OpenCodeAdapter) releaseNativeSlot(nativeID string) {
 	}
 }
 
+// releaseNativeSlotFor frees the slot only when the given ref owns it.
+func (a *OpenCodeAdapter) releaseNativeSlotFor(nativeID string, ref adapter.TurnRef) {
+	a.mu.Lock()
+	slot, ok := a.slots[nativeID]
+	a.mu.Unlock()
+	if ok && slot.owner == ref {
+		a.releaseNativeSlot(nativeID)
+	}
+}
+
+// markTurnTerminal records verified terminal evidence for a turn and
+// releases its native-session slot: the native side is conclusively done,
+// so a follow-up dispatch must not wait.
+func (a *OpenCodeAdapter) markTurnTerminal(nativeID, userMessageID string) {
+	a.mu.Lock()
+	var ref adapter.TurnRef
+	found := false
+	for r, d := range a.dispatches {
+		if d.nativeSessionID == nativeID && d.userMessageID == userMessageID {
+			d.terminal = true
+			ref = r
+			found = true
+		}
+	}
+	a.mu.Unlock()
+	if found {
+		a.releaseNativeSlotFor(nativeID, ref)
+	}
+}
+
 // recordVerdict stores the latest dispatch verdict for reconciliation
 // evidence rules.
 func (a *OpenCodeAdapter) recordVerdict(ref adapter.TurnRef, status adapter.DispatchStatus) {
@@ -746,6 +812,9 @@ func (a *OpenCodeAdapter) ensurePumpLocked(nativeID string, client *NativeClient
 		return p
 	}
 	p := newSessionPump(nativeID, client)
+	p.onTerminal = func(userMessageID string) {
+		a.markTurnTerminal(nativeID, userMessageID)
+	}
 	a.pumps[nativeID] = p
 	return p
 }

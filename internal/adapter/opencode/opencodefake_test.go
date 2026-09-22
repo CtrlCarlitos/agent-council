@@ -198,9 +198,13 @@ func (f *fakeOpenCodeServer) handler() http.Handler {
 	})
 	mux.HandleFunc("POST /session", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Title      string `json:"title"`
-			Directory  string `json:"directory"`
-			Model      string `json:"model"`
+			Title     string `json:"title"`
+			Directory string `json:"directory"`
+			Model     struct {
+				ProviderID string `json:"providerID"`
+				ID         string `json:"id"`
+				Variant    string `json:"variant"`
+			} `json:"model"`
 			Agent      string `json:"agent"`
 			Permission string `json:"permission"`
 		}

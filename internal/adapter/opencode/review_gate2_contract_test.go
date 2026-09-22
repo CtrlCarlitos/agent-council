@@ -169,13 +169,180 @@ func TestGate2_CreateSessionPayloadIsComplete(t *testing.T) {
 	for field, want := range map[string]any{
 		"title":      "council " + fresh,
 		"directory":  gate2Workspace,
-		"model":      "fake/model",
 		"agent":      nativeAgentPreset,
 		"permission": "deny",
 	} {
 		if got, _ := payload[field].(string); got != want {
 			t.Fatalf("create payload %s = %v, want %v (payload: %s)", field, got, want, raw)
 		}
+	}
+	// The model must be the structured native reference
+	// model:{providerID,id,variant} — not a flat string.
+	model, _ := payload["model"].(map[string]any)
+	if model == nil {
+		t.Fatalf("create payload model must be a structured reference, got %v (payload: %s)", payload["model"], raw)
+	}
+	if model["providerID"] != "fake" || model["id"] != "model" {
+		t.Fatalf("structured model mismatch: %v (payload: %s)", model, raw)
+	}
+}
+
+// Malformed frozen model identifiers are rejected before any native
+// resource is created.
+func TestGate2_CreateSessionRejectsMalformedModel(t *testing.T) {
+	adp, fake := gate2Fixture(t)
+	ctx := context.Background()
+
+	for _, bad := range []string{"noseparator", "/leading", "trailing/", "a/b/c"} {
+		_, err := adp.CreateSession(ctx, adapter.CreateSessionRequest{
+			SessionID:   gate1Session,
+			Contributor: "opencode",
+			Config:      adapter.SessionConfig{Model: bad},
+		})
+		if err == nil || !strings.Contains(err.Error(), "malformed") {
+			t.Fatalf("model %q must be rejected as malformed, got %v", bad, err)
+		}
+	}
+	if got := fake.ledger.promptAsyncCount(); got != 0 {
+		t.Fatalf("malformed model must never reach the native server, calls: %d", got)
+	}
+}
+
+// Duplicate CreateSession with mismatched configuration fails closed for
+// contributor, model, workspace, and tooling changes.
+func TestGate2_CreateSessionIdempotencyRequiresMatchingConfig(t *testing.T) {
+	adp, fake := gate2Fixture(t)
+	ctx := context.Background()
+
+	const fresh = "sess-fresh-idem"
+	fake.mu.Lock()
+	fake.sessions[fresh] = &fakeSession{id: fresh}
+	adp.servers.children[fresh] = &serverProcess{
+		endpoint: fake.endpoint,
+		username: gate1User,
+		password: gate1Password,
+	}
+	fake.mu.Unlock()
+
+	base := adapter.CreateSessionRequest{
+		SessionID:   fresh,
+		Contributor: "opencode",
+		Config:      adapter.SessionConfig{Model: "fake/model", WorkspaceRoot: gate2Workspace, Tooling: []string{"opencode"}},
+	}
+	first, err := adp.CreateSession(ctx, base)
+	if err != nil {
+		t.Fatalf("initial create: %v", err)
+	}
+
+	// Matching configuration: idempotent, same native session.
+	same, err := adp.CreateSession(ctx, base)
+	if err != nil || same.NativeSessionID != first.NativeSessionID {
+		t.Fatalf("matching duplicate must be idempotent, got %+v err=%v", same, err)
+	}
+
+	negatives := []struct {
+		name string
+		mut  func(*adapter.CreateSessionRequest)
+	}{
+		{"contributor", func(r *adapter.CreateSessionRequest) { r.Contributor = "claude" }},
+		{"model", func(r *adapter.CreateSessionRequest) { r.Config.Model = "other/model" }},
+		{"workspace", func(r *adapter.CreateSessionRequest) { r.Config.WorkspaceRoot = "/elsewhere" }},
+		{"tooling", func(r *adapter.CreateSessionRequest) { r.Config.Tooling = []string{"opencode", "extra"} }},
+	}
+	for _, tc := range negatives {
+		t.Run(tc.name, func(t *testing.T) {
+			req := base
+			tc.mut(&req)
+			if _, err := adp.CreateSession(ctx, req); err == nil {
+				t.Fatalf("mismatched %s must fail closed", tc.name)
+			} else if !strings.Contains(err.Error(), "different configuration") {
+				t.Fatalf("expected configuration-mismatch error, got %v", err)
+			}
+		})
+	}
+
+	// The binding still resolves to the original native session.
+	if _, err := adp.Collect(ctx, adapter.TurnRef{SessionID: fresh, TurnKey: "t-idem"}); err == nil {
+		t.Fatal("sanity: undispatched turn must not collect")
+	}
+	adp.mu.Lock()
+	native := adp.bindings[adapter.SessionID(fresh)].nativeID
+	adp.mu.Unlock()
+	if native != first.NativeSessionID {
+		t.Fatalf("binding must keep the original native session, got %q", native)
+	}
+}
+
+// A verified terminal observed by the pump releases the native-session
+// slot: a follow-up turn dispatches without any Collect call.
+func TestGate2_SlotReleasedBySSETerminalWithoutCollect(t *testing.T) {
+	adp, fake := gate2Fixture(t)
+	ctx := context.Background()
+
+	refA := adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-rel-a"}
+	if outcome, err := adp.Dispatch(ctx, refA, "first"); err != nil || outcome.Status != adapter.DispatchAccepted {
+		t.Fatalf("dispatch A: status=%v err=%v", outcome.Status, err)
+	}
+	msgID := adp.dispatches[refA].userMessageID
+
+	// Terminal arrives via the pump while A is still uncollected.
+	fake.mu.Lock()
+	fake.sessions[gate2NativeSession].scriptedEvents = append(fake.sessions[gate2NativeSession].scriptedEvents,
+		`{"type":"message.completed","parentID":"`+msgID+`"}`)
+	fake.mu.Unlock()
+	time.Sleep(150 * time.Millisecond)
+
+	refB := adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-rel-b"}
+	bDone := make(chan adapter.DispatchOutcome, 1)
+	go func() {
+		outcome, _ := adp.Dispatch(ctx, refB, "second")
+		bDone <- outcome
+	}()
+	select {
+	case out := <-bDone:
+		if out.Status != adapter.DispatchAccepted {
+			t.Fatalf("follow-up must be accepted after the SSE terminal, got %v", out.Status)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("SSE terminal must release the native slot for the follow-up dispatch")
+	}
+	adp.mu.Lock()
+	terminal := adp.dispatches[refA].terminal
+	adp.mu.Unlock()
+	if !terminal {
+		t.Fatal("SSE terminal must mark the dispatch terminal")
+	}
+}
+
+// A verified terminal from reconciliation releases the slot without any
+// Collect call.
+func TestGate2_SlotReleasedByReconcileTerminalWithoutCollect(t *testing.T) {
+	adp, _ := gate2Fixture(t)
+	ctx := context.Background()
+
+	refA := adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-rec-a"}
+	if outcome, err := adp.Dispatch(ctx, refA, "first"); err != nil || outcome.Status != adapter.DispatchAccepted {
+		t.Fatalf("dispatch A: status=%v err=%v", outcome.Status, err)
+	}
+	// The stub answered turn A; reconciliation observes the terminal.
+	rec, err := adp.Reconcile(ctx, adapter.RecoveryRef{TurnRef: refA, Generation: 1})
+	if err != nil || rec.Status != adapter.ReconciliationReachableTerminal {
+		t.Fatalf("reconcile must verify the terminal, got %+v err=%v", rec, err)
+	}
+
+	refB := adapter.TurnRef{SessionID: gate1Session, TurnKey: "t-rec-b"}
+	bDone := make(chan adapter.DispatchOutcome, 1)
+	go func() {
+		outcome, _ := adp.Dispatch(ctx, refB, "second")
+		bDone <- outcome
+	}()
+	select {
+	case out := <-bDone:
+		if out.Status != adapter.DispatchAccepted {
+			t.Fatalf("follow-up must be accepted after the reconciliation terminal, got %v", out.Status)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("reconciliation terminal must release the native slot")
 	}
 }
 

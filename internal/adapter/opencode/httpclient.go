@@ -203,19 +203,25 @@ func (c *NativeClient) Models(ctx context.Context) ([]string, error) {
 	return models, nil
 }
 
+// NativeModel is the structured native model reference, matching the
+// verified OpenCode schema: model:{providerID,id,variant}.
+type NativeModel struct {
+	ProviderID string `json:"providerID"`
+	ID         string `json:"id"`
+	Variant    string `json:"variant,omitempty"`
+}
+
 // NativeCreateSession is the typed native session-creation payload,
-// derived from the frozen harness configuration: the selected
-// provider/model, the council contributor agent preset, and the
+// derived from the frozen harness configuration: the selected structured
+// model reference, the council contributor agent preset, and the
 // deny-by-default permission preset. The server assigns the session ID;
 // the adapter never synthesizes one.
 type NativeCreateSession struct {
-	Title     string `json:"title"`
-	Directory string `json:"directory"`
-	Model     string `json:"model"`
-	Agent     string `json:"agent"`
-	// Permission is the deny-by-default preset: the native side must not
-	// infer any approval authority from Council profiles.
-	Permission string `json:"permission"`
+	Title      string      `json:"title"`
+	Directory  string      `json:"directory"`
+	Model      NativeModel `json:"model"`
+	Agent      string      `json:"agent"`
+	Permission string      `json:"permission"`
 }
 
 // NativeSessionMeta is the metadata a native session lookup returns.
