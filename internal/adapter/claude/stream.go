@@ -38,14 +38,14 @@ const (
 // StreamConfig carries the frozen expectations the stream is validated
 // against.
 type StreamConfig struct {
-	WorkspaceRoot     string
-	ExpectedVersion   string // probed CLI version from the manifest
-	ExpectedModel     string // frozen model alias from the harness spec
-	ExpectedSessionID string // the native session this stream must belong to
-	Manifest          storage.ToolkitManifest
-	UniverseTools     []string // pinned native tool universe
-	MaxLineBytes      int
-	MaxTotalBytes     int
+	WorkspaceRoot         string
+	ExpectedVersion       string // probed CLI version from the manifest
+	ExpectedModelIdentity string // frozen resolved native model id
+	ExpectedSessionID     string // the native session this stream must belong to
+	Manifest              storage.ToolkitManifest
+	UniverseTools         []string // pinned native tool universe
+	MaxLineBytes          int
+	MaxTotalBytes         int
 }
 
 // StreamEvent is one observable event on the turn stream.
@@ -147,6 +147,9 @@ type contentBlock struct {
 // called for observable events (may be nil). A nil error does NOT imply
 // success: inspect the outcome.
 func ParseStream(r io.Reader, cfg StreamConfig, onEvent func(StreamEvent)) (StreamOutcome, error) {
+	if strings.TrimSpace(cfg.ExpectedSessionID) == "" {
+		return StreamOutcome{}, fmt.Errorf("production stream parsing requires an ExpectedSessionID")
+	}
 	out := StreamOutcome{}
 	emit := func(ev StreamEvent) {
 		if onEvent != nil {
@@ -272,7 +275,12 @@ func ParseStream(r io.Reader, cfg StreamConfig, onEvent func(StreamEvent)) (Stre
 					if b.Type != "tool_result" {
 						continue
 					}
-					toolName := pendingTool[b.ToolUseID]
+					toolName, correlated := pendingTool[b.ToolUseID]
+					if !correlated {
+						out.Poisoned, out.PoisonReason = true, fmt.Sprintf(
+							"tool_result references uncorrelated tool_use_id %q", b.ToolUseID)
+						return out, nil
+					}
 					if b.IsError {
 						if class, isDenial := classifyDenial(textOf(b.Content)); isDenial {
 							emit(StreamEvent{Type: EventToolDenied, DeniedClass: class,
@@ -355,52 +363,51 @@ func validateInit(ev nativeEvent, cfg StreamConfig, hooksSeen []string) (*InitRe
 	if ev.Version != cfg.ExpectedVersion {
 		return rep, fmt.Sprintf("init claude_code_version %q does not match the probed version %q", ev.Version, cfg.ExpectedVersion)
 	}
-	if !strings.Contains(strings.ToLower(ev.Model), strings.ToLower(cfg.ExpectedModel)) {
-		return rep, fmt.Sprintf("init model %q does not correspond to the frozen model %q", ev.Model, cfg.ExpectedModel)
+	// Frozen model identity: the manifest pins the exact resolved native
+	// model id; a fuzzy alias match is never accepted.
+	if cfg.ExpectedModelIdentity == "" || ev.Model != cfg.ExpectedModelIdentity {
+		return rep, fmt.Sprintf("init model %q does not match the frozen native model identity %q",
+			ev.Model, cfg.ExpectedModelIdentity)
 	}
 	if ev.PermMode != "" && ev.PermMode != "default" {
 		return rep, fmt.Sprintf("init permissionMode %q is not the native default", ev.PermMode)
 	}
 
-	universe := make(map[string]struct{}, len(cfg.UniverseTools))
-	for _, tool := range cfg.UniverseTools {
-		universe[tool] = struct{}{}
+	// Enabled tools must be EXACTLY universe - denied complement: any
+	// unknown tool, any missing enabled tool, any denied tool enabled.
+	denied := make(map[string]struct{}, len(cfg.Manifest.DeniedComplement))
+	for _, d := range cfg.Manifest.DeniedComplement {
+		denied[d] = struct{}{}
 	}
+	expectedEnabled := make(map[string]struct{}, len(cfg.UniverseTools))
+	for _, tool := range cfg.UniverseTools {
+		if _, isDenied := denied[tool]; !isDenied {
+			expectedEnabled[tool] = struct{}{}
+		}
+	}
+	enabled := make(map[string]struct{}, len(ev.Tools))
 	for _, tool := range ev.Tools {
-		if _, known := universe[tool]; !known {
+		enabled[tool] = struct{}{}
+		if _, known := universeLookup(cfg.UniverseTools, tool); !known {
 			return rep, fmt.Sprintf("init reports unknown tool %q (not in the pinned universe)", tool)
 		}
-	}
-	for _, denied := range cfg.Manifest.DeniedComplement {
-		for _, tool := range ev.Tools {
-			if tool == denied {
-				return rep, fmt.Sprintf("init reports denied tool %q as enabled", denied)
-			}
+		if _, isDenied := denied[tool]; isDenied {
+			return rep, fmt.Sprintf("init reports denied tool %q as enabled", tool)
 		}
 	}
-	for _, skill := range cfg.Manifest.ExpectedSkills {
-		found := false
-		for _, s := range ev.Skills {
-			if s == skill {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return rep, fmt.Sprintf("init is missing expected skill %q", skill)
+	for tool := range expectedEnabled {
+		if _, on := enabled[tool]; !on {
+			return rep, fmt.Sprintf("init is missing expected enabled tool %q", tool)
 		}
 	}
-	for _, plugin := range cfg.Manifest.ExpectedPlugins {
-		found := false
-		for _, p := range rep.Plugins {
-			if p == plugin {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return rep, fmt.Sprintf("init is missing expected plugin %q", plugin)
-		}
+
+	// Skills/plugins are exact canonical set comparisons: missing AND
+	// unexpected entries both fail.
+	if reason := exactSetMismatch("skills", setOf(cfg.Manifest.ExpectedSkills), setOf(ev.Skills)); reason != "" {
+		return rep, fmt.Errorf("%s", reason).Error()
+	}
+	if reason := exactSetMismatch("plugins", setOf(cfg.Manifest.ExpectedPlugins), setOf(rep.Plugins)); reason != "" {
+		return rep, fmt.Errorf("%s", reason).Error()
 	}
 	for _, hook := range cfg.Manifest.ExpectedHooks {
 		found := false
@@ -415,6 +422,39 @@ func validateInit(ev nativeEvent, cfg StreamConfig, hooksSeen []string) (*InitRe
 		}
 	}
 	return rep, ""
+}
+
+func setOf(list []string) map[string]struct{} {
+	m := make(map[string]struct{}, len(list))
+	for _, s := range list {
+		m[s] = struct{}{}
+	}
+	return m
+}
+
+// exactSetMismatch returns a reason string when expected and actual
+// differ in either direction; "" when they are exact canonical sets.
+func exactSetMismatch(field string, expected, actual map[string]struct{}) string {
+	for v := range expected {
+		if _, ok := actual[v]; !ok {
+			return fmt.Sprintf("init is missing expected %s %q", field, v)
+		}
+	}
+	for v := range actual {
+		if _, ok := expected[v]; !ok {
+			return fmt.Sprintf("init reports unexpected %s %q", field, v)
+		}
+	}
+	return ""
+}
+
+func universeLookup(universe []string, tool string) (struct{}, bool) {
+	for _, u := range universe {
+		if u == tool {
+			return struct{}{}, true
+		}
+	}
+	return struct{}{}, false
 }
 
 // classifyDenial maps structured denial texts to the three denial

@@ -229,13 +229,14 @@ func TestClaudeFixture_ReplayThroughParser(t *testing.T) {
 	}
 
 	cfg := StreamConfig{
-		WorkspaceRoot:   "/ws",
-		ExpectedVersion: "2.1.278",
-		ExpectedModel:   "haiku",
-		Manifest:        toolkitManifestFixture([]string{"SessionStart:startup"}, []string{"s"}, nil),
-		UniverseTools:   []string{"Read", "Glob"},
-		MaxLineBytes:    1 << 20,
-		MaxTotalBytes:   8 << 20,
+		WorkspaceRoot:         "/ws",
+		ExpectedVersion:       "2.1.278",
+		ExpectedModelIdentity: "claude-haiku-4-5-20251001",
+		ExpectedSessionID:     testNativeID,
+		Manifest:              toolkitManifestFixture([]string{"SessionStart:startup"}, []string{"s"}, nil),
+		UniverseTools:         []string{"Read", "Glob"},
+		MaxLineBytes:          1 << 20,
+		MaxTotalBytes:         8 << 20,
 	}
 	var progress int
 	out, perr := ParseStream(stdout, cfg, func(ev StreamEvent) {

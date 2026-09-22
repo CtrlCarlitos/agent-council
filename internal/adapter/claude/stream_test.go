@@ -40,15 +40,16 @@ const maxTurnsResultJSON = `{"type":"result","subtype":"error_max_turns","is_err
 func streamConfig(t *testing.T) StreamConfig {
 	t.Helper()
 	return StreamConfig{
-		WorkspaceRoot:   "/ws/claude",
-		ExpectedVersion: "2.1.278",
-		ExpectedModel:   "haiku",
+		WorkspaceRoot:         "/ws/claude",
+		ExpectedVersion:       "2.1.278",
+		ExpectedModelIdentity: "claude-haiku-4-5-20251001",
+		ExpectedSessionID:     testNativeID,
 		Manifest: toolkitManifestFixture(
 			[]string{"SessionStart:startup"},
 			[]string{"research"},
 			[]string{"superpowers"},
 		),
-		UniverseTools: []string{"Task", "Bash", "Read", "Glob", "Grep", "Write", "WebSearch"},
+		UniverseTools: []string{"Task", "Read", "Glob", "Grep", "Bash", "Write", "WebSearch"},
 		MaxLineBytes:  1 << 20,
 		MaxTotalBytes: 8 << 20,
 	}
@@ -259,7 +260,10 @@ func TestStreamParser_InitManifestChecks(t *testing.T) {
 			"skill"},
 		{"empty model",
 			strings.Replace(baseInitJSON, `"claude-haiku-4-5-20251001"`, `""`, 1),
-			"model"},
+			"model identity"},
+		{"unrelated model containing alias substring",
+			strings.Replace(baseInitJSON, `"claude-haiku-4-5-20251001"`, `"claude-haiku-unrelated"`, 1),
+			"model identity"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
