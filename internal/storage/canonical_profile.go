@@ -31,6 +31,9 @@ type CanonicalProfile struct {
 	CodeIndexScope      []string                      `json:"code_index_scope"`
 	Tooling             []string                      `json:"tooling"`
 	Harnesses           map[string]HarnessProfileSpec `json:"harnesses"`
+	// ToolkitManifest is additive in cprof-v2 (absent in v1 encodings).
+	// See toolkit_manifest.go for the type and Claude eligibility rules.
+	ToolkitManifest *ToolkitManifestSpec `json:"toolkit_manifest,omitempty"`
 }
 
 // ComputeBriefDigest calculates the canonical digest for the run brief:
@@ -131,8 +134,20 @@ func normalizeStringSlice(slice []string, lower bool, cleanPath bool) []string {
 // ComputeProfileDigest computes the canonical profile digest and normalized JSON representation:
 // "cprof-v1:sha256:" + hex(sha256(canonical_profile_json))
 func ComputeProfileDigest(profile CanonicalProfile) (string, []byte, error) {
-	if profile.AlgoVersion != "cprof-v1" {
-		return "", nil, fmt.Errorf("unsupported profile algo_version: %q (expected %q)", profile.AlgoVersion, "cprof-v1")
+	switch profile.AlgoVersion {
+	case "cprof-v1":
+		if profile.ToolkitManifest != nil {
+			return "", nil, fmt.Errorf("toolkit_manifest requires algo_version %q, not %q", "cprof-v2", profile.AlgoVersion)
+		}
+	case "cprof-v2":
+		if profile.ToolkitManifest == nil {
+			return "", nil, fmt.Errorf("algo_version %q requires toolkit_manifest", profile.AlgoVersion)
+		}
+		if err := profile.ValidateForClaude(); err != nil {
+			return "", nil, err
+		}
+	default:
+		return "", nil, fmt.Errorf("unsupported profile algo_version: %q (expected %q or %q)", profile.AlgoVersion, "cprof-v1", "cprof-v2")
 	}
 
 	switch profile.WorkspaceMode {
@@ -178,6 +193,20 @@ func ComputeProfileDigest(profile CanonicalProfile) (string, []byte, error) {
 		"workspace_mode":       profile.WorkspaceMode,
 	}
 
+	if profile.AlgoVersion == "cprof-v2" {
+		m := profile.ToolkitManifest.ToolkitManifest
+		canonicalMap["toolkit_manifest"] = map[string]any{
+			"probed_cli_version":       norm.NFC.String(strings.Trim(m.ProbedCLIVersion, "\ufeff")),
+			"universe_evidence_path":   norm.NFC.String(strings.Trim(m.UniverseEvidencePath, "\ufeff")),
+			"universe_evidence_digest": strings.ToLower(strings.TrimSpace(m.UniverseEvidenceDigest)),
+			"approved_tools":           normalizeStringSlice(m.ApprovedTools, false, false),
+			"denied_complement":        normalizeStringSlice(m.DeniedComplement, false, false),
+			"expected_hooks":           normalizeStringSlice(m.ExpectedHooks, false, false),
+			"expected_skills":          normalizeStringSlice(m.ExpectedSkills, false, false),
+			"expected_plugins":         normalizeStringSlice(m.ExpectedPlugins, false, false),
+		}
+	}
+
 	buf := new(bytes.Buffer)
 	enc := json.NewEncoder(buf)
 	enc.SetEscapeHTML(false)
@@ -186,7 +215,7 @@ func ComputeProfileDigest(profile CanonicalProfile) (string, []byte, error) {
 	}
 	canonicalJSON := bytes.TrimRight(buf.Bytes(), "\n")
 	sum := sha256.Sum256(canonicalJSON)
-	digest := fmt.Sprintf("cprof-v1:sha256:%x", sum)
+	digest := fmt.Sprintf("%s:sha256:%x", profile.AlgoVersion, sum)
 	return digest, canonicalJSON, nil
 }
 
@@ -203,8 +232,11 @@ func ParseCanonicalProfileJSON(data []byte) (CanonicalProfile, error) {
 		return CanonicalProfile{}, errors.New("trailing characters after profile json")
 	}
 
-	if prof.AlgoVersion != "cprof-v1" {
-		return CanonicalProfile{}, fmt.Errorf("unsupported profile algo_version: %q (expected %q)", prof.AlgoVersion, "cprof-v1")
+	if prof.AlgoVersion != "cprof-v1" && prof.AlgoVersion != "cprof-v2" {
+		return CanonicalProfile{}, fmt.Errorf("unsupported profile algo_version: %q (expected %q or %q)", prof.AlgoVersion, "cprof-v1", "cprof-v2")
+	}
+	if prof.AlgoVersion == "cprof-v2" && prof.ToolkitManifest == nil {
+		return CanonicalProfile{}, fmt.Errorf("algo_version %q requires toolkit_manifest", prof.AlgoVersion)
 	}
 	switch prof.WorkspaceMode {
 	case "none", "readonly", "isolated_branch":
