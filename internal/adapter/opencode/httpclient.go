@@ -203,12 +203,32 @@ func (c *NativeClient) Models(ctx context.Context) ([]string, error) {
 	return models, nil
 }
 
-// CreateSession creates a native session; the returned ID is assigned by
-// the server, never synthesized by the adapter. The directory context is
-// sent verbatim: a server serving a different working directory rejects
-// the request.
-func (c *NativeClient) CreateSession(ctx context.Context, title, directory string) (string, error) {
-	payload, err := json.Marshal(map[string]any{"title": title, "directory": directory})
+// NativeCreateSession is the typed native session-creation payload,
+// derived from the frozen harness configuration: the selected
+// provider/model, the council contributor agent preset, and the
+// deny-by-default permission preset. The server assigns the session ID;
+// the adapter never synthesizes one.
+type NativeCreateSession struct {
+	Title     string `json:"title"`
+	Directory string `json:"directory"`
+	Model     string `json:"model"`
+	Agent     string `json:"agent"`
+	// Permission is the deny-by-default preset: the native side must not
+	// infer any approval authority from Council profiles.
+	Permission string `json:"permission"`
+}
+
+// NativeSessionMeta is the metadata a native session lookup returns.
+type NativeSessionMeta struct {
+	ID        string `json:"id"`
+	Directory string `json:"directory,omitempty"`
+	ProjectID string `json:"projectID,omitempty"`
+}
+
+// CreateSession creates a native session from the typed payload; the
+// returned ID is assigned by the server.
+func (c *NativeClient) CreateSession(ctx context.Context, req NativeCreateSession) (string, error) {
+	payload, err := json.Marshal(req)
 	if err != nil {
 		return "", err
 	}
@@ -228,21 +248,28 @@ func (c *NativeClient) CreateSession(ctx context.Context, title, directory strin
 	return created.ID, nil
 }
 
-// GetSession verifies an exact native session exists. A verified 404
-// returns false without error; any other status is an error.
-func (c *NativeClient) GetSession(ctx context.Context, sessionID string) (bool, error) {
+// GetSession looks up an exact native session. A verified 404 returns
+// false without error; any other status is an error. The metadata carries
+// the session's directory/project identity so callers can verify project
+// context — a 200 alone proves nothing about WHICH project the session
+// belongs to.
+func (c *NativeClient) GetSession(ctx context.Context, sessionID string) (*NativeSessionMeta, bool, error) {
 	resp, err := c.do(ctx, http.MethodGet, "/session/"+sessionID, "", nil)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case http.StatusOK:
-		return true, nil
+		var meta NativeSessionMeta
+		if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+			return nil, false, fmt.Errorf("decode session metadata: %w", err)
+		}
+		return &meta, true, nil
 	case http.StatusNotFound:
-		return false, nil
+		return nil, false, nil
 	default:
-		return false, fmt.Errorf("session lookup returned %d", resp.StatusCode)
+		return nil, false, fmt.Errorf("session lookup returned %d", resp.StatusCode)
 	}
 }
 

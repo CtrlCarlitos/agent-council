@@ -56,7 +56,10 @@ func TestNativeClient_CreateSessionAndDirectoryRejection(t *testing.T) {
 	client, fake := typedClientFixture(t)
 	ctx := context.Background()
 
-	id, err := client.CreateSession(ctx, "council test", "/allowed/dir")
+	id, err := client.CreateSession(ctx, NativeCreateSession{
+		Title: "council test", Directory: "/allowed/dir", Model: "fake/model",
+		Agent: "council", Permission: "deny",
+	})
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}
@@ -67,7 +70,10 @@ func TestNativeClient_CreateSessionAndDirectoryRejection(t *testing.T) {
 	// Directory-context rejection: a server bound to one working directory
 	// must refuse sessions for another.
 	fake.setWorkspaceDir("/allowed/dir")
-	if _, err := client.CreateSession(ctx, "council test", "/elsewhere"); err == nil {
+	if _, err := client.CreateSession(ctx, NativeCreateSession{
+		Title: "council test", Directory: "/elsewhere", Model: "fake/model",
+		Agent: "council", Permission: "deny",
+	}); err == nil {
 		t.Fatal("mismatched directory context must be rejected")
 	}
 	if got := fake.ledger.directoryRejections; got != 1 {
@@ -109,11 +115,15 @@ func TestNativeClient_MessageLifecycle(t *testing.T) {
 		t.Fatal("abort must hit the native endpoint once")
 	}
 
-	// Session existence: known and unknown.
-	if exists, err := client.GetSession(ctx, gate1Session); err != nil || !exists {
+	// Session existence + metadata: known and unknown.
+	meta, exists, err := client.GetSession(ctx, gate1Session)
+	if err != nil || !exists {
 		t.Fatalf("session must exist, exists=%v err=%v", exists, err)
 	}
-	if exists, err := client.GetSession(ctx, "sess-nope"); err != nil || exists {
+	if meta.ID != gate1Session {
+		t.Fatalf("session metadata must identify the session, got %+v", meta)
+	}
+	if _, exists, err := client.GetSession(ctx, "sess-nope"); err != nil || exists {
 		t.Fatalf("unknown session must be a verified 404, exists=%v err=%v", exists, err)
 	}
 }

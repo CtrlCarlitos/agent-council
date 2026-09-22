@@ -46,9 +46,13 @@ type serverManager struct {
 	mu       sync.Mutex
 	executor execpolicy.PolicyExecutor
 	launch   SessionLaunchSource
-	children map[string]*serverProcess // native session ID → child
+	children map[string]*serverProcess // child key (logical session) → child
 	starting map[string]chan struct{}  // session ID → in-flight launch
-	parked   map[string]parkedServer   // native session ID → parked record
+	parked   map[string]parkedServer   // child key → parked record
+	// nativeFor resolves the NATIVE session ID for a child key when a
+	// persisted binding exists; resume verification must check the exact
+	// native session, never the logical one.
+	nativeFor func(adapter.SessionID) string
 }
 
 // parkedServer records a session whose serve child was parked after idle
@@ -146,12 +150,18 @@ func (m *serverManager) start(ctx context.Context, sessionID adapter.SessionID) 
 	}
 
 	// Resume semantics: when this session was parked, the replacement
-	// server must still expose the exact native session.
+	// server must still expose the exact native session — resolved
+	// through the binding, never assumed to equal the logical ID.
 	m.mu.Lock()
 	_, wasParked := m.parked[string(sessionID)]
+	nativeFor := m.nativeFor
 	m.mu.Unlock()
 	if wasParked {
-		if err := m.verifyNativeSession(ctx, endpoint, username, password, string(sessionID)); err != nil {
+		verifyID := string(sessionID)
+		if nativeFor != nil {
+			verifyID = nativeFor(sessionID)
+		}
+		if err := m.verifyNativeSession(ctx, endpoint, username, password, verifyID); err != nil {
 			termCtx, termCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer termCancel()
 			_ = proc.Terminate(termCtx)
@@ -211,7 +221,11 @@ func (m *serverManager) park(ctx context.Context, sessionID adapter.SessionID) e
 func (m *serverManager) verifyNativeSession(ctx context.Context, endpoint, username, password, nativeID string) error {
 	vctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	exists, err := newNativeClient(endpoint, username, password).GetSession(vctx, nativeID)
+	// The resumed server's session metadata is not bound to a specific
+	// directory here: the manager keys children by the session's own
+	// child key and the adapter verifies project context at
+	// ResumeSession. Existence is the lifecycle fact this check owns.
+	_, exists, err := newNativeClient(endpoint, username, password).GetSession(vctx, nativeID)
 	if err != nil {
 		return fmt.Errorf("native session lookup: %w", err)
 	}

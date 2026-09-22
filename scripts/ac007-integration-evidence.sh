@@ -45,9 +45,9 @@ redact() {
 }
 
 fingerprint() {
-	# Print a short, non-reversible fingerprint of a secret's length and
-	# first two characters. Never the value itself.
-	printf 'len=%s head=%s**' "${#1}" "$(printf '%s' "$1" | cut -c1-2)"
+	# Print the secret's LENGTH only. No character of the value — not even
+	# a prefix — is ever printed.
+	printf 'len=%s' "${#1}"
 }
 
 log "AC-007 integration evidence run: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -88,16 +88,30 @@ PROBE_DIR="$(mktemp -d)"
 	fi
 	log "endpoint: $EP"
 
-	# Authenticated health + model inventory.
-	curl -sf -u "$USER_UC:$PASS_UC" "$EP/api/health" >health.json \
-		&& log "health: OK" || log "FAIL: authenticated health"
-	curl -sf -u "$USER_UC:$PASS_UC" "$EP/api/model" >models.json \
-		&& log "models: captured (inventory only; no provider call)" \
-		|| log "FAIL: authenticated models"
+	# Authenticated health + model inventory. Failures FAIL the script.
+	if curl -sf -u "$USER_UC:$PASS_UC" "$EP/api/health" >health.json; then
+		log "health: OK"
+	else
+		log "FAIL: authenticated health"
+		kill "$SERVE_PID" 2>/dev/null || true
+		exit 1
+	fi
+	if curl -sf -u "$USER_UC:$PASS_UC" "$EP/api/model" >models.json; then
+		log "models: captured (inventory only; no provider call)"
+	else
+		log "FAIL: authenticated models"
+		kill "$SERVE_PID" 2>/dev/null || true
+		exit 1
+	fi
 
-	# Unauthenticated request must be rejected.
+	# Unauthenticated request must be rejected with exactly 401.
 	UCODE="$(curl -s -o /dev/null -w '%{http_code}' "$EP/api/health")"
 	log "unauthenticated health status: $UCODE (expected 401)"
+	if [ "$UCODE" != "401" ]; then
+		log "FAIL: unauthenticated health must return 401, got $UCODE"
+		kill "$SERVE_PID" 2>/dev/null || true
+		exit 1
+	fi
 
 	kill "$SERVE_PID" 2>/dev/null || true
 	wait "$SERVE_PID" 2>/dev/null || true

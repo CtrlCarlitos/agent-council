@@ -30,6 +30,11 @@ type sessionPump struct {
 	mu     sync.Mutex
 	cursor int64               // last seen native event id
 	turns  map[string]*turnTap // user message ID → tap
+	// terminals is bounded per-turn state, independent of caller taps: a
+	// terminal outcome observed by the pump is retained so Observe
+	// callers attaching before or after the event still receive it
+	// exactly once, and reattachment replays it.
+	terminals map[string]adapter.Event
 
 	loopOnce sync.Once
 
@@ -48,10 +53,11 @@ type turnTap struct {
 
 func newSessionPump(nativeID string, client *NativeClient) *sessionPump {
 	return &sessionPump{
-		nativeID: nativeID,
-		client:   client,
-		turns:    make(map[string]*turnTap),
-		stopCh:   make(chan struct{}),
+		nativeID:  nativeID,
+		client:    client,
+		turns:     make(map[string]*turnTap),
+		terminals: make(map[string]adapter.Event),
+		stopCh:    make(chan struct{}),
 	}
 }
 
@@ -60,8 +66,16 @@ func newSessionPump(nativeID string, client *NativeClient) *sessionPump {
 func (p *sessionPump) register(userMessageID string, tap *turnTap) {
 	p.mu.Lock()
 	p.turns[userMessageID] = tap
+	terminal, hadTerminal := p.terminals[userMessageID]
 	p.mu.Unlock()
 	p.start()
+	if hadTerminal {
+		// The turn already finished before (or between) observations:
+		// deliver the retained terminal and close the tap.
+		if p.route(userMessageID, terminal) {
+			p.detach(userMessageID)
+		}
+	}
 }
 
 // start launches the drain loop exactly once, without registering a tap,
@@ -273,6 +287,11 @@ func (p *sessionPump) handlePermission(perm *struct {
 // stream closes for the consumer while the native pump keeps draining
 // (the session stays alive for follow-up turns).
 func (p *sessionPump) routeAndFinish(parentID string, ev adapter.Event) {
+	// Retain the terminal regardless of consumer presence: an Observe
+	// attaching later must still learn the turn finished.
+	p.mu.Lock()
+	p.terminals[parentID] = ev
+	p.mu.Unlock()
 	if p.route(parentID, ev) {
 		p.detach(parentID)
 	}
@@ -320,6 +339,9 @@ func (p *sessionPump) resyncFromHistory() {
 			ev.Status = council.TurnFailed
 			ev.Payload = asst.Error.Message
 		}
+		p.mu.Lock()
+		p.terminals[userMsgID] = ev
+		p.mu.Unlock()
 		if p.route(userMsgID, ev) {
 			tap.owner.mu.Lock()
 			if d, ok := tap.owner.dispatches[tap.ref]; ok {

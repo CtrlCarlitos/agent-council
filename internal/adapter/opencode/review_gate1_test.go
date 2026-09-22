@@ -79,8 +79,12 @@ func (gate1LaunchSource) OpenCodeServeLaunch(_ context.Context, sessionID adapte
 
 // newGate1ServerManager builds a server manager that launches children
 // backed by the fake HTTP server.
-func newGate1ServerManager(fake *fakeOpenCodeServer) *serverManager {
-	return newServerManager(&fixtureExecutor{fake: fake}, gate1LaunchSource{})
+func newGate1ServerManager(fake *fakeOpenCodeServer, owner *OpenCodeAdapter) *serverManager {
+	m := newServerManager(&fixtureExecutor{fake: fake}, gate1LaunchSource{})
+	if owner != nil {
+		m.nativeFor = owner.resolveNativeID
+	}
+	return m
 }
 
 // gate1Fixture wires an adapter against an authenticated fake OpenCode
@@ -95,7 +99,7 @@ func gate1Fixture(t *testing.T) (*OpenCodeAdapter, *fakeOpenCodeServer) {
 
 	identity := &fakeGate1Identity{}
 	adp := NewOpenCodeAdapter(nil, nil, identity, func(a *OpenCodeAdapter) {
-		a.servers = newGate1ServerManager(fake)
+		a.servers = newGate1ServerManager(fake, a)
 		a.servers.mu.Lock()
 		a.servers.children[gate1Session] = &serverProcess{
 			endpoint: endpoint,
@@ -118,7 +122,7 @@ func gate1FixtureWithGrace(t *testing.T, grace time.Duration) (*OpenCodeAdapter,
 
 	identity := &fakeGate1Identity{}
 	adp := NewOpenCodeAdapter(nil, nil, identity, WithIdleGrace(grace), func(a *OpenCodeAdapter) {
-		a.servers = newGate1ServerManager(fake)
+		a.servers = newGate1ServerManager(fake, a)
 		a.servers.mu.Lock()
 		a.servers.children[gate1Session] = &serverProcess{
 			endpoint: endpoint,
@@ -266,6 +270,9 @@ func TestGate1Review_CancelSendsAbort(t *testing.T) {
 	if got := fake.ledger.abortCount(); got != 1 {
 		t.Fatalf("expected exactly 1 native abort request, got %d", got)
 	}
+	if path := fake.ledger.abortPath(0); path != "/session/"+gate1Session+"/abort" {
+		t.Fatalf("abort must address the native session, got %q", path)
+	}
 	fake.mu.Lock()
 	aborted := fake.sessions[gate1Session].abortRequested
 	fake.mu.Unlock()
@@ -351,7 +358,7 @@ func TestGate1Review_RejectsMismatchedCredentials(t *testing.T) {
 	fake.mu.Unlock()
 
 	adp := NewOpenCodeAdapter(nil, nil, &fakeGate1Identity{}, func(a *OpenCodeAdapter) {
-		a.servers = newGate1ServerManager(fake)
+		a.servers = newGate1ServerManager(fake, a)
 		a.servers.mu.Lock()
 		a.servers.children[gate1Session] = &serverProcess{
 			endpoint: endpoint,

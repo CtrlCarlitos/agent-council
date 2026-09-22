@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/CtrlCarlitos/agent-council/internal/adapter"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/opencode"
 	"github.com/CtrlCarlitos/agent-council/internal/council"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
@@ -171,6 +172,40 @@ func TestAcceptance_OpenCode_BridgeLifecycle(t *testing.T) {
 		t.Fatalf("connect: %d %v", code, resp)
 	}
 
+	// Native session birth through the real adapter: CreateSession
+	// validates the model, sends the frozen payload, and records the
+	// SERVER-ASSIGNED native session ID — deliberately distinct from the
+	// logical session ID — as a persisted binding.
+	ws, err := srv.workspaceManager.AllocateWorkspace("run-acc", "sess-accept", "none", "example/repo",
+		"0123456789012345678901234567890123456789")
+	if err != nil {
+		t.Fatalf("workspace allocation: %v", err)
+	}
+	createResp, err := srv.adapter.CreateSession(ctx, adapter.CreateSessionRequest{
+		SessionID:   "sess-accept",
+		Contributor: "opencode",
+		Config:      adapter.SessionConfig{Model: "stub/model", WorkspaceRoot: ws.Root},
+	})
+	if err != nil {
+		t.Fatalf("native session creation: %v", err)
+	}
+	nativeID := createResp.NativeSessionID
+	if nativeID == "" || nativeID == "sess-accept" {
+		t.Fatalf("native session ID must be server-assigned and distinct, got %q", nativeID)
+	}
+	// Persist the binding under the adopted controller authority, at the
+	// session's current durable version.
+	hydratedBind, err := store.HydrateState(ctx)
+	if err != nil {
+		t.Fatalf("hydrate: %v", err)
+	}
+	bindVer := hydratedBind.Sessions["sess-accept"].RowVersion
+	if _, err := store.SetNativeBinding(ctx, "op-bind-acc", lease, "sess-accept", bindVer, storage.NativeBinding{
+		LogicalSessionID: "sess-accept", NativeSessionID: nativeID, Harness: "opencode",
+	}); err != nil {
+		t.Fatalf("persist binding: %v", err)
+	}
+
 	// 3. Bridge queue (expected_version from durable state).
 	hydrated0, err := store.HydrateState(ctx)
 	if err != nil {
@@ -210,21 +245,14 @@ func TestAcceptance_OpenCode_BridgeLifecycle(t *testing.T) {
 		t.Fatalf("expected native correlated output, got %q", result)
 	}
 
-	// The native dispatch reached the stub in the session's workspace.
-	ws, ok := srv.workspaceManager.GetPaths("run-acc", "sess-accept")
-	if !ok {
-		t.Fatal("workspace allocation missing")
+	// The native dispatch reached the stub under the SERVER-ASSIGNED
+	// native session, in the session's workspace.
+	hits := readStubState(t, ws.Root, ".stub-hits")
+	if !strings.Contains(strings.Join(hits, "\n"), "POST /session/"+nativeID+"/prompt_async") {
+		t.Fatalf("native dispatch must address the server-assigned session, hits: %v", hits)
 	}
 	if fails := readStubState(t, ws.Root, ".stub-authfail"); len(fails) != 0 {
 		t.Fatalf("native traffic must authenticate: %v", fails)
-	}
-
-	// Native session persistence (the stub records created sessions in
-	// its project directory); the acceptance flow addresses the child
-	// session directly, so seed the session record the native server
-	// would have persisted.
-	if err := os.WriteFile(filepath.Join(ws.Root, ".stub-sessions"), []byte("sess-accept\n"), 0o600); err != nil {
-		t.Fatalf("seed native session: %v", err)
 	}
 
 	// 7. Bridge disconnect.
@@ -259,8 +287,9 @@ func TestAcceptance_OpenCode_BridgeLifecycle(t *testing.T) {
 	}
 
 	// 10. Bridge queue + release follow-up: the adapter resumes a
-	// replacement server against the same workspace and verifies the
-	// exact native session.
+	// replacement server against the same workspace, verifies the exact
+	// server-assigned native session, and the follow-up dispatch
+	// addresses it.
 	hydrated, err := store.HydrateState(ctx)
 	if err != nil {
 		t.Fatalf("hydrate: %v", err)
@@ -289,10 +318,17 @@ func TestAcceptance_OpenCode_BridgeLifecycle(t *testing.T) {
 		t.Fatalf("collect 2: %d %v", code, resp)
 	}
 	if resp["status"] != string(council.TurnCompleted) {
-		t.Fatalf("follow-up turn must be completed, got %v", resp["status"])
+		t.Fatalf("follow-up turn must be completed, got %v (resp: %v)", resp["status"], resp)
 	}
 	if result, _ := resp["result"].(string); !strings.Contains(result, "stub assistant response") {
 		t.Fatalf("follow-up must reach the replacement server, got %q", result)
+	}
+
+	// The follow-up dispatch addressed the SERVER-ASSIGNED native
+	// session on the replacement server.
+	hits = readStubState(t, ws.Root, ".stub-hits")
+	if !strings.Contains(strings.Join(hits, "\n"), "POST /session/"+nativeID+"/prompt_async") {
+		t.Fatalf("follow-up must address the server-assigned session, hits: %v", hits)
 	}
 
 	// 12. Durable evidence: both turns persisted with native results.

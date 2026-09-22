@@ -51,15 +51,31 @@ type OpenCodeAdapter struct {
 	bindings   map[adapter.SessionID]*sessionBinding
 	pumps      map[string]*sessionPump // native session ID → event pump
 	parkTimers map[adapter.SessionID]*time.Timer
+	slots      map[string]*sessionSlot // native session ID → single-flight slot
+}
+
+// sessionSlot enforces the per-NATIVE-SESSION single-flight rule: at most
+// one dispatched turn may be in flight on a native session at a time,
+// regardless of how many TurnRefs map to it. The owning ref may re-enter
+// (retry after ambiguity). The channel is closed to release the slot.
+type sessionSlot struct {
+	released chan struct{}
+	owner    adapter.TurnRef
 }
 
 // sessionBinding records the server-assigned native session for a logical
 // session, established by CreateSession and re-established by
 // ResumeSession. The native ID is never synthesized by the adapter.
 type sessionBinding struct {
-	nativeID string
-	model    string
+	nativeID  string
+	model     string
+	directory string // expected project directory of the native session
 }
+
+// nativeAgentPreset is the agent preset Council requests for contributor
+// sessions. It is a fixed preset, never derived from profile tooling or
+// environment allowlists (those are not tool-approval authorities).
+const nativeAgentPreset = "council"
 
 // ErrNativeSessionMissing reports a persisted binding whose native session
 // no longer exists on the harness server (verified 404). Distinct from
@@ -100,6 +116,7 @@ func NewOpenCodeAdapter(
 		bindings:      make(map[adapter.SessionID]*sessionBinding),
 		pumps:         make(map[string]*sessionPump),
 		parkTimers:    make(map[adapter.SessionID]*time.Timer),
+		slots:         make(map[string]*sessionSlot),
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -119,7 +136,19 @@ func NewOpenCodeAdapterWithLaunch(
 ) *OpenCodeAdapter {
 	a := NewOpenCodeAdapter(executor, probeTemplate, identity, opts...)
 	a.servers = newServerManager(executor, launch)
+	a.servers.nativeFor = a.resolveNativeID
 	return a
+}
+
+// resolveNativeID returns the persisted native session for a child key,
+// or the key itself when no binding exists (direct-dispatch paths).
+func (a *OpenCodeAdapter) resolveNativeID(sessionID adapter.SessionID) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if b, ok := a.bindings[sessionID]; ok {
+		return b.nativeID
+	}
+	return string(sessionID)
 }
 
 // ── Probe ───────────────────────────────────────────────────────────────
@@ -180,7 +209,16 @@ func (a *OpenCodeAdapter) CreateSession(ctx context.Context, req adapter.CreateS
 	}
 
 	// The native session ID is assigned by the server, never synthesized.
-	nativeID, err := client.CreateSession(ctx, fmt.Sprintf("council %s", req.SessionID), req.Config.WorkspaceRoot)
+	// The payload carries the frozen harness configuration: selected
+	// model, council agent preset, deny-by-default permissions, and the
+	// workspace directory context.
+	nativeID, err := client.CreateSession(ctx, NativeCreateSession{
+		Title:      fmt.Sprintf("council %s", req.SessionID),
+		Directory:  req.Config.WorkspaceRoot,
+		Model:      model,
+		Agent:      nativeAgentPreset,
+		Permission: "deny",
+	})
 	if err != nil {
 		if IsPostWriteError(err) {
 			return adapter.SessionBinding{}, &adapter.ErrSessionCreationUncertain{
@@ -191,7 +229,11 @@ func (a *OpenCodeAdapter) CreateSession(ctx context.Context, req adapter.CreateS
 	}
 
 	a.mu.Lock()
-	a.bindings[req.SessionID] = &sessionBinding{nativeID: nativeID, model: model}
+	a.bindings[req.SessionID] = &sessionBinding{
+		nativeID:  nativeID,
+		model:     model,
+		directory: req.Config.WorkspaceRoot,
+	}
 	a.mu.Unlock()
 	binding.NativeSessionID = nativeID
 	return binding, nil
@@ -207,7 +249,7 @@ func (a *OpenCodeAdapter) ResumeSession(ctx context.Context, binding adapter.Ses
 	if err != nil {
 		return err
 	}
-	exists, err := client.GetSession(ctx, binding.NativeSessionID)
+	meta, exists, err := client.GetSession(ctx, binding.NativeSessionID)
 	if err != nil {
 		return err
 	}
@@ -217,10 +259,18 @@ func (a *OpenCodeAdapter) ResumeSession(ctx context.Context, binding adapter.Ses
 			NativeSessionID: binding.NativeSessionID,
 		}
 	}
+	// Fail closed on project-context mismatch: a native session that
+	// belongs to a different directory is not this session's runtime.
+	if expected := strings.TrimSpace(binding.Config.WorkspaceRoot); expected != "" &&
+		strings.TrimSpace(meta.Directory) != "" && meta.Directory != expected {
+		return fmt.Errorf("native session %s belongs to directory %q, expected %q; resume fails closed",
+			binding.NativeSessionID, meta.Directory, expected)
+	}
 	a.mu.Lock()
 	a.bindings[binding.SessionID] = &sessionBinding{
-		nativeID: binding.NativeSessionID,
-		model:    binding.Config.Model,
+		nativeID:  binding.NativeSessionID,
+		model:     binding.Config.Model,
+		directory: binding.Config.WorkspaceRoot,
 	}
 	a.mu.Unlock()
 	return nil
@@ -278,13 +328,36 @@ func (a *OpenCodeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, pro
 	a.launching[ref] = res
 	a.mu.Unlock()
 
+	// Per-native-session single-flight, launcher-only: a second turn
+	// bound to the same native session waits until the active turn
+	// reaches a terminal outcome or its dispatch fails before
+	// acceptance.
+	if err := a.acquireNativeSlot(ctx, ref, nativeID); err != nil {
+		a.mu.Lock()
+		delete(a.launching, ref)
+		a.mu.Unlock()
+		close(res.ready)
+		a.recordVerdict(ref, adapter.DispatchRejected)
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected, Reason: err.Error()}, err
+	}
+	nativeAccepted := false
+
 	outcome, err := a.dispatchNative(ctx, ref, client, nativeID, msgID, prompt)
+	// Pre-acceptance failure releases the native slot; an accepted or
+	// ambiguous dispatch holds it until the turn reaches a terminal
+	// outcome (Collect) or reconciliation resolves it.
+	releaseIfNotAccepted := func() {
+		if !nativeAccepted && outcome.Status == adapter.DispatchRejected {
+			a.releaseNativeSlot(nativeID)
+		}
+	}
 
 	a.mu.Lock()
 	delete(a.launching, ref)
 	a.verdicts[ref] = outcome.Status
 	switch outcome.Status {
 	case adapter.DispatchAccepted:
+		nativeAccepted = true
 		delete(a.unknown, ref)
 		a.dispatches[ref] = &managedDispatch{userMessageID: msgID, nativeSessionID: nativeID}
 		// Start the session pump loop now; taps are registered by Observe
@@ -299,6 +372,7 @@ func (a *OpenCodeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, pro
 
 	res.outcome, res.err = outcome, err
 	close(res.ready)
+	releaseIfNotAccepted()
 	return outcome, err
 }
 
@@ -378,7 +452,17 @@ func (a *OpenCodeAdapter) Cancel(ctx context.Context, ref adapter.TurnRef) (adap
 	if err != nil {
 		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown, Reason: err.Error()}, err
 	}
-	if err := client.Abort(ctx, string(ref.SessionID)); err != nil {
+	// Abort addresses the NATIVE session of the dispatched turn.
+	nativeID := string(ref.SessionID)
+	a.mu.Lock()
+	if d, ok := a.dispatches[ref]; ok {
+		nativeID = d.nativeSessionID
+	}
+	a.mu.Unlock()
+	if nativeID == string(ref.SessionID) {
+		nativeID = a.resolveNativeID(ref.SessionID)
+	}
+	if err := client.Abort(ctx, nativeID); err != nil {
 		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown, Reason: err.Error()}, err
 	}
 	return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelConfirmed}, nil
@@ -395,13 +479,16 @@ func (a *OpenCodeAdapter) Collect(ctx context.Context, ref adapter.TurnRef) (ada
 			Ref: ref, Status: council.TurnRunning, ResultStatus: adapter.ResultPending,
 		}, errors.New("turn not dispatched")
 	}
-	msg, found := a.findAssistantByParentID(ctx, string(ref.SessionID), d.userMessageID)
+	// The message query addresses the NATIVE session from the dispatch
+	// record; the child lookup stays keyed by the logical session.
+	msg, found := a.findAssistantByParentID(ctx, ref.SessionID, d.nativeSessionID, d.userMessageID)
 	if !found {
 		return adapter.TurnResult{
 			Ref: ref, Status: council.TurnRunning, ResultStatus: adapter.ResultPending,
 		}, nil
 	}
 	d.terminal = true
+	a.releaseNativeSlot(d.nativeSessionID)
 	a.scheduleIdleParkIfIdle(ref.SessionID)
 	text := ""
 	for _, p := range msg.Parts {
@@ -472,7 +559,7 @@ func (a *OpenCodeAdapter) Reconcile(ctx context.Context, ref adapter.RecoveryRef
 		return uncertain(), nil
 	}
 
-	exists, err := client.GetSession(ctx, nativeID)
+	_, exists, err := client.GetSession(ctx, nativeID)
 	if err != nil {
 		// Transport loss to the server: 404-proof is unavailable, and a
 		// lost connection proves nothing about an orphan worker's work.
@@ -509,13 +596,12 @@ func (a *OpenCodeAdapter) Reconcile(ctx context.Context, ref adapter.RecoveryRef
 		return uncertain(), nil
 	}
 
-	// The submission is on the server: answered?
+	// The submission is on the server: answered? A transport failure
+	// here establishes neither reachability nor activity — the evidence
+	// model requires uncertainty.
 	msgs, err := client.ListMessages(ctx, nativeID)
 	if err != nil {
-		return adapter.ReconciliationOutcome{
-			Ref: ref, Reachability: council.VisibilityReachable,
-			Status: adapter.ReconciliationReachableActive, Observed: council.TurnRunning,
-		}, nil
+		return uncertain(), nil
 	}
 	for i := range msgs {
 		m := &msgs[i]
@@ -547,12 +633,12 @@ func (a *OpenCodeAdapter) Reconcile(ctx context.Context, ref adapter.RecoveryRef
 
 // findAssistantByParentID polls the server for an assistant message whose
 // parentID matches the given ID. Returns the message and true when found.
-func (a *OpenCodeAdapter) findAssistantByParentID(ctx context.Context, sessionID string, parentID string) (*NativeMessage, bool) {
-	client, err := a.clientFor(adapter.SessionID(sessionID))
+func (a *OpenCodeAdapter) findAssistantByParentID(ctx context.Context, childKey adapter.SessionID, nativeSessionID, parentID string) (*NativeMessage, bool) {
+	client, err := a.clientFor(childKey)
 	if err != nil {
 		return nil, false
 	}
-	msgs, err := client.ListMessages(ctx, sessionID)
+	msgs, err := client.ListMessages(ctx, nativeSessionID)
 	if err != nil {
 		return nil, false
 	}
@@ -600,6 +686,49 @@ func (a *OpenCodeAdapter) clientForOrResume(ctx context.Context, sessionID adapt
 		return nil, fmt.Errorf("start serve child for %s: %w", sessionID, startErr)
 	}
 	return a.clientFor(sessionID)
+}
+
+// acquireNativeSlot blocks until the native session's dispatch slot is
+// free, then holds it for the given ref. The slot's owner re-enters
+// without blocking (retry after ambiguity). Fails on caller cancellation.
+func (a *OpenCodeAdapter) acquireNativeSlot(ctx context.Context, ref adapter.TurnRef, nativeID string) error {
+	for {
+		a.mu.Lock()
+		if a.slots == nil {
+			a.slots = make(map[string]*sessionSlot)
+		}
+		slot, held := a.slots[nativeID]
+		if !held {
+			a.slots[nativeID] = &sessionSlot{released: make(chan struct{}), owner: ref}
+			a.mu.Unlock()
+			return nil
+		}
+		if slot.owner == ref {
+			a.mu.Unlock()
+			return nil
+		}
+		released := slot.released
+		a.mu.Unlock()
+		select {
+		case <-released:
+			// freed; loop to re-acquire
+		case <-ctx.Done():
+			return fmt.Errorf("dispatch slot wait cancelled for native session %s: %w", nativeID, ctx.Err())
+		}
+	}
+}
+
+// releaseNativeSlot frees the native session's dispatch slot, if held.
+func (a *OpenCodeAdapter) releaseNativeSlot(nativeID string) {
+	a.mu.Lock()
+	slot, ok := a.slots[nativeID]
+	if ok {
+		delete(a.slots, nativeID)
+	}
+	a.mu.Unlock()
+	if ok {
+		close(slot.released)
+	}
 }
 
 // recordVerdict stores the latest dispatch verdict for reconciliation
@@ -685,8 +814,9 @@ func (a *OpenCodeAdapter) scheduleIdleParkIfIdle(sessionID adapter.SessionID) {
 		defer cancel()
 		if err := a.servers.park(parkCtx, sessionID); err == nil {
 			// The child is gone; its pump must not reconnect to a dead
-			// endpoint. Resume re-registers a fresh pump.
-			a.stopPump(string(sessionID))
+			// endpoint. The pump is keyed by the NATIVE session ID.
+			// Resume re-registers a fresh pump.
+			a.stopPump(a.resolveNativeID(sessionID))
 		}
 	})
 }

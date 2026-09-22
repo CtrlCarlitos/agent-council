@@ -34,6 +34,14 @@ type fakeOpenCodeServer struct {
 	// pending events: a one-shot server-side native stream drop.
 	dropEvents bool
 
+	// lastCreateSessionBody records the raw POST /session payload for
+	// contract assertions.
+	lastCreateSessionBody string
+
+	// dropMessageList makes the next GET message-list handler close the
+	// connection without responding (transport failure).
+	dropMessageList bool
+
 	// flakyPromptAsync is a one-shot fault injected into the next
 	// prompt_async call. "" disables it. "drop-before-record" hijacks the
 	// connection after reading the request but before recording state
@@ -69,6 +77,7 @@ type fakeRequestLedger struct {
 	promptAsyncSessions   []string
 	promptAsyncMessageIDs []string
 	abortCalls            int
+	abortPaths            []string
 	authFailures          int
 	modelCalls            int
 	sseConnects           []string
@@ -84,10 +93,17 @@ func (l *fakeRequestLedger) recordPromptAsync(sessionID, messageID string) {
 	l.promptAsyncMessageIDs = append(l.promptAsyncMessageIDs, messageID)
 }
 
-func (l *fakeRequestLedger) recordAbort() {
+func (l *fakeRequestLedger) recordAbort(path string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.abortCalls++
+	l.abortPaths = append(l.abortPaths, path)
+}
+
+func (l *fakeRequestLedger) abortPath(i int) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.abortPaths[i]
 }
 
 func (l *fakeRequestLedger) recordAuthFailure() {
@@ -147,6 +163,7 @@ func (l *fakeRequestLedger) recordDirectoryRejection() {
 type fakeSession struct {
 	id             string
 	title          string
+	directory      string
 	abortRequested bool
 	messages       []fakeMessage
 	scriptedEvents []string
@@ -181,19 +198,20 @@ func (f *fakeOpenCodeServer) handler() http.Handler {
 	})
 	mux.HandleFunc("POST /session", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Title     string `json:"title"`
-			Directory string `json:"directory"`
-			Model     struct {
-				ProviderID string `json:"providerID"`
-				ID         string `json:"id"`
-			} `json:"model"`
+			Title      string `json:"title"`
+			Directory  string `json:"directory"`
+			Model      string `json:"model"`
+			Agent      string `json:"agent"`
+			Permission string `json:"permission"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		raw, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(raw, &body); err != nil {
 			http.Error(w, "bad json", 400)
 			return
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		f.lastCreateSessionBody = string(raw)
 		// Directory-context rejection: the server serves exactly one
 		// working directory; a mismatched context is refused.
 		if f.workspaceDir != "" && body.Directory != f.workspaceDir {
@@ -202,7 +220,7 @@ func (f *fakeOpenCodeServer) handler() http.Handler {
 			return
 		}
 		id := fmt.Sprintf("ses_fake_%d", len(f.sessions)+1)
-		sess := &fakeSession{id: id, title: body.Title}
+		sess := &fakeSession{id: id, title: body.Title, directory: body.Directory}
 		f.sessions[id] = sess
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -220,7 +238,11 @@ func (f *fakeOpenCodeServer) handler() http.Handler {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"id": sess.id, "title": sess.title})
+		json.NewEncoder(w).Encode(map[string]any{
+			"id":        sess.id,
+			"title":     sess.title,
+			"directory": sess.directory,
+		})
 	})
 	mux.HandleFunc("POST /session/{sessionID}/prompt_async", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -306,6 +328,17 @@ func (f *fakeOpenCodeServer) handler() http.Handler {
 		w.WriteHeader(204)
 	})
 	mux.HandleFunc("GET /session/{sessionID}/message", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		drop := f.dropMessageList
+		f.dropMessageList = false
+		f.mu.Unlock()
+		if drop {
+			// An explicit 500 (not a bare close): Go's transport silently
+			// retries idempotent requests that die before any response
+			// bytes, which would mask the failure.
+			http.Error(w, "message list unavailable", 500)
+			return
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		sess, ok := f.sessions[r.PathValue("sessionID")]
@@ -462,7 +495,7 @@ func (f *fakeOpenCodeServer) handler() http.Handler {
 	mux.HandleFunc("POST /session/{sessionID}/abort", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		f.ledger.recordAbort()
+		f.ledger.recordAbort(r.URL.Path)
 		if sess, ok := f.sessions[r.PathValue("sessionID")]; ok {
 			sess.abortRequested = true
 		}
@@ -497,6 +530,21 @@ func (f *fakeOpenCodeServer) allowCredentials(user, pass string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.extraCreds = append(f.extraCreds, [2]string{user, pass})
+}
+
+// armDropMessageList makes the next message-list request fail at the
+// transport level.
+func (f *fakeOpenCodeServer) armDropMessageList() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dropMessageList = true
+}
+
+// lastCreateSessionPayload returns the raw POST /session body.
+func (f *fakeOpenCodeServer) lastCreateSessionPayload() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastCreateSessionBody
 }
 
 // armFlakyEvents arms a one-shot server-side native stream drop: the
