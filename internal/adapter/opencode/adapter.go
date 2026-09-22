@@ -230,8 +230,14 @@ func (a *OpenCodeAdapter) CreateSession(ctx context.Context, req adapter.CreateS
 	if res, ok := a.creating[req.SessionID]; ok {
 		a.mu.Unlock()
 		<-res.ready
-		// Another caller created the binding: this request still must
-		// match its configuration.
+		// The creator's outcome is shared verbatim: on failure waiters
+		// receive the same typed error — including uncertain native
+		// creation — never a generic substitute.
+		if res.err != nil {
+			return res.binding, res.err
+		}
+		// Creation succeeded: this request still must match its
+		// configuration.
 		a.mu.Lock()
 		stored, ok := a.bindings[req.SessionID]
 		a.mu.Unlock()
@@ -244,7 +250,7 @@ func (a *OpenCodeAdapter) CreateSession(ctx context.Context, req adapter.CreateS
 				"session %s is already bound with a different configuration; duplicate create fails closed",
 				req.SessionID)
 		}
-		return res.binding, res.err
+		return res.binding, nil
 	}
 	res := &createReservation{ready: make(chan struct{})}
 	a.creating[req.SessionID] = res

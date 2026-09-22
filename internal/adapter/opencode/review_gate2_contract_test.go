@@ -7,6 +7,8 @@ package opencode
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -743,4 +745,124 @@ func TestGate2_ConcurrentMismatchedCreateSessionFailsClosed(t *testing.T) {
 	if created != 1 {
 		t.Fatalf("mismatched concurrent creates must not create extra native sessions, got %d", created)
 	}
+}
+
+// Waiters on a failed concurrent creation receive the creator's typed
+// error verbatim — for both pre-write refusal and post-write uncertainty
+// — and no extra native session is created.
+func TestGate2_ConcurrentCreateWaitersShareCreatorFailure(t *testing.T) {
+	t.Run("pre-write refusal", func(t *testing.T) {
+		adp, fake := gate2Fixture(t)
+		ctx := context.Background()
+
+		const fresh = "sess-fresh-prewrite"
+		// The child's endpoint is dead: the inventory lookup fails
+		// before the request is written.
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		unreachable := fmt.Sprintf("http://%s", ln.Addr().String())
+		_ = ln.Close()
+		fake.mu.Lock()
+		fake.sessions[fresh] = &fakeSession{id: fresh}
+		adp.servers.children[fresh] = &serverProcess{
+			endpoint: unreachable,
+			username: gate1User,
+			password: gate1Password,
+		}
+		fake.mu.Unlock()
+
+		const callers = 4
+		var wg sync.WaitGroup
+		errs := make([]error, callers)
+		for i := 0; i < callers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				_, errs[i] = adp.CreateSession(ctx, adapter.CreateSessionRequest{
+					SessionID:   fresh,
+					Contributor: "opencode",
+					Config:      adapter.SessionConfig{Model: "fake/model", WorkspaceRoot: gate2Workspace},
+				})
+			}(i)
+		}
+		wg.Wait()
+
+		for i, err := range errs {
+			if err == nil {
+				t.Fatalf("caller %d: creation against a dead endpoint must fail", i)
+			}
+			var uncertain *adapter.ErrSessionCreationUncertain
+			if !errorsAs(err, &uncertain) {
+				t.Fatalf("caller %d must receive the creator's uncertain classification, got %T: %v", i, err, err)
+			}
+		}
+		// No native session reached the fake server.
+		fake.mu.Lock()
+		created := 0
+		for id := range fake.sessions {
+			if strings.HasPrefix(id, "ses_fake_") {
+				created++
+			}
+		}
+		fake.mu.Unlock()
+		if created != 0 {
+			t.Fatalf("failed creation must not create native sessions, got %d", created)
+		}
+	})
+
+	t.Run("post-write uncertainty", func(t *testing.T) {
+		adp, fake := gate2Fixture(t)
+		ctx := context.Background()
+
+		const fresh = "sess-fresh-postwrite"
+		fake.mu.Lock()
+		fake.sessions[fresh] = &fakeSession{id: fresh}
+		adp.servers.children[fresh] = &serverProcess{
+			endpoint: fake.endpoint,
+			username: gate1User,
+			password: gate1Password,
+		}
+		fake.mu.Unlock()
+		fake.armDropCreateSession()
+
+		const callers = 4
+		var wg sync.WaitGroup
+		errs := make([]error, callers)
+		for i := 0; i < callers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				_, errs[i] = adp.CreateSession(ctx, adapter.CreateSessionRequest{
+					SessionID:   fresh,
+					Contributor: "opencode",
+					Config:      adapter.SessionConfig{Model: "fake/model", WorkspaceRoot: gate2Workspace},
+				})
+			}(i)
+		}
+		wg.Wait()
+
+		for i, err := range errs {
+			if err == nil {
+				t.Fatalf("caller %d: a dropped create response must fail", i)
+			}
+			var uncertain *adapter.ErrSessionCreationUncertain
+			if !errorsAs(err, &uncertain) {
+				t.Fatalf("caller %d must share the creator's uncertain classification, got %T: %v", i, err, err)
+			}
+		}
+		// The dropped create persisted nothing: no native session exists.
+		fake.mu.Lock()
+		created := 0
+		for id := range fake.sessions {
+			if strings.HasPrefix(id, "ses_fake_") {
+				created++
+			}
+		}
+		fake.mu.Unlock()
+		if created != 0 {
+			t.Fatalf("an uncertain create must not record a native session, got %d", created)
+		}
+	})
 }

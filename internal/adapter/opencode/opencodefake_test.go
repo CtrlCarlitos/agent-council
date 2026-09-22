@@ -42,6 +42,10 @@ type fakeOpenCodeServer struct {
 	// connection without responding (transport failure).
 	dropMessageList bool
 
+	// dropCreateSession makes the next POST /session handler return a
+	// post-write disconnect after fully reading the request.
+	dropCreateSession bool
+
 	// flakyPromptAsync is a one-shot fault injected into the next
 	// prompt_async call. "" disables it. "drop-before-record" hijacks the
 	// connection after reading the request but before recording state
@@ -211,6 +215,19 @@ func (f *fakeOpenCodeServer) handler() http.Handler {
 		raw, _ := io.ReadAll(r.Body)
 		if err := json.Unmarshal(raw, &body); err != nil {
 			http.Error(w, "bad json", 400)
+			return
+		}
+		f.mu.Lock()
+		drop := f.dropCreateSession
+		f.dropCreateSession = false
+		f.mu.Unlock()
+		if drop {
+			// Post-write disconnect: the request was fully read; the
+			// client must classify the outcome as ambiguous.
+			conn, _, _ := w.(http.Hijacker).Hijack()
+			if conn != nil {
+				conn.Close()
+			}
 			return
 		}
 		f.mu.Lock()
@@ -534,6 +551,14 @@ func (f *fakeOpenCodeServer) allowCredentials(user, pass string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.extraCreds = append(f.extraCreds, [2]string{user, pass})
+}
+
+// armDropCreateSession makes the next POST /session return a post-write
+// disconnect after the request is fully read.
+func (f *fakeOpenCodeServer) armDropCreateSession() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dropCreateSession = true
 }
 
 // armDropMessageList makes the next message-list request fail at the
