@@ -97,6 +97,11 @@ func (a *OpenCodeAdapter) Probe(ctx context.Context) (adapter.ProbeReport, error
 	if err != nil {
 		return report, fmt.Errorf("probe serve launch: %w", err)
 	}
+	// The template-created scratch directory exists only for this probe
+	// run: remove it on every path past allocation — shape rejection,
+	// start failure, and normal termination alike — so a failed probe
+	// never leaks the directory.
+	defer func() { _ = os.RemoveAll(serveReq.Paths.Root) }()
 	if !execpolicy.IsOpenCodeServeLaunch(serveReq) {
 		return report, fmt.Errorf("%w: probe launch shape is %q %v",
 			execpolicy.ErrServerEnvShape, serveReq.Command, serveReq.Args)
@@ -111,9 +116,6 @@ func (a *OpenCodeAdapter) Probe(ctx context.Context) (adapter.ProbeReport, error
 	if err != nil {
 		return report, fmt.Errorf("probe serve start: %w", err)
 	}
-	// The template-created scratch directory exists only for this probe
-	// run: remove it once the probe child is terminated.
-	defer func() { _ = os.RemoveAll(serveReq.Paths.Root) }()
 
 	// Drain the child's stdout into a buffer while polling for the printed
 	// listen address; drain stderr for the child's lifetime.

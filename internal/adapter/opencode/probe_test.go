@@ -243,3 +243,51 @@ func TestProbe_ProductionTemplateEndToEndCleansScratch(t *testing.T) {
 		t.Fatalf("template-created scratch must be removed after Probe, remaining: %v", names)
 	}
 }
+
+// A probe whose serve child cannot start must still remove the
+// template-created scratch directory: cleanup covers every path past
+// directory allocation, not only successful termination.
+func TestProbe_StartFailureStillCleansScratch(t *testing.T) {
+	dir := t.TempDir()
+	binDir := compileStubOpencode(t)
+	t.Setenv("PATH", binDir+string(filepath.ListSeparator)+os.Getenv("PATH"))
+
+	scratchRoot := filepath.Join(dir, "operator-scratch")
+	if err := os.MkdirAll(scratchRoot, 0o700); err != nil {
+		t.Fatalf("mkdir scratch root: %v", err)
+	}
+	tpl := &brokenServeBinaryTemplate{stubProbeTemplate{base: scratchRoot}}
+	adp := NewOpenCodeAdapterWithLaunch(execpolicy.New(), tpl, nil, nil)
+
+	if _, err := adp.Probe(context.Background()); err == nil {
+		t.Fatal("probe must fail when the serve child cannot start")
+	}
+	entries, err := os.ReadDir(scratchRoot)
+	if err != nil {
+		t.Fatalf("read scratch root: %v", err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("failed probe start must not leak the scratch directory, remaining: %v", names)
+	}
+}
+
+type brokenServeBinaryTemplate struct{ stubProbeTemplate }
+
+func (t brokenServeBinaryTemplate) ProbeServeLaunch(_ context.Context) (execpolicy.LaunchRequest, error) {
+	scratch, err := os.MkdirTemp(t.base, "probe-scratch-")
+	if err != nil {
+		return execpolicy.LaunchRequest{}, err
+	}
+	return execpolicy.LaunchRequest{
+		RunID:     "run-probe",
+		SessionID: "sess-probe-serve",
+		Command:   "opencode-not-on-path",
+		Args:      []string{"serve", "--hostname", "127.0.0.1", "--port", "0"},
+		Paths:     workspace.WorkspacePaths{Root: scratch, Config: scratch},
+		Profile:   lifecycleProfile(),
+	}, nil
+}
