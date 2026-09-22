@@ -281,6 +281,7 @@ CREATE TABLE IF NOT EXISTS claude_attempt_launches (
 	reservation_seq    INTEGER NOT NULL,
 	state              TEXT NOT NULL DEFAULT 'reserved',
 	started_at         TEXT,
+	start_failed_at    TEXT,
 	first_stdin_byte_at TEXT,
 	known_dead_at      TEXT,
 	exit_code          INTEGER,

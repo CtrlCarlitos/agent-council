@@ -240,7 +240,18 @@ WHERE attempt_id = ?`, attemptID); err != nil {
 			attemptID, count, consumed, priorDead)
 	}
 
-	seq := count + 1
+	// Use MAX(reservation_seq)+1: start_failed rows retain their seq, so
+	// new reservations never collide with retained evidence.
+	var maxSeq sql.NullInt64
+	err = tx.QueryRowContext(ctx, `
+SELECT MAX(reservation_seq) FROM claude_attempt_launches WHERE attempt_id = ?`, attemptID).Scan(&maxSeq)
+	if err != nil {
+		return 0, err
+	}
+	seq := int64(1)
+	if maxSeq.Valid && maxSeq.Int64 > 0 {
+		seq = maxSeq.Int64 + 1
+	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO claude_attempt_launches (attempt_id, reservation_seq, state, executor_identity)
 VALUES (?, ?, 'reserved', ?)`, attemptID, seq, executorIdentity); err != nil {
@@ -274,6 +285,15 @@ WHERE attempt_id = ? AND reservation_seq = ?`, now, attemptID, seq)
 		_, err := s.DB().ExecContext(ctx, `
 UPDATE claude_attempt_launches SET state = 'start_failed', start_failed_at = ?
 WHERE attempt_id = ? AND reservation_seq = ?`, now, attemptID, seq)
+		if err != nil {
+			return err
+		}
+		// No process was created: release the launch slot so a new
+		// reservation is possible. The launch row is retained as
+		// evidence.
+		_, err = s.DB().ExecContext(ctx, `
+UPDATE claude_turn_attempts SET launch_count = launch_count - 1
+WHERE attempt_id = ? AND launch_count > 0`, attemptID)
 		return err
 	case "dead":
 		_, err := s.DB().ExecContext(ctx, `
@@ -304,12 +324,24 @@ UPDATE claude_turn_attempts SET observed_status = ?, transition_version = transi
 
 // SetClaudeAttemptTerminal records the verified terminal result payload.
 func (s *Store) SetClaudeAttemptTerminal(ctx context.Context, attemptID string, resultPayload, resultUsage string) error {
-	_, err := s.DB().ExecContext(ctx, `
+	// Exactly-once guard: only the first successful write wins (the
+	// WHERE clause requires terminal = 0).
+	res, err := s.DB().ExecContext(ctx, `
 UPDATE claude_turn_attempts SET terminal = 1, result_payload = ?, result_usage = ?,
 	observed_status = 'completed', transition_version = transition_version + 1,
-	updated_at = ? WHERE attempt_id = ?`,
+	updated_at = ? WHERE attempt_id = ? AND terminal = 0`,
 		resultPayload, resultUsage, time.Now().UTC().Format(time.RFC3339), attemptID)
-	return err
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("attempt %s already terminal; exactly-once guard prevented overwrite", attemptID)
+	}
+	return nil
 }
 
 // GetClaudeTurnAttempt returns the current attempt row.
@@ -317,9 +349,11 @@ func (s *Store) GetClaudeTurnAttempt(ctx context.Context, attemptID string) (*Cl
 	row := s.DB().QueryRowContext(ctx, `
 SELECT attempt_id, session_id, turn_key, native_id, prompt_digest,
        baseline_file_identity, baseline_size, baseline_entries, materialized_baseline,
-       transcript_protection, launch_count, absence_redispatch_consumed,
+       transcript_protection, protection_attestation_id, launch_count, absence_redispatch_consumed,
        accepted, terminal, result_payload, result_usage, observed_status,
-       uncertainty_disposition, transition_version, created_at, updated_at
+       uncertainty_disposition, disposition_actor, disposition_generation,
+       disposition_op_id, disposition_at,
+       transition_version, created_at, updated_at
 FROM claude_turn_attempts WHERE attempt_id = ?`, attemptID)
 	return scanClaudeAttempt(row)
 }
@@ -329,9 +363,11 @@ func (s *Store) GetLatestClaudeTurnAttempt(ctx context.Context, sessionID, turnK
 	row := s.DB().QueryRowContext(ctx, `
 SELECT attempt_id, session_id, turn_key, native_id, prompt_digest,
        baseline_file_identity, baseline_size, baseline_entries, materialized_baseline,
-       transcript_protection, launch_count, absence_redispatch_consumed,
+       transcript_protection, protection_attestation_id, launch_count, absence_redispatch_consumed,
        accepted, terminal, result_payload, result_usage, observed_status,
-       uncertainty_disposition, transition_version, created_at, updated_at
+       uncertainty_disposition, disposition_actor, disposition_generation,
+       disposition_op_id, disposition_at,
+       transition_version, created_at, updated_at
 FROM claude_turn_attempts
 WHERE session_id = ? AND turn_key = ?
 ORDER BY created_at DESC LIMIT 1`, sessionID, turnKey)
