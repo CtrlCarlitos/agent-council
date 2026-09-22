@@ -287,8 +287,11 @@ func (a *OpenCodeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, pro
 	case adapter.DispatchAccepted:
 		delete(a.unknown, ref)
 		a.dispatches[ref] = &managedDispatch{userMessageID: msgID, nativeSessionID: nativeID}
+		// Start the session pump loop now; taps are registered by Observe
+		// callers only, so no event is ever delivered to an orphaned
+		// buffer.
 		pump := a.ensurePumpLocked(nativeID, client)
-		pump.register(msgID, &turnTap{ref: ref, stream: adapter.NewBufferedStream(ref, 64), owner: a})
+		pump.start()
 	case adapter.DispatchUnknown:
 		a.unknown[ref] = msgID
 	}

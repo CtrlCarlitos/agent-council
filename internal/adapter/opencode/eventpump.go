@@ -61,6 +61,12 @@ func (p *sessionPump) register(userMessageID string, tap *turnTap) {
 	p.mu.Lock()
 	p.turns[userMessageID] = tap
 	p.mu.Unlock()
+	p.start()
+}
+
+// start launches the drain loop exactly once, without registering a tap,
+// so no event is ever delivered to an orphaned buffer.
+func (p *sessionPump) start() {
 	p.loopOnce.Do(func() { go p.loop() })
 }
 
