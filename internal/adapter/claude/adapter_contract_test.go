@@ -483,17 +483,16 @@ func TestClaudeAdapter_ConcurrentCreationFailureShared(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create failing session record: %v", err)
 	}
-	// Pre-create the config root so materialization fails closed, and
-	// instrument materialization to prove ONE creation attempt is
-	// shared by every concurrent caller.
+	// Instrument materialization through the adapter-owned seam to
+	// prove ONE creation attempt is shared by every concurrent caller.
 	var matCalls atomic.Int32
-	origMaterialize := materializeConfigRootFn
-	materializeConfigRootFn = func(templateDir, base, runID, sessionID string) (string, string, error) {
+	origMaterialize := h.adapter.materialize
+	h.adapter.materialize = func(templateDir, base, runID, sessionID string) (string, string, error) {
 		matCalls.Add(1)
 		time.Sleep(100 * time.Millisecond)
 		return "", "", fmt.Errorf("injected materialization failure for %s", sessionID)
 	}
-	defer func() { materializeConfigRootFn = origMaterialize }()
+	defer func() { h.adapter.materialize = origMaterialize }()
 
 	const n = 3
 	var wg sync.WaitGroup
@@ -722,6 +721,53 @@ func TestClaudeAdapter_ResumeSessionInspection(t *testing.T) {
 	}
 	if err := h.adapter.ResumeSession(ctx, binding); err == nil {
 		t.Fatal("symlinked transcript must be rejected")
+	}
+}
+
+// A template that defines the reserved projects/ directory is
+// rejected at creation: the runtime transcript subtree (§3.6) is owned
+// by the runtime, and a template collision would make the frozen
+// digest and the copied-root digest disagree forever.
+func TestClaudeAdapter_TemplateMayNotReserveProjectsDir(t *testing.T) {
+	h := newAdapterHarness(t)
+
+	writeKnob(t, h.template, "keep.txt", "template marker")
+	os.MkdirAll(filepath.Join(h.template, "projects"), 0o700)
+	defer os.RemoveAll(filepath.Join(h.template, "projects"))
+
+	_, err := h.adapter.CreateSession(context.Background(), adapter.CreateSessionRequest{
+		SessionID:   h.sessionID,
+		Contributor: "claude",
+		Config: adapter.SessionConfig{
+			WorkspaceRoot: h.wsRoot,
+			Model:         primaryModel,
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "reserved for runtime transcripts") {
+		t.Fatalf("template defining projects/ must be rejected, got %v", err)
+	}
+	if stored, _ := h.store.GetClaudeSessionBinding(context.Background(), string(h.sessionID)); stored != nil {
+		t.Fatal("no binding may exist for a session whose template was rejected")
+	}
+
+	// After removing the reserved directory the same request succeeds.
+	if err := os.RemoveAll(filepath.Join(h.template, "projects")); err != nil {
+		t.Fatalf("remove reserved dir: %v", err)
+	}
+	binding, err := h.adapter.CreateSession(context.Background(), adapter.CreateSessionRequest{
+		SessionID:   h.sessionID,
+		Contributor: "claude",
+		Config: adapter.SessionConfig{
+			WorkspaceRoot: h.wsRoot,
+			Model:         primaryModel,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create after removing reserved dir: %v", err)
+	}
+	h.persistBinding(t, string(h.sessionID), binding.NativeSessionID, primaryModel, h.wsRoot)
+	if err := h.adapter.ResumeSession(context.Background(), binding); err != nil {
+		t.Fatalf("binding from a clean template must pass local inspection: %v", err)
 	}
 }
 
@@ -1047,6 +1093,20 @@ func TestClaudeAdapter_FailedTerminalMapping(t *testing.T) {
 	}
 	if !attempt.Terminal || attempt.ObservedStatus != "failed" {
 		t.Fatalf("durable attempt must be terminal failed, got terminal=%v status=%q", attempt.Terminal, attempt.ObservedStatus)
+	}
+
+	// A verified failed terminal still proves the native process
+	// accepted the prompt: the first turn materializes the binding and
+	// its transcript satisfies resume through the FAILED attempt.
+	after, err := h.store.GetClaudeSessionBinding(ctx, string(h.sessionID))
+	if err != nil || after == nil {
+		t.Fatalf("get binding: %v", err)
+	}
+	if !after.Materialized {
+		t.Fatal("a verified failed first turn must still materialize the binding")
+	}
+	if err := h.adapter.ResumeSession(ctx, binding); err != nil {
+		t.Fatalf("materialized failed first turn must resume via its transcript: %v", err)
 	}
 
 	rec, err := h.adapter.Reconcile(ctx, adapter.RecoveryRef{TurnRef: ref, Generation: 1})

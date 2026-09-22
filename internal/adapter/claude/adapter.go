@@ -63,6 +63,10 @@ type ClaudeAdapter struct {
 	identity     DispatchIdentitySource
 	configBase   string
 	templateDir  string
+	// materialize is the config-root materialization step. It is
+	// adapter-owned (not a package global) so tests can instrument it
+	// without racing parallel production-path callers.
+	materialize func(templateDir, base, runID, sessionID string) (string, string, error)
 
 	mu        sync.Mutex
 	turns     map[adapter.TurnRef]*turnRun
@@ -126,6 +130,7 @@ func NewClaudeAdapter(
 		identity:     identity,
 		configBase:   configBase,
 		templateDir:  templateDir,
+		materialize:  MaterializeConfigRoot,
 		turns:        make(map[adapter.TurnRef]*turnRun),
 		singleFlt:    make(map[string]*claudeSlot),
 		creations:    make(map[adapter.SessionID]*creationCall),
@@ -141,11 +146,6 @@ func sessionUUID() (string, error) {
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }
-
-// materializeConfigRootFn indirection exists so contract tests can
-// prove the creation reservation runs materialization exactly once per
-// concurrent creation burst.
-var materializeConfigRootFn = MaterializeConfigRoot
 
 func (a *ClaudeAdapter) acquireSlot(ctx context.Context, nativeID, owner string) error {
 	for {
@@ -269,6 +269,9 @@ func (a *ClaudeAdapter) createBinding(ctx context.Context, req adapter.CreateSes
 			req.SessionID, meta.Contributor)
 	}
 
+	if err := validateTemplateReservesRuntimeDirs(a.templateDir); err != nil {
+		return adapter.SessionBinding{}, "", err
+	}
 	templateDigest, err := TemplateDigest(a.templateDir)
 	if err != nil {
 		return adapter.SessionBinding{}, "", fmt.Errorf("frozen template digest: %w", err)
@@ -297,7 +300,7 @@ func (a *ClaudeAdapter) createBinding(ctx context.Context, req adapter.CreateSes
 	if err != nil {
 		return adapter.SessionBinding{}, "", err
 	}
-	_, materializedDigest, err := materializeConfigRootFn(a.templateDir, a.configBase, runID, string(req.SessionID))
+	_, materializedDigest, err := a.materialize(a.templateDir, a.configBase, runID, string(req.SessionID))
 	if err != nil {
 		return adapter.SessionBinding{}, "", fmt.Errorf("materialize config root: %w", err)
 	}

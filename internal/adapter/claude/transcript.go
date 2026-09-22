@@ -263,8 +263,10 @@ func CorrelateTranscriptPrompt(path string, attempts []*storage.ClaudeTurnAttemp
 
 // attemptPromptAuthoritative reports whether the attempt's recorded
 // prompt digest is trustworthy session evidence: only an explicitly
-// accepted attempt (protected mode) or one with a verified completed
-// terminal result qualifies.
+// accepted attempt (protected mode) or one with a VERIFIED terminal
+// result qualifies — completed or failed. A verified failed terminal
+// (e.g. error_max_turns) still proves the native process accepted that
+// prompt, so a materialized failed first turn can resume.
 func attemptPromptAuthoritative(a *storage.ClaudeTurnAttempt) bool {
 	if a == nil || strings.TrimSpace(a.PromptDigest) == "" {
 		return false
@@ -272,5 +274,8 @@ func attemptPromptAuthoritative(a *storage.ClaudeTurnAttempt) bool {
 	if a.Accepted != nil && *a.Accepted {
 		return true
 	}
-	return a.Terminal && a.ObservedStatus == "completed"
+	if !a.Terminal {
+		return false
+	}
+	return a.ObservedStatus == "completed" || a.ObservedStatus == "failed"
 }

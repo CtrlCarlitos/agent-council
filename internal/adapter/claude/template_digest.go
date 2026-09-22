@@ -31,6 +31,28 @@ func sha256Hex(data []byte) string {
 	return fmt.Sprintf("%x", sum)
 }
 
+// runtimeTranscriptDir is reserved by §3.6: transcripts live under
+// projects/ inside the per-session config root, owned by the runtime
+// and the transcript trust model. An operator template may not define
+// it — otherwise the frozen digest (whole template) and the copied
+// root digest (excluding the runtime subtree) could never agree.
+const runtimeTranscriptDir = "projects"
+
+// validateTemplateReservesRuntimeDirs rejects a template that defines
+// the reserved runtime transcript directory.
+func validateTemplateReservesRuntimeDirs(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("read template tree %s: %w", dir, err)
+	}
+	for _, e := range entries {
+		if e.Name() == runtimeTranscriptDir {
+			return fmt.Errorf("template defines %q, which is reserved for runtime transcripts (§3.6)", runtimeTranscriptDir)
+		}
+	}
+	return nil
+}
+
 // TemplateDigest computes ctmpl-v1:sha256:<hex> over the template tree.
 func TemplateDigest(dir string) (string, error) {
 	return TemplateDigestExcluding(dir, nil)
