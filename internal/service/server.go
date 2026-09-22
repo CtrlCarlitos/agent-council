@@ -31,6 +31,13 @@ type ServerConfig struct {
 	// it.
 	OpenCodeProbeProfile storage.CanonicalProfile
 
+	// OpenCodeProbeScratchRoot is the operator-provisioned directory for
+	// probe scratch directories. Required when OpenCodeBinaryPath is set;
+	// it must lie outside both StateDir and WorkspaceBaseDir. The service
+	// creates it with operator-only permissions (0700) and tightens a
+	// pre-provisioned directory to the same mode.
+	OpenCodeProbeScratchRoot string
+
 	// OpenCodeBinaryPath, when set, enables the OpenCode persistent
 	// contributor adapter via production seams backed by the storage
 	// store and AC-005 workspace manager. Empty means no OpenCode
@@ -101,7 +108,11 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 	// production OpenCode adapter with fail-closed seams backed by the same
 	// workspace manager and policy executor the service uses.
 	if adp == nil && strings.TrimSpace(cfg.OpenCodeBinaryPath) != "" {
-		probeTemplate := opencode.NewOperatorProbeLaunchTemplate(cfg.OpenCodeBinaryPath, filepath.Join(cfg.StateDir, "probe-scratch"), cfg.OpenCodeProbeProfile)
+		scratchRoot, scratchErr := resolveOpenCodeProbeScratchRoot(cfg)
+		if scratchErr != nil {
+			return nil, fmt.Errorf("OpenCode probe scratch root: %w", scratchErr)
+		}
+		probeTemplate := opencode.NewOperatorProbeLaunchTemplate(cfg.OpenCodeBinaryPath, scratchRoot, cfg.OpenCodeProbeProfile)
 		var opErr error
 		adp, opErr = opencode.NewProductionOpenCodeAdapter(store, wm, pe, probeTemplate)
 		if opErr != nil {

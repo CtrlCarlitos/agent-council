@@ -36,11 +36,12 @@ func TestGateSpecReview_ProductionConstruction(t *testing.T) {
 	defer lock.Release()
 
 	cfg := ServerConfig{
-		StateDir:           stateDir,
-		InstanceID:         "inst-pw",
-		AuthToken:          "tok-pw",
-		WorkspaceBaseDir:   wsBase,
-		OpenCodeBinaryPath: "opencode",
+		StateDir:                 stateDir,
+		InstanceID:               "inst-pw",
+		AuthToken:                "tok-pw",
+		WorkspaceBaseDir:         wsBase,
+		OpenCodeBinaryPath:       "opencode",
+		OpenCodeProbeScratchRoot: filepath.Join(dir, "probe-scratch"),
 	}
 
 	// Construct through the production path: OpenCodeBinaryPath set means
