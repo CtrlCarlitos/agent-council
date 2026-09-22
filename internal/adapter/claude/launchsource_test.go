@@ -2,7 +2,11 @@ package claude
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +18,29 @@ import (
 
 // filepathSeparator is the OS path separator as a string.
 var filepathSeparator = string(filepath.Separator)
+
+// evidenceRootFor writes the committed universe evidence for the frozen
+// manifest (approved + denied complement) into a temp root and returns
+// the root path.
+func evidenceRootFor(t *testing.T) (string, string) {
+	t.Helper()
+	root := t.TempDir()
+	tools := []string{"Read", "Glob", "Grep", "Bash", "Write", "WebSearch"}
+	doc := map[string]any{"claude_code_version": "2.1.278", "tools": tools}
+	b, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	p := filepath.Join(root, "docs", "superpowers", "evidence", "ac008-native-tool-universe-2.1.278.json")
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(p, b, 0o600); err != nil {
+		t.Fatalf("write universe: %v", err)
+	}
+	digest := fmt.Sprintf("sha256:%x", sha256.Sum256(b))
+	return root, digest
+}
 
 // asErrUnsupportedProfile mirrors errors.As for the typed profile error.
 func asErrUnsupportedProfile(err error, target **storage.ErrUnsupportedProfile) bool {
@@ -32,7 +59,7 @@ const (
 	testNativeID  = "e8e4074f-8a52-4c28-b1f7-9a2e5dbf4a11"
 )
 
-func v2ClaudeProfile() storage.CanonicalProfile {
+func v2ClaudeProfile(universeDigest string) storage.CanonicalProfile {
 	p := storage.CanonicalProfile{
 		AlgoVersion:         "cprof-v2",
 		WorkspaceMode:       "none",
@@ -46,19 +73,21 @@ func v2ClaudeProfile() storage.CanonicalProfile {
 	p.ToolkitManifest = &storage.ToolkitManifestSpec{ToolkitManifest: storage.ToolkitManifest{
 		ProbedCLIVersion:       "2.1.278",
 		UniverseEvidencePath:   "docs/superpowers/evidence/ac008-native-tool-universe-2.1.278.json",
-		UniverseEvidenceDigest: "sha256:" + strings.Repeat("a", 64),
+		UniverseEvidenceDigest: universeDigest,
 		ApprovedTools:          []string{"Read", "Glob", "Grep"},
 		DeniedComplement:       []string{"Bash", "Write", "WebSearch"},
 		ExpectedHooks:          []string{"SessionStart:startup"},
+		TurnsBound:             8,
 	}}
 	return p
 }
 
-func launchSourceFixture(t *testing.T) (*ClaudeTurnLaunchSource, *workspace.WorkspaceManager, *storage.Store) {
+func launchSourceFixture(t *testing.T) (*ClaudeTurnLaunchSource, *workspace.WorkspaceManager, *storage.Store, string) {
 	t.Helper()
 	dir := t.TempDir()
 	stateDir := dir + "/state"
 	wsBase := dir + "/workspaces"
+	evidenceRoot, universeDigest := evidenceRootFor(t)
 	store, err := storage.Open(storage.StoreOptions{StateDir: stateDir})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -72,7 +101,7 @@ func launchSourceFixture(t *testing.T) (*ClaudeTurnLaunchSource, *workspace.Work
 		Brief: "launch source", SourceRepoIdentity: "example/repo",
 		SourceCommit: "0123456789012345678901234567890123456789",
 		SourceTree:   "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
-		Profile:      v2ClaudeProfile(),
+		Profile:      v2ClaudeProfile(universeDigest),
 	}); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -92,17 +121,17 @@ func launchSourceFixture(t *testing.T) (*ClaudeTurnLaunchSource, *workspace.Work
 		t.Fatalf("allocate workspace: %v", err)
 	}
 
-	src := NewClaudeTurnLaunchSource(store, wm, 8, filepath.Join(dir, "claude-config"))
-	return src, wm, store
+	src := NewClaudeTurnLaunchSource(store, wm, filepath.Join(dir, "claude-config"), evidenceRoot)
+	return src, wm, store, universeDigest
 }
 
 // The first turn uses --session-id with the caller-chosen native UUID
 // and carries the exact contract prefix, frozen model, bound, and tool
 // policy from the frozen manifest.
 func TestClaudeTurnLaunch_FirstTurnSessionIDContract(t *testing.T) {
-	src, wm, _ := launchSourceFixture(t)
+	src, wm, _, _ := launchSourceFixture(t)
 
-	req, err := src.ClaudeTurnLaunch(context.Background(), testSessionID, testNativeID, true)
+	req, err := src.ClaudeTurnLaunch(context.Background(), testSessionID, testNativeID, true, "sha256:prompt-digest")
 	if err != nil {
 		t.Fatalf("launch: %v", err)
 	}
@@ -143,9 +172,9 @@ func TestClaudeTurnLaunch_FirstTurnSessionIDContract(t *testing.T) {
 
 // Follow-up turns resume the exact native session.
 func TestClaudeTurnLaunch_ResumeUsesExactNativeSession(t *testing.T) {
-	src, _, _ := launchSourceFixture(t)
+	src, _, _, _ := launchSourceFixture(t)
 
-	req, err := src.ClaudeTurnLaunch(context.Background(), testSessionID, testNativeID, false)
+	req, err := src.ClaudeTurnLaunch(context.Background(), testSessionID, testNativeID, false, "sha256:prompt-digest")
 	if err != nil {
 		t.Fatalf("launch: %v", err)
 	}
@@ -161,7 +190,7 @@ func TestClaudeTurnLaunch_ResumeUsesExactNativeSession(t *testing.T) {
 
 // A session whose contributor is not claude is rejected.
 func TestClaudeTurnLaunch_RejectsNonClaudeContributor(t *testing.T) {
-	src, _, store := launchSourceFixture(t)
+	src, _, store, _ := launchSourceFixture(t)
 
 	// Seed an opencode-contributor session in the fixture run.
 	ctx := context.Background()
@@ -172,7 +201,7 @@ func TestClaudeTurnLaunch_RejectsNonClaudeContributor(t *testing.T) {
 		t.Fatalf("create opencode session: %v", err)
 	}
 
-	if _, err := src.ClaudeTurnLaunch(ctx, "sess-oc", testNativeID, true); err == nil {
+	if _, err := src.ClaudeTurnLaunch(ctx, "sess-oc", testNativeID, true, "sha256:pd"); err == nil {
 		t.Fatal("non-claude sessions must be rejected")
 	} else if !strings.Contains(err.Error(), "not claude") {
 		t.Fatalf("expected contributor error, got %v", err)
@@ -198,7 +227,7 @@ func TestClaudeTurnLaunch_RejectsLegacyProfile(t *testing.T) {
 
 	const lease = "lease-ls-legacy"
 	ctx := context.Background()
-	v1 := v2ClaudeProfile()
+	v1 := v2ClaudeProfile("sha256:" + strings.Repeat("a", 64))
 	v1.AlgoVersion = "cprof-v1"
 	v1.ToolkitManifest = nil
 	if _, err := store.CreateRunWithProfile(ctx, storage.CreateRunWithProfileRequest{
@@ -217,8 +246,9 @@ func TestClaudeTurnLaunch_RejectsLegacyProfile(t *testing.T) {
 		t.Fatalf("create session: %v", err)
 	}
 
-	src := NewClaudeTurnLaunchSource(store, wm, 8, filepath.Join(dir, "claude-config"))
-	_, err = src.ClaudeTurnLaunch(context.Background(), "sess-legacy", testNativeID, true)
+	evidenceRoot, _ := evidenceRootFor(t)
+	src := NewClaudeTurnLaunchSource(store, wm, filepath.Join(dir, "claude-config"), evidenceRoot)
+	_, err = src.ClaudeTurnLaunch(context.Background(), "sess-legacy", testNativeID, true, "sha256:pd")
 	var unsupported *storage.ErrUnsupportedProfile
 	if err == nil || !asErrUnsupportedProfile(err, &unsupported) {
 		t.Fatalf("legacy profile must fail with typed ErrUnsupportedProfile, got %T: %v", err, err)
@@ -258,4 +288,105 @@ func containsAll(list []string, want ...string) bool {
 		}
 	}
 	return true
+}
+
+// The pinned universe is verified, not trusted: version drift and
+// complement mismatches reject the launch.
+func TestClaudeTurnLaunch_VerifiesPinnedUniverse(t *testing.T) {
+	ctx := context.Background()
+	const lease = "lease-ls-uni"
+	dir := t.TempDir()
+	stateDir := dir + "/state"
+	store, err := storage.Open(storage.StoreOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	wm, err := workspace.NewWorkspaceManager(stateDir, dir+"/ws")
+	if err != nil {
+		t.Fatalf("workspace manager: %v", err)
+	}
+
+	base := t.TempDir()
+	src := NewClaudeTurnLaunchSource(store, wm,
+		filepath.Join(dir, "claude-config"), base)
+
+	writeUniverseFile := func(t *testing.T, path string, version string, tools []string) string {
+		t.Helper()
+		doc := map[string]any{"claude_code_version": version, "tools": tools}
+		b, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		full := filepath.Join(base, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(full, b, 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		return fmt.Sprintf("sha256:%x", sha256.Sum256(b))
+	}
+	seedSession := func(t *testing.T, runID, sessionID string, profile storage.CanonicalProfile) {
+		t.Helper()
+		if _, err := store.CreateRunWithProfile(ctx, storage.CreateRunWithProfileRequest{
+			OpID: "op-" + runID, ControllerLease: lease, RunID: runID,
+			Brief: "universe", SourceRepoIdentity: "example/repo",
+			SourceCommit: "0123456789012345678901234567890123456789",
+			SourceTree:   "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+			Profile:      profile,
+		}); err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		if _, err := store.CreateSession(ctx, "op-"+sessionID, lease, storage.SessionRecord{
+			ID: sessionID, RunID: runID, Contributor: "claude", Role: "reviewer",
+			IsActiveContributor: true, State: "parked", Visibility: "reachable",
+		}); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+	}
+
+	t.Run("version drift", func(t *testing.T) {
+		driftDigest := writeUniverseFile(t, "run-uni-drift/sess-uni-drift/config/universe.json",
+			"9.9.9", []string{"Read", "Glob", "Grep", "Bash", "Write", "WebSearch"})
+		profile := v2ClaudeProfile(driftDigest)
+		profile.ToolkitManifest.ToolkitManifest.UniverseEvidencePath =
+			"run-uni-drift/sess-uni-drift/config/universe.json"
+		seedSession(t, "run-uni-drift", "sess-uni-drift", profile) // opID derived
+		_, err := src.ClaudeTurnLaunch(ctx, "sess-uni-drift", testNativeID, true, "sha256:pd")
+		if err == nil || !strings.Contains(err.Error(), "pinned universe is for CLI") {
+			t.Fatalf("version drift must be rejected, got %v", err)
+		}
+	})
+
+	t.Run("complement mismatch", func(t *testing.T) {
+		// Universe carries Bash/Write/WebSearch beyond the approved set,
+		// but the frozen complement only lists Bash.
+		digest := writeUniverseFile(t, "run-uni-comp/sess-uni-comp/config/universe.json",
+			"2.1.278", []string{"Read", "Glob", "Grep", "Bash", "Write", "WebSearch"})
+		profile := v2ClaudeProfile(digest)
+		profile.ToolkitManifest.ToolkitManifest.UniverseEvidencePath =
+			"run-uni-comp/sess-uni-comp/config/universe.json"
+		profile.ToolkitManifest.ToolkitManifest.DeniedComplement = []string{"Bash"}
+		seedSession(t, "run-uni-comp", "sess-uni-comp", profile)
+
+		_, err := src.ClaudeTurnLaunch(ctx, "sess-uni-comp", testNativeID, true, "sha256:pd")
+		if err == nil || !strings.Contains(err.Error(), "does not match universe") {
+			t.Fatalf("complement mismatch must reject the launch, got %v", err)
+		}
+	})
+
+	t.Run("approved tool outside universe", func(t *testing.T) {
+		digest := writeUniverseFile(t, "run-uni-app/sess-uni-app/config/universe.json",
+			"2.1.278", []string{"Read", "Glob"})
+		profile := v2ClaudeProfile(digest)
+		profile.ToolkitManifest.ToolkitManifest.UniverseEvidencePath =
+			"run-uni-app/sess-uni-app/config/universe.json"
+		seedSession(t, "run-uni-app", "sess-uni-app", profile)
+
+		_, err := src.ClaudeTurnLaunch(ctx, "sess-uni-app", testNativeID, true, "sha256:pd")
+		if err == nil || !strings.Contains(err.Error(), "absent from the pinned") {
+			t.Fatalf("approved tool outside the universe must reject, got %v", err)
+		}
+	})
 }

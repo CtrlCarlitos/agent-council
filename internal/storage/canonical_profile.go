@@ -204,6 +204,7 @@ func ComputeProfileDigest(profile CanonicalProfile) (string, []byte, error) {
 			"expected_hooks":           normalizeStringSlice(m.ExpectedHooks, false, false),
 			"expected_skills":          normalizeStringSlice(m.ExpectedSkills, false, false),
 			"expected_plugins":         normalizeStringSlice(m.ExpectedPlugins, false, false),
+			"turns_bound":              m.TurnsBound,
 		}
 	}
 

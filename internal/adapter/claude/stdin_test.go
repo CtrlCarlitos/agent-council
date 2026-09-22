@@ -3,6 +3,7 @@ package claude
 import (
 	"bytes"
 	"errors"
+	"io"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -110,3 +111,24 @@ func TestStdinWriter_FlagIsAtomic(t *testing.T) {
 type nopCloser struct{ *bytes.Buffer }
 
 func (n *nopCloser) Close() error { return nil }
+
+// zeroWriter returns (0, nil) from every Write: the writer must fail
+// closed with io.ErrNoProgress instead of looping forever.
+type zeroWriter struct{}
+
+func (zeroWriter) Write([]byte) (int, error) { return 0, nil }
+func (zeroWriter) Close() error              { return nil }
+
+func TestStdinWriter_ZeroProgressFailsClosed(t *testing.T) {
+	w := NewStdinWriter(zeroWriter{})
+	err := w.WritePrompt([]byte("prompt"))
+	if err == nil {
+		t.Fatal("(0, nil) writes must fail closed")
+	}
+	if !errors.Is(err, io.ErrNoProgress) {
+		t.Fatalf("expected io.ErrNoProgress, got %v", err)
+	}
+	if w.TransmissionBegan() {
+		t.Fatal("no progress means no transmission")
+	}
+}

@@ -54,6 +54,10 @@ type LaunchRequest struct {
 	// contained in (service-validated). Required whenever
 	// ClaudeConfigDir is set; verified symlink-safe before injection.
 	ClaudeConfigBaseDir string
+	// PromptDigest is the frozen prompt hash for durable acceptance
+	// correlation (AC-008 §3.5). Recorded on the attempt, never sent to
+	// the native side.
+	PromptDigest string
 }
 
 // CapabilityChecker verifies whether the host environment supports required isolation capabilities.

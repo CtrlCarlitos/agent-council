@@ -53,6 +53,7 @@ func TestOpenCodeEligibility_AcceptsCprofV2Profile(t *testing.T) {
 				ApprovedTools:          []string{"Read", "Glob"},
 				DeniedComplement:       []string{"Bash"},
 				ExpectedHooks:          []string{"SessionStart:startup"},
+				TurnsBound:             8,
 			}},
 		},
 	}); err != nil {

@@ -18,6 +18,10 @@ type ToolkitManifest struct {
 	ExpectedHooks          []string `json:"expected_hooks"`
 	ExpectedSkills         []string `json:"expected_skills"`
 	ExpectedPlugins        []string `json:"expected_plugins"`
+	// TurnsBound is the frozen --max-turns bound for every Claude turn
+	// invocation of this run. Covered by the profile digest; the ONLY
+	// source of the bound at launch time.
+	TurnsBound int `json:"turns_bound"`
 }
 
 // ToolkitManifestSpec attaches the manifest to the profile. The embedded
@@ -78,6 +82,9 @@ func (p CanonicalProfile) ValidateForClaude() error {
 	}
 	if err := validateSHA256Digest(m.UniverseEvidenceDigest); err != nil {
 		return &ErrUnsupportedProfile{AlgoVersion: p.AlgoVersion, Reason: "universe_evidence_digest: " + err.Error()}
+	}
+	if m.TurnsBound <= 0 {
+		return &ErrUnsupportedProfile{AlgoVersion: p.AlgoVersion, Reason: "manifest turns_bound must be positive"}
 	}
 	return nil
 }

@@ -69,6 +69,7 @@ func (w *StdinWriter) WritePrompt(prompt []byte) error {
 		if n > 0 {
 			w.began.Store(true)
 			prompt = prompt[n:]
+			continue
 		}
 		if err != nil {
 			if w.began.Load() {
@@ -76,6 +77,8 @@ func (w *StdinWriter) WritePrompt(prompt []byte) error {
 			}
 			return err
 		}
+		// (0, nil) makes no progress: fail closed rather than spin.
+		return io.ErrNoProgress
 	}
 	return nil
 }

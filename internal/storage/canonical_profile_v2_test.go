@@ -15,6 +15,7 @@ func v2Manifest() ToolkitManifest {
 		ExpectedHooks:          []string{"SessionStart:startup", "PreToolUse"},
 		ExpectedSkills:         []string{"research"},
 		ExpectedPlugins:        []string{"superpowers"},
+		TurnsBound:             8,
 	}
 }
 
@@ -136,6 +137,24 @@ func TestCanonicalProfileV2_RequiresCompleteManifest(t *testing.T) {
 	if _, _, err := ComputeProfileDigest(p); err == nil {
 		t.Fatal("escaping universe evidence path must be rejected")
 	}
+	// Restore a valid path for the remaining positive assertions.
+	p.ToolkitManifest.ToolkitManifest.UniverseEvidencePath =
+		"docs/superpowers/evidence/ac008-native-tool-universe-2.1.278.json"
+
+	// The frozen turns bound must be positive and is digest-covered.
+	p.ToolkitManifest.ToolkitManifest.TurnsBound = 0
+	if _, _, err := ComputeProfileDigest(p); err == nil {
+		t.Fatal("non-positive turns bound must be rejected")
+	}
+	p.ToolkitManifest.ToolkitManifest.TurnsBound = 8
+	d, canon, err := ComputeProfileDigest(p)
+	if err != nil {
+		t.Fatalf("valid turns bound must pass: %v", err)
+	}
+	if !strings.Contains(string(canon), `"turns_bound":8`) {
+		t.Fatal("turns_bound must be part of the canonical profile JSON")
+	}
+	_ = d
 }
 
 // Claude eligibility: v2 + complete manifest passes; v1 (or v2 without a
