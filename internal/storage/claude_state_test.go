@@ -121,6 +121,10 @@ func TestClaudeState_CrashAfterStdinBeforeAcceptance(t *testing.T) {
 	if err := store.RecordClaudeLaunchState(ctx, "att-c", 1, "started", nil); err != nil {
 		t.Fatalf("mark started: %v", err)
 	}
+	// Simulate stdin transmission, then crash before acceptance.
+	if err := store.RecordClaudeStdinTransmitted(ctx, "att-c", 1); err != nil {
+		t.Fatalf("record stdin: %v", err)
+	}
 
 	// Reopen: accepted must be NULL (unknown), not false.
 	reopened := reopenStore(t, store)
@@ -179,14 +183,23 @@ func TestClaudeState_RedispatchConsumedCannotAuthorizeThird(t *testing.T) {
 	store := openClaudeStore(t)
 	ctx := context.Background()
 
-	// Protected mode: the redispatch requires valid protection evidence.
+	// Protected mode: the redispatch requires a valid frozen attestation
+	// and a separately recorded positive-absence decision.
 	attempt := claudeAttemptFixture("att-rd", "sess-rd", "t-rd", "nat-rd")
 	attempt.TranscriptProtection = "protected"
-	attempt.AttestationID = "cprot-v1:sha256:test"
+	attempt.AttestationID = "cprot-v1:sha256:fixed-test-id"
 	if err := store.InsertClaudeTurnAttempt(ctx, attempt); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	// Launch 1: started then dead (verified absence).
+	if _, err := store.DB().ExecContext(ctx, `
+INSERT INTO claude_protection_attestations
+	(attestation_id, claude_version, platform, manifest_digest, template_digest,
+	 probe_results, probed_at, actor)
+VALUES ('cprot-v1:sha256:fixed-test-id', '2.1.278', 'test', 'md', 'td', '[]', '2026-09-22T00:00:00Z', 'op')`,
+	); err != nil {
+		t.Fatalf("insert attestation: %v", err)
+	}
+	// Launch 1: started then dead (process death alone is insufficient).
 	if _, err := store.ReserveClaudeLaunch(ctx, "att-rd", "fixture"); err != nil {
 		t.Fatalf("reserve 1: %v", err)
 	}
@@ -196,6 +209,10 @@ func TestClaudeState_RedispatchConsumedCannotAuthorizeThird(t *testing.T) {
 	exit := 0
 	if err := store.RecordClaudeLaunchState(ctx, "att-rd", 1, "dead", &exit); err != nil {
 		t.Fatalf("dead: %v", err)
+	}
+	// Separately record the positive-absence decision (controller action).
+	if err := store.RecordClaudeAbsenceVerified(ctx, "att-rd"); err != nil {
+		t.Fatalf("absence verified: %v", err)
 	}
 
 	// Consume the redispatch authorization.
@@ -260,14 +277,22 @@ func TestClaudeState_RedispatchDecisionBeforeConsumption(t *testing.T) {
 	store := openClaudeStore(t)
 	ctx := context.Background()
 
-	// Protected mode: the redispatch requires valid protection evidence.
+	// Protected mode with a valid frozen attestation.
 	attempt := claudeAttemptFixture("att-e", "sess-e", "t-e", "nat-e")
 	attempt.TranscriptProtection = "protected"
-	attempt.AttestationID = "cprot-v1:sha256:test"
+	attempt.AttestationID = "cprot-v1:sha256:fixed-test-id"
 	if err := store.InsertClaudeTurnAttempt(ctx, attempt); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	// Launch 1: started then dead (verified absence).
+	if _, err := store.DB().ExecContext(ctx, `
+INSERT INTO claude_protection_attestations
+	(attestation_id, claude_version, platform, manifest_digest, template_digest,
+	 probe_results, probed_at, actor)
+VALUES ('cprot-v1:sha256:fixed-test-id', '2.1.278', 'test', 'md', 'td', '[]', '2026-09-22T00:00:00Z', 'op')`,
+	); err != nil {
+		t.Fatalf("insert attestation: %v", err)
+	}
+	// Launch 1: started then dead.
 	if _, err := store.ReserveClaudeLaunch(ctx, "att-e", "fixture"); err != nil {
 		t.Fatalf("reserve 1: %v", err)
 	}
@@ -277,6 +302,10 @@ func TestClaudeState_RedispatchDecisionBeforeConsumption(t *testing.T) {
 	}
 	if err := store.RecordClaudeLaunchState(ctx, "att-e", 1, "dead", &exit); err != nil {
 		t.Fatalf("dead: %v", err)
+	}
+	// Separately record the positive-absence decision (controller action).
+	if err := store.RecordClaudeAbsenceVerified(ctx, "att-e"); err != nil {
+		t.Fatalf("absence verified: %v", err)
 	}
 
 	// Reopen: the redispatch decision re-derives exactly one reservation.

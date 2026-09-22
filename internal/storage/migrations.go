@@ -261,6 +261,7 @@ CREATE TABLE IF NOT EXISTS claude_turn_attempts (
 	protection_attestation_id TEXT NOT NULL DEFAULT '',
 	launch_count       INTEGER NOT NULL DEFAULT 0 CHECK (launch_count BETWEEN 0 AND 2),
 	absence_redispatch_consumed INTEGER NOT NULL DEFAULT 0,
+	absence_verified        TEXT NOT NULL DEFAULT '',
 	accepted           INTEGER,
 	terminal           INTEGER NOT NULL DEFAULT 0,
 	result_payload     TEXT,

@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS claude_turn_attempts (
 	protection_attestation_id TEXT NOT NULL DEFAULT '',
 	launch_count       INTEGER NOT NULL DEFAULT 0 CHECK (launch_count BETWEEN 0 AND 2),
 	absence_redispatch_consumed INTEGER NOT NULL DEFAULT 0,
+	absence_verified        TEXT NOT NULL DEFAULT '',
 	accepted           INTEGER,
 	terminal           INTEGER NOT NULL DEFAULT 0,
 	result_payload     TEXT,
@@ -228,20 +229,45 @@ WHERE attempt_id = ? AND state IN ('started','dead')`, attemptID).Scan(&priorDea
 	if count == 0 {
 		// Initial launch: always allowed.
 	} else if count == 1 && consumed == 0 && priorDead >= 1 {
-		// Protected verified-absence redispatch: requires a valid
-		// protection attestation and consumes the one-time
-		// authorization. Advisory attempts stay uncertain permanently.
-		var protection, attestationID string
+		// Protected verified-absence redispatch: requires (1) a valid
+		// protection attestation in the attestations table matching the
+		// attempt's frozen attestation_id, (2) a separately recorded
+		// positive-absence decision (absence_verified flag), and (3)
+		// transcript_protection = 'protected'. Advisory attempts stay
+		// uncertain permanently.
+		var protection, attestationID, absenceVerified string
 		err = tx.QueryRowContext(ctx, `
-SELECT transcript_protection, protection_attestation_id
-FROM claude_turn_attempts WHERE attempt_id = ?`, attemptID).Scan(&protection, &attestationID)
+SELECT ta.transcript_protection, ta.protection_attestation_id, ta.absence_verified
+FROM claude_turn_attempts ta WHERE ta.attempt_id = ?`, attemptID).Scan(&protection, &attestationID, &absenceVerified)
 		if err != nil {
 			return 0, err
 		}
-		if protection != "protected" || strings.TrimSpace(attestationID) == "" {
+		if protection != "protected" {
 			return 0, fmt.Errorf(
-				"redispatch requires protected transcript evidence (protection=%q attestation=%q)",
-				protection, attestationID)
+				"redispatch requires protected transcript evidence (protection=%q)", protection)
+		}
+		if strings.TrimSpace(attestationID) == "" {
+			return 0, fmt.Errorf("redispatch requires a protection attestation id")
+		}
+		// The attestation must exist in the attestations table and match
+		// the attempt's frozen identity.
+		var attCount int
+		err = tx.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM claude_protection_attestations
+WHERE attestation_id = ?`, attestationID).Scan(&attCount)
+		if err != nil {
+			return 0, err
+		}
+		if attCount != 1 {
+			return 0, fmt.Errorf(
+				"redispatch requires a valid attestation %q in claude_protection_attestations", attestationID)
+		}
+		// A separately recorded positive-absence decision is required:
+		// process death alone proves the child stopped, not that the
+		// transcript was unaffected.
+		if absenceVerified != "verified" {
+			return 0, fmt.Errorf(
+				"redispatch requires a separately recorded positive-absence decision (absence_verified=%q)", absenceVerified)
 		}
 		if _, err := tx.ExecContext(ctx, `
 UPDATE claude_turn_attempts SET absence_redispatch_consumed = 1
@@ -329,9 +355,33 @@ WHERE attempt_id = ? AND reservation_seq = ?`, now, attemptID, seq, exitCode)
 // boundary on a launch row.
 func (s *Store) RecordClaudeStdinTransmitted(ctx context.Context, attemptID string, seq int64) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.DB().ExecContext(ctx, `
+	res, err := s.DB().ExecContext(ctx, `
 UPDATE claude_attempt_launches SET first_stdin_byte_at = ?
-WHERE attempt_id = ? AND reservation_seq = ?`, now, attemptID, seq)
+WHERE attempt_id = ? AND reservation_seq = ? AND state = 'started'`,
+		now, attemptID, seq)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf(
+			"stdin transmission requires a started launch row (attempt=%s seq=%d)", attemptID, seq)
+	}
+	return nil
+}
+
+// RecordClaudeAbsenceVerified records a controller-level positive-
+// absence decision on the attempt. This is a separate, explicit action
+// — process death alone does NOT set it. Only attempts in protected
+// mode with a valid attestation can have absence verified.
+func (s *Store) RecordClaudeAbsenceVerified(ctx context.Context, attemptID string) error {
+	_, err := s.DB().ExecContext(ctx, `
+UPDATE claude_turn_attempts SET absence_verified = 'verified'
+WHERE attempt_id = ? AND transcript_protection = 'protected'
+  AND protection_attestation_id != ''`, attemptID)
 	return err
 }
 
