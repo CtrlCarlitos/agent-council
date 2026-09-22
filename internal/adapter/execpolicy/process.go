@@ -10,7 +10,7 @@ import (
 
 // ManagedProcess defines the interface for interacting with a council-supervised process.
 type ManagedProcess interface {
-	Stdin() io.Writer
+	Stdin() io.WriteCloser
 	Stdout() io.Reader
 	Stderr() io.Reader
 	Wait() (int, error)
@@ -30,7 +30,7 @@ type managedProcess struct {
 	waitErr  error
 }
 
-func (p *managedProcess) Stdin() io.Writer {
+func (p *managedProcess) Stdin() io.WriteCloser {
 	return p.stdinPipe
 }
 

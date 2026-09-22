@@ -58,6 +58,9 @@ type LaunchRequest struct {
 	// correlation (AC-008 §3.5). Recorded on the attempt, never sent to
 	// the native side.
 	PromptDigest string
+	// UniverseTools carries the pinned native tool universe for parser
+	// drift checks (AC-008 §3.8). Set by the Claude launch source.
+	UniverseTools []string
 }
 
 // CapabilityChecker verifies whether the host environment supports required isolation capabilities.
@@ -135,7 +138,7 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 	}
 
 	// 2. Validate profile algorithm version
-	if req.Profile.AlgoVersion != "" && req.Profile.AlgoVersion != "cprof-v1" {
+	if req.Profile.AlgoVersion != "" && req.Profile.AlgoVersion != "cprof-v1" && req.Profile.AlgoVersion != "cprof-v2" {
 		return nil, fmt.Errorf("%w: invalid profile algo_version %q", ErrInvalidLaunchRequest, req.Profile.AlgoVersion)
 	}
 

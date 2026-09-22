@@ -186,16 +186,15 @@ func (a *ClaudeAdapter) ResumeSession(ctx context.Context, binding adapter.Sessi
 // ── Dispatch ────────────────────────────────────────────────────────────
 
 type turnRun struct {
-	ref         adapter.TurnRef
-	attemptID   string
-	nativeID    string
-	stream      *adapter.BufferedStream
-	proc        execpolicy.ManagedProcess
-	cancel      context.CancelFunc
-	mu          sync.Mutex
-	started     bool
-	startFailed bool
-	dead        bool
+	ref           adapter.TurnRef
+	attemptID     string
+	nativeID      string
+	workspaceRoot string
+	manifest      storage.ToolkitManifest
+	universeTools []string
+	stream        *adapter.BufferedStream
+	proc          execpolicy.ManagedProcess
+	cancel        context.CancelFunc
 }
 
 // Dispatch runs one bounded claude -p process for the turn. The launch
@@ -231,6 +230,19 @@ func (a *ClaudeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, promp
 
 	launch, err := a.launchSource.ClaudeTurnLaunch(ctx, ref.SessionID, nativeID, false, promptDigest)
 	if err != nil {
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
+			Reason: err.Error()}, err
+	}
+
+	// Durable attempt record with pre-launch baseline (advisory: the
+	// first turn has no transcript to measure; subsequent turns use the
+	// previous baseline).
+	baseline := storage.ClaudeTurnAttempt{
+		AttemptID: attempt, SessionID: string(ref.SessionID),
+		TurnKey: ref.TurnKey, NativeID: nativeID, PromptDigest: promptDigest,
+		BaselineMaterialized: false, TranscriptProtection: "advisory",
+	}
+	if err := a.store.InsertClaudeTurnAttempt(ctx, baseline); err != nil {
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
 			Reason: err.Error()}, err
 	}
@@ -271,11 +283,21 @@ func (a *ClaudeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, promp
 			Reason: "stdin rejected before transmission: " + stdinErr.Error()}, nil
 	}
 
+	// Close stdin: the fixture reads the prompt via ReadAll(Stdin).
+	if err := proc.Stdin().Close(); err != nil {
+		a.releaseSlot(nativeID, owner)
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown,
+			Reason: "stdin close: " + err.Error()}, nil
+	}
+
 	// Turn stream: one per turn, fed by the parser.
 	stream := adapter.NewBufferedStream(ref, 64)
 	run := &turnRun{
 		ref: ref, attemptID: attempt, nativeID: nativeID,
-		stream: stream, proc: proc,
+		workspaceRoot: launch.Paths.Root,
+		manifest:      launch.Profile.ToolkitManifest.ToolkitManifest,
+		universeTools: launch.UniverseTools,
+		stream:        stream, proc: proc,
 	}
 	a.mu.Lock()
 	a.turns[ref] = run
@@ -292,10 +314,12 @@ func (a *ClaudeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, promp
 // or non-terminal EOF leaves the attempt Uncertain (never Failed).
 func (a *ClaudeAdapter) runTurn(run *turnRun, stdin *StdinWriter) {
 	cfg := StreamConfig{
-		WorkspaceRoot:         "/ws/claude",
-		ExpectedVersion:       "2.1.278",
+		WorkspaceRoot:         run.workspaceRoot,
+		ExpectedVersion:       run.manifest.ProbedCLIVersion,
 		ExpectedModelIdentity: "claude-haiku-4-5-20251001",
 		ExpectedSessionID:     run.nativeID,
+		Manifest:              run.manifest,
+		UniverseTools:         run.universeTools,
 		MaxLineBytes:          1 << 20,
 		MaxTotalBytes:         8 << 20,
 	}

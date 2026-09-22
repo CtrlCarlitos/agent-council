@@ -158,6 +158,12 @@ func (s *ClaudeTurnLaunchSource) ClaudeTurnLaunch(ctx context.Context, sessionID
 		args = append(args, frozen...)
 	}
 
+	// Compute the pinned universe for the parser's tool drift check.
+	universe, uerr := ResolveUniverseEvidence(s.evidenceRoot, manifest.UniverseEvidencePath, manifest.UniverseEvidenceDigest)
+	if uerr != nil {
+		return execpolicy.LaunchRequest{}, fmt.Errorf("universe verification: %w", uerr)
+	}
+
 	return execpolicy.LaunchRequest{
 		RunID:               meta.RunID,
 		SessionID:           string(sessionID),
@@ -168,5 +174,6 @@ func (s *ClaudeTurnLaunchSource) ClaudeTurnLaunch(ctx context.Context, sessionID
 		ClaudeConfigDir:     configDir,
 		ClaudeConfigBaseDir: s.configBase,
 		PromptDigest:        promptDigest,
+		UniverseTools:       universe.Tools,
 	}, nil
 }
