@@ -1,6 +1,6 @@
 # AC-008 Design — Claude persistent contributor adapter
 
-Status: DRAFT v5 for review
+Status: DRAFT v6 for review
 Date: 2026-09-22
 Issue: #8
 Depends on: AC-003 (controller grants), AC-005 (workspaces/execution policy),
@@ -303,6 +303,14 @@ A `--resume` invocation REQUIRES a prompt and starts a provider turn
   2. an **operator-authorized live inventory probe** (a minimal native
      invocation whose `system/init` is captured and committed) run before
      profile freeze when the installed version differs.
+
+  The committed base universe covers NATIVE tools only — it deliberately
+  excludes installation-specific `mcp__*` and plugin-contributed tools.
+  **Any enabled MCP/plugin tool therefore requires path 2 (the pre-freeze
+  live inventory probe)**; the committed base universe alone is valid
+  only when the frozen run has no enabled MCP/plugin tools AND
+  `system/init` at dispatch contains no native tool names beyond the
+  committed list (drift → Uncertain per the init rule).
   At dispatch time, `system/init.tools[]` is compared against the pinned
   universe: drift (unknown or missing tools) terminates the process and
   classifies Uncertain (§3.9) — the first turn is never used to discover
@@ -395,11 +403,15 @@ claude_turn_attempts
   baseline_size       INTEGER
   baseline_entries    INTEGER
   materialized_baseline BOOL
-  started_at          TIMESTMP NULL  -- process launched
-  first_stdin_byte_at TIMESTMP NULL  -- transmission begun (ambiguity boundary)
-  known_dead_at       TIMESTMP NULL  -- process exit observed
   transcript_protection TEXT (protected|advisory|unverified)
+  protection_attestation_id TEXT NULL
+                      -- WHICH attestation governed this attempt's
+                      -- evidence classification, frozen at launch; a
+                      -- newer attestation never upgrades old attempts
   prompt_digest       TEXT
+  launch_count        INTEGER (0..2)
+                      -- 1 = initial launch; 2 = the single protected-
+                      -- verified-absence redispatch was consumed
   accepted            BOOL NULL    -- known only in protected mode
   terminal            BOOL
   result_payload      TEXT NULL    -- verified terminal result text
@@ -413,19 +425,38 @@ claude_turn_attempts
                       -- (AC-004 authority) via the disposition journal
                       -- entry, not a bare column write
   updated_at
+
+claude_attempt_launches              -- one row per process launch
+  attempt_id         FK
+  launch_index       INTEGER (1|2)
+  UNIQUE(attempt_id, launch_index)
+  started_at         TIMESTMP
+  first_stdin_byte_at TIMESTMP NULL
+  known_dead_at      TIMESTMP NULL
+  exit_code          INTEGER NULL
+  executor_identity  TEXT            -- policy fingerprint of the launch
 ```
 
 **Crash-safe ordering** (each step durable before the next):
 1. persist attempt with baseline (materialized flag or cursor) — before
    launch;
-2. mark `started_at` — after executor Start returns;
+2. `launch_count 0→1` + insert launch row + mark `started_at` — after
+   executor Start returns;
 3. mark `first_stdin_byte_at` — after the prompt write begins;
-4. acceptance (`accepted`, prompt digest match) — from transcript;
+4. acceptance (`accepted`, prompt digest match) — protected mode only,
+   from transcript;
 5. terminal (`terminal`, `result_payload`, `result_usage`) — only from an
    observed `result` event;
 6. `observed_status` — automatically from evidence (completed/failed/
    missing/uncertain);
-7. `uncertainty_disposition` — ONLY by explicit controller decision
+7. **redispatch consumption** — the single protected-mode verified-
+   absence redispatch is an atomic transition: precondition (protection
+   attestation valid for this attempt, verified absence recorded, launch
+   count = 1) sets `launch_count 1→2` and inserts the second launch row
+   in ONE transaction; a crash between decision and consumption leaves
+   launch_count = 1, and the transition is re-derived — it can never
+   authorize a third launch;
+8. `uncertainty_disposition` — ONLY by explicit controller decision
    (AC-004 authority), recorded as a journal entry with actor,
    generation, and operation ID; it resolves an uncertain attempt and
    unblocks the native session.
@@ -437,16 +468,62 @@ dir / 0600 files; Windows: ACL-equivalent or fail-closed capability as
 §3.6); atomically renamed into place; on any failure the temporary
 directory is removed and the session is not materialized.
 
-**Profile encoding (finding 3)**: the toolkit manifest is added to the
-canonical profile as explicit fields (`toolkit_manifest`: expected hooks,
-skills, plugins, approved tools, denied complement, probed CLI version,
-universe evidence digest), bumping the canonical profile algorithm
-version. **Legacy profiles — those frozen before the bump — are
-INELIGIBLE for the Claude adapter**: `CreateSession`/dispatch fail closed
-with a typed `ErrUnsupportedProfile` (the adapter requires the frozen
-tool policy; no record-only mode exists, and silently weakened
-enforcement is the failure mode it prevents). New runs must freeze with
-the new profile version; backfill of old runs is out of scope.
+**Protection attestation (durable, finding 2)**:
+
+```
+claude_protection_attestations
+  attestation_id     TEXT PK     -- cprot-v1:sha256:<hex> over the
+                                 -- canonical attestation payload below
+  claude_version     TEXT        -- probed CLI version
+  platform           TEXT        -- os/arch
+  manifest_digest    TEXT        -- toolkit manifest digest in force
+  template_digest    TEXT        -- ctmpl-v1 digest in force
+  probe_results      TEXT (JSON) -- per-path: tool, target, denied bool,
+                                 -- enforcing capability, denial text
+  probed_at          TIMESTMP
+  actor              TEXT        -- operator identity (journal-linked)
+```
+
+- Canonical attestation payload: the fields above framed like the
+  template digest (length-prefixed UTF-8, fixed field order), digest
+  prefix `cprot-v1:sha256:`; the attestation row is created only by an
+  operator-authorized journal operation (AC-004 authority).
+- Attempts freeze `protection_attestation_id` at launch: the governing
+  attestation is whichever record was valid for (claude version,
+  manifest digest, template digest, platform) AT LAUNCH. A later
+  attestation never retroactively upgrades or reclassifies earlier
+  attempts; a version/template/manifest/platform change simply means new
+  launches have no valid attestation and run advisory until a new probe
+  suite is attested.
+
+**Profile encoding (finding 3, exact)**:
+
+- New algorithm identifier: **`cprof-v2`**, digest prefix
+  `cprof-v2:sha256:<hex>`. Canonical encoding is JSON with sorted keys,
+  no insignificant whitespace, UTF-8 — identical normalization to
+  `cprof-v1` — plus the additive field:
+  ```json
+  "toolkit_manifest": {
+    "probed_cli_version": "2.1.278",
+    "universe_evidence_digest": "<sha256 of the committed universe file>",
+    "approved_tools": ["..."],
+    "denied_complement": ["..."],
+    "expected_hooks": ["..."],
+    "expected_skills": ["..."],
+    "expected_plugins": ["..."]
+  }
+  ```
+- **AC-007 compatibility**: `cprof-v2` is purely additive — every
+  `cprof-v1` field is present with identical semantics. The OpenCode
+  adapter (AC-007) accepts BOTH `cprof-v1` and `cprof-v2` and ignores
+  `toolkit_manifest`; its existing frozen configurations survive the
+  bump unchanged.
+- **Claude eligibility**: the Claude adapter REQUIRES `cprof-v2` with a
+  populated `toolkit_manifest`. Legacy `cprof-v1` profiles remain
+  readable (OpenCode runs continue) but are rejected specifically for
+  Claude production sessions with a typed `ErrUnsupportedProfile` —
+  CreateSession and dispatch fail closed; no record-only mode exists.
+  Backfill of old runs is out of scope.
 
 **Template digest formula (finding 5)** — `ctmpl-v1:sha256:<hex>`:
 1. Enumerate the template tree: regular files only (symlinks, devices,
