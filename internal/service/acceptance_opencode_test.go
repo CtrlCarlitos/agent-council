@@ -60,7 +60,9 @@ func (b *acceptanceBridge) do(method, path, body string) (int, map[string]any) {
 // park -> bridge reconnect -> bridge queue/release follow-up -> resume
 // replacement server -> bridge collect follow-up.
 func TestAcceptance_OpenCode_BridgeLifecycle(t *testing.T) {
-	dir := t.TempDir()
+	// testStateDir keeps the state path short enough for a unix socket
+	// (sun_path); the workspace base and probe root live beside it.
+	dir := testStateDir(t)
 	stateDir := filepath.Join(dir, "state")
 	wsBase := filepath.Join(dir, "workspaces")
 	for _, d := range []string{stateDir, wsBase} {
@@ -138,10 +140,16 @@ func TestAcceptance_OpenCode_BridgeLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("configured service construction: %v", err)
 	}
-	t.Cleanup(func() { _ = srv.Close() })
+	started := false
+	t.Cleanup(func() {
+		if started {
+			_ = srv.Close()
+		}
+	})
 	if err := srv.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
+	started = true
 	bridge := &acceptanceBridge{t: t, client: newTestClient(srv.SocketPath()), token: authToken}
 
 	// 1. Adopt: the controller lease secret is returned exactly once.
