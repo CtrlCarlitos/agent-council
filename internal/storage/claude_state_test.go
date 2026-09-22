@@ -179,7 +179,11 @@ func TestClaudeState_RedispatchConsumedCannotAuthorizeThird(t *testing.T) {
 	store := openClaudeStore(t)
 	ctx := context.Background()
 
-	if err := store.InsertClaudeTurnAttempt(ctx, claudeAttemptFixture("att-rd", "sess-rd", "t-rd", "nat-rd")); err != nil {
+	// Protected mode: the redispatch requires valid protection evidence.
+	attempt := claudeAttemptFixture("att-rd", "sess-rd", "t-rd", "nat-rd")
+	attempt.TranscriptProtection = "protected"
+	attempt.AttestationID = "cprot-v1:sha256:test"
+	if err := store.InsertClaudeTurnAttempt(ctx, attempt); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 	// Launch 1: started then dead (verified absence).
@@ -256,7 +260,11 @@ func TestClaudeState_RedispatchDecisionBeforeConsumption(t *testing.T) {
 	store := openClaudeStore(t)
 	ctx := context.Background()
 
-	if err := store.InsertClaudeTurnAttempt(ctx, claudeAttemptFixture("att-e", "sess-e", "t-e", "nat-e")); err != nil {
+	// Protected mode: the redispatch requires valid protection evidence.
+	attempt := claudeAttemptFixture("att-e", "sess-e", "t-e", "nat-e")
+	attempt.TranscriptProtection = "protected"
+	attempt.AttestationID = "cprot-v1:sha256:test"
+	if err := store.InsertClaudeTurnAttempt(ctx, attempt); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 	// Launch 1: started then dead (verified absence).
@@ -357,5 +365,66 @@ func TestClaudeState_SchemaVersionIsExactly4(t *testing.T) {
 		if err != nil {
 			t.Fatalf("table %s must exist: %v", table, err)
 		}
+	}
+}
+
+// Advisory-mode attempts cannot redispatch after verified absence: the
+// protection check fails closed.
+func TestClaudeState_AdvisoryModeBlocksRedispatch(t *testing.T) {
+	store := openClaudeStore(t)
+	ctx := context.Background()
+
+	// Advisory attempt (the default): started then dead.
+	if err := store.InsertClaudeTurnAttempt(ctx, claudeAttemptFixture("att-adv", "sess-adv", "t-adv", "nat-adv")); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if _, err := store.ReserveClaudeLaunch(ctx, "att-adv", "fixture"); err != nil {
+		t.Fatalf("reserve 1: %v", err)
+	}
+	exit := 0
+	if err := store.RecordClaudeLaunchState(ctx, "att-adv", 1, "started", nil); err != nil {
+		t.Fatalf("started: %v", err)
+	}
+	if err := store.RecordClaudeLaunchState(ctx, "att-adv", 1, "dead", &exit); err != nil {
+		t.Fatalf("dead: %v", err)
+	}
+
+	_, err := store.ReserveClaudeLaunch(ctx, "att-adv", "fixture")
+	if err == nil || !strings.Contains(err.Error(), "protected transcript evidence") {
+		t.Fatalf("advisory-mode redispatch must fail closed, got %v", err)
+	}
+}
+
+// The stdin transmission boundary is durably recorded on the launch row.
+func TestClaudeState_StdinTransmissionRecorded(t *testing.T) {
+	store := openClaudeStore(t)
+	ctx := context.Background()
+
+	if err := store.InsertClaudeTurnAttempt(ctx, claudeAttemptFixture("att-stdin", "sess-stdin", "t-stdin", "nat-stdin")); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	seq, err := store.ReserveClaudeLaunch(ctx, "att-stdin", "fixture")
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if err := store.RecordClaudeLaunchState(ctx, "att-stdin", seq, "started", nil); err != nil {
+		t.Fatalf("started: %v", err)
+	}
+	if err := store.RecordClaudeStdinTransmitted(ctx, "att-stdin", seq); err != nil {
+		t.Fatalf("record stdin: %v", err)
+	}
+
+	// Reopen and verify the launch row carries the stdin boundary.
+	reopened := reopenStore(t, store)
+	var stdinAt *string
+	err = reopened.DB().QueryRow(
+		`SELECT first_stdin_byte_at FROM claude_attempt_launches WHERE attempt_id = ? AND reservation_seq = ?`,
+		"att-stdin", seq,
+	).Scan(&stdinAt)
+	if err != nil {
+		t.Fatalf("read stdin boundary: %v", err)
+	}
+	if stdinAt == nil || *stdinAt == "" {
+		t.Fatal("first_stdin_byte_at must be recorded after transmission")
 	}
 }

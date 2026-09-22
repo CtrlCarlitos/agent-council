@@ -228,8 +228,21 @@ WHERE attempt_id = ? AND state IN ('started','dead')`, attemptID).Scan(&priorDea
 	if count == 0 {
 		// Initial launch: always allowed.
 	} else if count == 1 && consumed == 0 && priorDead >= 1 {
-		// Protected verified-absence redispatch: consumes the one-time
-		// authorization.
+		// Protected verified-absence redispatch: requires a valid
+		// protection attestation and consumes the one-time
+		// authorization. Advisory attempts stay uncertain permanently.
+		var protection, attestationID string
+		err = tx.QueryRowContext(ctx, `
+SELECT transcript_protection, protection_attestation_id
+FROM claude_turn_attempts WHERE attempt_id = ?`, attemptID).Scan(&protection, &attestationID)
+		if err != nil {
+			return 0, err
+		}
+		if protection != "protected" || strings.TrimSpace(attestationID) == "" {
+			return 0, fmt.Errorf(
+				"redispatch requires protected transcript evidence (protection=%q attestation=%q)",
+				protection, attestationID)
+		}
 		if _, err := tx.ExecContext(ctx, `
 UPDATE claude_turn_attempts SET absence_redispatch_consumed = 1
 WHERE attempt_id = ?`, attemptID); err != nil {
@@ -258,9 +271,9 @@ VALUES (?, ?, 'reserved', ?)`, attemptID, seq, executorIdentity); err != nil {
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `
-UPDATE claude_turn_attempts SET launch_count = ?, transition_version = transition_version + 1,
-	updated_at = ? WHERE attempt_id = ?`,
-		seq, time.Now().UTC().Format(time.RFC3339), attemptID); err != nil {
+UPDATE claude_turn_attempts SET launch_count = launch_count + 1,
+	transition_version = transition_version + 1, updated_at = ?
+WHERE attempt_id = ?`, time.Now().UTC().Format(time.RFC3339), attemptID); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -282,19 +295,26 @@ UPDATE claude_attempt_launches SET state = 'started', started_at = ?
 WHERE attempt_id = ? AND reservation_seq = ?`, now, attemptID, seq)
 		return err
 	case "start_failed":
-		_, err := s.DB().ExecContext(ctx, `
+		tx, txErr := s.DB().BeginTx(ctx, nil)
+		if txErr != nil {
+			return txErr
+		}
+		defer tx.Rollback()
+		if _, err := tx.ExecContext(ctx, `
 UPDATE claude_attempt_launches SET state = 'start_failed', start_failed_at = ?
-WHERE attempt_id = ? AND reservation_seq = ?`, now, attemptID, seq)
-		if err != nil {
+WHERE attempt_id = ? AND reservation_seq = ?`, now, attemptID, seq); err != nil {
 			return err
 		}
 		// No process was created: release the launch slot so a new
 		// reservation is possible. The launch row is retained as
-		// evidence.
-		_, err = s.DB().ExecContext(ctx, `
+		// evidence. Both the launch-row state change and the slot
+		// release are one atomic transaction.
+		if _, err := tx.ExecContext(ctx, `
 UPDATE claude_turn_attempts SET launch_count = launch_count - 1
-WHERE attempt_id = ? AND launch_count > 0`, attemptID)
-		return err
+WHERE attempt_id = ? AND launch_count > 0`, attemptID); err != nil {
+			return err
+		}
+		return tx.Commit()
 	case "dead":
 		_, err := s.DB().ExecContext(ctx, `
 UPDATE claude_attempt_launches SET state = 'dead', known_dead_at = ?, exit_code = ?
@@ -303,6 +323,16 @@ WHERE attempt_id = ? AND reservation_seq = ?`, now, attemptID, seq, exitCode)
 	default:
 		return fmt.Errorf("unknown launch state %q", state)
 	}
+}
+
+// RecordClaudeStdinTransmitted records the first-byte transmission
+// boundary on a launch row.
+func (s *Store) RecordClaudeStdinTransmitted(ctx context.Context, attemptID string, seq int64) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.DB().ExecContext(ctx, `
+UPDATE claude_attempt_launches SET first_stdin_byte_at = ?
+WHERE attempt_id = ? AND reservation_seq = ?`, now, attemptID, seq)
+	return err
 }
 
 // MarkClaudeAttemptAccepted records the acceptance boundary (protected
