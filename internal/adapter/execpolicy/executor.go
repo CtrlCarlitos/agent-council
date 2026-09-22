@@ -45,6 +45,11 @@ type LaunchRequest struct {
 	// an `opencode serve` child. The executor accepts it only on that exact
 	// launch shape and injects it after the scrub pass.
 	GeneratedServerEnv *GeneratedServerEnv
+	// ClaudeConfigDir carries the per-session Claude config root for an
+	// exact `claude -p` launch. The executor accepts it only on that
+	// shape, injects it as CLAUDE_CONFIG_DIR after the scrub pass, and
+	// keeps it out of captured event payloads.
+	ClaudeConfigDir string
 }
 
 // CapabilityChecker verifies whether the host environment supports required isolation capabilities.
@@ -297,6 +302,19 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 	// the secret filter cannot strip them (Gate-spec: these are Council-
 	// generated transport credentials, not inherited secrets).
 	scrubbedEnv = appendGeneratedServerEnv(scrubbedEnv, req)
+
+	// Typed Claude config-dir extension: validated against the exact
+	// Claude launch shape, then injected as CLAUDE_CONFIG_DIR after the
+	// scrub pass (AC-008 §3.7).
+	if req.ClaudeConfigDir != "" {
+		if err := validateClaudeConfigDir(req); err != nil {
+			if proxyToClose != nil {
+				_ = proxyToClose.Close()
+			}
+			return nil, err
+		}
+		scrubbedEnv = append(scrubbedEnv, "CLAUDE_CONFIG_DIR="+req.ClaudeConfigDir)
+	}
 
 	cmd := exec.CommandContext(ctx, req.Command, req.Args...)
 	cmd.Dir = req.Paths.Root

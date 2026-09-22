@@ -36,6 +36,16 @@ type ServerConfig struct {
 	// turn before parking it. Zero uses the adapter default.
 	OpenCodeIdleGrace time.Duration
 
+	// ClaudeBinaryPath, when set, enables the Claude persistent
+	// contributor adapter (AC-008). Empty means no Claude adapter.
+	ClaudeBinaryPath string
+
+	// ClaudeConfigBaseDir is the operator-provisioned base directory for
+	// per-session Claude config roots. Required when ClaudeBinaryPath is
+	// set; validated to be disjoint from StateDir and WorkspaceBaseDir
+	// and secured to operator-only permissions.
+	ClaudeConfigBaseDir string
+
 	// OpenCodeProbeScratchRoot is the operator-provisioned directory for
 	// probe scratch directories. Required when OpenCodeBinaryPath is set;
 	// it must lie outside both StateDir and WorkspaceBaseDir. The service
