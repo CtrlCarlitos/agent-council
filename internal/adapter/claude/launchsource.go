@@ -175,5 +175,6 @@ func (s *ClaudeTurnLaunchSource) ClaudeTurnLaunch(ctx context.Context, sessionID
 		ClaudeConfigBaseDir: s.configBase,
 		PromptDigest:        promptDigest,
 		UniverseTools:       universe.Tools,
+		Model:               model,
 	}, nil
 }

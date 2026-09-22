@@ -3,10 +3,11 @@
 package claude
 
 // Task 5 adapter contract evidence (POSIX — real executor + fixture
-// child): session creation persistence, first-vs-resume identity
-// selection, process lifecycle through PolicyExecutor, parser-to-tap
-// event delivery, terminal persistence (completed AND failed), slot
-// retention on ambiguity, cancel/observe semantics, and four-state
+// child): §3.3 creation reservation (shared identity, typed mismatch
+// failures, no adapter persistence), §3.4 resume local inspection,
+// §3.5 durable blocking + disposition unblocking, first-vs-resume
+// identity selection, terminal mapping (completed AND failed),
+// ambiguity slot semantics, cancel/observe semantics, and four-state
 // reconcile over durable evidence.
 
 import (
@@ -16,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -73,7 +75,6 @@ func newAdapterHarness(t *testing.T) *adapterHarness {
 	universeDoc := `{"claude_code_version":"2.1.278","tools":["Read","Glob","Grep","Bash","Write","WebSearch"]}`
 	universePath := filepath.Join(evidenceRoot, "docs", "superpowers", "evidence", "ac008-native-tool-universe-2.1.278.json")
 	os.WriteFile(universePath, []byte(universeDoc), 0o600)
-	universeDigest := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(universeDoc)))
 
 	const lease = "lease-adapter"
 	ctx := context.Background()
@@ -82,27 +83,7 @@ func newAdapterHarness(t *testing.T) *adapterHarness {
 		Brief: "adapter test", SourceRepoIdentity: "example/repo",
 		SourceCommit: "0123456789012345678901234567890123456789",
 		SourceTree:   "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
-		Profile: func() storage.CanonicalProfile {
-			p := storage.CanonicalProfile{
-				AlgoVersion:         "cprof-v2",
-				WorkspaceMode:       "none",
-				IsolationStrictness: "permissive_dev",
-				NetworkMode:         "unrestricted",
-				Tooling:             []string{"claude", "git", "go"},
-				Harnesses: map[string]storage.HarnessProfileSpec{
-					"claude": {Model: primaryModel, NativeAuthMode: "inherited_host_keychain"},
-				},
-			}
-			p.ToolkitManifest = &storage.ToolkitManifestSpec{ToolkitManifest: storage.ToolkitManifest{
-				ProbedCLIVersion:       "2.1.278",
-				UniverseEvidencePath:   "docs/superpowers/evidence/ac008-native-tool-universe-2.1.278.json",
-				UniverseEvidenceDigest: universeDigest,
-				ApprovedTools:          []string{"Read", "Glob", "Grep"},
-				DeniedComplement:       []string{"Bash", "Write", "WebSearch"},
-				TurnsBound:             8,
-			}}
-			return p
-		}(),
+		Profile:      claudeProfile("sha256:"+sha256Sum(universeDoc), primaryModel),
 	}); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -138,30 +119,103 @@ func newAdapterHarness(t *testing.T) *adapterHarness {
 	}
 }
 
-// createSession drives the production CreateSession path and registers
-// a durable claude binding for the (claude-contributor) session record.
+func claudeProfile(universeDigest, model string) storage.CanonicalProfile {
+	p := storage.CanonicalProfile{
+		AlgoVersion:         "cprof-v2",
+		WorkspaceMode:       "none",
+		IsolationStrictness: "permissive_dev",
+		NetworkMode:         "unrestricted",
+		Tooling:             []string{"claude", "git", "go"},
+		Harnesses: map[string]storage.HarnessProfileSpec{
+			"claude": {Model: model, NativeAuthMode: "inherited_host_keychain"},
+		},
+	}
+	p.ToolkitManifest = &storage.ToolkitManifestSpec{ToolkitManifest: storage.ToolkitManifest{
+		ProbedCLIVersion:       "2.1.278",
+		UniverseEvidencePath:   "docs/superpowers/evidence/ac008-native-tool-universe-2.1.278.json",
+		UniverseEvidenceDigest: universeDigest,
+		ApprovedTools:          []string{"Read", "Glob", "Grep"},
+		DeniedComplement:       []string{"Bash", "Write", "WebSearch"},
+		TurnsBound:             8,
+	}}
+	return p
+}
+
+// createSession drives the production CreateSession path and then
+// performs the §3.3 persistence the service/storage layer owns.
 func (h *adapterHarness) createSession(t *testing.T, id string) adapter.SessionBinding {
+	t.Helper()
+	return h.createSessionWithConfig(t, id, primaryModel, h.workspaceRoot(t, id))
+}
+
+func (h *adapterHarness) createSessionWithConfig(t *testing.T, id, model, workspaceRoot string) adapter.SessionBinding {
 	t.Helper()
 	binding, err := h.adapter.CreateSession(context.Background(), adapter.CreateSessionRequest{
 		SessionID:   adapter.SessionID(id),
 		Contributor: "claude",
 		Config: adapter.SessionConfig{
-			WorkspaceRoot: h.workspaceRoot(t, id),
-			Model:         primaryModel,
+			WorkspaceRoot: workspaceRoot,
+			Model:         model,
 		},
 	})
 	if err != nil {
 		t.Fatalf("create session %s: %v", id, err)
 	}
+	h.persistBinding(t, id, binding.NativeSessionID, model, workspaceRoot)
 	return binding
+}
+
+// persistBinding is the §3.3 service/storage persistence seam: the
+// adapter returned the binding, the storage layer records it.
+func (h *adapterHarness) persistBinding(t *testing.T, id, nativeID, model, workspaceRoot string) {
+	t.Helper()
+	digest, err := TemplateDigest(h.template)
+	if err != nil {
+		t.Fatalf("template digest: %v", err)
+	}
+	runID, err := h.store.GetSessionRunID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("run lookup for %s: %v", id, err)
+	}
+	if err := h.store.InsertClaudeSessionBinding(context.Background(), storage.ClaudeSessionBinding{
+		SessionID:      id,
+		NativeID:       nativeID,
+		Model:          model,
+		Workspace:      workspaceRoot,
+		ConfigRoot:     ConfigRootPath(h.configBase, runID, id),
+		TemplateDigest: digest,
+		CreatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("persist binding for %s: %v", id, err)
+	}
+}
+
+// simulateDisposition records the controller's uncertainty disposition
+// directly (Task 6 wraps this transition with journal authority); the
+// adapter must observe the durable state change and unblock.
+func (h *adapterHarness) simulateDisposition(t *testing.T, attemptID string) {
+	t.Helper()
+	_, err := h.store.DB().ExecContext(context.Background(), `
+UPDATE claude_turn_attempts SET uncertainty_disposition = 'abandoned',
+	disposition_actor = 'controller-test', disposition_generation = 1,
+	disposition_op_id = 'op-disposition-test', disposition_at = ?
+WHERE attempt_id = ?`, time.Now().UTC().Format(time.RFC3339), attemptID)
+	if err != nil {
+		t.Fatalf("simulate disposition: %v", err)
+	}
 }
 
 func (h *adapterHarness) workspaceRoot(t *testing.T, sessionID string) string {
 	t.Helper()
-	if paths, ok := h.wm.GetPaths("run-adapter", sessionID); ok {
+	return h.workspaceRootFor(t, "run-adapter", sessionID)
+}
+
+func (h *adapterHarness) workspaceRootFor(t *testing.T, runID, sessionID string) string {
+	t.Helper()
+	if paths, ok := h.wm.GetPaths(runID, sessionID); ok {
 		return paths.Root
 	}
-	paths, err := h.wm.AllocateWorkspace("run-adapter", sessionID, "none", "example/repo",
+	paths, err := h.wm.AllocateWorkspace(runID, sessionID, "none", "example/repo",
 		"0123456789012345678901234567890123456789")
 	if err != nil {
 		t.Fatalf("allocate workspace for %s: %v", sessionID, err)
@@ -200,11 +254,11 @@ func drainStream(t *testing.T, stream adapter.Stream) []adapter.Event {
 
 // fixtureStream builds a full fixture stream replay (hook + init with
 // the exact runtime session id and cwd, then the custom lines).
-func fixtureStream(wsRoot, nativeID string, extra ...string) string {
+func fixtureStream(wsRoot, nativeID, model string, extra ...string) string {
 	lines := []string{
 		`{"type":"system","subtype":"hook_started","hook_name":"SessionStart:startup"}`,
 		fmt.Sprintf(`{"type":"system","subtype":"init","session_id":%q,"cwd":%q,"claude_code_version":"2.1.278","model":%q,"permissionMode":"default","tools":["Read","Glob","Grep"],"skills":[],"plugins":[]}`,
-			nativeID, wsRoot, primaryModel),
+			nativeID, wsRoot, model),
 	}
 	lines = append(lines, extra...)
 	return strings.Join(lines, "\n") + "\n"
@@ -246,6 +300,11 @@ func argInvoked(invocation []string, flag string) bool {
 	return false
 }
 
+func sha256Sum(data string) string {
+	sum := sha256.Sum256([]byte(data))
+	return fmt.Sprintf("%x", sum)
+}
+
 type testIdentitySource struct{}
 
 func (testIdentitySource) AttemptFor(_ context.Context, ref adapter.TurnRef) (string, bool) {
@@ -256,16 +315,24 @@ func unusedIdentityFunc(ctx context.Context, ref adapter.TurnRef) (string, bool)
 	return "att_" + ref.TurnKey, true
 }
 
-// ── CreateSession ───────────────────────────────────────────────────────
+// ── §3.3 CreateSession reservation ──────────────────────────────────────
 
-// CreateSession generates a fresh UUIDv4 native identity, materializes
-// the per-session config root, and persists an unmaterialized binding;
-// duplicates are idempotent; non-claude contributors are refused.
-func TestClaudeAdapter_CreateSessionPersistsBinding(t *testing.T) {
+// CreateSession reserves one UUIDv4 native identity and materializes
+// the config root but does NOT persist; duplicates share the reserved
+// identity concurrently; mismatched callers fail closed with typed
+// errors.
+func TestClaudeAdapter_CreateSessionReservation(t *testing.T) {
 	h := newAdapterHarness(t)
 	ctx := context.Background()
 
-	binding := h.createSession(t, string(h.sessionID))
+	binding, err := h.adapter.CreateSession(ctx, adapter.CreateSessionRequest{
+		SessionID:   h.sessionID,
+		Contributor: "claude",
+		Config:      adapter.SessionConfig{WorkspaceRoot: h.wsRoot, Model: primaryModel},
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
 	if binding.NativeSessionID == string(h.sessionID) {
 		t.Fatal("native id must be freshly generated, not the logical session id")
 	}
@@ -273,28 +340,17 @@ func TestClaudeAdapter_CreateSessionPersistsBinding(t *testing.T) {
 		t.Fatalf("native id must be UUIDv4, got %q", binding.NativeSessionID)
 	}
 
-	stored, err := h.store.GetClaudeSessionBinding(ctx, string(h.sessionID))
-	if err != nil || stored == nil {
-		t.Fatalf("get binding: %v", err)
+	// §3.3: the adapter does not persist.
+	if stored, _ := h.store.GetClaudeSessionBinding(ctx, string(h.sessionID)); stored != nil {
+		t.Fatal("CreateSession must not persist; the service/storage layer owns persistence")
 	}
-	if stored.NativeID != binding.NativeSessionID {
-		t.Fatalf("persisted native id %q != returned %q", stored.NativeID, binding.NativeSessionID)
-	}
-	if stored.Materialized {
-		t.Fatal("fresh binding must be unmaterialized")
-	}
+
 	wantRoot := ConfigRootPath(h.configBase, "run-adapter", string(h.sessionID))
-	if stored.ConfigRoot != wantRoot {
-		t.Fatalf("config root %q != expected %q", stored.ConfigRoot, wantRoot)
-	}
-	if stored.TemplateDigest == "" {
-		t.Fatal("template digest must be recorded")
-	}
-	if _, err := os.Stat(filepath.Join(stored.ConfigRoot, "settings.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(wantRoot, "settings.json")); err != nil {
 		t.Fatalf("materialized config root missing settings.json: %v", err)
 	}
 
-	// Duplicate request: idempotent, same native id.
+	// Duplicate request before persistence: shared reserved identity.
 	again, err := h.adapter.CreateSession(ctx, adapter.CreateSessionRequest{
 		SessionID:   h.sessionID,
 		Contributor: "claude",
@@ -307,10 +363,58 @@ func TestClaudeAdapter_CreateSessionPersistsBinding(t *testing.T) {
 		t.Fatalf("duplicate create: %v", err)
 	}
 	if again.NativeSessionID != binding.NativeSessionID {
-		t.Fatalf("duplicate create returned %q, want %q", again.NativeSessionID, binding.NativeSessionID)
+		t.Fatalf("duplicate create returned %q, want the reserved %q", again.NativeSessionID, binding.NativeSessionID)
 	}
 
-	// Non-claude contributor: refused before any native identity is minted.
+	// Concurrent duplicates: one native identity, shared result.
+	const n = 4
+	var wg sync.WaitGroup
+	ids := make([]string, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(slot int) {
+			defer wg.Done()
+			b, err := h.adapter.CreateSession(ctx, adapter.CreateSessionRequest{
+				SessionID:   h.sessionID,
+				Contributor: "claude",
+				Config:      adapter.SessionConfig{WorkspaceRoot: h.wsRoot, Model: primaryModel},
+			})
+			if err == nil {
+				ids[slot] = b.NativeSessionID
+			}
+			errs[slot] = err
+		}(i)
+	}
+	wg.Wait()
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("concurrent create %d: %v", i, errs[i])
+		}
+		if ids[i] != binding.NativeSessionID {
+			t.Fatalf("concurrent create %d returned %q, want shared %q", i, ids[i], binding.NativeSessionID)
+		}
+	}
+
+	// Mismatched callers fail closed with typed errors.
+	mismatch := func(cfg adapter.SessionConfig, contributor council.Contributor, field string) {
+		t.Helper()
+		_, err := h.adapter.CreateSession(ctx, adapter.CreateSessionRequest{
+			SessionID: h.sessionID, Contributor: contributor, Config: cfg,
+		})
+		var typed *ErrSessionConfigMismatch
+		if !asConfigMismatch(err, &typed) {
+			t.Fatalf("mismatched %s must fail with ErrSessionConfigMismatch, got %v", field, err)
+		}
+		if typed.Field != field {
+			t.Fatalf("mismatch reported field %q, want %q", typed.Field, field)
+		}
+	}
+	mismatch(adapter.SessionConfig{WorkspaceRoot: h.wsRoot, Model: "claude-opus-4-1-20250805"}, "claude", "model")
+	mismatch(adapter.SessionConfig{WorkspaceRoot: h.wsRoot + "-other", Model: primaryModel}, "claude", "workspace")
+	mismatch(adapter.SessionConfig{WorkspaceRoot: h.wsRoot, Model: primaryModel}, "opencode", "contributor")
+
+	// Non-claude session records are refused outright.
 	if _, err := h.store.CreateSession(ctx, "op-sess-other", "lease-adapter", storage.SessionRecord{
 		ID: "sess-other", RunID: "run-adapter", Contributor: "opencode", Role: "reviewer",
 		IsActiveContributor: true, State: "parked", Visibility: "reachable",
@@ -324,8 +428,234 @@ func TestClaudeAdapter_CreateSessionPersistsBinding(t *testing.T) {
 	}); err == nil {
 		t.Fatal("non-claude contributor must be refused")
 	}
-	if b, _ := h.store.GetClaudeSessionBinding(ctx, "sess-other"); b != nil {
-		t.Fatal("no binding may be persisted for a non-claude contributor")
+
+	// A mutated frozen template fails the digest comparison on the
+	// reserved session.
+	writeKnob(t, h.template, "drift.md", "drift")
+	if _, err := h.adapter.CreateSession(ctx, adapter.CreateSessionRequest{
+		SessionID: h.sessionID, Contributor: "claude",
+		Config: adapter.SessionConfig{WorkspaceRoot: h.wsRoot, Model: primaryModel},
+	}); !asConfigMismatch(err, nil) {
+		t.Fatalf("mutated template must fail the digest comparison, got %v", err)
+	}
+	os.Remove(filepath.Join(h.template, "drift.md"))
+}
+
+func asConfigMismatch(err error, target **ErrSessionConfigMismatch) bool {
+	for err != nil {
+		if typed, ok := err.(*ErrSessionConfigMismatch); ok {
+			if target != nil {
+				*target = typed
+			}
+			return true
+		}
+		u, ok := err.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+		err = u.Unwrap()
+	}
+	return false
+}
+
+// After the service persists the binding, a duplicate CreateSession
+// must match the persisted frozen config and share its native id.
+func TestClaudeAdapter_CreateSessionMatchesPersistedBinding(t *testing.T) {
+	h := newAdapterHarness(t)
+	ctx := context.Background()
+
+	binding := h.createSession(t, string(h.sessionID))
+
+	again, err := h.adapter.CreateSession(ctx, adapter.CreateSessionRequest{
+		SessionID: h.sessionID, Contributor: "claude",
+		Config: adapter.SessionConfig{WorkspaceRoot: h.wsRoot, Model: primaryModel},
+	})
+	if err != nil {
+		t.Fatalf("duplicate after persistence: %v", err)
+	}
+	if again.NativeSessionID != binding.NativeSessionID {
+		t.Fatalf("persisted native id mismatch: %q vs %q", again.NativeSessionID, binding.NativeSessionID)
+	}
+
+	if _, err := h.adapter.CreateSession(ctx, adapter.CreateSessionRequest{
+		SessionID: h.sessionID, Contributor: "claude",
+		Config: adapter.SessionConfig{WorkspaceRoot: h.wsRoot, Model: "claude-opus-4-1-20250805"},
+	}); !asConfigMismatch(err, nil) {
+		t.Fatalf("persisted model mismatch must fail closed, got %v", err)
+	}
+}
+
+// ── §3.4 ResumeSession local inspection ─────────────────────────────────
+
+func TestClaudeAdapter_ResumeSessionInspection(t *testing.T) {
+	h := newAdapterHarness(t)
+	ctx := context.Background()
+
+	// Unpersisted session: resume fails closed.
+	if err := h.adapter.ResumeSession(ctx, adapter.SessionBinding{
+		SessionID:       h.sessionID,
+		NativeSessionID: "00000000-0000-4000-8000-00000000000f",
+	}); err == nil {
+		t.Fatal("resume without a persisted binding must fail")
+	}
+
+	binding := h.createSession(t, string(h.sessionID))
+
+	// Steps 1–2 on an unmaterialized binding: success, no transcript
+	// required — never classified as lost.
+	if err := h.adapter.ResumeSession(ctx, binding); err != nil {
+		t.Fatalf("unmaterialized resume must succeed: %v", err)
+	}
+
+	// Native id mismatch: typed.
+	if err := h.adapter.ResumeSession(ctx, adapter.SessionBinding{
+		SessionID:       h.sessionID,
+		NativeSessionID: "00000000-0000-4000-8000-00000000000f",
+		Config:          binding.Config,
+	}); !asConfigMismatch(err, nil) {
+		t.Fatalf("native id mismatch must be typed, got %v", err)
+	}
+
+	// Model mismatch: typed.
+	if err := h.adapter.ResumeSession(ctx, adapter.SessionBinding{
+		SessionID:       h.sessionID,
+		NativeSessionID: binding.NativeSessionID,
+		Config:          adapter.SessionConfig{Model: "claude-opus-4-1-20250805", WorkspaceRoot: h.wsRoot},
+	}); !asConfigMismatch(err, nil) {
+		t.Fatalf("model mismatch must be typed, got %v", err)
+	}
+
+	// Frozen template drift: typed.
+	writeKnob(t, h.template, "drift.md", "drift")
+	if err := h.adapter.ResumeSession(ctx, binding); !asConfigMismatch(err, nil) {
+		t.Fatalf("template drift must be typed, got %v", err)
+	}
+	os.Remove(filepath.Join(h.template, "drift.md"))
+
+	// Missing config root: failure.
+	stored, _ := h.store.GetClaudeSessionBinding(ctx, string(h.sessionID))
+	rootBackup := filepath.Join(filepath.Dir(stored.ConfigRoot), "root-backup")
+	if err := os.Rename(stored.ConfigRoot, rootBackup); err != nil {
+		t.Fatalf("stash config root: %v", err)
+	}
+	if err := h.adapter.ResumeSession(ctx, binding); err == nil {
+		t.Fatal("missing config root must fail")
+	}
+	if err := os.Rename(rootBackup, stored.ConfigRoot); err != nil {
+		t.Fatalf("restore config root: %v", err)
+	}
+
+	// Materialized binding without a transcript: failure.
+	if err := h.store.MarkClaudeSessionMaterialized(ctx, string(h.sessionID)); err != nil {
+		t.Fatalf("mark materialized: %v", err)
+	}
+	if err := h.adapter.ResumeSession(ctx, binding); err == nil {
+		t.Fatal("materialized binding without its transcript must fail")
+	}
+
+	// Materialized binding with a valid transcript at the derived path.
+	path, err := TranscriptPath(stored.ConfigRoot, stored.Workspace, stored.NativeID)
+	if err != nil {
+		t.Fatalf("transcript path: %v", err)
+	}
+	if os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir projects: %v", err)
+	}
+	transcript := strings.Join([]string{
+		`{"type":"user","message":{"role":"user","content":"prompt"}}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(transcript), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	if err := h.adapter.ResumeSession(ctx, binding); err != nil {
+		t.Fatalf("materialized resume with transcript must succeed: %v", err)
+	}
+
+	// Corrupt transcript: integrity failure.
+	if err := os.WriteFile(path, []byte("{\"type\":\"user\"\nNOT JSON\n"), 0o600); err != nil {
+		t.Fatalf("write corrupt transcript: %v", err)
+	}
+	if err := h.adapter.ResumeSession(ctx, binding); err == nil {
+		t.Fatal("corrupt transcript must fail integrity checks")
+	}
+
+	// Symlinked transcript: rejected.
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove transcript: %v", err)
+	}
+	if err := os.WriteFile(path+"-real", []byte(transcript), 0o600); err != nil {
+		t.Fatalf("write real transcript: %v", err)
+	}
+	if err := os.Symlink(path+"-real", path); err != nil {
+		t.Fatalf("symlink transcript: %v", err)
+	}
+	if err := h.adapter.ResumeSession(ctx, binding); err == nil {
+		t.Fatal("symlinked transcript must be rejected")
+	}
+}
+
+// ── §3.5 durable blocking + disposition unblocking ──────────────────────
+
+// An unresolved attempt blocks every later turn on the native session
+// from DURABLE state — including through an adapter "restart" (fresh
+// in-memory state, same store) — and the controller's recorded
+// disposition unblocks it.
+func TestClaudeAdapter_RestartBlockingAndDispositionUnblock(t *testing.T) {
+	h := newAdapterHarness(t)
+	ctx := context.Background()
+	h.createSession(t, string(h.sessionID))
+
+	// Force an uncertain attempt: the child exits without reading
+	// stdin, so a large prompt fails post-transmission.
+	writeKnob(t, h.wsRoot, ".claude-fixture-stdin-exit", "")
+	ref := adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-ambig"}
+	outcome, err := h.adapter.Dispatch(ctx, ref, strings.Repeat("x", 1<<20))
+	if err != nil || outcome.Status != adapter.DispatchUnknown {
+		t.Fatalf("ambiguous dispatch: %v %v", outcome.Status, err)
+	}
+	attempt, err := h.store.GetLatestClaudeTurnAttempt(ctx, string(h.sessionID), "t-ambig")
+	if err != nil || attempt == nil || attempt.Terminal || attempt.ObservedStatus != "uncertain" {
+		t.Fatalf("attempt must be durably uncertain: %+v %v", attempt, err)
+	}
+	if attempt.UncertaintyDisposition != nil {
+		t.Fatal("uncertainty disposition must be unset before the controller acts")
+	}
+
+	// Same process: blocked from durable state.
+	next := adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-next-1"}
+	outcome, _ = h.adapter.Dispatch(ctx, next, "prompt")
+	if outcome.Status != adapter.DispatchRejected ||
+		!strings.Contains(outcome.Reason, "unresolved attempt") {
+		t.Fatalf("unresolved attempt must block, got %v (%s)", outcome.Status, outcome.Reason)
+	}
+
+	// Restart: a fresh adapter over the same store (empty in-memory
+	// slot and turn maps) must still observe the durable block.
+	restarted := NewClaudeAdapter(h.store, h.wm, h.adapter.executor, h.adapter.launchSource,
+		testIdentitySource{}, h.configBase, h.template)
+	outcome, _ = restarted.Dispatch(ctx, adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-next-2"}, "prompt")
+	if outcome.Status != adapter.DispatchRejected ||
+		!strings.Contains(outcome.Reason, "unresolved attempt") {
+		t.Fatalf("durable block must survive restart, got %v (%s)", outcome.Status, outcome.Reason)
+	}
+
+	// The controller records the disposition; the durable state change
+	// unblocks the session — including for the restarted adapter.
+	h.simulateDisposition(t, attempt.AttemptID)
+
+	// Clear the fault knob so the unblocking turn can run the happy
+	// stream.
+	os.Remove(filepath.Join(h.wsRoot, ".claude-fixture-stdin-exit"))
+
+	outcome, err = restarted.Dispatch(ctx, next, "prompt")
+	if err != nil || outcome.Status != adapter.DispatchAccepted {
+		t.Fatalf("disposition must unblock the session, got %v (%s) err=%v", outcome.Status, outcome.Reason, err)
+	}
+	result := waitTerminal(t, h, next)
+	if result.Status != council.TurnCompleted {
+		t.Fatalf("post-disposition turn must complete, got %+v", result)
 	}
 }
 
@@ -403,13 +733,56 @@ func TestClaudeAdapter_PreMaterializedBindingResumes(t *testing.T) {
 	}
 }
 
-// ── Ambiguous write: slot blocking ──────────────────────────────────────
+// The stream validates the frozen launch model, not a hardcoded one: a
+// second run pinned to a different Claude model completes.
+func TestClaudeAdapter_CarriesFrozenModel(t *testing.T) {
+	h := newAdapterHarness(t)
+	ctx := context.Background()
+
+	const otherModel = "claude-sonnet-4-5-20250929"
+	const otherSession = "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e"
+	const otherRun = "run-adapter-2"
+
+	universeDoc := `{"claude_code_version":"2.1.278","tools":["Read","Glob","Grep","Bash","Write","WebSearch"]}`
+	if _, err := h.store.CreateRunWithProfile(ctx, storage.CreateRunWithProfileRequest{
+		OpID: "op-run-adapter-2", ControllerLease: "lease-adapter-2", RunID: otherRun,
+		Brief: "adapter model test", SourceRepoIdentity: "example/repo",
+		SourceCommit: "0123456789012345678901234567890123456789",
+		SourceTree:   "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+		Profile:      claudeProfile("sha256:"+sha256Sum(universeDoc), otherModel),
+	}); err != nil {
+		t.Fatalf("create second run: %v", err)
+	}
+	if _, err := h.store.CreateSession(ctx, "op-sess-adapter-2", "lease-adapter-2", storage.SessionRecord{
+		ID: otherSession, RunID: otherRun, Contributor: "claude", Role: "reviewer",
+		IsActiveContributor: true, State: "parked", Visibility: "reachable",
+	}); err != nil {
+		t.Fatalf("create second session: %v", err)
+	}
+
+	h.createSessionWithConfig(t, otherSession, otherModel, h.workspaceRootFor(t, otherRun, otherSession))
+
+	if _, err := h.adapter.Dispatch(ctx, adapter.TurnRef{SessionID: otherSession, TurnKey: "t-model"}, "prompt"); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	result := waitTerminal(t, h, adapter.TurnRef{SessionID: otherSession, TurnKey: "t-model"})
+	if result.Status != council.TurnCompleted || result.Output != "fixture response" {
+		t.Fatalf("frozen model must be carried into stream validation, got %+v", result)
+	}
+
+	wsRoot := h.workspaceRootFor(t, otherRun, otherSession)
+	invocations := fixtureArgLines(t, wsRoot)
+	if len(invocations) != 1 || argValue(invocations[0], "--model") != otherModel {
+		t.Fatalf("launch must pin the frozen model, got %v", invocations)
+	}
+}
+
+// ── Ambiguous write: durable uncertainty ────────────────────────────────
 
 // A stdin failure after the first transmitted byte is ambiguous: the
 // outcome is unknown, the first-byte boundary is persisted, the attempt
-// stays uncertain, and the single-flight slot is NOT released — the
-// native session is blocked until disposition.
-func TestClaudeAdapter_PostTransmissionFailureBlocksSlot(t *testing.T) {
+// stays uncertain, and the session is blocked from durable state.
+func TestClaudeAdapter_PostTransmissionFailureBlocksDurally(t *testing.T) {
 	h := newAdapterHarness(t)
 	ctx := context.Background()
 	h.createSession(t, string(h.sessionID))
@@ -443,13 +816,13 @@ func TestClaudeAdapter_PostTransmissionFailureBlocksSlot(t *testing.T) {
 		t.Fatal("first-byte transmission boundary must be persisted")
 	}
 
-	// The slot is retained: a second dispatch on the native session
-	// cannot acquire single-flight access.
-	blockedCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
-	defer cancel()
-	second, _ := h.adapter.Dispatch(blockedCtx, adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-second"}, "prompt")
-	if second.Status != adapter.DispatchRejected {
-		t.Fatalf("blocked session must reject the second dispatch, got %v (%s)", second.Status, second.Reason)
+	// The block derives from durable state: the next dispatch is
+	// rejected with the unresolved-attempt reason (the in-memory slot
+	// was released when active execution ended).
+	second, _ := h.adapter.Dispatch(ctx, adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-second"}, "prompt")
+	if second.Status != adapter.DispatchRejected ||
+		!strings.Contains(second.Reason, "unresolved attempt") {
+		t.Fatalf("blocked session must reject with the durable reason, got %v (%s)", second.Status, second.Reason)
 	}
 }
 
@@ -463,7 +836,7 @@ func TestClaudeAdapter_FailedTerminalMapping(t *testing.T) {
 	ctx := context.Background()
 	binding := h.createSession(t, string(h.sessionID))
 
-	writeKnob(t, h.wsRoot, ".claude-fixture", fixtureStream(h.wsRoot, binding.NativeSessionID,
+	writeKnob(t, h.wsRoot, ".claude-fixture", fixtureStream(h.wsRoot, binding.NativeSessionID, primaryModel,
 		fmt.Sprintf(`{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]},"session_id":%q}`, binding.NativeSessionID),
 		fmt.Sprintf(`{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":%q,"result":"reached max turns"}`, binding.NativeSessionID),
 	))
@@ -553,7 +926,7 @@ func TestClaudeAdapter_ObserveDetachAndCompletion(t *testing.T) {
 
 // Cancelling an unknown or completed turn reports CancelUnknown; a
 // mid-turn cancel terminates the process, leaves the attempt uncertain
-// without a result, and retains the slot.
+// without a result, and the session blocks from durable state.
 func TestClaudeAdapter_CancelSemantics(t *testing.T) {
 	h := newAdapterHarness(t)
 	ctx := context.Background()
@@ -592,11 +965,10 @@ func TestClaudeAdapter_CancelSemantics(t *testing.T) {
 		t.Fatal("cancelled turn has no verified result and must not be terminal")
 	}
 
-	// The slot is retained: the session is blocked until disposition.
-	blockedCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
-	defer cancel()
-	blocked, _ := h.adapter.Dispatch(blockedCtx, adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-next"}, "prompt")
-	if blocked.Status != adapter.DispatchRejected {
+	// The block derives from durable state.
+	blocked, _ := h.adapter.Dispatch(ctx, adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-next"}, "prompt")
+	if blocked.Status != adapter.DispatchRejected ||
+		!strings.Contains(blocked.Reason, "unresolved attempt") {
 		t.Fatalf("blocked session must reject dispatch after cancel, got %v (%s)", blocked.Status, blocked.Reason)
 	}
 }
@@ -604,11 +976,9 @@ func TestClaudeAdapter_CancelSemantics(t *testing.T) {
 // ── Reconcile four-state ────────────────────────────────────────────────
 
 // Reconcile over durable evidence: unknown refs are Uncertain (never
-// DefinitivelyMissing by absence), a live in-process run is
-// reachable-active, a verified terminal is committed, and retained
-// start_failed rows are positive pre-start evidence for
-// DefinitivelyMissing.
-func TestClaudeAdapter_ReconcileFourStates(t *testing.T) {
+// DefinitivelyMissing by absence) and a live in-process run is
+// reachable-active.
+func TestClaudeAdapter_ReconcileActiveAndUnknownStates(t *testing.T) {
 	h := newAdapterHarness(t)
 	ctx := context.Background()
 
@@ -647,6 +1017,7 @@ func TestClaudeAdapter_ReconcileFourStates(t *testing.T) {
 }
 
 // The terminal and missing reconciliation legs run on their own
+// session so the uncertain legs above do not block them.
 func TestClaudeAdapter_ReconcileTerminalAndMissingStates(t *testing.T) {
 	h := newAdapterHarness(t)
 	ctx := context.Background()
@@ -690,9 +1061,4 @@ func TestClaudeAdapter_ReconcileTerminalAndMissingStates(t *testing.T) {
 		rec.Reachability != council.VisibilityReachable {
 		t.Fatalf("start_failed evidence must reconcile definitively-missing, got %+v", rec)
 	}
-}
-
-func sha256Sum(data string) string {
-	sum := sha256.Sum256([]byte(data))
-	return fmt.Sprintf("%x", sum)
 }

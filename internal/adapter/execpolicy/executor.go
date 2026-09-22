@@ -61,6 +61,10 @@ type LaunchRequest struct {
 	// UniverseTools carries the pinned native tool universe for parser
 	// drift checks (AC-008 §3.8). Set by the Claude launch source.
 	UniverseTools []string
+	// Model is the frozen native model identity the launch pins via
+	// --model (AC-008 §3.7). The stream parser validates the init
+	// event's model against it. Set by the Claude launch source.
+	Model string
 }
 
 // CapabilityChecker verifies whether the host environment supports required isolation capabilities.
