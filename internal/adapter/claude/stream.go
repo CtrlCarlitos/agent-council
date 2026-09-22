@@ -1,0 +1,419 @@
+package claude
+
+// NDJSON stream parser and §3.9 failure state machine (AC-008 spec):
+// one pass over the process stdout producing typed events and a terminal
+// outcome. Any started process without exactly one verified terminal
+// result remains Uncertain.
+
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/CtrlCarlitos/agent-council/internal/storage"
+)
+
+// Stream event types surfaced to observer taps.
+type StreamEventType string
+
+const (
+	EventProgress      StreamEventType = "progress"
+	EventToolRequested StreamEventType = "tool_requested"
+	EventToolDenied    StreamEventType = "tool_denied"
+	EventTerminal      StreamEventType = "terminal"
+)
+
+// Denial classes (spec §3.8): each maps to a distinct verified native
+// denial text.
+const (
+	DenialApprovalDenied string = "approval_denied"
+	DenialGuardrail      string = "guardrail_denied"
+	DenialToolDisabled   string = "tool_disabled"
+)
+
+// StreamConfig carries the frozen expectations the stream is validated
+// against.
+type StreamConfig struct {
+	WorkspaceRoot   string
+	ExpectedVersion string // probed CLI version from the manifest
+	ExpectedModel   string // frozen model alias from the harness spec
+	Manifest        storage.ToolkitManifest
+	UniverseTools   []string // pinned native tool universe
+	MaxLineBytes    int
+	MaxTotalBytes   int
+}
+
+// StreamEvent is one observable event on the turn stream.
+type StreamEvent struct {
+	Type        StreamEventType
+	DeniedClass string // for ToolDenied: approval_denied|guardrail_denied|tool_disabled
+	ToolName    string
+	Text        string
+}
+
+// InitReport is the toolkit evidence captured from system/init plus the
+// hooks observed on the stream.
+type InitReport struct {
+	SessionID      string
+	Version        string
+	Model          string
+	PermissionMode string
+	Cwd            string
+	Tools          []string
+	Skills         []string
+	Plugins        []string
+	HooksSeen      []string
+	APIKeySource   string
+}
+
+// StreamOutcome is the parser's terminal verdict for one invocation.
+type StreamOutcome struct {
+	Terminal     bool
+	Completed    bool
+	ResultText   string
+	SessionID    string
+	Poisoned     bool
+	PoisonReason string
+	Init         *InitReport
+}
+
+// ParsedToolResult is a structured tool_result from the native stream.
+type ParsedToolResult struct {
+	ToolName string
+	IsError  bool
+	Text     string
+}
+
+// nativeEvent is the raw per-line envelope.
+type nativeEvent struct {
+	Type      string          `json:"type"`
+	Subtype   string          `json:"subtype"`
+	SessionID string          `json:"session_id"`
+	HookName  string          `json:"hook_name"`
+	Cwd       string          `json:"cwd"`
+	Version   string          `json:"claude_code_version"`
+	Model     string          `json:"model"`
+	PermMode  string          `json:"permissionMode"`
+	APIKeySrc string          `json:"apiKeySource"`
+	Tools     []string        `json:"tools"`
+	Skills    []string        `json:"skills"`
+	Plugins   []pluginRef     `json:"plugins"`
+	Message   messageEnvelope `json:"message"`
+	Result    string          `json:"result"`
+	IsError   bool            `json:"is_error"`
+}
+
+type pluginRef struct {
+	Name string `json:"name"`
+}
+
+// messageEnvelope covers assistant and user messages.
+type messageEnvelope struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+type contentBlock struct {
+	Type    string          `json:"type"`
+	Text    string          `json:"text"`
+	Name    string          `json:"name"`
+	IsError bool            `json:"is_error"`
+	Content json.RawMessage `json:"content"`
+}
+
+// ParseStream reads one invocation's NDJSON stdout, validates it against
+// the frozen expectations, and returns the terminal outcome. onEvent is
+// called for observable events (may be nil). A nil error does NOT imply
+// success: inspect the outcome.
+func ParseStream(r io.Reader, cfg StreamConfig, onEvent func(StreamEvent)) (StreamOutcome, error) {
+	out := StreamOutcome{}
+	emit := func(ev StreamEvent) {
+		if onEvent != nil {
+			onEvent(ev)
+		}
+	}
+
+	var initReport *InitReport
+	var hooksSeen []string
+	resultCount := 0
+	totalBytes := 0
+	reader := bufio.NewReader(r)
+
+	var tornTail string
+	for {
+		line, more, readErr := readBoundedLine(reader, cfg.MaxLineBytes, &totalBytes)
+		if totalBytes > cfg.MaxTotalBytes {
+			out.Poisoned, out.PoisonReason = true, "stream exceeded total byte budget"
+			return out, nil
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			out.Poisoned, out.PoisonReason = true, fmt.Sprintf("stream read: %v", readErr)
+			return out, nil
+		}
+		if !more {
+			// Unterminated final line: torn tail. Tolerated — but only as
+			// a non-evidence tail. Parsed content from it is discarded.
+			if utf8.ValidString(line) {
+				tornTail = line
+			}
+			break
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+
+		var ev nativeEvent
+		if err := json.Unmarshal([]byte(trimmed), &ev); err != nil {
+			out.Poisoned, out.PoisonReason = true, fmt.Sprintf("malformed NDJSON mid-stream: %v", err)
+			return out, nil
+		}
+
+		switch ev.Type {
+		case "system":
+			switch ev.Subtype {
+			case "init":
+				rep, reason := validateInit(ev, cfg, hooksSeen)
+				if reason != "" {
+					out.Poisoned, out.PoisonReason = true, reason
+					return out, nil
+				}
+				initReport = rep
+				out.SessionID = rep.SessionID
+			case "hook_started":
+				if ev.HookName != "" {
+					hooksSeen = append(hooksSeen, ev.HookName)
+				}
+			}
+		case "assistant":
+			var blocks []contentBlock
+			if len(ev.Message.Content) > 0 {
+				if err := json.Unmarshal(ev.Message.Content, &blocks); err != nil {
+					out.Poisoned, out.PoisonReason = true, fmt.Sprintf("malformed assistant content: %v", err)
+					return out, nil
+				}
+				for _, b := range blocks {
+					if b.Type == "text" && b.Text != "" {
+						emit(StreamEvent{Type: EventProgress, Text: b.Text})
+					}
+					if b.Type == "tool_use" {
+						emit(StreamEvent{Type: EventToolRequested, ToolName: b.Name})
+					}
+				}
+			}
+		case "user":
+			var blocks []contentBlock
+			if len(ev.Message.Content) > 0 {
+				if err := json.Unmarshal(ev.Message.Content, &blocks); err != nil {
+					out.Poisoned, out.PoisonReason = true, fmt.Sprintf("malformed user content: %v", err)
+					return out, nil
+				}
+				for _, b := range blocks {
+					if b.Type != "tool_result" {
+						continue
+					}
+					if b.IsError {
+						if class, isDenial := classifyDenial(textOf(b.Content)); isDenial {
+							emit(StreamEvent{Type: EventToolDenied, DeniedClass: class, Text: textOf(b.Content)})
+							continue
+						}
+						emit(StreamEvent{Type: EventProgress, Text: "tool error: " + textOf(b.Content)})
+					}
+				}
+			}
+		case "result":
+			resultCount++
+			if resultCount > 1 {
+				out.Poisoned, out.PoisonReason = true, "multiple result events (protocol drift)"
+				return out, nil
+			}
+			out.Terminal = true
+			out.SessionID = ev.SessionID
+			out.ResultText = ev.Result
+			out.Completed = !ev.IsError && ev.Subtype == "success"
+		case "rate_limit_event", "system_thinking":
+			// advisory; ignored
+		}
+
+		if readErr != nil {
+			break
+		}
+	}
+
+	if initReport == nil {
+		out.Poisoned, out.PoisonReason = true, "stream ended without a system/init event"
+		return out, nil
+	}
+	out.Init = initReport
+	out.Init.HooksSeen = hooksSeen
+	if tornTail != "" {
+		// Diagnostics only; never evidence.
+		out.PoisonReason = ""
+	}
+	return out, nil
+}
+
+// validateInit checks the init event against the frozen expectations.
+// Returns a toolkit-evidence poison reason on mismatch.
+func validateInit(ev nativeEvent, cfg StreamConfig, hooksSeen []string) (*InitReport, string) {
+	rep := &InitReport{
+		SessionID:      ev.SessionID,
+		Version:        ev.Version,
+		Model:          ev.Model,
+		PermissionMode: ev.PermMode,
+		Cwd:            ev.Cwd,
+		Tools:          ev.Tools,
+		Skills:         ev.Skills,
+		APIKeySource:   ev.APIKeySrc,
+	}
+	for _, p := range ev.Plugins {
+		rep.Plugins = append(rep.Plugins, p.Name)
+	}
+	rep.HooksSeen = hooksSeen
+
+	if ev.Cwd != cfg.WorkspaceRoot {
+		return rep, fmt.Sprintf("init cwd %q does not match the workspace root %q", ev.Cwd, cfg.WorkspaceRoot)
+	}
+	if ev.Version != cfg.ExpectedVersion {
+		return rep, fmt.Sprintf("init claude_code_version %q does not match the probed version %q", ev.Version, cfg.ExpectedVersion)
+	}
+	if !strings.Contains(strings.ToLower(ev.Model), strings.ToLower(cfg.ExpectedModel)) {
+		return rep, fmt.Sprintf("init model %q does not correspond to the frozen model %q", ev.Model, cfg.ExpectedModel)
+	}
+	if ev.PermMode != "" && ev.PermMode != "default" {
+		return rep, fmt.Sprintf("init permissionMode %q is not the native default", ev.PermMode)
+	}
+
+	universe := make(map[string]struct{}, len(cfg.UniverseTools))
+	for _, tool := range cfg.UniverseTools {
+		universe[tool] = struct{}{}
+	}
+	for _, tool := range ev.Tools {
+		if _, known := universe[tool]; !known {
+			return rep, fmt.Sprintf("init reports unknown tool %q (not in the pinned universe)", tool)
+		}
+	}
+	for _, denied := range cfg.Manifest.DeniedComplement {
+		for _, tool := range ev.Tools {
+			if tool == denied {
+				return rep, fmt.Sprintf("init reports denied tool %q as enabled", denied)
+			}
+		}
+	}
+	for _, skill := range cfg.Manifest.ExpectedSkills {
+		found := false
+		for _, s := range ev.Skills {
+			if s == skill {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return rep, fmt.Sprintf("init is missing expected skill %q", skill)
+		}
+	}
+	for _, plugin := range cfg.Manifest.ExpectedPlugins {
+		found := false
+		for _, p := range rep.Plugins {
+			if p == plugin {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return rep, fmt.Sprintf("init is missing expected plugin %q", plugin)
+		}
+	}
+	for _, hook := range cfg.Manifest.ExpectedHooks {
+		found := false
+		for _, h := range hooksSeen {
+			if h == hook {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return rep, fmt.Sprintf("init stream is missing expected hook %q", hook)
+		}
+	}
+	return rep, ""
+}
+
+// classifyDenial maps structured denial texts to the three denial
+// classes. Returns ("", false) for genuine tool errors.
+func classifyDenial(text string) (string, bool) {
+	lower := strings.ToLower(text)
+	switch {
+	case strings.Contains(lower, "requested permissions") && strings.Contains(lower, "haven't granted"):
+		return DenialApprovalDenied, true
+	case strings.Contains(lower, "guardrail denied") ||
+		strings.Contains(lower, "pretooluse:") && strings.Contains(lower, "hook error"):
+		return DenialGuardrail, true
+	case strings.Contains(lower, "no such tool available") ||
+		strings.Contains(lower, "disabled for this session"):
+		return DenialToolDisabled, true
+	default:
+		return "", false
+	}
+}
+
+func textOf(content json.RawMessage) string {
+	// content may be a string or an array of typed blocks.
+	var asText string
+	if err := json.Unmarshal(content, &asText); err == nil {
+		return asText
+	}
+	var blocks []contentBlock
+	if err := json.Unmarshal(content, &blocks); err == nil {
+		parts := make([]string, 0, len(blocks))
+		for _, b := range blocks {
+			if b.Text != "" {
+				parts = append(parts, b.Text)
+			}
+		}
+		return strings.Join(parts, " ")
+	}
+	return string(content)
+}
+
+// readBoundedLine reads one newline-terminated line enforcing the
+// per-line and total byte budgets. A torn final line (EOF without \n)
+// is returned as-is: the parse step tolerates or poisons it, per §3.9.
+// The returned hasMore flag reports whether more stream remains.
+func readBoundedLine(r *bufio.Reader, maxLine int, total *int) (line string, more bool, err error) {
+	var acc []byte
+	for {
+		chunk, err := r.ReadByte()
+		if err != nil {
+			if err == io.EOF {
+				if len(acc) > 0 {
+					*total += len(acc)
+					if len(acc) > maxLine {
+						return "", false, fmt.Errorf("final line exceeds %d bytes", maxLine)
+					}
+					return string(acc), false, nil
+				}
+				return "", false, io.EOF
+			}
+			return "", false, err
+		}
+		acc = append(acc, chunk)
+		*total++
+		if len(acc) > maxLine {
+			return "", false, fmt.Errorf("line exceeds %d bytes", maxLine)
+		}
+		if chunk == '\n' {
+			return strings.TrimSuffix(string(acc), "\n"), true, nil
+		}
+	}
+}
+
+// utf8 is used for torn-tail validity.
+var _ = utf8.RuneLen
