@@ -33,6 +33,19 @@ func sha256Hex(data []byte) string {
 
 // TemplateDigest computes ctmpl-v1:sha256:<hex> over the template tree.
 func TemplateDigest(dir string) (string, error) {
+	return TemplateDigestExcluding(dir, nil)
+}
+
+// TemplateDigestExcluding computes ctmpl-v1:sha256:<hex> over the tree,
+// skipping any top-level directory named in excludeRel. The §3.6
+// runtime transcript subtree (projects/) lives inside the per-session
+// config root and is owned by the transcript trust model, so the
+// frozen-digest comparison of a materialized root excludes it.
+func TemplateDigestExcluding(dir string, excludeRel []string) (string, error) {
+	excluded := make(map[string]struct{}, len(excludeRel))
+	for _, rel := range excludeRel {
+		excluded[rel] = struct{}{}
+	}
 	type entry struct {
 		rel  string
 		data []byte
@@ -44,14 +57,22 @@ func TemplateDigest(dir string) (string, error) {
 		if err != nil {
 			return err
 		}
+		if d.IsDir() {
+			if path != dir {
+				if rel, rerr := filepath.Rel(dir, path); rerr == nil {
+					top, _, _ := strings.Cut(filepath.ToSlash(rel), "/")
+					if _, skip := excluded[top]; skip {
+						return filepath.SkipDir
+					}
+				}
+			}
+			return nil
+		}
 		if d.Type()&fs.ModeSymlink != 0 {
 			return fmt.Errorf("template contains symlink: %s", path)
 		}
-		if !d.Type().IsRegular() && !d.IsDir() {
+		if !d.Type().IsRegular() {
 			return fmt.Errorf("template contains non-regular file: %s", path)
-		}
-		if d.IsDir() {
-			return nil
 		}
 		rel, err := filepath.Rel(dir, path)
 		if err != nil {

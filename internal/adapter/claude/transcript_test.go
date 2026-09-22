@@ -114,8 +114,23 @@ func TestInspectTranscript_GroupReadableRejected(t *testing.T) {
 	if err := os.Chmod(p, 0o640); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
-	if _, err := InspectTranscript(p); err == nil || !strings.Contains(err.Error(), "group or others") {
+	if _, err := InspectTranscript(p); err == nil || !strings.Contains(err.Error(), "0600") {
 		t.Fatalf("group-readable transcript must be rejected, got %v", err)
+	}
+}
+
+func TestInspectTranscript_NonStandardOwnerModesRejected(t *testing.T) {
+	dir := t.TempDir()
+	for _, mode := range []os.FileMode{0o000, 0o100, 0o700, 0o400} {
+		p := filepath.Join(dir, "bound.jsonl")
+		os.WriteFile(p, []byte(`{"type":"user","message":{"role":"user","content":"x"}}`+"\n"), 0o600)
+		if err := os.Chmod(p, mode); err != nil {
+			t.Fatalf("chmod %o: %v", mode, err)
+		}
+		if _, err := InspectTranscript(p); err == nil || !strings.Contains(err.Error(), "0600") {
+			t.Fatalf("mode %o must be rejected as non-0600, got %v", mode, err)
+		}
+		os.Remove(p)
 	}
 }
 

@@ -142,6 +142,11 @@ func sessionUUID() (string, error) {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }
 
+// materializeConfigRootFn indirection exists so contract tests can
+// prove the creation reservation runs materialization exactly once per
+// concurrent creation burst.
+var materializeConfigRootFn = MaterializeConfigRoot
+
 func (a *ClaudeAdapter) acquireSlot(ctx context.Context, nativeID, owner string) error {
 	for {
 		a.mu.Lock()
@@ -229,22 +234,24 @@ func (a *ClaudeAdapter) CreateSession(ctx context.Context, req adapter.CreateSes
 	a.createMu.Unlock()
 
 	binding, digest, err := a.createBinding(ctx, req)
-	if err != nil {
-		// The failed reservation is removed so a LATER caller may
-		// retry; everyone who waited on THIS call shares the failure.
-		a.createMu.Lock()
-		if a.creations[req.SessionID] == call {
-			delete(a.creations, req.SessionID)
-		}
-		a.createMu.Unlock()
-	}
 	call.binding = binding
 	call.err = err
 	call.contributor = req.Contributor
 	call.model = req.Config.Model
 	call.workspace = req.Config.WorkspaceRoot
 	call.templateDigest = digest
+	// Publish the outcome BEFORE retiring a failed reservation: a
+	// caller arriving in the retirement window finds this call, sees
+	// done closed, and shares the result instead of rerunning
+	// materialization concurrently.
 	close(call.done)
+	if err != nil {
+		a.createMu.Lock()
+		if a.creations[req.SessionID] == call {
+			delete(a.creations, req.SessionID)
+		}
+		a.createMu.Unlock()
+	}
 	return binding, err
 }
 
@@ -290,7 +297,7 @@ func (a *ClaudeAdapter) createBinding(ctx context.Context, req adapter.CreateSes
 	if err != nil {
 		return adapter.SessionBinding{}, "", err
 	}
-	_, materializedDigest, err := MaterializeConfigRoot(a.templateDir, a.configBase, runID, string(req.SessionID))
+	_, materializedDigest, err := materializeConfigRootFn(a.templateDir, a.configBase, runID, string(req.SessionID))
 	if err != nil {
 		return adapter.SessionBinding{}, "", fmt.Errorf("materialize config root: %w", err)
 	}
@@ -370,6 +377,18 @@ func (a *ClaudeAdapter) ResumeSession(ctx context.Context, binding adapter.Sessi
 	}
 	if st, err := os.Stat(stored.ConfigRoot); err != nil || !st.IsDir() {
 		return fmt.Errorf("per-session config root %s is missing", stored.ConfigRoot)
+	}
+	// The MATERIALIZED root itself must still match the frozen
+	// template: mutation of the copied tree is detected here. The §3.6
+	// runtime transcript subtree is excluded — transcripts are trusted
+	// through their own inspection and correlation model.
+	rootDigest, err := TemplateDigestExcluding(stored.ConfigRoot, []string{"projects"})
+	if err != nil {
+		return fmt.Errorf("materialized config root %s failed digest: %w", stored.ConfigRoot, err)
+	}
+	if stored.TemplateDigest != rootDigest {
+		return &ErrSessionConfigMismatch{SessionID: binding.SessionID, Field: "config_root_digest",
+			Want: stored.TemplateDigest, Have: rootDigest}
 	}
 	if stored.Materialized {
 		path, err := TranscriptPath(stored.ConfigRoot, stored.Workspace, stored.NativeID)

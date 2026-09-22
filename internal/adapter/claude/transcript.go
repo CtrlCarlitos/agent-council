@@ -123,8 +123,11 @@ func InspectTranscript(path string) (*TranscriptInspection, error) {
 	if err := verifyTranscriptOwnership(st); err != nil {
 		return nil, err
 	}
-	if st.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("bound transcript %s must not be readable by group or others (mode %o)", path, st.Mode().Perm())
+	// §3.6: a regular transcript file with 0600 semantics — owner
+	// read/write exactly, no group or other access, no executable or
+	// write-only variants.
+	if st.Mode().Perm() != 0o600 {
+		return nil, fmt.Errorf("bound transcript %s must have 0600 permissions, got %o", path, st.Mode().Perm())
 	}
 	if st.Size() > MaxTranscriptFileBytes {
 		return nil, fmt.Errorf("bound transcript %s exceeds the %d-byte file bound", path, MaxTranscriptFileBytes)
@@ -233,16 +236,19 @@ func userEntryText(msg struct {
 }
 
 // CorrelateTranscriptPrompt proves THIS transcript is THIS session's
-// (§3.4 step 3): some recorded attempt of this session must have a
-// user entry in the transcript whose prompt text hashes — under that
-// attempt's identity — to the attempt's stored prompt digest.
+// (§3.4 step 3): an AUTHORITATIVE attempt of this session — explicitly
+// accepted (protected mode) or carrying a verified completed terminal —
+// must have a user entry in the transcript whose prompt text hashes,
+// under that attempt's identity, to the attempt's stored prompt
+// digest. Entries belonging to uncertain or missing attempts are never
+// authoritative.
 func CorrelateTranscriptPrompt(path string, attempts []*storage.ClaudeTurnAttempt) error {
 	ins, err := InspectTranscript(path)
 	if err != nil {
 		return err
 	}
 	for _, attempt := range attempts {
-		if strings.TrimSpace(attempt.PromptDigest) == "" {
+		if !attemptPromptAuthoritative(attempt) {
 			continue
 		}
 		for _, text := range ins.UserTexts {
@@ -253,4 +259,18 @@ func CorrelateTranscriptPrompt(path string, attempts []*storage.ClaudeTurnAttemp
 	}
 	return fmt.Errorf(
 		"bound transcript %s carries no accepted user entry matching any recorded prompt digest of this session", path)
+}
+
+// attemptPromptAuthoritative reports whether the attempt's recorded
+// prompt digest is trustworthy session evidence: only an explicitly
+// accepted attempt (protected mode) or one with a verified completed
+// terminal result qualifies.
+func attemptPromptAuthoritative(a *storage.ClaudeTurnAttempt) bool {
+	if a == nil || strings.TrimSpace(a.PromptDigest) == "" {
+		return false
+	}
+	if a.Accepted != nil && *a.Accepted {
+		return true
+	}
+	return a.Terminal && a.ObservedStatus == "completed"
 }

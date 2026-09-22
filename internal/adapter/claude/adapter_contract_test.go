@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -482,11 +483,17 @@ func TestClaudeAdapter_ConcurrentCreationFailureShared(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create failing session record: %v", err)
 	}
-	// Pre-create the config root so materialization fails closed.
-	existing := ConfigRootPath(h.configBase, failRun, failSession)
-	if err := os.MkdirAll(existing, 0o700); err != nil {
-		t.Fatalf("pre-create config root: %v", err)
+	// Pre-create the config root so materialization fails closed, and
+	// instrument materialization to prove ONE creation attempt is
+	// shared by every concurrent caller.
+	var matCalls atomic.Int32
+	origMaterialize := materializeConfigRootFn
+	materializeConfigRootFn = func(templateDir, base, runID, sessionID string) (string, string, error) {
+		matCalls.Add(1)
+		time.Sleep(100 * time.Millisecond)
+		return "", "", fmt.Errorf("injected materialization failure for %s", sessionID)
 	}
+	defer func() { materializeConfigRootFn = origMaterialize }()
 
 	const n = 3
 	var wg sync.WaitGroup
@@ -506,21 +513,29 @@ func TestClaudeAdapter_ConcurrentCreationFailureShared(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+	if got := matCalls.Load(); got != 1 {
+		t.Fatalf("concurrent creation must run materialization exactly once, got %d attempts", got)
+	}
 	for i := 0; i < n; i++ {
-		if errs[i] == nil || !strings.Contains(errs[i].Error(), "materialize config root") {
-			t.Fatalf("concurrent caller %d must share the creation failure, got %v", i, errs[i])
+		if errs[i] == nil {
+			t.Fatalf("concurrent caller %d must fail", i)
+		}
+		if errs[i] != errs[0] {
+			t.Fatalf("concurrent caller %d must share the SAME typed failure instance, got %v vs %v", i, errs[i], errs[0])
 		}
 	}
 
 	// A later caller (after the failed reservation was retired) retries
-	// independently and receives the same deterministic failure — the
-	// stale typed failure is not replayed as cached success or error.
+	// independently: a second materialization attempt runs.
 	if _, err := h.adapter.CreateSession(ctx, adapter.CreateSessionRequest{
 		SessionID:   adapter.SessionID(failSession),
 		Contributor: "claude",
 		Config:      adapter.SessionConfig{WorkspaceRoot: h.wsRoot, Model: primaryModel},
 	}); err == nil || !strings.Contains(err.Error(), "materialize config root") {
 		t.Fatalf("independent retry must fail on its own while the root exists, got %v", err)
+	}
+	if got := matCalls.Load(); got != 2 {
+		t.Fatalf("the independent retry must run its own materialization attempt, got %d total", got)
 	}
 }
 
@@ -620,13 +635,25 @@ func TestClaudeAdapter_ResumeSessionInspection(t *testing.T) {
 	}
 
 	// Materialized binding whose transcript carries the accepted user
-	// entry correlating with the recorded attempt's prompt digest.
+	// entry correlating with the recorded attempt's prompt digest. An
+	// UNCERTAIN attempt is never authoritative: even a perfectly
+	// matching user entry must not validate resume.
+	if err := h.store.InsertClaudeTurnAttempt(ctx, storage.ClaudeTurnAttempt{
+		AttemptID: "att_uncertain", SessionID: string(h.sessionID), TurnKey: "t-uncertain",
+		NativeID: stored.NativeID, PromptDigest: PromptDigest("uncertain prompt", "att_uncertain"),
+		TranscriptProtection: "advisory",
+	}); err != nil {
+		t.Fatalf("insert uncertain attempt: %v", err)
+	}
 	if err := h.store.InsertClaudeTurnAttempt(ctx, storage.ClaudeTurnAttempt{
 		AttemptID: "att_resume", SessionID: string(h.sessionID), TurnKey: "t-resume",
 		NativeID: stored.NativeID, PromptDigest: PromptDigest("the resume prompt", "att_resume"),
 		TranscriptProtection: "advisory",
 	}); err != nil {
 		t.Fatalf("insert attempt: %v", err)
+	}
+	if err := h.store.SetClaudeAttemptTerminal(ctx, "att_resume", "completed", "ok result", "{}"); err != nil {
+		t.Fatalf("make attempt authoritative: %v", err)
 	}
 	path, err := TranscriptPath(stored.ConfigRoot, stored.Workspace, stored.NativeID)
 	if err != nil {
@@ -643,9 +670,27 @@ func TestClaudeAdapter_ResumeSessionInspection(t *testing.T) {
 			t.Fatalf("write transcript: %v", err)
 		}
 	}
+	writeTranscript("uncertain prompt")
+	if err := h.adapter.ResumeSession(ctx, binding); err == nil ||
+		!strings.Contains(err.Error(), "matching any recorded prompt digest") {
+		t.Fatalf("an uncertain attempt's entry must not validate resume, got %v", err)
+	}
+
 	writeTranscript("the resume prompt")
 	if err := h.adapter.ResumeSession(ctx, binding); err != nil {
 		t.Fatalf("materialized resume with correlating transcript must succeed: %v", err)
+	}
+
+	// Mutation of the MATERIALIZED root is detected: the copied tree
+	// must still match the frozen template digest (the §3.6 projects/
+	// runtime subtree is excluded from that comparison).
+	writeKnob(t, stored.ConfigRoot, "injected.txt", "mutation")
+	if err := h.adapter.ResumeSession(ctx, binding); !asConfigMismatch(err, nil) {
+		t.Fatalf("mutated config root must fail the frozen digest, got %v", err)
+	}
+	os.Remove(filepath.Join(stored.ConfigRoot, "injected.txt"))
+	if err := h.adapter.ResumeSession(ctx, binding); err != nil {
+		t.Fatalf("restored config root must resume cleanly: %v", err)
 	}
 
 	// A user entry that matches no recorded prompt digest fails the
