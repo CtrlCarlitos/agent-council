@@ -88,9 +88,9 @@ stdin → parse) but has these P1 gaps:
    Uncertain (not DefinitivelyMissing); failed terminals ⇒ TurnFailed.
 7. **Stderr drained twice concurrently** — drain exactly once, from
    process start.
-8. **Observe panics on absent map entry** — must handle gracefully.
-9. **Cancel reports confirmed** — must report CancelUnknown since
-   termination produces no verified terminal result.
+8. **Observe/Cancel need test coverage** — Observe handles absent
+   map entries and Cancel returns CancelUnknown (both implemented);
+   add regression tests but do not rewrite.
 10. **Terminal-persistence failure releases the slot** — must retain
     the slot (outcome is uncertain, not resolvable).
 
@@ -116,7 +116,8 @@ Missing test coverage:
    release slot only on terminal or pre-acceptance rejection.
 3. Fix runTurn: drain stderr once, use out.Completed to select
    TurnCompleted vs TurnFailed, retain slot on non-terminal outcomes.
-4. Fix Observe nil-check, Cancel unknown return.
+4. Add regression tests for Observe nil-check and Cancel
+   CancelUnknown (already implemented, insufficiently tested).
 5. Write adapter contract tests (first-vs-resume, ambiguous-write,
    failed terminal, detach, cancel, reconcile).
 6. Write storage crash-boundary reopen tests if not already present.
