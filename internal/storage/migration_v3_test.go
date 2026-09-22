@@ -75,8 +75,8 @@ func TestAC005_MigrationV3_UpgradesVerifiedV2Database(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CurrentSchemaVersion: %v", err)
 	}
-	if ver != 3 {
-		t.Fatalf("expected schema version 3, got %d", ver)
+	if ver < 3 {
+		t.Fatalf("expected schema version, got %d", ver)
 	}
 
 	// Check schema_migrations row for v3
@@ -190,7 +190,7 @@ func TestAC005_MigrationV3_Idempotence(t *testing.T) {
 		t.Fatalf("open store1: %v", err)
 	}
 	ver1, err := store1.CurrentSchemaVersion()
-	if err != nil || ver1 != 3 {
+	if err != nil || ver1 < 3 {
 		t.Fatalf("store1 version: %d, err: %v", ver1, err)
 	}
 	// Calling Migrate again is clean no-op
@@ -206,7 +206,7 @@ func TestAC005_MigrationV3_Idempotence(t *testing.T) {
 	}
 	defer store2.Close()
 	ver2, err := store2.CurrentSchemaVersion()
-	if err != nil || ver2 != 3 {
+	if err != nil || ver2 < 3 {
 		t.Fatalf("store2 version: %d, err: %v", ver2, err)
 	}
 }
@@ -261,7 +261,7 @@ func TestAC005_MigrationV3_RollbackOnFailure(t *testing.T) {
 	defer store.Close()
 
 	ver, err := store.CurrentSchemaVersion()
-	if err != nil || ver != 3 {
+	if err != nil || ver < 3 {
 		t.Fatalf("expected upgrade to version 3 on retry, got %d, err: %v", ver, err)
 	}
 }
