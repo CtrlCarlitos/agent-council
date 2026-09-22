@@ -2,10 +2,10 @@
 
 package service
 
-// POSIX subprocess fixture: Probe end-to-end through the configured
-// scratch root with a controlled stub binary. The portable validation
-// evidence (containment, permissions, symlink rejections) lives in
-// probe_scratch_test.go with no build tags.
+// POSIX construction-level and subprocess evidence for the probe scratch
+// root: service construction enforces the configured root, and Probe
+// runs end-to-end against a controlled stub binary. The portable
+// validation evidence lives in probe_scratch_test.go.
 
 import (
 	"context"
@@ -20,6 +20,40 @@ import (
 
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
+
+// Construction through the service must enforce the configured root:
+// a missing root fails closed at NewServerWithAdapter.
+func TestProbeScratchRoot_ConstructionRequiresRoot(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	wsBase := filepath.Join(dir, "workspaces")
+	for _, d := range []string{stateDir, wsBase} {
+		if err := os.MkdirAll(d, 0700); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	store, err := storage.Open(storage.StoreOptions{StateDir: stateDir})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	lock, lockErr := AcquireServiceLock(stateDir)
+	if lockErr != nil {
+		t.Fatalf("lock: %v", lockErr)
+	}
+	t.Cleanup(func() { _ = lock.Release() })
+
+	cfg := ServerConfig{
+		StateDir:           stateDir,
+		InstanceID:         "inst-probe-scratch-construction",
+		AuthToken:          "tok",
+		WorkspaceBaseDir:   wsBase,
+		OpenCodeBinaryPath: "opencode",
+	}
+	if _, err := NewServerWithAdapter(store, lock, cfg, nil); err == nil {
+		t.Fatal("construction without a configured probe scratch root must fail")
+	}
+}
 
 // The configured scratch root must be usable end-to-end: construction
 // through the production wiring path, then Probe against a controlled
