@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/execpolicy"
+	"github.com/CtrlCarlitos/agent-council/internal/adapter/opencode"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/workspace"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
@@ -23,6 +25,29 @@ type ServerConfig struct {
 	InstanceID       string
 	AuthToken        string
 	WorkspaceBaseDir string
+	// OpenCodeProbeProfile is the operator-approved canonical profile the
+	// OpenCode capability probe launches carry. Required when
+	// OpenCodeBinaryPath is set: the probe template fails closed without
+	// it.
+	OpenCodeProbeProfile storage.CanonicalProfile
+
+	// OpenCodeIdleGrace, when positive, configures how long the OpenCode
+	// adapter keeps a contributor server alive after its last terminal
+	// turn before parking it. Zero uses the adapter default.
+	OpenCodeIdleGrace time.Duration
+
+	// OpenCodeProbeScratchRoot is the operator-provisioned directory for
+	// probe scratch directories. Required when OpenCodeBinaryPath is set;
+	// it must lie outside both StateDir and WorkspaceBaseDir. The service
+	// creates it with operator-only permissions (0700) and tightens a
+	// pre-provisioned directory to the same mode.
+	OpenCodeProbeScratchRoot string
+
+	// OpenCodeBinaryPath, when set, enables the OpenCode persistent
+	// contributor adapter via production seams backed by the storage
+	// store and AC-005 workspace manager. Empty means no OpenCode
+	// adapter.
+	OpenCodeBinaryPath string
 }
 
 type ReadinessResponse struct {
@@ -73,6 +98,41 @@ func NewServer(store *storage.Store, lock *ServiceLock, cfg ServerConfig) (*Serv
 }
 
 func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerConfig, adp adapter.Adapter) (*Server, error) {
+	// Create shared service dependencies once.
+	var wm *workspace.WorkspaceManager
+	if cfg.WorkspaceBaseDir != "" {
+		var err error
+		wm, err = workspace.NewWorkspaceManager(cfg.StateDir, cfg.WorkspaceBaseDir)
+		if err != nil {
+			return nil, fmt.Errorf("workspace manager: %w", err)
+		}
+	}
+	pe := execpolicy.New()
+
+	// If no adapter is provided but OpenCode is configured, construct the
+	// production OpenCode adapter with fail-closed seams backed by the same
+	// workspace manager and policy executor the service uses.
+	if adp == nil && strings.TrimSpace(cfg.OpenCodeBinaryPath) != "" {
+		scratchRoot, scratchErr := resolveOpenCodeProbeScratchRoot(cfg)
+		if scratchErr != nil {
+			return nil, fmt.Errorf("OpenCode probe scratch root: %w", scratchErr)
+		}
+		probeTemplate := opencode.NewOperatorProbeLaunchTemplate(cfg.OpenCodeBinaryPath, scratchRoot, cfg.OpenCodeProbeProfile)
+		opts := []opencode.OpenCodeAdapterOption{}
+		if cfg.OpenCodeIdleGrace > 0 {
+			opts = append(opts, opencode.WithIdleGrace(cfg.OpenCodeIdleGrace))
+		}
+		var opErr error
+		adp, opErr = opencode.NewProductionOpenCodeAdapter(store, wm, pe, probeTemplate, opts...)
+		if opErr != nil {
+			return nil, fmt.Errorf("OpenCode adapter construction: %w", opErr)
+		}
+	}
+
+	return newServerWithAdapter(store, lock, cfg, adp, wm, pe)
+}
+
+func newServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerConfig, adp adapter.Adapter, wm *workspace.WorkspaceManager, pe execpolicy.PolicyExecutor) (*Server, error) {
 	if store == nil {
 		return nil, errors.New("store cannot be nil")
 	}
@@ -91,16 +151,6 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 
 	socketPath := filepath.Join(cfg.StateDir, "council.sock")
 	tokenPath := filepath.Join(cfg.StateDir, "auth.token")
-
-	var wm *workspace.WorkspaceManager
-	if cfg.WorkspaceBaseDir != "" {
-		var err error
-		wm, err = workspace.NewWorkspaceManager(cfg.StateDir, cfg.WorkspaceBaseDir)
-		if err != nil {
-			return nil, fmt.Errorf("new workspace manager: %w", err)
-		}
-	}
-	pe := execpolicy.New()
 
 	if adp == nil && wm != nil {
 		adp = execpolicy.NewWorkerAdapter(wm, pe, store)
