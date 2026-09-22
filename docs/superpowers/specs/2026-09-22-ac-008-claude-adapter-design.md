@@ -1,6 +1,6 @@
 # AC-008 Design — Claude persistent contributor adapter
 
-Status: DRAFT v4 for review
+Status: DRAFT v5 for review
 Date: 2026-09-22
 Issue: #8
 Depends on: AC-003 (controller grants), AC-005 (workspaces/execution policy),
@@ -177,27 +177,36 @@ A `--resume` invocation REQUIRES a prompt and starts a provider turn
   missing-session error (`ErrNativeSessionMissing`, typed and distinct).
   Resume itself makes no native call and consumes no quota.
 
-### 3.5 Durable dispatch correlation
+### 3.5 Durable dispatch correlation (finding 2)
 
 - **Pre-launch baseline**: before starting the process, the attempt record
   stores the transcript baseline — for a materialized session,
   `(file-identity, byte size, entry count)` as typed columns; for a first
   turn, `materialized=false`.
-- **Acceptance boundary**: accepted when the transcript advances past the
-  baseline with a new `user` entry whose prompt digest matches the
-  attempt's stored prompt digest.
-- **No-redispatch rule**: once a process has been STARTED for an attempt,
-  no redispatch of that attempt occurs. If acceptance cannot be proven
-  and no result was observed, the attempt remains **Uncertain until the
-  controller explicitly records an uncertainty disposition** — and this
-  holds across daemon restarts (the slot/blocking state is derived from
-  durable attempt state, not process memory). Any replacement
-  work runs as a NEW attempt on the session. Reconciliation cannot
-  resolve a lost started attempt (§3.10); it can only gather evidence
-  for the disposition decision.
+- **Acceptance is capability-conditional**:
+  - **Protected mode** (transcript-protection attestation valid, §3.6):
+    the turn is accepted when the transcript advances past the baseline
+    with a new `user` entry whose prompt digest matches the attempt's
+    stored prompt digest.
+  - **Advisory/unverified mode**: transcript observations are DIAGNOSTIC
+    ONLY. `accepted` remains UNKNOWN after process start; nothing the
+    adapter reads from the transcript classifies or authorizes anything.
+- **Redispatch rule, capability-conditional**:
+  - **Protected mode**: verified positive absence (baseline unchanged
+    AND the process known dead) authorizes exactly ONE same-attempt
+    redispatch — nothing was accepted, so re-execution cannot double-run.
+    Absence after the redispatch too requires disposition.
+  - **Advisory/unverified mode**: once a process has been STARTED, no
+    redispatch of that attempt occurs at all. The attempt remains
+    **Uncertain until the controller explicitly records an uncertainty
+    disposition** — across daemon restarts (blocking state derives from
+    durable attempt state, not process memory). Any replacement work runs
+    as a NEW attempt.
 - **Blocking semantics**: an unresolved (uncertain, undisposed) attempt
   blocks every subsequent turn on the same native session — including
   after restart — until the controller records the disposition.
+  Reconciliation cannot resolve a lost started attempt (§3.10); it can
+  only gather evidence for the disposition decision.
 
 ### 3.6 Transcript (JSONL) trust model (findings 2, 5)
 
@@ -222,10 +231,20 @@ A `--resume` invocation REQUIRES a prompt and starts a provider turn
   enforcing capability named per path (cwd boundary, guardrail hook,
   deny-list). Only if EVERY enabled tool path is proven denied on the
   installed version does the transcript become **protected evidence**,
-  authoritative for acceptance/absence decisions (redispatch safety).
-  Any reachable path ⇒ advisory forever for that version. The probe suite
-  is an operator-authorized action (it deliberately points a worker at a
-  sibling history) and is re-run on every native version bump.
+  authoritative for acceptance/absence decisions (including the single
+  verified-absence redispatch). Any reachable path ⇒ advisory for that
+  configuration. The probe suite is an operator-authorized action (it
+  deliberately points a worker at a sibling history).
+- **Protection attestation**: protected capability is persisted as an
+  attestation record, not an enum on the attempt. The attestation binds:
+  Claude CLI version, toolkit-manifest digest, template digest, platform,
+  the full per-path probe results with enforcing capabilities, and the
+  probe timestamp/actor. A launch's transcript is treated as protected
+  ONLY while the attestation matches the CURRENT version, manifest
+  digest, template digest, and platform exactly; any version bump,
+  template or manifest change, or platform difference invalidates it and
+  the mode reverts to advisory until a new probe suite is run and
+  attested.
 - **Integrity checks (both modes)**: derived path with no symlinks;
   POSIX ownership/mode 0600 checked — **Windows: fail-closed platform
   statement** — the POSIX checks are not expressible, so the transcript is
@@ -235,9 +254,9 @@ A `--resume` invocation REQUIRES a prompt and starts a provider turn
   single-writer by construction (slot); tail-only reads past the recorded
   baseline, size-capped; entries matched by exact verified `type` fields.
 - **Trust ceiling**: even in protected mode the JSONL is written by the
-  native process, not by Council — it authorizes acceptance/absence only.
-  It NEVER proves terminal completion: the terminal `result` event is
-  stdout-only (verified).
+  native process, not by Council — it authorizes acceptance and
+  verified-absence redispatch only. It NEVER proves terminal completion:
+  the terminal `result` event is stdout-only (verified).
 
 ### 3.7 Launch seam
 
@@ -271,28 +290,40 @@ A `--resume` invocation REQUIRES a prompt and starts a provider turn
   surface; forbidden flags absent from the approved template). Provider-
   free.
 
-### 3.8 Frozen tooling enforcement (finding 3)
+### 3.8 Frozen tooling enforcement (findings 3, 1-round-4)
 
-- **Deny set = verified native tool universe − approved set.** The
-  universe is the native tool list captured by `system/init.tools[]` at
-  probe/first-session time and versioned with the probed CLI version.
-  The adapter computes the complement against the frozen approved set and
-  passes the **complete complement through `--disallowedTools`** — the
-  verified denial mechanism — never relying on `--allowedTools`
-  exclusivity.
-- **Unknown native tools** (present in `system/init` but absent from the
-  captured universe): the process is terminated and the turn classified
-  Uncertain (§3.9 init rule) — protocol drift is never absorbed silently.
-- **Live omitted-tool probe required**: before the enforcement claim is
-  marked verified, an implementation-phase probe must dispatch a prompt
-  requiring an omitted tool under the computed complement and record the
-  structured denial. Until then the enforcement row is evidence-pending,
-  and the guardrail PreToolUse hooks remain the operating second layer.
+- **Version-pinned universe, never self-discovered.** The deny complement
+  must exist BEFORE the first prompt is transmitted, but `system/init`
+  arrives only after that. The native tool universe therefore comes from
+  one of two pre-freeze sources, never from the governed turn itself:
+  1. the **committed evidence universe** for the probed CLI version —
+     `docs/superpowers/evidence/ac008-native-tool-universe-<version>.json`
+     (captured from `system/init.tools[]` during research; the 2.1.278
+     file is committed); or
+  2. an **operator-authorized live inventory probe** (a minimal native
+     invocation whose `system/init` is captured and committed) run before
+     profile freeze when the installed version differs.
+  At dispatch time, `system/init.tools[]` is compared against the pinned
+  universe: drift (unknown or missing tools) terminates the process and
+  classifies Uncertain (§3.9) — the first turn is never used to discover
+  the policy governing it.
+- **Deny set = pinned universe − approved set.** The adapter computes the
+  full complement against the frozen approved set and passes it through
+  `--disallowedTools` — the verified denial mechanism ("No such tool
+  available: … disabled for this session, in subagents as well as here").
+  `--allowedTools` exclusivity is NOT relied upon (native default mode
+  executes some tools with no list — verified).
+- **Live omitted-tool probe required** (implementation-phase, before the
+  enforcement claim is marked verified): dispatch a prompt requiring an
+  omitted tool under the computed complement and record the structured
+  denial. Until then the enforcement row is evidence-pending, and the
+  guardrail PreToolUse hooks remain the operating second layer.
 - **Manifest**: approved tools, denied complement, expected hooks, skills,
-  plugins — the frozen toolkit manifest, recorded in the run profile and
-  covered by the profile digest. Per-session toolkit evidence =
-  `system/init` compared against the manifest (`cwd`, version, model,
-  permission mode, manifest presence).
+  plugins, probed CLI version, and the universe evidence file digest —
+  the frozen toolkit manifest, recorded in the run profile and covered by
+  the profile digest. Per-session toolkit evidence = `system/init`
+  compared against the manifest (`cwd`, version, model, permission mode,
+  manifest presence).
 
 ### 3.9 Stream, process, and init failure semantics (finding 4)
 
@@ -369,11 +400,18 @@ claude_turn_attempts
   known_dead_at       TIMESTMP NULL  -- process exit observed
   transcript_protection TEXT (protected|advisory|unverified)
   prompt_digest       TEXT
-  accepted            BOOL
+  accepted            BOOL NULL    -- known only in protected mode
   terminal            BOOL
   result_payload      TEXT NULL    -- verified terminal result text
   result_usage        TEXT NULL    -- usage/cost JSON (verified terminal only)
-  disposition         TEXT NULL    -- completed|failed|uncertain-disposed|missing
+  observed_status     TEXT         -- completed|failed|missing|uncertain
+                      -- (service-derived from evidence; automatic)
+  uncertainty_disposition
+                      TEXT NULL    -- controller decision ONLY for
+                      -- resolving uncertainty: nullable, carries actor,
+                      -- controller generation, operation ID, timestamp
+                      -- (AC-004 authority) via the disposition journal
+                      -- entry, not a bare column write
   updated_at
 ```
 
@@ -385,7 +423,12 @@ claude_turn_attempts
 4. acceptance (`accepted`, prompt digest match) — from transcript;
 5. terminal (`terminal`, `result_payload`, `result_usage`) — only from an
    observed `result` event;
-6. `disposition` — only by explicit controller decision.
+6. `observed_status` — automatically from evidence (completed/failed/
+   missing/uncertain);
+7. `uncertainty_disposition` — ONLY by explicit controller decision
+   (AC-004 authority), recorded as a journal entry with actor,
+   generation, and operation ID; it resolves an uncertain attempt and
+   unblocks the native session.
 
 **Template materialization (atomic)**: validated source template (regular
 files only, no symlinks, per-file size bounds, total size bound); copied
@@ -394,14 +437,32 @@ dir / 0600 files; Windows: ACL-equivalent or fail-closed capability as
 §3.6); atomically renamed into place; on any failure the temporary
 directory is removed and the session is not materialized.
 
-**Refinement — profile encoding**: the toolkit manifest is added to the
+**Profile encoding (finding 3)**: the toolkit manifest is added to the
 canonical profile as explicit fields (`toolkit_manifest`: expected hooks,
-skills, plugins, approved tools, denied complement, probed CLI version),
-bumping the canonical profile algorithm version; backfill behavior: runs
-frozen before the version bump carry no manifest and pin toolkit
-enforcement to "record-only" (evidence captured, mismatches logged, no
-termination). Template digest formula: `ctmpl-v1:sha256:<hex>` over the
-sorted (relative path, file bytes) pairs of the template tree.
+skills, plugins, approved tools, denied complement, probed CLI version,
+universe evidence digest), bumping the canonical profile algorithm
+version. **Legacy profiles — those frozen before the bump — are
+INELIGIBLE for the Claude adapter**: `CreateSession`/dispatch fail closed
+with a typed `ErrUnsupportedProfile` (the adapter requires the frozen
+tool policy; no record-only mode exists, and silently weakened
+enforcement is the failure mode it prevents). New runs must freeze with
+the new profile version; backfill of old runs is out of scope.
+
+**Template digest formula (finding 5)** — `ctmpl-v1:sha256:<hex>`:
+1. Enumerate the template tree: regular files only (symlinks, devices,
+   directories-as-entries rejected); paths normalized to relative
+   forward-slash UTF-8 form (no leading `./`, no trailing slash);
+   duplicate normalized paths rejected.
+2. Order entries by normalized path, byte-wise lexicographic (UTF-8
+   bytes; case-sensitive — no case folding).
+3. Frame: `uint32-BE(entry-count)` then, per entry,
+   `uint32-BE(len(path-bytes)) || path-bytes ||
+    uint32-BE(len(file-bytes)) || raw file bytes`
+   (an empty file contributes a zero length prefix and no bytes; length
+   prefixes are 4-byte big-endian; byte encoding is raw UTF-8 for paths
+   and raw file content).
+4. Digest = `sha256` over the framed byte sequence, rendered
+   `ctmpl-v1:sha256:<lowercase-hex>`.
 
 ## 4. Evidence plan (fixtures vs integration)
 
@@ -445,13 +506,17 @@ sorted (relative path, file bytes) pairs of the template tree.
 
 1. **Concurrent duplicate dispatch** — N callers, one TurnRef: one native
    process, shared verdict, single-flight per native session.
-2. **Crash after process start** — process killed post-acceptance,
-   pre-result: attempt stays Uncertain; reconciliation cannot resolve it;
-   it remains uncertain until the controller explicitly disposes it, and
-   any replacement work is a new attempt.
+2. **Crash after process start** — process killed post-start:
+   reconciliation cannot resolve it. Protected mode with verified absence
+   authorizes one same-attempt redispatch; otherwise the attempt remains
+   uncertain until the controller explicitly disposes it, and any
+   replacement work is a new attempt.
 3. **Orphan process after daemon death** — restart finds the attempt
-   unaccounted; the durable baseline proves acceptance; the unresolved
-   attempt blocks the native session (across restarts) until disposed.
+   unaccounted; in protected mode the durable baseline may prove
+   acceptance (diagnostic and acceptance only); the unresolved attempt
+   blocks the native session (across restarts) until the controller
+   records the uncertainty disposition. In advisory mode the baseline
+   proves nothing and the attempt is simply uncertain-until-disposed.
 4. **Truncated JSONL** — torn final line: acceptance evidence still
    parses; no terminal claim.
 5. **Exact-session mismatch** — transcript whose recorded first-prompt
