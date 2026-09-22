@@ -355,9 +355,13 @@ WHERE attempt_id = ? AND reservation_seq = ?`, now, attemptID, seq, exitCode)
 // boundary on a launch row.
 func (s *Store) RecordClaudeStdinTransmitted(ctx context.Context, attemptID string, seq int64) error {
 	now := time.Now().UTC().Format(time.RFC3339)
+	// First-write-wins: the WHERE clause requires the boundary to be
+	// unset AND the launch to be in started state. A duplicate call is
+	// idempotent — the original ambiguity boundary is never overwritten.
 	res, err := s.DB().ExecContext(ctx, `
 UPDATE claude_attempt_launches SET first_stdin_byte_at = ?
-WHERE attempt_id = ? AND reservation_seq = ? AND state = 'started'`,
+WHERE attempt_id = ? AND reservation_seq = ? AND state = 'started'
+  AND first_stdin_byte_at IS NULL`,
 		now, attemptID, seq)
 	if err != nil {
 		return err
@@ -368,7 +372,8 @@ WHERE attempt_id = ? AND reservation_seq = ? AND state = 'started'`,
 	}
 	if n == 0 {
 		return fmt.Errorf(
-			"stdin transmission requires a started launch row (attempt=%s seq=%d)", attemptID, seq)
+			"stdin transmission requires a started launch row with no recorded boundary (attempt=%s seq=%d)",
+			attemptID, seq)
 	}
 	return nil
 }
@@ -377,12 +382,37 @@ WHERE attempt_id = ? AND reservation_seq = ? AND state = 'started'`,
 // absence decision on the attempt. This is a separate, explicit action
 // — process death alone does NOT set it. Only attempts in protected
 // mode with a valid attestation can have absence verified.
+// RecordClaudeAbsenceVerified records the service-derived positive-
+// absence decision on the attempt. It is NOT a controller decision —
+// verified absence is protected evidence derived from the attempt's own
+// frozen attestation. Fail closed: the attempt must be in protected
+// mode, carry a valid attestation in the attestations table, and not
+// already have absence verified. RowsAffected is checked: a no-op
+// update returns an error rather than silently succeeding.
 func (s *Store) RecordClaudeAbsenceVerified(ctx context.Context, attemptID string) error {
-	_, err := s.DB().ExecContext(ctx, `
-UPDATE claude_turn_attempts SET absence_verified = 'verified'
-WHERE attempt_id = ? AND transcript_protection = 'protected'
-  AND protection_attestation_id != ''`, attemptID)
-	return err
+	res, err := s.DB().ExecContext(ctx, `
+UPDATE claude_turn_attempts SET absence_verified = 'verified',
+	transition_version = transition_version + 1, updated_at = ?
+WHERE attempt_id = ?
+  AND transcript_protection = 'protected'
+  AND protection_attestation_id != ''
+  AND absence_verified = ''
+  AND EXISTS (
+      SELECT 1 FROM claude_protection_attestations
+      WHERE attestation_id = claude_turn_attempts.protection_attestation_id
+  )`, time.Now().UTC().Format(time.RFC3339), attemptID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf(
+			"absence verification requires protected mode with a valid attestation (attempt %s)", attemptID)
+	}
+	return nil
 }
 
 // MarkClaudeAttemptAccepted records the acceptance boundary (protected

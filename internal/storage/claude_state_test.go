@@ -457,3 +457,88 @@ func TestClaudeState_StdinTransmissionRecorded(t *testing.T) {
 		t.Fatal("first_stdin_byte_at must be recorded after transmission")
 	}
 }
+
+// Absence verification fails closed without a valid attestation row.
+func TestClaudeState_AbsenceVerifiedFailsWithoutAttestation(t *testing.T) {
+	store := openClaudeStore(t)
+	ctx := context.Background()
+
+	attempt := claudeAttemptFixture("att-noatt", "sess-noatt", "t-noatt", "nat-noatt")
+	attempt.TranscriptProtection = "protected"
+	attempt.AttestationID = "cprot-v1:sha256:nonexistent"
+	if err := store.InsertClaudeTurnAttempt(ctx, attempt); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	// The attestation row does not exist: the verification must fail.
+	if err := store.RecordClaudeAbsenceVerified(ctx, "att-noatt"); err == nil {
+		t.Fatal("absence verification without a valid attestation row must fail")
+	}
+}
+
+// A duplicate stdin-transmission call does not overwrite the original
+// ambiguity boundary timestamp.
+func TestClaudeState_StdinTransmissionFirstWriteWins(t *testing.T) {
+	store := openClaudeStore(t)
+	ctx := context.Background()
+
+	if err := store.InsertClaudeTurnAttempt(ctx, claudeAttemptFixture("att-stdin-wins", "sess-stdin-wins", "t-stdin-wins", "nat-stdin-wins")); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	seq, err := store.ReserveClaudeLaunch(ctx, "att-stdin-wins", "fixture")
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if err := store.RecordClaudeLaunchState(ctx, "att-stdin-wins", seq, "started", nil); err != nil {
+		t.Fatalf("started: %v", err)
+	}
+
+	// First call: records the boundary.
+	if err := store.RecordClaudeStdinTransmitted(ctx, "att-stdin-wins", seq); err != nil {
+		t.Fatalf("first stdin: %v", err)
+	}
+
+	var first string
+	err = store.DB().QueryRow(
+		`SELECT first_stdin_byte_at FROM claude_attempt_launches
+		 WHERE attempt_id = ? AND reservation_seq = ?`, "att-stdin-wins", seq,
+	).Scan(&first)
+	if err != nil {
+		t.Fatalf("read boundary: %v", err)
+	}
+
+	// A duplicate call must not change the timestamp (the WHERE clause
+	// requires first_stdin_byte_at IS NULL, so it is a no-op).
+	if err := store.RecordClaudeStdinTransmitted(ctx, "att-stdin-wins", seq); err == nil {
+		// Idempotent no-op is also acceptable, but the timestamp must be
+		// unchanged either way.
+	}
+	var second string
+	err = store.DB().QueryRow(
+		`SELECT first_stdin_byte_at FROM claude_attempt_launches
+		 WHERE attempt_id = ? AND reservation_seq = ?`, "att-stdin-wins", seq,
+	).Scan(&second)
+	if err != nil {
+		t.Fatalf("read boundary 2: %v", err)
+	}
+	if first != second {
+		t.Fatalf("duplicate stdin call must not change the boundary, got %q then %q", first, second)
+	}
+}
+
+// Absence verification is service-derived protected evidence, not a
+// controller decision: it cannot be set on advisory-mode attempts.
+func TestClaudeState_AbsenceVerifiedAdvisoryModeFails(t *testing.T) {
+	store := openClaudeStore(t)
+	ctx := context.Background()
+
+	attempt := claudeAttemptFixture("att-adv-abs", "sess-adv-abs", "t-adv-abs", "nat-adv-abs")
+	// TranscriptProtection is "advisory" (zero value in the fixture)
+	if err := store.InsertClaudeTurnAttempt(ctx, attempt); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	if err := store.RecordClaudeAbsenceVerified(ctx, "att-adv-abs"); err == nil {
+		t.Fatal("advisory-mode attempts cannot have absence verified")
+	}
+}
