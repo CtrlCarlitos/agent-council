@@ -752,34 +752,35 @@ func TestGate2_ConcurrentMismatchedCreateSessionFailsClosed(t *testing.T) {
 // — and no extra native session is created.
 func TestGate2_ConcurrentCreateWaitersShareCreatorFailure(t *testing.T) {
 	t.Run("pre-write refusal", func(t *testing.T) {
-		adp, fake := gate2Fixture(t)
+		adp, _ := gate2Fixture(t)
 		ctx := context.Background()
 
 		const fresh = "sess-fresh-prewrite"
-		// The child's endpoint is dead: the inventory lookup fails
-		// before the request is written.
+		// The child's endpoint is dead: every native attempt fails at
+		// the connection layer, before the request is written.
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatalf("listen: %v", err)
 		}
 		unreachable := fmt.Sprintf("http://%s", ln.Addr().String())
 		_ = ln.Close()
-		fake.mu.Lock()
-		fake.sessions[fresh] = &fakeSession{id: fresh}
+		adp.mu.Lock()
 		adp.servers.children[fresh] = &serverProcess{
 			endpoint: unreachable,
 			username: gate1User,
 			password: gate1Password,
 		}
-		fake.mu.Unlock()
+		adp.mu.Unlock()
 
 		const callers = 4
 		var wg sync.WaitGroup
 		errs := make([]error, callers)
+		barrier := make(chan struct{})
 		for i := 0; i < callers; i++ {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
+				<-barrier // all callers overlap
 				_, errs[i] = adp.CreateSession(ctx, adapter.CreateSessionRequest{
 					SessionID:   fresh,
 					Contributor: "opencode",
@@ -787,6 +788,7 @@ func TestGate2_ConcurrentCreateWaitersShareCreatorFailure(t *testing.T) {
 				})
 			}(i)
 		}
+		close(barrier)
 		wg.Wait()
 
 		for i, err := range errs {
@@ -798,17 +800,66 @@ func TestGate2_ConcurrentCreateWaitersShareCreatorFailure(t *testing.T) {
 				t.Fatalf("caller %d must receive the creator's uncertain classification, got %T: %v", i, err, err)
 			}
 		}
-		// No native session reached the fake server.
-		fake.mu.Lock()
-		created := 0
-		for id := range fake.sessions {
-			if strings.HasPrefix(id, "ses_fake_") {
-				created++
+	})
+
+	// Attempt counting against a live, credential-enforcing server: a
+	// wrong-credential child counts every native attempt in the ledger.
+	// With the barrier forcing overlap, the reservation must produce
+	// exactly ONE attempt — never one per caller.
+	t.Run("attempt counting", func(t *testing.T) {
+		// The server expects the real credential; the child carries a
+		// mismatched one, so every attempt is rejected and counted.
+		wrong, endpoint := startFakeServerWithAuth(t, gate1User, "correct-password")
+		wrong.mu.Lock()
+		wrong.sessions[gate1Session] = &fakeSession{id: gate1Session}
+		wrong.mu.Unlock()
+
+		identity := &fakeGate1Identity{}
+		adp := NewOpenCodeAdapter(nil, nil, identity, func(a *OpenCodeAdapter) {
+			a.servers = newGate1ServerManager(wrong, a)
+			a.servers.mu.Lock()
+			a.servers.children[gate1Session] = &serverProcess{
+				endpoint: endpoint,
+				username: gate1User,
+				password: "wrong-password",
+			}
+			a.servers.mu.Unlock()
+		})
+		ctx := context.Background()
+
+		const callers = 4
+		var wg sync.WaitGroup
+		errs := make([]error, callers)
+		barrier := make(chan struct{})
+		for i := 0; i < callers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-barrier // all callers overlap
+				_, errs[i] = adp.CreateSession(ctx, adapter.CreateSessionRequest{
+					SessionID:   gate1Session,
+					Contributor: "opencode",
+					Config:      adapter.SessionConfig{Model: "fake/model"},
+				})
+			}(i)
+		}
+		close(barrier)
+		wg.Wait()
+
+		for i, err := range errs {
+			if err == nil {
+				t.Fatalf("caller %d: creation with mismatched credentials must fail", i)
+			}
+			var uncertain *adapter.ErrSessionCreationUncertain
+			if !errorsAs(err, &uncertain) {
+				t.Fatalf("caller %d must share the creator's uncertain classification, got %T: %v", i, err, err)
 			}
 		}
-		fake.mu.Unlock()
-		if created != 0 {
-			t.Fatalf("failed creation must not create native sessions, got %d", created)
+		// The single shared attempt: exactly one rejected request reached
+		// the server (the middleware counts every attempt, including
+		// ones rejected before reaching any handler).
+		if got := wrong.ledger.authFailureCount(); got != 1 {
+			t.Fatalf("waiters must not attempt independently: %d counted attempts for %d callers", got, callers)
 		}
 	})
 
