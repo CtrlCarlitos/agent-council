@@ -16,6 +16,13 @@ import (
 // --version and --help contract probes, and replays a stream for -p
 // mode (consuming stdin). The default happy stream uses the session-id
 // from args; a .claude-fixture file in the CWD overrides the stream.
+// Test knobs (all resolved in the workspace CWD):
+//   - .claude-fixture-args      append-mode log of argv (identity-flag
+//     evidence for --session-id vs --resume selection)
+//   - .claude-fixture-delay     sleep <file content> ms after reading
+//     stdin, before emitting (mid-turn cancel / reconcile-active)
+//   - .claude-fixture-stdin-exit exit without reading stdin after a
+//     short grace period (post-transmission stdin failure)
 
 var claudeFixtureSourceLines = []string{
 	"package main",
@@ -25,6 +32,8 @@ var claudeFixtureSourceLines = []string{
 	"\t\"io\"",
 	"\t\"os\"",
 	"\t\"strings\"",
+	"\t\"time\"",
+	"\t\"strconv\"",
 	")",
 	"",
 	"const versionLine = \"2.1.278 (Claude Code)\"",
@@ -53,7 +62,23 @@ var claudeFixtureSourceLines = []string{
 	"\t\t}",
 	"\t}",
 	"",
+	"\tif _, err := os.Stat(\".claude-fixture-stdin-exit\"); err == nil {",
+	"\t\ttime.Sleep(50 * time.Millisecond)",
+	"\t\treturn",
+	"\t}",
+	"",
 	"\tio.ReadAll(os.Stdin)",
+	"",
+	"\tif f, err := os.OpenFile(\".claude-fixture-args\", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600); err == nil {",
+	"\t\tfmt.Fprintf(f, \"%s\\n\", strings.Join(args, \"\\x1f\"))",
+	"\t\tf.Close()",
+	"\t}",
+	"",
+	"\tif b, err := os.ReadFile(\".claude-fixture-delay\"); err == nil {",
+	"\t\tif ms, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {",
+	"\t\t\ttime.Sleep(time.Duration(ms) * time.Millisecond)",
+	"\t\t}",
+	"\t}",
 	"",
 	"\tif raw, err := os.ReadFile(\".claude-fixture\"); err == nil {",
 	"\t\tfor _, line := range strings.Split(string(raw), \"\\n\") {",
@@ -165,6 +190,10 @@ func TestClaudeFixture_ReplayThroughParser(t *testing.T) {
 
 	cmd := exec.Command(bin, "-p", "--output-format", "stream-json", "--verbose",
 		"--session-id", testNativeID, "--model", "claude-haiku-4-5-20251001", "--max-turns", "8")
+	// Isolate the child CWD: fixture knobs (including the args log)
+	// resolve relative to it and must never land in the package dir.
+	childDir := t.TempDir()
+	cmd.Dir = childDir
 	cmd.Stdin = strings.NewReader("the prompt")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -174,9 +203,8 @@ func TestClaudeFixture_ReplayThroughParser(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 
-	realCwd, _ := os.Getwd()
 	cfg := StreamConfig{
-		WorkspaceRoot:         realCwd,
+		WorkspaceRoot:         childDir,
 		ExpectedVersion:       "2.1.278",
 		ExpectedModelIdentity: "claude-haiku-4-5-20251001",
 		ExpectedSessionID:     testNativeID,

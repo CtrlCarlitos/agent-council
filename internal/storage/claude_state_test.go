@@ -331,11 +331,11 @@ func TestClaudeState_TerminalPersistenceExactlyOnce(t *testing.T) {
 	if err := store.InsertClaudeTurnAttempt(ctx, claudeAttemptFixture("att-once", "sess-once", "t-once", "nat-once")); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	if err := store.SetClaudeAttemptTerminal(ctx, "att-once", "first result", `{"cost":1}`); err != nil {
+	if err := store.SetClaudeAttemptTerminal(ctx, "att-once", "completed", "first result", `{"cost":1}`); err != nil {
 		t.Fatalf("first terminal: %v", err)
 	}
 	// A second (different) result must be rejected by the exactly-once guard.
-	if err := store.SetClaudeAttemptTerminal(ctx, "att-once", "second result", `{"cost":2}`); err == nil {
+	if err := store.SetClaudeAttemptTerminal(ctx, "att-once", "completed", "second result", `{"cost":2}`); err == nil {
 		t.Fatal("second terminal must fail with the exactly-once guard")
 	}
 	a, err := store.GetClaudeTurnAttempt(ctx, "att-once")
@@ -344,6 +344,64 @@ func TestClaudeState_TerminalPersistenceExactlyOnce(t *testing.T) {
 	}
 	if a.ResultPayload == nil || *a.ResultPayload != "first result" {
 		t.Fatalf("first result must be preserved, got %v", a.ResultPayload)
+	}
+}
+
+// A verified error result (error_max_turns) is terminal with
+// observed_status='failed', not 'completed'. Invalid statuses are
+// rejected.
+func TestClaudeState_TerminalFailedStatusMapping(t *testing.T) {
+	store := openClaudeStore(t)
+	ctx := context.Background()
+
+	if err := store.InsertClaudeTurnAttempt(ctx, claudeAttemptFixture("att-fail", "sess-fail", "t-fail", "nat-fail")); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := store.SetClaudeAttemptTerminal(ctx, "att-fail", "error_max_turns", "max turns reached", `{"subtype":"error_max_turns"}`); err == nil {
+		t.Fatal("error_max_turns is not a valid observed status; must be rejected")
+	}
+	if err := store.SetClaudeAttemptTerminal(ctx, "att-fail", "failed", "max turns reached", `{"subtype":"error_max_turns"}`); err != nil {
+		t.Fatalf("failed terminal: %v", err)
+	}
+	a, err := store.GetClaudeTurnAttempt(ctx, "att-fail")
+	if err != nil || a == nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !a.Terminal || a.ObservedStatus != "failed" {
+		t.Fatalf("expected terminal failed, got terminal=%v status=%q", a.Terminal, a.ObservedStatus)
+	}
+}
+
+// Launch states are returned in reservation order for reconciliation
+// evidence.
+func TestClaudeState_LaunchStatesInReservationOrder(t *testing.T) {
+	store := openClaudeStore(t)
+	ctx := context.Background()
+
+	if err := store.InsertClaudeTurnAttempt(ctx, claudeAttemptFixture("att-states", "sess-states", "t-states", "nat-states")); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	seq1, err := store.ReserveClaudeLaunch(ctx, "att-states", "fixture")
+	if err != nil {
+		t.Fatalf("reserve 1: %v", err)
+	}
+	if err := store.RecordClaudeLaunchState(ctx, "att-states", seq1, "start_failed", nil); err != nil {
+		t.Fatalf("start_failed: %v", err)
+	}
+	seq2, err := store.ReserveClaudeLaunch(ctx, "att-states", "fixture")
+	if err != nil {
+		t.Fatalf("reserve 2 (after start_failed slot release): %v", err)
+	}
+	if err := store.RecordClaudeLaunchState(ctx, "att-states", seq2, "started", nil); err != nil {
+		t.Fatalf("started: %v", err)
+	}
+
+	states, err := store.ClaudeAttemptLaunchStates(ctx, "att-states")
+	if err != nil {
+		t.Fatalf("launch states: %v", err)
+	}
+	if len(states) != 2 || states[0] != "start_failed" || states[1] != "started" {
+		t.Fatalf("expected [start_failed started] in reservation order, got %v", states)
 	}
 }
 

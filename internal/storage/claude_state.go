@@ -432,15 +432,21 @@ UPDATE claude_turn_attempts SET observed_status = ?, transition_version = transi
 	return err
 }
 
-// SetClaudeAttemptTerminal records the verified terminal result payload.
-func (s *Store) SetClaudeAttemptTerminal(ctx context.Context, attemptID string, resultPayload, resultUsage string) error {
+// SetClaudeAttemptTerminal records the verified terminal result payload
+// with its evidence-derived observed status: 'completed' for a verified
+// success result, 'failed' for a verified error result (e.g.
+// error_max_turns). Both are terminal; only the status differs.
+func (s *Store) SetClaudeAttemptTerminal(ctx context.Context, attemptID, observedStatus, resultPayload, resultUsage string) error {
+	if observedStatus != "completed" && observedStatus != "failed" {
+		return fmt.Errorf("terminal observed status must be completed or failed, got %q", observedStatus)
+	}
 	// Exactly-once guard: only the first successful write wins (the
 	// WHERE clause requires terminal = 0).
 	res, err := s.DB().ExecContext(ctx, `
 UPDATE claude_turn_attempts SET terminal = 1, result_payload = ?, result_usage = ?,
-	observed_status = 'completed', transition_version = transition_version + 1,
+	observed_status = ?, transition_version = transition_version + 1,
 	updated_at = ? WHERE attempt_id = ? AND terminal = 0`,
-		resultPayload, resultUsage, time.Now().UTC().Format(time.RFC3339), attemptID)
+		resultPayload, resultUsage, observedStatus, time.Now().UTC().Format(time.RFC3339), attemptID)
 	if err != nil {
 		return err
 	}
@@ -524,6 +530,31 @@ func nullStr(ns sql.NullString) *string {
 	}
 	v := ns.String
 	return &v
+}
+
+// ClaudeAttemptLaunchStates returns the state of every launch row for
+// an attempt (reserved|started|start_failed|dead), in reservation
+// order. Read-only evidence for reconciliation (spec §3.10): a
+// reserved/started/dead row means the process may have run (Uncertain);
+// only start_failed rows are positive pre-start evidence that no
+// process was ever created (DefinitivelyMissing).
+func (s *Store) ClaudeAttemptLaunchStates(ctx context.Context, attemptID string) ([]string, error) {
+	rows, err := s.DB().QueryContext(ctx, `
+SELECT state FROM claude_attempt_launches
+WHERE attempt_id = ? ORDER BY reservation_seq`, attemptID)
+	if err != nil {
+		return nil, fmt.Errorf("query claude launch states: %w", err)
+	}
+	defer rows.Close()
+	var states []string
+	for rows.Next() {
+		var state string
+		if err := rows.Scan(&state); err != nil {
+			return nil, err
+		}
+		states = append(states, state)
+	}
+	return states, rows.Err()
 }
 
 // HasClaudeUnresolvedAttempts reports whether the session has any

@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
@@ -42,6 +44,7 @@ type ClaudeAdapter struct {
 	launchSource *ClaudeTurnLaunchSource
 	identity     DispatchIdentitySource
 	configBase   string
+	templateDir  string
 
 	mu        sync.Mutex
 	turns     map[adapter.TurnRef]*turnRun
@@ -52,6 +55,8 @@ type turnRun struct {
 	ref           adapter.TurnRef
 	attemptID     string
 	nativeID      string
+	launchSeq     int64
+	firstTurn     bool
 	workspaceRoot string
 	manifest      storage.ToolkitManifest
 	universeTools []string
@@ -72,6 +77,7 @@ func NewClaudeAdapter(
 	launchSource *ClaudeTurnLaunchSource,
 	identity DispatchIdentitySource,
 	configBase string,
+	templateDir string,
 ) *ClaudeAdapter {
 	return &ClaudeAdapter{
 		store:        store,
@@ -80,6 +86,7 @@ func NewClaudeAdapter(
 		launchSource: launchSource,
 		identity:     identity,
 		configBase:   configBase,
+		templateDir:  templateDir,
 		turns:        make(map[adapter.TurnRef]*turnRun),
 		singleFlt:    make(map[string]*claudeSlot),
 	}
@@ -132,30 +139,81 @@ func (a *ClaudeAdapter) releaseSlot(nativeID, owner string) {
 	}
 }
 
+func (a *ClaudeAdapter) removeTurn(ref adapter.TurnRef) {
+	a.mu.Lock()
+	delete(a.turns, ref)
+	a.mu.Unlock()
+}
+
 // ── CreateSession ───────────────────────────────────────────────────────
 
+// CreateSession generates the native UUIDv4 identity, materializes the
+// per-session config root from the frozen template, and persists the
+// unmaterialized binding. Duplicate requests return the existing
+// binding idempotently. No native call is made: materialization is
+// local, and the binding stays materialized=false until a verified
+// first-turn result proves the native session exists.
 func (a *ClaudeAdapter) CreateSession(ctx context.Context, req adapter.CreateSessionRequest) (adapter.SessionBinding, error) {
 	if err := req.Validate(); err != nil {
 		return adapter.SessionBinding{}, err
 	}
+	if existing, err := a.store.GetClaudeSessionBinding(ctx, string(req.SessionID)); err != nil {
+		return adapter.SessionBinding{}, err
+	} else if existing != nil {
+		return a.existingBinding(req, existing), nil
+	}
+
+	runID, err := a.store.GetSessionRunID(ctx, string(req.SessionID))
+	if err != nil {
+		return adapter.SessionBinding{}, fmt.Errorf("session run lookup: %w", err)
+	}
+	meta, err := a.store.GetSessionMetadata(ctx, string(req.SessionID))
+	if err != nil {
+		return adapter.SessionBinding{}, fmt.Errorf("session metadata lookup: %w", err)
+	}
+	if meta.Contributor != "claude" {
+		return adapter.SessionBinding{}, fmt.Errorf(
+			"session %s contributor is %q, not claude; refusing to create a Claude binding", req.SessionID, meta.Contributor)
+	}
+
+	nativeID, err := sessionUUID()
+	if err != nil {
+		return adapter.SessionBinding{}, err
+	}
+	root, templateDigest, err := MaterializeConfigRoot(a.templateDir, a.configBase, runID, string(req.SessionID))
+	if err != nil {
+		return adapter.SessionBinding{}, fmt.Errorf("materialize config root: %w", err)
+	}
+	if err := a.store.InsertClaudeSessionBinding(ctx, storage.ClaudeSessionBinding{
+		SessionID:      string(req.SessionID),
+		NativeID:       nativeID,
+		Model:          req.Config.Model,
+		Workspace:      req.Config.WorkspaceRoot,
+		ConfigRoot:     root,
+		TemplateDigest: templateDigest,
+		CreatedAt:      time.Now().UTC(),
+	}); err != nil {
+		// Lost a creation race: the winner's binding is authoritative.
+		if existing, gerr := a.store.GetClaudeSessionBinding(ctx, string(req.SessionID)); gerr == nil && existing != nil {
+			return a.existingBinding(req, existing), nil
+		}
+		return adapter.SessionBinding{}, fmt.Errorf("insert claude session binding: %w", err)
+	}
 	return adapter.SessionBinding{
-		SessionID:   req.SessionID,
-		Contributor: req.Contributor,
-		Config:      req.Config,
+		SessionID:       req.SessionID,
+		Contributor:     req.Contributor,
+		NativeSessionID: nativeID,
+		Config:          req.Config,
 	}, nil
 }
 
-// GenerateNativeSessionID produces a crypto/rand UUIDv4 native identity
-// and materializes the per-session config root.
-func (a *ClaudeAdapter) GenerateNativeSessionID(templateDir string) (string, error) {
-	nativeID, err := sessionUUID()
-	if err != nil {
-		return "", err
+func (a *ClaudeAdapter) existingBinding(req adapter.CreateSessionRequest, existing *storage.ClaudeSessionBinding) adapter.SessionBinding {
+	return adapter.SessionBinding{
+		SessionID:       req.SessionID,
+		Contributor:     req.Contributor,
+		NativeSessionID: existing.NativeID,
+		Config:          req.Config,
 	}
-	if _, _, err := MaterializeConfigRoot(templateDir, a.configBase, nativeID, nativeID); err != nil {
-		return "", fmt.Errorf("materialize config root: %w", err)
-	}
-	return nativeID, nil
 }
 
 // ── ResumeSession ───────────────────────────────────────────────────────
@@ -196,15 +254,19 @@ func (a *ClaudeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, promp
 			Reason: err.Error()}, err
 	}
 	accepted := false
-	releaseIfRejected := func(stage string) {
+	releaseIfRejected := func() {
 		if !accepted {
 			a.releaseSlot(nativeID, attempt)
 		}
 	}
 
-	launch, err := a.launchSource.ClaudeTurnLaunch(ctx, ref.SessionID, nativeID, false, promptDigest)
+	// The binding's materialization state selects the native identity
+	// flag: an unmaterialized binding is a first turn (--session-id); a
+	// materialized one resumes the proven native session (--resume).
+	firstTurn := !binding.Materialized
+	launch, err := a.launchSource.ClaudeTurnLaunch(ctx, ref.SessionID, nativeID, firstTurn, promptDigest)
 	if err != nil {
-		releaseIfRejected("launch source")
+		releaseIfRejected()
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
 			Reason: err.Error()}, err
 	}
@@ -215,14 +277,14 @@ func (a *ClaudeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, promp
 		BaselineMaterialized: false, TranscriptProtection: "advisory",
 	}
 	if err := a.store.InsertClaudeTurnAttempt(ctx, baseline); err != nil {
-		releaseIfRejected("baseline")
+		releaseIfRejected()
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
 			Reason: err.Error()}, err
 	}
 
 	seq, resErr := a.store.ReserveClaudeLaunch(ctx, attempt, "claude-turn")
 	if resErr != nil {
-		releaseIfRejected("reservation")
+		releaseIfRejected()
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
 			Reason: resErr.Error()}, resErr
 	}
@@ -233,46 +295,68 @@ func (a *ClaudeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, promp
 	proc, startErr := a.executor.Start(lifecycleCtx, launch)
 	if startErr != nil {
 		lifecycleCancel()
-		_ = a.store.RecordClaudeLaunchState(ctx, attempt, int64(seq), "start_failed", nil)
-		a.releaseSlot(nativeID, attempt)
+		if recErr := a.store.RecordClaudeLaunchState(ctx, attempt, seq, "start_failed", nil); recErr != nil {
+			// The reservation evidence could not be closed out: the
+			// outcome is not provably pre-acceptance.
+			return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown,
+				Reason: "start failed and launch state could not be recorded: " + recErr.Error()}, recErr
+		}
+		releaseIfRejected()
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
 			Reason: "start failed: " + startErr.Error()}, startErr
 	}
-	if err := a.store.RecordClaudeLaunchState(ctx, attempt, int64(seq), "started", nil); err != nil {
+	if err := a.store.RecordClaudeLaunchState(ctx, attempt, seq, "started", nil); err != nil {
 		_ = proc.Terminate(lifecycleCtx)
 		lifecycleCancel()
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown,
 			Reason: "started but could not record launch state"}, nil
 	}
 
+	// stderr is drained exactly once, for the process lifetime.
 	go drainReader(proc.Stderr())
 
-	stdin := NewStdinWriter(proc.Stdin())
+	// The prompt crosses the stdin boundary through a writer that
+	// persists the first-byte transmission evidence at the write
+	// boundary itself (spec §3.11 step 4).
+	bw := &boundaryWriter{w: proc.Stdin(), store: a.store, ctx: ctx, attemptID: attempt, seq: seq}
+	stdin := NewStdinWriter(bw)
 	if stdinErr := stdin.WritePrompt([]byte(prompt)); stdinErr != nil {
 		_ = proc.Terminate(lifecycleCtx)
 		lifecycleCancel()
-		a.releaseSlot(nativeID, attempt)
+		_ = a.store.RecordClaudeLaunchState(ctx, attempt, seq, "dead", nil)
 		if stdin.TransmissionBegan() {
+			// Ambiguous: the native session is blocked until
+			// disposition. The slot is NOT released.
 			return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown,
 				Reason: "prompt transmission began but failed: " + stdinErr.Error()}, nil
 		}
+		// Pre-transmission: no prompt byte reached the process, a safe
+		// pre-acceptance rejection.
+		releaseIfRejected()
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
 			Reason: "stdin rejected before transmission: " + stdinErr.Error()}, nil
 	}
-	if err := proc.Stdin().Close(); err != nil {
+	if bwErr := bw.boundaryError(); bwErr != nil {
+		_ = proc.Terminate(lifecycleCtx)
 		lifecycleCancel()
+		_ = a.store.RecordClaudeLaunchState(ctx, attempt, seq, "dead", nil)
+		// The boundary evidence could not be persisted: the outcome
+		// cannot be classified. Slot retained.
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown,
+			Reason: "first-byte transmission boundary could not be persisted: " + bwErr.Error()}, nil
+	}
+	if err := proc.Stdin().Close(); err != nil {
+		_ = proc.Terminate(lifecycleCtx)
+		lifecycleCancel()
+		// The full prompt was written; a close failure is ambiguous.
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown,
 			Reason: "stdin close failed: " + err.Error()}, nil
 	}
 
-	if err := a.store.RecordClaudeStdinTransmitted(ctx, attempt, int64(seq)); err != nil {
-		// Non-fatal: the turn may still succeed.
-		_ = err
-	}
-
 	stream := adapter.NewBufferedStream(ref, 64)
 	run := &turnRun{
-		ref: ref, attemptID: attempt, nativeID: nativeID,
+		ref: ref, attemptID: attempt, nativeID: nativeID, launchSeq: seq,
+		firstTurn:     firstTurn,
 		workspaceRoot: launch.Paths.Root,
 		manifest:      launch.Profile.ToolkitManifest.ToolkitManifest,
 		universeTools: launch.UniverseTools,
@@ -283,12 +367,12 @@ func (a *ClaudeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, promp
 	a.mu.Unlock()
 
 	accepted = true
-	go a.runTurn(run, lifecycleCtx, lifecycleCancel)
+	go a.runTurn(run)
 
 	return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchAccepted}, nil
 }
 
-func (a *ClaudeAdapter) runTurn(run *turnRun, lifecycleCtx context.Context, lifecycleCancel context.CancelFunc) {
+func (a *ClaudeAdapter) runTurn(run *turnRun) {
 	cfg := StreamConfig{
 		WorkspaceRoot:         run.workspaceRoot,
 		ExpectedVersion:       run.manifest.ProbedCLIVersion,
@@ -315,32 +399,54 @@ func (a *ClaudeAdapter) runTurn(run *turnRun, lifecycleCtx context.Context, life
 		}
 	})
 
-	go drainReader(run.proc.Stderr())
-	_, _ = run.proc.Wait()
+	exitCode, _ := run.proc.Wait()
+	_ = a.store.RecordClaudeLaunchState(context.Background(), run.attemptID, run.launchSeq, "dead", &exitCode)
 
 	if out.Poisoned || !out.Terminal {
 		// Uncertain: no verified terminal proof. The slot is NOT
 		// released: the native session is blocked until the controller
 		// disposes the uncertain attempt.
-		a.mu.Lock()
-		delete(a.turns, run.ref)
-		a.mu.Unlock()
+		a.removeTurn(run.ref)
 		run.stream.CloseWithErr(fmt.Errorf("stream ended without verified result: %s", out.PoisonReason))
 		return
 	}
 
+	// A verified result is terminal in both directions: success maps to
+	// completed, a verified error result (e.g. error_max_turns) maps to
+	// failed.
+	status := "completed"
+	turnStatus := council.TurnCompleted
+	if !out.Completed {
+		status = "failed"
+		turnStatus = council.TurnFailed
+	}
 	usageJSON := ""
 	if out.ResultUsage != nil {
 		usageJSON = out.ResultUsage.Raw
 	}
-	if err := a.store.SetClaudeAttemptTerminal(context.Background(), run.attemptID, out.ResultText, usageJSON); err != nil {
+	if err := a.store.SetClaudeAttemptTerminal(context.Background(), run.attemptID, status, out.ResultText, usageJSON); err != nil {
+		// Terminal persistence failed: the outcome cannot be resolved,
+		// so the attempt stays uncertain and the slot is retained.
+		a.removeTurn(run.ref)
 		run.stream.CloseWithErr(fmt.Errorf("terminal persistence: %w", err))
-		a.releaseSlot(run.nativeID, run.attemptID)
 		return
 	}
+	if run.firstTurn {
+		if err := a.store.MarkClaudeSessionMaterialized(context.Background(), string(run.ref.SessionID)); err != nil {
+			a.removeTurn(run.ref)
+			run.stream.SendOrOverflow(adapter.Event{
+				Ref: run.ref, Type: adapter.EventTerminal,
+				Status: turnStatus, Payload: out.ResultText,
+			})
+			run.stream.CloseWithErr(fmt.Errorf("mark session materialized: %w", err))
+			a.releaseSlot(run.nativeID, run.attemptID)
+			return
+		}
+	}
+	a.removeTurn(run.ref)
 	run.stream.SendOrOverflow(adapter.Event{
 		Ref: run.ref, Type: adapter.EventTerminal,
-		Status: council.TurnCompleted, Payload: out.ResultText,
+		Status: turnStatus, Payload: out.ResultText,
 	})
 	run.stream.Close()
 	a.releaseSlot(run.nativeID, run.attemptID)
@@ -354,6 +460,32 @@ func drainReader(r interface{ Read([]byte) (int, error) }) {
 		}
 	}
 }
+
+// boundaryWriter persists the first-byte transmission boundary at the
+// write boundary. A storage failure is captured and surfaced by the
+// dispatcher — it is durable ambiguity evidence, never dropped.
+type boundaryWriter struct {
+	w         io.Writer
+	store     *storage.Store
+	ctx       context.Context
+	attemptID string
+	seq       int64
+
+	recorded    atomic.Bool
+	recordError error
+}
+
+func (b *boundaryWriter) Write(p []byte) (int, error) {
+	n, werr := b.w.Write(p)
+	if n > 0 && b.recorded.CompareAndSwap(false, true) {
+		if rerr := b.store.RecordClaudeStdinTransmitted(b.ctx, b.attemptID, b.seq); rerr != nil {
+			b.recordError = rerr
+		}
+	}
+	return n, werr
+}
+
+func (b *boundaryWriter) boundaryError() error { return b.recordError }
 
 func (a *ClaudeAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter.Stream, error) {
 	a.mu.Lock()
@@ -398,9 +530,15 @@ func (a *ClaudeAdapter) Collect(ctx context.Context, ref adapter.TurnRef) (adapt
 			ResultStatus: adapter.ResultPending}, errors.New("turn not dispatched")
 	}
 	if attempt.Terminal && attempt.ResultPayload != nil {
+		status := council.TurnCompleted
+		resultStatus := adapter.ResultAvailable
+		if attempt.ObservedStatus == "failed" {
+			status = council.TurnFailed
+			resultStatus = adapter.ResultFailed
+		}
 		return adapter.TurnResult{
-			Ref: ref, Status: council.TurnCompleted,
-			ResultStatus: adapter.ResultAvailable,
+			Ref: ref, Status: status,
+			ResultStatus: resultStatus,
 			Output:       *attempt.ResultPayload,
 			CompletedAt:  time.Now().UTC(),
 		}, nil
@@ -409,35 +547,66 @@ func (a *ClaudeAdapter) Collect(ctx context.Context, ref adapter.TurnRef) (adapt
 		ResultStatus: adapter.ResultPending}, nil
 }
 
+// Reconcile classifies a recovered turn from durable evidence only
+// (spec §3.10): a live in-process run is reachable-active; a verified
+// terminal is committed (completed or failed); anything else —
+// including a missing attempt row or a reserved/started/dead launch —
+// stays Uncertain. Only retained start_failed rows are positive
+// pre-start evidence that no process was ever created
+// (DefinitivelyMissing); absence of evidence is never positive proof.
 func (a *ClaudeAdapter) Reconcile(ctx context.Context, ref adapter.RecoveryRef) (adapter.ReconciliationOutcome, error) {
-	attempt, err := a.store.GetLatestClaudeTurnAttempt(ctx, string(ref.TurnRef.SessionID), ref.TurnRef.TurnKey)
-	if err != nil {
+	a.mu.Lock()
+	_, live := a.turns[ref.TurnRef]
+	a.mu.Unlock()
+	if live {
 		return adapter.ReconciliationOutcome{Ref: ref,
-			Reachability: council.VisibilityHostLost,
-			Status:       adapter.ReconciliationUncertain,
+			Reachability: council.VisibilityReachable,
+			Status:       adapter.ReconciliationReachableActive,
 			Observed:     council.TurnRunning,
 		}, nil
 	}
-	if attempt == nil {
+
+	attempt, err := a.store.GetLatestClaudeTurnAttempt(ctx, string(ref.TurnRef.SessionID), ref.TurnRef.TurnKey)
+	if err != nil || attempt == nil {
+		return uncertainReconciliation(ref), nil
+	}
+	if attempt.Terminal {
+		observed := council.TurnCompleted
+		if attempt.ObservedStatus == "failed" {
+			observed = council.TurnFailed
+		}
+		return adapter.ReconciliationOutcome{Ref: ref,
+			Reachability: council.VisibilityReachable,
+			Status:       adapter.ReconciliationReachableTerminal,
+			Observed:     observed,
+			Result:       ptrDeref(attempt.ResultPayload),
+		}, nil
+	}
+	states, err := a.store.ClaudeAttemptLaunchStates(ctx, attempt.AttemptID)
+	if err != nil {
+		return uncertainReconciliation(ref), nil
+	}
+	for _, state := range states {
+		if state == "reserved" || state == "started" || state == "dead" {
+			return uncertainReconciliation(ref), nil
+		}
+	}
+	if len(states) > 0 {
 		return adapter.ReconciliationOutcome{Ref: ref,
 			Reachability: council.VisibilityReachable,
 			Status:       adapter.ReconciliationDefinitivelyMissing,
 			Observed:     council.TurnFailed,
 		}, nil
 	}
-	if attempt.Terminal {
-		return adapter.ReconciliationOutcome{Ref: ref,
-			Reachability: council.VisibilityReachable,
-			Status:       adapter.ReconciliationReachableTerminal,
-			Observed:     council.TurnCompleted,
-			Result:       ptrDeref(attempt.ResultPayload),
-		}, nil
-	}
+	return uncertainReconciliation(ref), nil
+}
+
+func uncertainReconciliation(ref adapter.RecoveryRef) adapter.ReconciliationOutcome {
 	return adapter.ReconciliationOutcome{Ref: ref,
 		Reachability: council.VisibilityHostLost,
 		Status:       adapter.ReconciliationUncertain,
 		Observed:     council.TurnRunning,
-	}, nil
+	}
 }
 
 func ptrDeref(s *string) string {
