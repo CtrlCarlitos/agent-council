@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -100,6 +101,13 @@ func (a ProtectionAttestation) Validate() error {
 	if strings.TrimSpace(a.ProbedAt) == "" {
 		return fmt.Errorf("attestation requires the probe timestamp")
 	}
+	ts, err := time.Parse(time.RFC3339, a.ProbedAt)
+	if err != nil {
+		return fmt.Errorf("attestation probed_at must be RFC3339: %w", err)
+	}
+	if ts.Location() != time.UTC {
+		return fmt.Errorf("attestation probed_at must be UTC")
+	}
 	if strings.TrimSpace(a.Actor) == "" {
 		return fmt.Errorf("attestation requires the operator actor")
 	}
@@ -155,10 +163,8 @@ func (a ProtectionAttestation) Digest() (string, error) {
 		})
 	}
 	sort.Slice(canonical, func(i, j int) bool {
-		ni, _ := canonical[i].ToolClass.canonicalName()
-		nj, _ := canonical[j].ToolClass.canonicalName()
-		if ni != nj {
-			return ni < nj
+		if canonical[i].ToolClass != canonical[j].ToolClass {
+			return canonical[i].ToolClass < canonical[j].ToolClass
 		}
 		return canonical[i].ToolName < canonical[j].ToolName
 	})

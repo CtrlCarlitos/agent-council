@@ -30,7 +30,9 @@ func validAttestation() ProtectionAttestation {
 // actor). The encoder must reproduce THIS digest, not merely a stable
 // one.
 func TestProtectionAttestation_FixedGoldenVector(t *testing.T) {
-	want := "cprot-v1:sha256:eb783f24c4fe2edced1b9b66e577abc61596b8f5bce73d84f3cb80dd968284f3"
+	// Independently recomputed for the numeric enum sort order
+	// (read, bash, mcp).
+	want := "cprot-v1:sha256:dda4ff20431e3890d4a9203c6b6fb7866629e4550e1321e3d98ae439065a1402"
 	a := validAttestation()
 	got, err := a.Digest()
 	if err != nil {
@@ -140,6 +142,8 @@ func TestProtectionAttestation_Rejections(t *testing.T) {
 		{"missing version", func(a *ProtectionAttestation) { a.ClaudeVersion = " " }, "probed CLI version"},
 		{"missing actor", func(a *ProtectionAttestation) { a.Actor = "" }, "operator actor"},
 		{"missing probed time", func(a *ProtectionAttestation) { a.ProbedAt = "" }, "probe timestamp"},
+		{"non-RFC3339 probed time", func(a *ProtectionAttestation) { a.ProbedAt = "yesterday" }, "RFC3339"},
+		{"non-UTC probed time", func(a *ProtectionAttestation) { a.ProbedAt = "2026-09-22T00:00:00+02:00" }, "UTC"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
