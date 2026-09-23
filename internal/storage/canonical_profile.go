@@ -128,10 +128,21 @@ var granularApprovalKeys = []string{
 // corresponding capture is committed to the repository. With no
 // committed evidence for a key's shape, profile freeze REJECTS the
 // granular policy entirely (fail-closed honest gap; string policies
-// remain fully usable). The committed ac009 approval-schema subset pins
-// approval REQUEST payloads, not granular policy values, so it adds no
-// entries here.
-var granularShapeEvidence = map[string]string{}
+// remain fully usable).
+//
+// The committed 0.154.0 capture
+// docs/superpowers/evidence/ac009-schema-0.154.0/TurnStartParams.json
+// pins the complete AskForApproval.granular shape: exactly the five keys
+// below, each typed boolean (mcp_elicitations/rules/sandbox_approval
+// required; request_permissions/skill_approval default false). All five
+// entries are therefore wired to that capture (AC-009 Task 9).
+var granularShapeEvidence = map[string]string{
+	"mcp_elicitations":    "docs/superpowers/evidence/ac009-schema-0.154.0/TurnStartParams.json",
+	"request_permissions": "docs/superpowers/evidence/ac009-schema-0.154.0/TurnStartParams.json",
+	"rules":               "docs/superpowers/evidence/ac009-schema-0.154.0/TurnStartParams.json",
+	"sandbox_approval":    "docs/superpowers/evidence/ac009-schema-0.154.0/TurnStartParams.json",
+	"skill_approval":      "docs/superpowers/evidence/ac009-schema-0.154.0/TurnStartParams.json",
+}
 
 // CodexHarnessSpec is the frozen per-run codex block added by cprof-v3
 // (AC-009 spec §3.8). Every value the design freezes and compares

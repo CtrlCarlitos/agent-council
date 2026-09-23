@@ -203,7 +203,7 @@ INSERT INTO codex_protection_attestations
 	 probe_results, probed_at, actor)
 VALUES (?, '0.154.0', ?, 'sha256:manifest', 'cprof-v3:sha256:profile', ?, '2026-09-23T00:00:00Z', 'op')
 ON CONFLICT(attestation_id) DO UPDATE SET probe_results = excluded.probe_results`,
-			*attestationID, codexPlatformIdentity(), raw); err != nil {
+			*attestationID, codexPlatformIdentity(h.adapter.policy), raw); err != nil {
 			t.Fatalf("upsert attestation row: %v", err)
 		}
 	}
@@ -246,7 +246,7 @@ INSERT INTO codex_protection_attestations
 	(attestation_id, codex_version, platform, manifest_digest, profile_digest,
 	 probe_results, probed_at, actor)
 VALUES (?, ?, ?, ?, ?, ?, '2026-09-23T00:00:00Z', 'op')`,
-		id, h.policy.AppServerVersion, codexPlatformIdentity(), h.policy.ManifestDigest, h.profileDigest, raw); err != nil {
+		id, h.policy.AppServerVersion, codexPlatformIdentity(h.policy), h.policy.ManifestDigest, h.profileDigest, raw); err != nil {
 		t.Fatalf("insert attestation with records: %v", err)
 	}
 }
@@ -470,7 +470,7 @@ INSERT INTO codex_protection_attestations
 	 probe_results, probed_at, actor)
 VALUES (?, '0.154.0', ?, 'sha256:manifest', 'cprof-v3:sha256:profile', ?, '2026-09-23T00:00:00Z', 'op')
 ON CONFLICT(attestation_id) DO UPDATE SET probe_results = excluded.probe_results`,
-					*tc.attID, codexPlatformIdentity(), tc.rawRow); err != nil {
+					*tc.attID, codexPlatformIdentity(h.adapter.policy), tc.rawRow); err != nil {
 					t.Fatalf("seed undecodable row: %v", err)
 				}
 			}

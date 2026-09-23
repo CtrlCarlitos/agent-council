@@ -48,7 +48,7 @@ INSERT INTO codex_protection_attestations
 	(attestation_id, codex_version, platform, manifest_digest, profile_digest,
 	 probe_results, probed_at, actor)
 VALUES (?, ?, ?, ?, ?, '[]', '2026-09-23T00:00:00Z', 'op')`,
-		id, h.policy.AppServerVersion, codexPlatformIdentity(), md, h.profileDigest)
+		id, h.policy.AppServerVersion, codexPlatformIdentity(h.policy), md, h.profileDigest)
 	if err != nil {
 		t.Fatalf("insert harness attestation: %v", err)
 	}

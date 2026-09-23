@@ -242,3 +242,12 @@ func (c *CodexClient) MCPServerStatusList(ctx context.Context) (json.RawMessage,
 	err := c.conn.Call(ctx, "mcpServerStatus/list", struct{}{}, &out)
 	return out, err
 }
+
+// ModelList retrieves the credential-free model catalog (schema-verified
+// method; no model call is made). The raw catalog is returned: model
+// pinning stays a frozen-profile concern, never an adapter choice.
+func (c *CodexClient) ModelList(ctx context.Context) (json.RawMessage, error) {
+	var out json.RawMessage
+	err := c.conn.Call(ctx, "model/list", struct{}{}, &out)
+	return out, err
+}

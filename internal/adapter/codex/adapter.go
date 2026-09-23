@@ -1798,7 +1798,7 @@ func (a *CodexAdapter) resolveRolloutProtection(ctx context.Context) (string, *s
 	if seamOK && strings.TrimSpace(seamID) != "" {
 		var err error
 		rowID, err = a.store.FindCodexProtectionAttestation(ctx,
-			a.policy.AppServerVersion, codexPlatformIdentity(), a.policy.ManifestDigest, a.profileDigest)
+			a.policy.AppServerVersion, codexPlatformIdentity(a.policy), a.policy.ManifestDigest, a.profileDigest)
 		if err != nil {
 			return "", nil, err
 		}

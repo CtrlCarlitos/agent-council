@@ -44,11 +44,14 @@ var MaxRolloutTailBytes = int64(8 << 20)
 // callers degrade to integrity=unverified and Uncertain decisions.
 func rolloutTrustSupported() bool { return runtime.GOOS != "windows" }
 
-// codexPlatformIdentity is the attestation binding string for the
-// running platform (§3.7: os + family/arch family), matching the claude
-// adapter convention.
-func codexPlatformIdentity() string {
-	return runtime.GOOS + "/" + runtime.GOARCH
+// codexPlatformIdentity is the attestation binding string for the frozen
+// launch platform (§3.7: platform is the profile manifest shape os +
+// family). Both sides of the protection tuple — the launch-time lookup
+// and the journal operation's durable rows — derive the string from the
+// frozen policy/attestation pair, so the tuple match can never disagree
+// on platform identity.
+func codexPlatformIdentity(policy CodexLaunchPolicy) string {
+	return policy.PlatformOS + "/" + policy.PlatformFamily
 }
 
 // ResolveRollout resolves the rollout path for a native thread id by the

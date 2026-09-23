@@ -251,16 +251,35 @@ func TestCanonicalProfileV3_ApprovalsReviewerMustBeUser(t *testing.T) {
 	}
 }
 
-// Granular approval policy: structurally legal (five keys, canonical
-// byte encoding) but rejected at freeze while no committed schema
-// evidence pins the sub-value shapes (fail-closed honest gap).
-func TestCanonicalProfileV3_GranularUnpinnedShapeRejectedAtFreeze(t *testing.T) {
+// Granular approval policy: the committed 0.154.0 TurnStartParams.json
+// capture pins the five-key all-boolean AskForApproval.granular shape,
+// so a well-formed granular policy now freezes (Task 9 wired the shape
+// evidence; Task 2's fail-closed gap is closed). The freeze must still
+// enforce the shape registry: every canonical granular key carries a
+// committed evidence path, and the granular policy participates in the
+// canonical encoding.
+func TestCanonicalProfileV3_GranularShapeEvidenceWired(t *testing.T) {
+	// The registry pins exactly the canonical granular keys.
+	if len(granularShapeEvidence) != len(granularApprovalKeys) {
+		t.Fatalf("shape evidence registry must pin exactly the canonical granular keys, got %d entries", len(granularShapeEvidence))
+	}
+	for _, key := range granularApprovalKeys {
+		path := granularShapeEvidence[key]
+		if path == "" {
+			t.Fatalf("granular key %q has no committed shape evidence", key)
+		}
+		if !strings.HasPrefix(path, "docs/superpowers/evidence/") {
+			t.Fatalf("granular key %q evidence %q must be a committed repo-relative evidence path", key, path)
+		}
+	}
 	p := v3Profile()
 	p.Harnesses["codex"].Codex.ApprovalPolicy = CodexApprovalPolicy{Kind: "granular", Granular: granularFixture()}
-	if _, _, err := ComputeProfileDigest(p); err == nil {
-		t.Fatal("granular approval_policy without committed shape evidence must be rejected at freeze")
-	} else if !strings.Contains(err.Error(), "schema") {
-		t.Fatalf("rejection must name the missing schema evidence, got %v", err)
+	digest, _, err := ComputeProfileDigest(p)
+	if err != nil {
+		t.Fatalf("granular approval_policy with committed shape evidence must freeze, got %v", err)
+	}
+	if digest == "" {
+		t.Fatal("freeze must produce a digest")
 	}
 }
 

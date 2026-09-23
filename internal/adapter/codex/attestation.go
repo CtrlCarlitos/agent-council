@@ -116,6 +116,15 @@ type ProtectionAttestation struct {
 
 const maxExcerptBytes = 256
 
+// PlatformIdentity is the canonical platform binding string (§3.7): the
+// profile manifest shape os + family joined with "/". The journal
+// operation stores THIS string in the durable platform column and the
+// launch-time lookup compares against the same derivation from the
+// frozen policy — one canonical form on both sides of the tuple match.
+func (a ProtectionAttestation) PlatformIdentity() string {
+	return a.PlatformOS + "/" + a.PlatformFamily
+}
+
 // Validate enforces the attestation invariants: valid UTF-8 in every
 // string field, non-empty binding fields, RFC3339-UTC probed_at, known
 // enums, complete denial records

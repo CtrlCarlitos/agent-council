@@ -15,6 +15,7 @@ import (
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/claude"
+	"github.com/CtrlCarlitos/agent-council/internal/adapter/codex"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/execpolicy"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/opencode"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/workspace"
@@ -133,6 +134,72 @@ func resolveClaudeEvidenceRoot(cfg ServerConfig) (string, error) {
 	return dir, nil
 }
 
+// resolveCodexEvidenceRoot validates the configured trusted evidence
+// root for the codex frozen event-universe re-hash: required and a real
+// directory.
+func resolveCodexEvidenceRoot(cfg ServerConfig) (string, error) {
+	dir := strings.TrimSpace(cfg.CodexEvidenceRoot)
+	if dir == "" {
+		return "", fmt.Errorf("CodexEvidenceRoot is required when CodexBinaryPath is configured")
+	}
+	dir = filepath.Clean(dir)
+	st, err := os.Stat(dir)
+	if err != nil {
+		return "", fmt.Errorf("codex evidence root %s is missing: %w", dir, err)
+	}
+	if !st.IsDir() {
+		return "", fmt.Errorf("codex evidence root %s is not a directory", dir)
+	}
+	return dir, nil
+}
+
+// resolveCodexScratchRoot validates and prepares the configured codex
+// neutral scratch root (probe children and session children). Mirrors
+// the OpenCode probe scratch family: operator-provided, disjoint from
+// StateDir and WorkspaceBaseDir (resolved, pre- and post-creation),
+// operator-only permissions.
+func resolveCodexScratchRoot(cfg ServerConfig) (string, error) {
+	root := strings.TrimSpace(cfg.CodexScratchRoot)
+	if root == "" {
+		return "", fmt.Errorf("CodexScratchRoot is required when CodexBinaryPath is configured")
+	}
+	root = filepath.Clean(root)
+
+	bases := map[string]string{}
+	for name, base := range map[string]string{
+		"StateDir":         cfg.StateDir,
+		"WorkspaceBaseDir": cfg.WorkspaceBaseDir,
+	} {
+		base = strings.TrimSpace(base)
+		if base == "" {
+			continue
+		}
+		bases[name] = filepath.Clean(base)
+	}
+
+	resolved, err := resolveExistingPath(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve codex scratch root: %w", err)
+	}
+	if err := checkScratchContainment(bases, resolved); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", fmt.Errorf("create codex scratch root: %w", err)
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		return "", fmt.Errorf("secure codex scratch root: %w", err)
+	}
+	resolvedFinal, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve codex scratch root after creation: %w", err)
+	}
+	if err := checkScratchContainment(bases, resolvedFinal); err != nil {
+		return "", err
+	}
+	return root, nil
+}
+
 type ServerConfig struct {
 	StateDir         string
 	InstanceID       string
@@ -193,6 +260,32 @@ type ServerConfig struct {
 	// store and AC-005 workspace manager. Empty means no OpenCode
 	// adapter.
 	OpenCodeBinaryPath string
+
+	// CodexBinaryPath, when set, enables the Codex persistent
+	// contributor adapter (AC-009). Empty means no Codex adapter.
+	CodexBinaryPath string
+
+	// CodexProfile is the operator-approved frozen cprof-v3 run profile
+	// with the complete harnesses.codex block. Required when
+	// CodexBinaryPath is set: the frozen launch policy (including the
+	// canonical toolkit-manifest digest) is validated from it at
+	// construction, and the event-universe evidence is re-hashed at
+	// validation. An incomplete block or evidence drift fails the
+	// wiring, never the first launch.
+	CodexProfile storage.CanonicalProfile
+
+	// CodexEvidenceRoot is the trusted evidence root the frozen event-
+	// universe re-hash runs against. Required when CodexBinaryPath is
+	// set.
+	CodexEvidenceRoot string
+
+	// CodexScratchRoot is the operator-provisioned neutral scratch
+	// directory: the working directory of every codex child (probe
+	// children and session children alike — process plumbing only; the
+	// thread cwd is the frozen workspace root). Required when
+	// CodexBinaryPath is set; disjoint from StateDir and
+	// WorkspaceBaseDir, operator-only permissions (0700).
+	CodexScratchRoot string
 }
 
 type ReadinessResponse struct {
@@ -258,8 +351,8 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 	// production OpenCode adapter with fail-closed seams backed by the same
 	// workspace manager and policy executor the service uses.
 	if adp == nil && strings.TrimSpace(cfg.OpenCodeBinaryPath) != "" {
-		if strings.TrimSpace(cfg.ClaudeBinaryPath) != "" {
-			return nil, errors.New("only one persistent contributor adapter can be wired per service instance (OpenCode and Claude are both configured)")
+		if strings.TrimSpace(cfg.ClaudeBinaryPath) != "" || strings.TrimSpace(cfg.CodexBinaryPath) != "" {
+			return nil, errors.New("only one persistent contributor adapter can be wired per service instance (OpenCode and Claude/Codex are both configured)")
 		}
 		scratchRoot, scratchErr := resolveOpenCodeProbeScratchRoot(cfg)
 		if scratchErr != nil {
@@ -282,6 +375,9 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 	// validation: config base, template dir, evidence root, probe
 	// scratch root, and probe profile are all required.
 	if adp == nil && strings.TrimSpace(cfg.ClaudeBinaryPath) != "" {
+		if strings.TrimSpace(cfg.CodexBinaryPath) != "" {
+			return nil, errors.New("only one persistent contributor adapter can be wired per service instance (Claude and Codex are both configured)")
+		}
 		configBase, err := resolveClaudeConfigBaseDir(cfg)
 		if err != nil {
 			return nil, fmt.Errorf("Claude config base: %w", err)
@@ -303,6 +399,29 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 		adp, clErr = claude.NewProductionClaudeAdapter(store, wm, pe, probeTemplate, configBase, templateDir, evidenceRoot)
 		if clErr != nil {
 			return nil, fmt.Errorf("Claude adapter construction: %w", clErr)
+		}
+	}
+
+	// If no adapter is provided but Codex is configured, construct the
+	// production Codex adapter (AC-009) with fail-closed configuration
+	// validation: scratch root, evidence root, and the frozen cprof-v3
+	// profile are all required; the frozen launch policy (including the
+	// canonical toolkit-manifest digest) and the event-universe re-hash
+	// are validated at construction, and the §3.3 eligibility lookup is
+	// always wired to the durable cprot-v2 rows.
+	if adp == nil && strings.TrimSpace(cfg.CodexBinaryPath) != "" {
+		scratchRoot, err := resolveCodexScratchRoot(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("Codex scratch root: %w", err)
+		}
+		if _, err := resolveCodexEvidenceRoot(cfg); err != nil {
+			return nil, fmt.Errorf("Codex evidence root: %w", err)
+		}
+		probeTemplate := codex.NewCodexProbeLaunchTemplate(cfg.CodexBinaryPath, scratchRoot, cfg.CodexProfile)
+		var cxErr error
+		adp, cxErr = codex.NewProductionCodexAdapter(store, pe, probeTemplate, cfg.CodexProfile, cfg.CodexEvidenceRoot)
+		if cxErr != nil {
+			return nil, fmt.Errorf("Codex adapter construction: %w", cxErr)
 		}
 	}
 

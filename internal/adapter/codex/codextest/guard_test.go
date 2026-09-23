@@ -60,6 +60,72 @@ func TestCodexTest_ImportGuard_ProductionPackagesDoNotImportCodexTest(t *testing
 	}
 }
 
+// The test-only construction surface is the fixture-scope seam: outside
+// the codex package itself (where the constructors and the production
+// guard live), NO production source file may reference
+// NewFixtureScopedAdapter, FixtureOption, or FixtureMode. An import of
+// codextest is already refused above; this guard closes the remaining
+// path — a production package reaching the test-only scope through the
+// codex package's constructors directly (Task 8 boundary extension).
+func TestCodexTest_ImportGuard_NoFixtureConstructorReferencesOutsideCodexPackage(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", "..", "..", ".."))
+	if err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+	forbidden := map[string]bool{
+		"NewFixtureScopedAdapter": true,
+		"FixtureOption":           true,
+		"FixtureMode":             true,
+	}
+	walkErr := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			switch info.Name() {
+			case "vendor", ".git":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		// The codex package itself owns the constructors and the typed
+		// production rejection; codextest carries the fixture harness.
+		if strings.Contains(filepath.ToSlash(path), "internal/adapter/codex") {
+			return nil
+		}
+		fset := token.NewFileSet()
+		f, parseErr := parser.ParseFile(fset, path, nil, 0)
+		if parseErr != nil {
+			return parseErr
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			sel, ok := n.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			if forbidden[sel.Sel.Name] {
+				t.Errorf("production file %s illegally references the test-only fixture constructor surface: %s.%s",
+					path, identName(sel.X), sel.Sel.Name)
+			}
+			return true
+		})
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatalf("failed checking fixture constructor references: %v", walkErr)
+	}
+}
+
+func identName(e ast.Expr) string {
+	if id, ok := e.(*ast.Ident); ok {
+		return id.Name
+	}
+	return "?"
+}
+
 // evalStringConst evaluates a package-level const declared as a
 // (possibly concatenated) Go string expression.
 func evalStringConst(t *testing.T, f *ast.File, name string) string {
