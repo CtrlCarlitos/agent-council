@@ -551,6 +551,30 @@ ORDER BY probed_at DESC LIMIT 1`,
 	return id, nil
 }
 
+// CodexProtectionProbeResults returns the durable cprot-v2 record frame
+// (attestation.go EncodeProbeRecords output) for an attestation id, or
+// nil when no row carries that id. This is the approval responder's
+// eligibility seam (spec §3.6): a deny-equivalent payload may be sent
+// only after the governing attestation's records carry a live-verified
+// approval_deny for that variant. A missing row is nil, not an error —
+// absence of evidence fails closed at the caller.
+func (s *Store) CodexProtectionProbeResults(ctx context.Context, attestationID string) ([]byte, error) {
+	if strings.TrimSpace(attestationID) == "" {
+		return nil, nil
+	}
+	var raw []byte
+	err := s.DB().QueryRowContext(ctx,
+		`SELECT probe_results FROM codex_protection_attestations WHERE attestation_id = ?`,
+		attestationID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query codex protection probe results: %w", err)
+	}
+	return raw, nil
+}
+
 // CodexAttemptLaunchStates returns the launch reservation states for an
 // attempt in reservation order (reserved|started|start_failed|dead).
 func (s *Store) CodexAttemptLaunchStates(ctx context.Context, attemptID string) ([]string, error) {

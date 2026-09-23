@@ -251,6 +251,31 @@ func requestLog(t *testing.T, scratch string) []string {
 	return readFixtureFile(t, scratch, ".codex-fixture-requests")
 }
 
+// readReplies reads the verbatim reply frames the fixture logged
+// (Council's answers to server→client approval requests).
+func readReplies(t *testing.T, scratch string) []string {
+	t.Helper()
+	return readFixtureFile(t, scratch, ".codex-fixture-replies")
+}
+
+// waitForReply polls the reply log until a frame carrying the given
+// JSON-encoded id appears, returning the whole log.
+func waitForReply(t *testing.T, scratch, id string, timeout time.Duration) []string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		for _, line := range readReplies(t, scratch) {
+			if strings.Contains(line, `"id":`+id+",") || strings.Contains(line, `"id":`+id+"}") {
+				return readReplies(t, scratch)
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no reply frame with id %s ever appeared; replies=%v", id, readReplies(t, scratch))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func terminatedCount(t *testing.T, scratch string) int {
 	t.Helper()
 	return len(readFixtureFile(t, scratch, ".codex-fixture-terminated"))

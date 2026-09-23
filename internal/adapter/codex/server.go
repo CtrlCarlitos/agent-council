@@ -118,6 +118,12 @@ type CodexServer struct {
 	launch   ChildLaunchSource
 	policy   CodexLaunchPolicy
 
+	// onServerRequest routes server→client requests (the approval seam)
+	// to the adapter's responder. Set once by the adapter constructor,
+	// before any child can start; when nil the bounded default queue
+	// stays in service (NextServerRequest).
+	onServerRequest func(adapter.SessionID, ServerRequest)
+
 	mu          sync.Mutex
 	children    map[string]*codexChild
 	starting    map[string]chan struct{}
@@ -151,6 +157,15 @@ func NewCodexServer(executor execpolicy.PolicyExecutor, launch ChildLaunchSource
 func (m *CodexServer) SetIdleGrace(d time.Duration) {
 	m.mu.Lock()
 	m.idleGrace = d
+	m.mu.Unlock()
+}
+
+// SetServerRequestHandler installs the approval responder routing hook.
+// It must be called before any child starts (the adapter constructor
+// does): the registration is read at child start under the lock.
+func (m *CodexServer) SetServerRequestHandler(fn func(adapter.SessionID, ServerRequest)) {
+	m.mu.Lock()
+	m.onServerRequest = fn
 	m.mu.Unlock()
 }
 
@@ -298,6 +313,16 @@ func (m *CodexServer) start(ctx context.Context, sessionID adapter.SessionID) (*
 	conn := NewConn(proc.Stdin(), proc.Stdout())
 	pump := NewEventPump()
 	conn.SetNotificationHandler(pump.HandleNotification)
+	// Responder install ordering (spec §3.6): the approval responder is
+	// registered BEFORE the framing reader starts, so a server→client
+	// request can never arrive unhandled (pump-before-first-request).
+	m.mu.Lock()
+	hook := m.onServerRequest
+	m.mu.Unlock()
+	if hook != nil {
+		session := adapter.SessionID(key)
+		conn.SetRequestHandler(func(sr ServerRequest) { hook(session, sr) })
+	}
 	onFatal := func(cause error) { m.poison(key, cause) }
 	conn.SetFatalHandler(onFatal)
 	pump.SetFatalHandler(onFatal)

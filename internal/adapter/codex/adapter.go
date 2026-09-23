@@ -150,7 +150,7 @@ func NewCodexAdapter(
 	identity DispatchIdentitySource,
 	attestation AttestationLookup,
 ) *CodexAdapter {
-	return &CodexAdapter{
+	a := &CodexAdapter{
 		store:         store,
 		server:        server,
 		policy:        policy,
@@ -162,6 +162,14 @@ func NewCodexAdapter(
 		creations:     make(map[adapter.SessionID]*codexCreationCall),
 		uncertain:     make(map[adapter.SessionID]error),
 	}
+	// The approval responder is installed for every child this server
+	// starts (spec §3.6): registration happens at child start, BEFORE
+	// the framing reader runs, so a server→client request can never
+	// arrive unhandled.
+	if server != nil {
+		server.SetServerRequestHandler(a.handleApprovalRequest)
+	}
+	return a
 }
 
 type codexSlot struct {
@@ -212,6 +220,40 @@ type codexTurnRun struct {
 	termOnce   sync.Once
 	termStatus string
 	terminated bool
+
+	// Approval responder state (spec §3.6): answered denials mirror into
+	// the stream exactly once per ApprovalID, and responder diagnostics
+	// (late denials, fail-closed receipts) are kept as bounded in-memory
+	// notes on the attempt run.
+	mirrorMu    sync.Mutex
+	mirrored    map[string]struct{}
+	diagMu      sync.Mutex
+	diagnostics []string
+}
+
+// markApprovalMirrored claims the once-per-ApprovalID mirror slot: the
+// first claimant mirrors the tool_requested/tool_denied pair; duplicate
+// re-denies are idempotent on the wire but never re-mirror.
+func (r *codexTurnRun) markApprovalMirrored(approvalID string) bool {
+	r.mirrorMu.Lock()
+	defer r.mirrorMu.Unlock()
+	if r.mirrored == nil {
+		r.mirrored = make(map[string]struct{})
+	}
+	if _, dup := r.mirrored[approvalID]; dup {
+		return false
+	}
+	r.mirrored[approvalID] = struct{}{}
+	return true
+}
+
+// runDiagnostics returns a copy of the bounded responder diagnostic log.
+func (r *codexTurnRun) runDiagnostics() []string {
+	r.diagMu.Lock()
+	defer r.diagMu.Unlock()
+	out := make([]string, len(r.diagnostics))
+	copy(out, r.diagnostics)
+	return out
 }
 
 // markCancelRequested records an accepted turn/interrupt request and
@@ -802,33 +844,10 @@ func (a *CodexAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt
 			Reason: "child ready but launch state could not be recorded"}, nil
 	}
 
-	// The turn/start write rides an adapter-owned context: a disconnected
-	// controller cannot skip the verification chain or abandon the ack.
-	wctx, wcancel := context.WithTimeout(context.WithoutCancel(ctx), dispatchAckTimeout)
-	defer wcancel()
-	raw, turnErr := child.client.TurnStart(wctx, turnParams)
-	if turnErr != nil {
-		return a.classifyTurnStartFailure(ctx, ref, attempt, seq, turnErr, releaseIfRejected)
-	}
-
-	// The frame was fully written: record the transmission boundary
-	// (first-byte-wins; the request provably reached the child's stdin).
-	if err := a.store.RecordCodexStdinTransmitted(ctx, attempt, seq); err != nil {
-		a.server.markIdle(ref.SessionID)
-		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown,
-			Reason: "turn/start acknowledged but the transmission boundary could not be persisted: " + err.Error()}, nil
-	}
-
-	turnID := nativeTurnIDFromResult(raw)
-	if turnID == "" {
-		// A definitive success without a correlatable native turn id:
-		// single-flight cannot map the turn honestly — fail toward
-		// uncertainty (the turn may be running).
-		a.server.markIdle(ref.SessionID)
-		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown,
-			Reason: "turn/start succeeded but the result carries no native turn id"}, nil
-	}
-
+	// The run is registered BEFORE the turn/start write: a server→client
+	// approval request that races the dispatch ack must find its turn
+	// (the §3.6 responder mirrors it into this run's stream). The turn
+	// route is installed after the ack carries the native turn id.
 	run := &codexTurnRun{
 		ref:            ref,
 		attemptID:      attempt,
@@ -839,8 +858,43 @@ func (a *CodexAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt
 		stream:         adapter.NewBufferedStream(ref, adapter.DefaultBufferCapacity),
 		termCh:         make(chan string),
 	}
+	a.mu.Lock()
+	a.turns[ref] = run
+	a.mu.Unlock()
+
+	// The turn/start write rides an adapter-owned context: a disconnected
+	// controller cannot skip the verification chain or abandon the ack.
+	wctx, wcancel := context.WithTimeout(context.WithoutCancel(ctx), dispatchAckTimeout)
+	defer wcancel()
+	raw, turnErr := child.client.TurnStart(wctx, turnParams)
+	if turnErr != nil {
+		a.abandonPreAcceptanceRun(ref, run, turnErr.Error())
+		return a.classifyTurnStartFailure(ctx, ref, attempt, seq, turnErr, releaseIfRejected)
+	}
+
+	// The frame was fully written: record the transmission boundary
+	// (first-byte-wins; the request provably reached the child's stdin).
+	if err := a.store.RecordCodexStdinTransmitted(ctx, attempt, seq); err != nil {
+		a.abandonPreAcceptanceRun(ref, run, "the transmission boundary could not be persisted: "+err.Error())
+		a.server.markIdle(ref.SessionID)
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown,
+			Reason: "turn/start acknowledged but the transmission boundary could not be persisted: " + err.Error()}, nil
+	}
+
+	turnID := nativeTurnIDFromResult(raw)
+	if turnID == "" {
+		// A definitive success without a correlatable native turn id:
+		// single-flight cannot map the turn honestly — fail toward
+		// uncertainty (the turn may be running).
+		a.abandonPreAcceptanceRun(ref, run, "turn/start succeeded but the result carries no native turn id")
+		a.server.markIdle(ref.SessionID)
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown,
+			Reason: "turn/start succeeded but the result carries no native turn id"}, nil
+	}
+
 	tap, terr := child.pump.InstallTurnRoute(nativeID, turnID)
 	if terr != nil {
+		a.abandonPreAcceptanceRun(ref, run, "the turn route could not be installed: "+terr.Error())
 		a.server.markIdle(ref.SessionID)
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown,
 			Reason: "turn route could not be installed: " + terr.Error()}, terr
@@ -857,10 +911,6 @@ func (a *CodexAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt
 				Reason: "turn accepted but the native turn id could not be bound: " + err.Error()}, nil
 		}
 	}
-
-	a.mu.Lock()
-	a.turns[ref] = run
-	a.mu.Unlock()
 
 	// First acceptance: resolve the rollout by the bounded UUID-suffix
 	// scan (session_meta verified, path integrity enforced) and
@@ -1266,6 +1316,20 @@ func usageFromJSON(raw string) adapter.ExecutionUsage {
 	return usage
 }
 
+// abandonPreAcceptanceRun deregisters a run whose turn/start did not
+// reach a verified acceptance (§3.9 taxonomy): the run leaves the live
+// map and its observation stream closes with the reason. Any denial
+// mirrored while the write was in flight remains honest evidence on the
+// attempt; the classification itself is classifyTurnStartFailure's.
+func (a *CodexAdapter) abandonPreAcceptanceRun(ref adapter.TurnRef, run *codexTurnRun, reason string) {
+	a.mu.Lock()
+	if cur, ok := a.turns[ref]; ok && cur == run {
+		delete(a.turns, ref)
+	}
+	a.mu.Unlock()
+	run.stream.CloseWithErr(fmt.Errorf("turn/start did not reach a verified acceptance: %s", reason))
+}
+
 // finishTurn releases everything an accepted turn held.
 func (a *CodexAdapter) finishTurn(run *codexTurnRun) {
 	if run.routeInstalled && run.pump != nil {
@@ -1509,6 +1573,56 @@ func ptrStr(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// handleApprovalRequest routes one server→child request to the §3.6
+// approval responder, replying through the session's live child. The
+// lookup is per call and bounded-retried: a request racing the handshake
+// (e.g. emitted before the initialize response) must still be answered
+// once the child registers.
+func (a *CodexAdapter) handleApprovalRequest(sessionID adapter.SessionID, sr ServerRequest) {
+	reply := func(id json.RawMessage, result any) error {
+		deadline := time.Now().Add(approvalReplyResolutionGrace)
+		for {
+			child, err := a.server.child(sessionID)
+			if err == nil {
+				return child.conn.Respond(id, result)
+			}
+			if time.Now().After(deadline) {
+				return err
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	newResponder(a, sessionID, reply).HandleRequest(sr)
+}
+
+// runForNativeThread returns the live turn run bound to a native thread,
+// or nil. Single-flight guarantees at most one live turn per thread; the
+// run is registered BEFORE turn/start is written so an approval request
+// racing the dispatch ack still finds its turn.
+func (a *CodexAdapter) runForNativeThread(threadID string) *codexTurnRun {
+	if threadID == "" {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, run := range a.turns {
+		if run.nativeThreadID == threadID {
+			return run
+		}
+	}
+	return nil
+}
+
+// slotHeld reports whether the single-flight slot for a native thread is
+// held: a dispatch is in flight even in the window before its run is
+// observable.
+func (a *CodexAdapter) slotHeld(nativeID string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, held := a.singleFlt[nativeID]
+	return held
 }
 
 // ── Single-flight ───────────────────────────────────────────────────────

@@ -781,3 +781,32 @@ func TestCodexState_LatestAttemptPerTurn(t *testing.T) {
 		t.Fatalf("missing turn must be nil, got %+v err=%v", none, err)
 	}
 }
+
+// The approval responder's eligibility seam (spec §3.6) reads the durable
+// cprot-v2 record frame by attestation id: present rows return the exact
+// bytes; a missing row returns nil (absence fails closed at the caller),
+// never an error.
+func TestCodexState_CodexProtectionProbeResults(t *testing.T) {
+	store := openCodexStore(t)
+	ctx := context.Background()
+
+	insertCodexAttestation(t, store)
+
+	raw, err := store.CodexProtectionProbeResults(ctx, codexAttestationID())
+	if err != nil {
+		t.Fatalf("probe results: %v", err)
+	}
+	if string(raw) != "[]" {
+		t.Fatalf("probe_results must round-trip verbatim, got %q", raw)
+	}
+
+	missing, err := store.CodexProtectionProbeResults(ctx, "cprot-v2:sha256:absent")
+	if err != nil || missing != nil {
+		t.Fatalf("a missing attestation row must be nil,nil, got %q err=%v", missing, err)
+	}
+
+	empty, err := store.CodexProtectionProbeResults(ctx, "")
+	if err != nil || empty != nil {
+		t.Fatalf("an empty attestation id must be nil,nil, got %q err=%v", empty, err)
+	}
+}
