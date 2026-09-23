@@ -172,6 +172,48 @@ func TestCodexState_LaunchDeadStateRecorded(t *testing.T) {
 	}
 }
 
+// The protection-attestation lookup must match the FULL frozen tuple —
+// (codex version, platform, manifest digest, profile digest); a row that
+// disagrees on the manifest digest alone never satisfies it (§3.7
+// fail-closed).
+func TestCodexState_FindProtectionAttestationRequiresManifestDigest(t *testing.T) {
+	store := openCodexStore(t)
+	ctx := context.Background()
+
+	const (
+		version  = "0.154.0"
+		platform = "linux/amd64"
+		profile  = "cprof-v3:sha256:pd"
+	)
+	trueManifest := "sha256:" + strings.Repeat("aa", 32)
+	otherManifest := "sha256:" + strings.Repeat("bb", 32)
+	insert := func(id, manifest string) {
+		t.Helper()
+		if _, err := store.DB().ExecContext(ctx, `
+INSERT INTO codex_protection_attestations
+	(attestation_id, codex_version, platform, manifest_digest, profile_digest,
+	 probe_results, probed_at, actor)
+VALUES (?, ?, ?, ?, ?, '[]', '2026-09-23T00:00:00Z', 'op')`,
+			id, version, platform, manifest, profile); err != nil {
+			t.Fatalf("insert attestation: %v", err)
+		}
+	}
+	trueID := "cprot-v2:sha256:" + strings.Repeat("ab", 32)
+	insert(trueID, trueManifest)
+
+	got, err := store.FindCodexProtectionAttestation(ctx, version, platform, trueManifest, profile)
+	if err != nil || got != trueID {
+		t.Fatalf("the full-tuple match must find the attestation: %q err=%v", got, err)
+	}
+
+	// A manifest-digest disagreement returns nothing — even though every
+	// other tuple member matches.
+	got, err = store.FindCodexProtectionAttestation(ctx, version, platform, otherManifest, profile)
+	if err != nil || got != "" {
+		t.Fatalf("a manifest digest mismatch must fail the lookup, got %q err=%v", got, err)
+	}
+}
+
 // Crash boundary (c): Start succeeded but started_at never persisted —
 // the reserved row with started_at NULL means possibly-running; the
 // attempt must remain uncertain and no redispatch is authorized.

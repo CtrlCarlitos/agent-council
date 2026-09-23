@@ -150,7 +150,15 @@ func (a *CodexAdapter) reconcileProtected(ctx context.Context, ref adapter.Recov
 		return uncertainReconciliation(ref), true
 	}
 	if err := a.store.SetCodexAttemptAccepted(ctx, attempt.AttemptID); err != nil {
-		return uncertainReconciliation(ref), true
+		// The terminal IS committed durably — that is the truth, even if
+		// the acceptance upgrade could not be recorded. Re-read the
+		// committed state and report the terminal; never contradict
+		// durable state with an Uncertain verdict.
+		committed, rerr := a.store.GetCodexTurnAttempt(ctx, attempt.AttemptID)
+		if rerr != nil || committed == nil || !committed.Terminal {
+			return uncertainReconciliation(ref), true
+		}
+		return terminalReconciliation(ref, committed), true
 	}
 	outcome := terminalReconciliation(ref, &storage.CodexTurnAttempt{ObservedStatus: observed, ResultPayload: &rawStr})
 	return outcome, true

@@ -34,15 +34,21 @@ import (
 
 // insertHarnessAttestation records the cprot-v2 attestation row the
 // harness's eligibility seam reports, bound to the harness's frozen
-// (version, platform, profile) tuple.
-func insertHarnessAttestation(t *testing.T, h *adapterHarness, id string) {
+// (version, platform, manifest, profile) tuple. Pass manifestDigest ""
+// to use the harness's frozen manifest digest, or a divergent value to
+// prove the tuple match fails closed.
+func insertHarnessAttestation(t *testing.T, h *adapterHarness, id string, manifestDigest ...string) {
 	t.Helper()
+	md := h.policy.ManifestDigest
+	if len(manifestDigest) > 0 && manifestDigest[0] != "" {
+		md = manifestDigest[0]
+	}
 	_, err := h.store.DB().ExecContext(context.Background(), `
 INSERT INTO codex_protection_attestations
 	(attestation_id, codex_version, platform, manifest_digest, profile_digest,
 	 probe_results, probed_at, actor)
-VALUES (?, ?, ?, 'sha256:manifest', ?, '[]', '2026-09-23T00:00:00Z', 'op')`,
-		id, h.policy.AppServerVersion, codexPlatformIdentity(), h.profileDigest)
+VALUES (?, ?, ?, ?, ?, '[]', '2026-09-23T00:00:00Z', 'op')`,
+		id, h.policy.AppServerVersion, codexPlatformIdentity(), md, h.profileDigest)
 	if err != nil {
 		t.Fatalf("insert harness attestation: %v", err)
 	}
@@ -515,6 +521,34 @@ func TestCodexAdapter_ProtectionFrozenAtLaunch(t *testing.T) {
 		att := waitAttempt(t, h, "t-adv", func(a *storage.CodexTurnAttempt) bool { return a.Terminal })
 		if att.RolloutProtection != "advisory" || att.AttestationID != nil {
 			t.Fatalf("advisory freeze: %q %v", att.RolloutProtection, att.AttestationID)
+		}
+	})
+
+	t.Run("manifestDigestMismatchFailsClosed", func(t *testing.T) {
+		h := newAdapterHarness(t)
+		scenario := append([]string{authOKLine()}, threadStartRules(testThreadID, h.wsRoot, h.model)...)
+		scenario = append(scenario, resumeRule(testThreadID, h.wsRoot, h.model, nil))
+		scenario = append(scenario, turnAcceptedRules(testThreadID, testTurnID, true)...)
+		writeScenario(t, h.scratch, scenario...)
+		h.createAndPersist(t)
+		seedRollout(t, h, testThreadID)
+		// A valid otherwise-matching attestation row whose manifest
+		// digest DIFFERS from the launch's frozen manifest digest must
+		// never satisfy the tuple: protection degrades to advisory,
+		// with no attestation id frozen.
+		insertHarnessAttestation(t, h, testAttestationID(), "sha256:"+strings.Repeat("ff", 32))
+		if h.policy.ManifestDigest == "sha256:"+strings.Repeat("ff", 32) {
+			t.Fatal("fixture invariant broken: the divergent digest must differ from the frozen one")
+		}
+
+		out, err := h.dispatch(t, "t-mismatch", "prompt")
+		if err != nil || out.Status != adapter.DispatchAccepted {
+			t.Fatalf("dispatch: %+v err=%v", out, err)
+		}
+		att := waitAttempt(t, h, "t-mismatch", func(a *storage.CodexTurnAttempt) bool { return a.Terminal })
+		if att.RolloutProtection != "advisory" || att.AttestationID != nil {
+			t.Fatalf("a manifest-digest mismatch must degrade to advisory, got %q %v",
+				att.RolloutProtection, att.AttestationID)
 		}
 	})
 }

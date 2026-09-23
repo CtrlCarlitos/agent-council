@@ -767,6 +767,7 @@ func (a *CodexAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt
 	// FAILURE is never silently downgraded.
 	protection, attestationID, pErr := a.resolveRolloutProtection(ctx)
 	if pErr != nil {
+		a.server.markIdle(ref.SessionID)
 		releaseIfRejected()
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
 			Reason: "rollout protection resolution: " + pErr.Error()}, pErr
@@ -1626,10 +1627,10 @@ func nativeTurnIDFromResult(raw json.RawMessage) string {
 // resolveRolloutProtection freezes the rollout protection class for a
 // new attempt (§3.7): the isolation-attestation seam must report a valid
 // attestation AND a durable cprot-v2 row must exist matching the frozen
-// (codex version, platform, profile) tuple for the same id. Advisory is
-// the default; the unverified platform degrades to integrity=unverified.
-// A lookup FAILURE is returned — protection is never silently
-// downgraded by an error (the AC-008 rule).
+// (codex version, platform, manifest digest, profile digest) tuple for
+// the same id. Advisory is the default; the unverified platform degrades
+// to integrity=unverified. A lookup FAILURE is returned — protection is
+// never silently downgraded by an error (the AC-008 rule).
 func (a *CodexAdapter) resolveRolloutProtection(ctx context.Context) (string, *string, error) {
 	seamID, seamOK := "", false
 	if a.attestation != nil {
@@ -1639,7 +1640,7 @@ func (a *CodexAdapter) resolveRolloutProtection(ctx context.Context) (string, *s
 	if seamOK && strings.TrimSpace(seamID) != "" {
 		var err error
 		rowID, err = a.store.FindCodexProtectionAttestation(ctx,
-			a.policy.AppServerVersion, codexPlatformIdentity(), a.profileDigest)
+			a.policy.AppServerVersion, codexPlatformIdentity(), a.policy.ManifestDigest, a.profileDigest)
 		if err != nil {
 			return "", nil, err
 		}

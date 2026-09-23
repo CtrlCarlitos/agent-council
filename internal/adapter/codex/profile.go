@@ -33,7 +33,11 @@ func (e *ErrUnsupportedProfile) Error() string {
 // for the launch seam. ApprovalPolicyCanonical is the canonical JSON
 // encoding of the frozen approval policy (string literal or granular
 // object); effective-config comparison (§3.5) treats any byte
-// difference against the native side as drift.
+// difference against the native side as drift. ManifestDigest is the
+// canonical toolkit-manifest digest (storage.ComputeToolkitManifestDigest)
+// frozen at validation — the same value the §3.7 protection-attestation
+// journal operation stores, so the protected-evidence tuple match
+// (version, platform, manifest, profile) is exact.
 type CodexLaunchPolicy struct {
 	AppServerVersion           string
 	ModelProvider              string
@@ -51,6 +55,7 @@ type CodexLaunchPolicy struct {
 	RulesUnverifiable          []string
 	EventUniversePath          string
 	EventUniverseDigest        string
+	ManifestDigest             string
 }
 
 // ValidateCodexHarness validates the frozen codex harness block of a run
@@ -77,6 +82,16 @@ func ValidateCodexHarness(profile storage.CanonicalProfile, evidenceRoot string)
 
 	unsupported := func(reason string) (CodexLaunchPolicy, error) {
 		return CodexLaunchPolicy{}, &ErrUnsupportedProfile{AlgoVersion: profile.AlgoVersion, Reason: reason}
+	}
+
+	// cprof-v3 requires the toolkit manifest; its canonical digest is
+	// part of the frozen launch tuple (§3.7 protected-evidence match).
+	if profile.ToolkitManifest == nil {
+		return unsupported("cprof-v3 profile requires toolkit_manifest")
+	}
+	manifestDigest, err := storage.ComputeToolkitManifestDigest(profile.ToolkitManifest.ToolkitManifest)
+	if err != nil {
+		return unsupported("toolkit manifest digest: " + err.Error())
 	}
 
 	if strings.TrimSpace(c.AppServerVersion) == "" {
@@ -145,6 +160,7 @@ func ValidateCodexHarness(profile storage.CanonicalProfile, evidenceRoot string)
 		RulesUnverifiable:          append([]string(nil), c.RulesEvidence.Unverifiable...),
 		EventUniversePath:          c.EventUniversePath,
 		EventUniverseDigest:        c.EventUniverseDigest,
+		ManifestDigest:             manifestDigest,
 	}, nil
 }
 

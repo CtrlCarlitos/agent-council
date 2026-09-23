@@ -345,18 +345,7 @@ func ComputeProfileDigest(profile CanonicalProfile) (string, []byte, error) {
 	}
 
 	if profile.AlgoVersion == "cprof-v2" || profile.AlgoVersion == "cprof-v3" {
-		m := profile.ToolkitManifest.ToolkitManifest
-		canonicalMap["toolkit_manifest"] = map[string]any{
-			"probed_cli_version":       norm.NFC.String(strings.Trim(m.ProbedCLIVersion, "\ufeff")),
-			"universe_evidence_path":   norm.NFC.String(strings.Trim(m.UniverseEvidencePath, "\ufeff")),
-			"universe_evidence_digest": strings.ToLower(strings.TrimSpace(m.UniverseEvidenceDigest)),
-			"approved_tools":           normalizeStringSlice(m.ApprovedTools, false, false),
-			"denied_complement":        normalizeStringSlice(m.DeniedComplement, false, false),
-			"expected_hooks":           normalizeStringSlice(m.ExpectedHooks, false, false),
-			"expected_skills":          normalizeStringSlice(m.ExpectedSkills, false, false),
-			"expected_plugins":         normalizeStringSlice(m.ExpectedPlugins, false, false),
-			"turns_bound":              m.TurnsBound,
-		}
+		canonicalMap["toolkit_manifest"] = canonicalToolkitManifestMap(profile.ToolkitManifest.ToolkitManifest)
 	}
 
 	buf := new(bytes.Buffer)
@@ -369,6 +358,43 @@ func ComputeProfileDigest(profile CanonicalProfile) (string, []byte, error) {
 	sum := sha256.Sum256(canonicalJSON)
 	digest := fmt.Sprintf("%s:sha256:%x", profile.AlgoVersion, sum)
 	return digest, canonicalJSON, nil
+}
+
+// canonicalToolkitManifestMap builds the normalized canonical sub-map
+// for a toolkit manifest — EXACTLY the value ComputeProfileDigest
+// embeds under "toolkit_manifest". Shared so the standalone manifest
+// digest and the profile digest can never diverge.
+func canonicalToolkitManifestMap(m ToolkitManifest) map[string]any {
+	return map[string]any{
+		"probed_cli_version":       norm.NFC.String(strings.Trim(m.ProbedCLIVersion, "\ufeff")),
+		"universe_evidence_path":   norm.NFC.String(strings.Trim(m.UniverseEvidencePath, "\ufeff")),
+		"universe_evidence_digest": strings.ToLower(strings.TrimSpace(m.UniverseEvidenceDigest)),
+		"approved_tools":           normalizeStringSlice(m.ApprovedTools, false, false),
+		"denied_complement":        normalizeStringSlice(m.DeniedComplement, false, false),
+		"expected_hooks":           normalizeStringSlice(m.ExpectedHooks, false, false),
+		"expected_skills":          normalizeStringSlice(m.ExpectedSkills, false, false),
+		"expected_plugins":         normalizeStringSlice(m.ExpectedPlugins, false, false),
+		"turns_bound":              m.TurnsBound,
+	}
+}
+
+// ComputeToolkitManifestDigest returns the canonical toolkit-manifest
+// digest — `sha256:<hex>` over the same normalized canonical JSON
+// encoding ComputeProfileDigest embeds under "toolkit_manifest". This is
+// THE manifest_digest value the codex launch policy freezes at
+// validation and the codex protection-attestation journal operation
+// stores: both call this one function, so the frozen launch tuple and
+// the durable attestation rows can never disagree on manifest identity.
+func ComputeToolkitManifestDigest(manifest ToolkitManifest) (string, error) {
+	buf := new(bytes.Buffer)
+	enc := json.NewEncoder(buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(canonicalToolkitManifestMap(manifest)); err != nil {
+		return "", fmt.Errorf("encode canonical toolkit manifest json: %w", err)
+	}
+	canonicalJSON := bytes.TrimRight(buf.Bytes(), "\n")
+	sum := sha256.Sum256(canonicalJSON)
+	return fmt.Sprintf("sha256:%x", sum), nil
 }
 
 // canonicalJSONValue re-encodes a raw JSON value verbatim as canonical

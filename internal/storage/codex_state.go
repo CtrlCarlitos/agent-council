@@ -529,18 +529,19 @@ WHERE attempt_id = ? AND accepted IS NULL
 }
 
 // FindCodexProtectionAttestation returns the attestation id whose
-// durable cprot-v2 row matches the frozen (codex version, platform,
-// profile digest) tuple in force at launch, or "" when none matches.
-// This is the adapter-side freeze check for the §3.7 protected-evidence
-// upgrade; the manifest-digest match is enforced by the production
-// attestation lookup wiring that produced the seam id.
-func (s *Store) FindCodexProtectionAttestation(ctx context.Context, codexVersion, platform, profileDigest string) (string, error) {
+// durable cprot-v2 row matches the frozen launch tuple (codex version,
+// platform, manifest digest, profile digest) EXACTLY — all four binding
+// columns, spec §3.7 — or "" when none matches. This is the adapter-side
+// freeze check for the §3.7 protected-evidence upgrade; a row that
+// disagrees on ANY tuple member (manifest digest included) never
+// satisfies the lookup.
+func (s *Store) FindCodexProtectionAttestation(ctx context.Context, codexVersion, platform, manifestDigest, profileDigest string) (string, error) {
 	var id string
 	err := s.DB().QueryRowContext(ctx, `
 SELECT attestation_id FROM codex_protection_attestations
-WHERE codex_version = ? AND platform = ? AND profile_digest = ?
+WHERE codex_version = ? AND platform = ? AND manifest_digest = ? AND profile_digest = ?
 ORDER BY probed_at DESC LIMIT 1`,
-		codexVersion, platform, profileDigest).Scan(&id)
+		codexVersion, platform, manifestDigest, profileDigest).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}

@@ -223,6 +223,71 @@ func TestCodexAdapter_Reconcile_VerifiedAbsenceAuthorizesOneRedispatch(t *testin
 	}
 }
 
+// Forced accepted-write failure: the terminal IS committed durably, so
+// Reconcile must return ReachableTerminal with the committed outcome —
+// never an Uncertain verdict that contradicts durable state.
+func TestCodexAdapter_Reconcile_AcceptedWriteFailureKeepsTerminalTruth(t *testing.T) {
+	turnKey := "t-rec-accfail"
+	prompt := "reconstruct with a failing acceptance upgrade"
+	h, ref := lostAttemptScenario(t, turnKey, prompt, true)
+
+	binding, err := h.store.GetCodexSessionBinding(context.Background(), testSessionID)
+	if err != nil || binding == nil || binding.RolloutPath == nil {
+		t.Fatalf("binding: %+v err=%v", binding, err)
+	}
+	f, err := os.OpenFile(*binding.RolloutPath, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open rollout: %v", err)
+	}
+	for _, line := range []string{
+		harnessTurnContext(h, testTurnID, nil),
+		harnessUserItem(turnKey, prompt),
+		harnessTaskComplete("committed regardless", false),
+	} {
+		if _, err := f.WriteString(line + "\n"); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Force the acceptance upgrade to fail: accepted set to 0 (not NULL,
+	// not 1) makes SetCodexAttemptAccepted's once-only guard refuse the
+	// write with an error, exactly like any other upgrade failure.
+	att, err := h.store.GetLatestCodexTurnAttempt(context.Background(), testSessionID, turnKey)
+	if err != nil || att == nil {
+		t.Fatalf("attempt: %v", err)
+	}
+	if _, err := h.store.DB().ExecContext(context.Background(),
+		`UPDATE codex_turn_attempts SET accepted = 0 WHERE attempt_id = ?`, att.AttemptID); err != nil {
+		t.Fatalf("force accepted failure: %v", err)
+	}
+
+	outcome, err := h.adapter.Reconcile(context.Background(), reconcileRef(ref))
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if err := outcome.Validate(); err != nil {
+		t.Fatalf("outcome validation: %v", err)
+	}
+	if outcome.Status != adapter.ReconciliationReachableTerminal || outcome.Observed != council.TurnCompleted {
+		t.Fatalf("the committed terminal is the truth; must not report Uncertain: %+v", outcome)
+	}
+
+	// Durable state confirms: terminal committed, accepted untouched.
+	after, err := h.store.GetCodexTurnAttempt(context.Background(), att.AttemptID)
+	if err != nil || after == nil {
+		t.Fatalf("attempt after reconcile: %v", err)
+	}
+	if !after.Terminal || after.ObservedStatus != "completed" {
+		t.Fatalf("terminal must be durably committed: %+v", after)
+	}
+	if after.Accepted == nil || *after.Accepted {
+		t.Fatalf("accepted must remain unupgraded after the forced failure: %v", after.Accepted)
+	}
+}
+
 // Protected attempt, baseline unchanged, but the child death is NOT
 // durably known (launch never recorded dead): no absence claim —
 // Uncertain.
