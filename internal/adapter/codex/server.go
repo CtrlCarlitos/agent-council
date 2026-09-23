@@ -456,6 +456,16 @@ func (m *CodexServer) child(sessionID adapter.SessionID) (*codexChild, error) {
 	return child, nil
 }
 
+// hasChild reports whether a live child is running for the session. The
+// adapter uses it to scope the dispatch-time eligibility gate to paths
+// that would START a child (§3.9: the gate binds every launch).
+func (m *CodexServer) hasChild(sessionID adapter.SessionID) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.children[string(sessionID)]
+	return ok
+}
+
 // isParked reports whether the session has a parked (stopped but
 // resumable) child.
 func (m *CodexServer) isParked(sessionID adapter.SessionID) bool {

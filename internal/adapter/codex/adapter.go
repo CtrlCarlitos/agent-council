@@ -132,6 +132,12 @@ type CodexAdapter struct {
 
 	createMu  sync.Mutex
 	creations map[adapter.SessionID]*codexCreationCall
+	// uncertain is the in-adapter §3.4 tombstone: a logical session whose
+	// creation ended uncertain may never be auto-retried in this process.
+	// Cleared ONLY by ResolveCreationUncertainty (the service layer's
+	// explicit resolution seam); durable cross-restart blocking is
+	// recorded by the service journal, not here.
+	uncertain map[adapter.SessionID]error
 }
 
 var _ adapter.Adapter = (*CodexAdapter)(nil)
@@ -159,6 +165,7 @@ func NewCodexAdapter(
 		turns:         make(map[adapter.TurnRef]*codexTurnRun),
 		singleFlt:     make(map[string]*codexSlot),
 		creations:     make(map[adapter.SessionID]*codexCreationCall),
+		uncertain:     make(map[adapter.SessionID]error),
 	}
 }
 
@@ -223,7 +230,10 @@ func (a *CodexAdapter) Probe(ctx context.Context) (adapter.ProbeReport, error) {
 // created, §3.3 step 2) → creation-reservation route → thread/start →
 // id equality confirmed → binding with materialized=false. Concurrent
 // duplicates share the reserved outcome; repeated identical config is
-// idempotent; changed config fails closed.
+// idempotent; changed config fails closed. A creation that ended
+// UNCERTAIN tombstones the logical session (§3.4: automatic recreation
+// blocked): any further CreateSession for that SessionID returns the
+// typed uncertain error until the service layer explicitly resolves it.
 func (a *CodexAdapter) CreateSession(ctx context.Context, req adapter.CreateSessionRequest) (adapter.SessionBinding, error) {
 	if err := req.Validate(); err != nil {
 		return adapter.SessionBinding{}, err
@@ -236,6 +246,18 @@ func (a *CodexAdapter) CreateSession(ctx context.Context, req adapter.CreateSess
 	}
 
 	a.createMu.Lock()
+	if cause, blocked := a.uncertain[req.SessionID]; blocked {
+		a.createMu.Unlock()
+		// §3.4: automatic recreation is blocked after an uncertain
+		// creation. The in-adapter tombstone stops retries in THIS
+		// process; durable cross-restart blocking is the service
+		// journal's responsibility (Task 9/10 acceptance asserts it).
+		return adapter.SessionBinding{}, &adapter.ErrSessionCreationUncertain{
+			SessionID:   req.SessionID,
+			Contributor: req.Contributor,
+			Err:         fmt.Errorf("creation uncertainty is unresolved for this session: %w", cause),
+		}
+	}
 	if call, ok := a.creations[req.SessionID]; ok {
 		a.createMu.Unlock()
 		<-call.done
@@ -264,6 +286,15 @@ func (a *CodexAdapter) CreateSession(ctx context.Context, req adapter.CreateSess
 	// and shares the result (AC-008 pattern).
 	close(call.done)
 	if err != nil {
+		// §3.4 tombstone: an uncertain creation blocks automatic
+		// recreation for this logical session until the service layer
+		// explicitly resolves it.
+		var unc *adapter.ErrSessionCreationUncertain
+		if errors.As(err, &unc) {
+			a.createMu.Lock()
+			a.uncertain[req.SessionID] = err
+			a.createMu.Unlock()
+		}
 		a.createMu.Lock()
 		if a.creations[req.SessionID] == call {
 			delete(a.creations, req.SessionID)
@@ -273,22 +304,30 @@ func (a *CodexAdapter) CreateSession(ctx context.Context, req adapter.CreateSess
 	return binding, err
 }
 
+// ResolveCreationUncertainty clears the in-adapter creation-uncertain
+// tombstone for a logical session, permitting a new CreateSession. It is
+// the explicit, controller-visible resolution seam the service layer
+// owns (Task 9): automatic retries NEVER clear it, and durable
+// cross-restart blocking is recorded by the service journal — this
+// in-memory map is one process's enforcement of the same §3.4 rule.
+// It reports whether a tombstone was cleared.
+func (a *CodexAdapter) ResolveCreationUncertainty(sessionID adapter.SessionID) bool {
+	a.createMu.Lock()
+	defer a.createMu.Unlock()
+	_, ok := a.uncertain[sessionID]
+	if ok {
+		delete(a.uncertain, sessionID)
+	}
+	return ok
+}
+
 // createBinding performs the validated creation in §3.4 gate order.
 func (a *CodexAdapter) createBinding(ctx context.Context, req adapter.CreateSessionRequest) (adapter.SessionBinding, error) {
 	// §3.3 ordering step 1 — BEFORE any child starts: the isolation
 	// attestation is durable Council-side state. Missing ⇒ typed
 	// ErrProductionEligibilityMissing, no process started.
-	if a.attestation == nil {
-		return adapter.SessionBinding{}, &ErrProductionEligibilityMissing{
-			SessionID: req.SessionID,
-			Reason:    "no attestation lookup is wired into the production constructor",
-		}
-	}
-	if _, ok := a.attestation(); !ok {
-		return adapter.SessionBinding{}, &ErrProductionEligibilityMissing{
-			SessionID: req.SessionID,
-			Reason:    "no valid isolation attestation for the frozen (codex version, platform, manifest) tuple",
-		}
+	if err := a.checkProductionEligibility(req.SessionID); err != nil {
+		return adapter.SessionBinding{}, err
 	}
 
 	meta, err := a.store.GetSessionMetadata(ctx, string(req.SessionID))
@@ -404,6 +443,28 @@ func (a *CodexAdapter) bindingFor(req adapter.CreateSessionRequest, nativeID str
 		NativeSessionID: nativeID,
 		Config:          req.Config,
 	}
+}
+
+// checkProductionEligibility applies the §3.3 eligibility gate: a valid
+// isolation attestation must exist for the frozen (codex version,
+// platform, manifest) tuple. It fires BEFORE any child starts — at
+// CreateSession (ordering step 1) and at every Dispatch that launches a
+// replacement child (§3.9: "at every launch"). A nil lookup fails
+// closed; there is no inference of eligibility from absent evidence.
+func (a *CodexAdapter) checkProductionEligibility(sessionID adapter.SessionID) error {
+	if a.attestation == nil {
+		return &ErrProductionEligibilityMissing{
+			SessionID: sessionID,
+			Reason:    "no attestation lookup is wired into the production constructor",
+		}
+	}
+	if _, ok := a.attestation(); !ok {
+		return &ErrProductionEligibilityMissing{
+			SessionID: sessionID,
+			Reason:    "no valid isolation attestation for the frozen (codex version, platform, manifest) tuple",
+		}
+	}
+	return nil
 }
 
 // compareCreationConfig enforces the §3.4 fail-closed mismatch rule
@@ -564,6 +625,19 @@ func (a *CodexAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt
 	}
 
 	a.server.markBusy(ref.SessionID)
+
+	// §3.9: the eligibility gate fires at every launch. A dispatch that
+	// needs a replacement child (parked, crashed, or first dispatch after
+	// restart) re-checks the attestation BEFORE any process starts — the
+	// check precedes markBusy so a refused launch leaves no state behind.
+	if !a.server.hasChild(ref.SessionID) {
+		if err := a.checkProductionEligibility(ref.SessionID); err != nil {
+			a.server.markIdle(ref.SessionID)
+			releaseIfRejected()
+			return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
+				Reason: err.Error()}, err
+		}
+	}
 
 	// Pre-transmission verification (§3.5 step 1) — FIRST TURN INCLUDED.
 	// The child may be a replacement after parking; the handshake gate

@@ -539,6 +539,51 @@ func TestCodexAdapter_CreateSessionDriftedIdFailsClosed(t *testing.T) {
 	}
 }
 
+// §3.4: automatic recreation is blocked after an uncertain creation. The
+// second CreateSession for the same logical session returns the typed
+// uncertain error WITHOUT starting a new child or thread; only the
+// explicit ResolveCreationUncertainty seam clears the tombstone.
+func TestCodexAdapter_CreationUncertainTombstoneBlocksRetry(t *testing.T) {
+	h := newAdapterHarness(t)
+	writeScenario(t, h.scratch,
+		authOKLine(),
+		`{"emit_on_request": {"method":"thread/start","line":{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"`+testThreadID+`","status":{"type":"idle"}}}}}}`,
+		`{"respond": {"method":"thread/start","delay_ms":2000,"result":{"id":"`+testThreadID+`","status":{"type":"idle"}}}}`)
+	withTimeoutVar(t, &creationAckTimeout, 200*time.Millisecond)
+
+	req := adapter.CreateSessionRequest{
+		SessionID:   testSessionID,
+		Contributor: "codex",
+		Config:      adapter.SessionConfig{WorkspaceRoot: h.wsRoot, Model: h.model},
+	}
+	_, firstErr := h.adapter.CreateSession(context.Background(), req)
+	var firstUnc *adapter.ErrSessionCreationUncertain
+	if !errors.As(firstErr, &firstUnc) {
+		t.Fatalf("first creation must be uncertain, got %T: %v", firstErr, firstErr)
+	}
+
+	// The automatic retry is refused by the tombstone — no new child.
+	if _, err := h.adapter.CreateSession(context.Background(), req); err == nil {
+		t.Fatal("retried creation must fail closed on the unresolved uncertainty")
+	} else {
+		var uncertain *adapter.ErrSessionCreationUncertain
+		if !errors.As(err, &uncertain) {
+			t.Fatalf("retry must carry the typed uncertain error, got %T: %v", err, err)
+		}
+	}
+	if args := readFixtureFile(t, h.scratch, ".codex-fixture-args"); len(args) != 1 {
+		t.Fatalf("the blocked retry must not start a child, launches: %v", args)
+	}
+
+	// Only the explicit resolution seam clears the tombstone.
+	if !h.adapter.ResolveCreationUncertainty(testSessionID) {
+		t.Fatal("resolve must report a cleared tombstone")
+	}
+	if h.adapter.ResolveCreationUncertainty(testSessionID) {
+		t.Fatal("a second resolve must report nothing to clear")
+	}
+}
+
 // ── §3.4 ResumeSession (local inspection only) ──────────────────────────
 
 func TestCodexAdapter_ResumeSessionLocalOnly(t *testing.T) {
@@ -848,6 +893,31 @@ func TestCodexAdapter_CrashBoundaryReservedNotStarted(t *testing.T) {
 	}
 }
 
+// §3.9: the eligibility gate fires at every launch. A dispatch that
+// needs a replacement child (park, crash, restart — no live child)
+// re-checks the attestation BEFORE any process starts.
+func TestCodexAdapter_DispatchEligibilityGateOnChildReplacement(t *testing.T) {
+	h := newAdapterHarness(t)
+	h.createAndPersist(t)
+
+	// Child-replacement situation: the running child is gone.
+	h.server.stop(context.Background(), testSessionID)
+	h.eligible.Store(false)
+
+	out, err := h.dispatch(t, "t-elig", "prompt")
+	var missing *ErrProductionEligibilityMissing
+	if !errors.As(err, &missing) {
+		t.Fatalf("expected ErrProductionEligibilityMissing, got %T: %v", err, err)
+	}
+	if out.Status != adapter.DispatchRejected {
+		t.Fatalf("eligibility loss is a pre-acceptance rejection, got %s", out.Status)
+	}
+	// Exactly the creation launch remains: no replacement child started.
+	if args := readFixtureFile(t, h.scratch, ".codex-fixture-args"); len(args) != 1 {
+		t.Fatalf("no child may start without eligibility, launches: %v", args)
+	}
+}
+
 // Resume of a missing native session: the deterministic verbatim error
 // maps to the typed ErrNativeSessionMissing as a pre-acceptance
 // rejection, and the child is terminated.
@@ -969,6 +1039,70 @@ func TestCodexAdapter_PhasedSurfacesHonest(t *testing.T) {
 		t.Fatalf("live cancel must stay CancelUnknown, got %+v err=%v", co, err)
 	}
 	waitAttempt(t, h, "t-phase", func(a *storage.CodexTurnAttempt) bool { return a.NativeTurnID != nil })
+}
+
+// §6.1 scenario 1 — concurrent duplicate dispatch: N callers, ONE
+// TurnRef, one shared verdict. Exactly one dispatch is accepted, the
+// others are rejected (never queued), exactly one turn/start reaches the
+// wire, and exactly one durable attempt row exists.
+func TestCodexAdapter_ConcurrentDispatchScenarioOne(t *testing.T) {
+	h := newAdapterHarness(t)
+	scenario := append([]string{authOKLine()}, threadStartRules(testThreadID, h.wsRoot, h.model)...)
+	scenario = append(scenario, resumeRule(testThreadID, h.wsRoot, h.model, nil))
+	scenario = append(scenario, turnAcceptedRules(testThreadID, testTurnID, false)...)
+	writeScenario(t, h.scratch, scenario...)
+	h.createAndPersist(t)
+
+	const n = 8
+	ref := adapter.TurnRef{SessionID: testSessionID, TurnKey: "t-sc1"}
+	outcomes := make([]adapter.DispatchOutcome, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			outcomes[i], errs[i] = h.adapter.Dispatch(context.Background(), ref, "shared prompt")
+		}(i)
+	}
+	wg.Wait()
+
+	accepted := 0
+	for i := 0; i < n; i++ {
+		switch outcomes[i].Status {
+		case adapter.DispatchAccepted:
+			accepted++
+		case adapter.DispatchRejected:
+			// Expected for the losers; the reason differs by which gate
+			// observed the duplicate (durable block, busy, or duplicate
+			// attempt insert) — all are rejections, none queued.
+		default:
+			t.Fatalf("caller %d: unexpected verdict %+v err=%v", i, outcomes[i], errs[i])
+		}
+	}
+	if accepted != 1 {
+		t.Fatalf("exactly one caller may be accepted, got %d", accepted)
+	}
+
+	turns := 0
+	for _, r := range requestLog(t, h.scratch) {
+		if r == "turn/start" {
+			turns++
+		}
+	}
+	if turns != 1 {
+		t.Fatalf("exactly one turn/start may reach the wire, got %d (%v)", turns, requestLog(t, h.scratch))
+	}
+
+	var rows int
+	if err := h.store.DB().QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM codex_turn_attempts WHERE session_id = ? AND turn_key = ?`,
+		testSessionID, ref.TurnKey).Scan(&rows); err != nil {
+		t.Fatalf("count attempts: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("exactly one attempt row must exist, got %d", rows)
+	}
 }
 
 // compile-time contract check: a drifted adapter contract fails loudly.
