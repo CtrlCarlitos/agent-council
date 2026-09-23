@@ -318,9 +318,17 @@ func runContractProbe(
 		}
 		scanErr = sc.Err()
 	}()
-	go drainReader(proc.Stderr())
-	_, waitErr := proc.Wait()
+	stderrDone := make(chan struct{})
+	go func() {
+		defer close(stderrDone)
+		drainReader(proc.Stderr())
+	}()
+	// StdoutPipe/StderrPipe readers must reach EOF before Wait reaps the
+	// child and closes the descriptors. Reaping first races the scanners
+	// and can turn a complete probe response into os.ErrClosed.
 	<-outDone
+	<-stderrDone
+	_, waitErr := proc.Wait()
 	if waitErr != nil {
 		return "", fmt.Errorf("probe child failed: %w", waitErr)
 	}
