@@ -525,6 +525,12 @@ func TestAcceptance_Claude_ApprovalRequiredBoundedRun(t *testing.T) {
 		t.Fatalf("write fixture stream: %v", err)
 	}
 
+	// Keep the turn alive briefly so the worker's terminal handling is
+	// deterministic against the fast fixture replay.
+	if err := os.WriteFile(filepath.Join(acc.wsRoot, ".claude-fixture-delay"), []byte("200"), 0o600); err != nil {
+		t.Fatalf("write delay knob: %v", err)
+	}
+
 	start := time.Now()
 	hydrated, err := acc.store.HydrateState(ctx)
 	if err != nil {
