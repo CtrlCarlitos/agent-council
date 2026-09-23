@@ -699,7 +699,11 @@ adapter side effect.
   (canonical zero UUID → verbatim `no rollout found … (code -32600)`
   asserts the deterministic missing-thread contract); `model/list`
   (credential-free inventory); `codex mcp list`; `codex login status`
-  (auth evidence without secrets). `generate-json-schema` captures are
+  (auth evidence without secrets). Errata (planning): the MCP inventory
+  probe surface is `mcpServerStatus/list` via the probe child (per §3.8's
+  toolkit-verification bullet); the `codex mcp list` CLI form is an
+  optional operator capture, not an adapter launch.
+  `generate-json-schema` captures are
   research evidence, not a run-time dependency.
 
 ### 3.9 Stream, protocol, and failure semantics
