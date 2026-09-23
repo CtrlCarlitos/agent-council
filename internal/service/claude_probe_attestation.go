@@ -13,10 +13,63 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/CtrlCarlitos/agent-council/internal/adapter"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/claude"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
+
+// CreateClaudeSession is the PRODUCTION session-birth path (§3.3): the
+// service owns the whole flow — controller authority is pre-flighted,
+// the wired adapter generates the native identity and materializes the
+// config root, and the returned binding is persisted under the run
+// controller's credential in one durable transition (BindClaudeSession
+// re-validates authority inside its transaction). No other production
+// caller may pair CreateSession with binding persistence.
+func (s *Server) CreateClaudeSession(ctx context.Context, opID, controllerLease string, req adapter.CreateSessionRequest) (adapter.SessionBinding, storage.OperationReceipt, error) {
+	if strings.TrimSpace(opID) == "" || strings.TrimSpace(controllerLease) == "" {
+		return adapter.SessionBinding{}, storage.OperationReceipt{}, errors.New(
+			"session creation requires the operation id and the controller lease")
+	}
+	if s.adapter == nil {
+		return adapter.SessionBinding{}, storage.OperationReceipt{}, errors.New(
+			"no contributor adapter is wired; cannot create a Claude session")
+	}
+	runID, err := s.store.GetSessionRunID(ctx, string(req.SessionID))
+	if err != nil {
+		return adapter.SessionBinding{}, storage.OperationReceipt{}, fmt.Errorf("session run lookup: %w", err)
+	}
+	// Pre-flight authority: reject before any native identity is minted
+	// or any config root is materialized.
+	if err := s.store.CheckControllerAuthority(ctx, runID, controllerLease); err != nil {
+		return adapter.SessionBinding{}, storage.OperationReceipt{}, fmt.Errorf("controller authority: %w", err)
+	}
+
+	binding, err := s.adapter.CreateSession(ctx, req)
+	if err != nil {
+		return adapter.SessionBinding{}, storage.OperationReceipt{}, fmt.Errorf("native session creation: %w", err)
+	}
+
+	configRoot := claude.ConfigRootPath(s.cfg.ClaudeConfigBaseDir, runID, string(req.SessionID))
+	templateDigest, err := claude.TemplateDigest(s.cfg.ClaudeTemplateDir)
+	if err != nil {
+		return adapter.SessionBinding{}, storage.OperationReceipt{}, fmt.Errorf("frozen template digest: %w", err)
+	}
+	receipt, err := s.store.BindClaudeSession(ctx, opID, controllerLease, storage.ClaudeSessionBinding{
+		SessionID:      string(req.SessionID),
+		NativeID:       binding.NativeSessionID,
+		Model:          req.Config.Model,
+		Workspace:      req.Config.WorkspaceRoot,
+		ConfigRoot:     configRoot,
+		TemplateDigest: templateDigest,
+		CreatedAt:      time.Now().UTC(),
+	})
+	if err != nil {
+		return adapter.SessionBinding{}, storage.OperationReceipt{}, fmt.Errorf("persist binding: %w", err)
+	}
+	return binding, receipt, nil
+}
 
 // ClaudeProbeAttestationRequest carries one operator-authorized
 // attestation recording: the idempotency op_id, the acting operator

@@ -33,7 +33,8 @@ runs in CI except where explicitly marked **manual evidence**.
 | §3.10 reconciliation four-state | `TestClaudeAdapter_ReconcileActiveAndUnknownStates`, `TestClaudeAdapter_ReconcileTerminalAndMissingStates` |
 | §3.11 durable state schema | `TestClaudeState_SchemaVersionIsExactly4` + full `TestClaudeState_*` transition suite; launch-state evidence: `TestClaudeState_LaunchStatesInReservationOrder` |
 | Production service wiring (fail-closed) | `TestServiceWiring_ClaudeConfigurationFailClosed`, `TestServiceWiring_ClaudeConstructionSucceeds`, config-base/scratch validation (`claude_config_base_test.go`, scratch containment regressions) |
-| Bridge lifecycle (acceptance story) | `TestAcceptance_Claude_BridgeLifecycle` (adopt-once → connect → CreateSession + §3.3 persistence → queue → release → gated execution → collect → disconnect → reconnect → --resume follow-up → durable outcomes; resume passes local inspection with transcript correlation end-to-end) |
+| Bridge lifecycle (acceptance story) | `TestAcceptance_Claude_BridgeLifecycle` (adopt-once → connect → **production session birth via `Server.CreateClaudeSession`** — authority pre-flight, wrong-credential refusal, §3.3 persistence under the controller credential → queue → release → gated execution → collect → disconnect → reconnect → --resume follow-up → durable outcomes; resume passes local inspection with transcript correlation end-to-end) |
+| Production session-birth persistence | `Server.CreateClaudeSession` + `storage.BindClaudeSession` (controller authority re-validated in the write transaction, idempotent by op_id, one-binding guard, journaled); exercised through the service boundary by all three acceptance tests |
 | Production protection freezing | `TestClaudeAdapter_FreezesMatchingAttestation` (advisory before recording; protected with frozen id after; lookup failure rejects) |
 
 ## Manual evidence (not CI)
@@ -45,10 +46,15 @@ CI-excluded:
    complete-choice-set assertions as the probe (§2.1 verified sets);
 2. minimal live step, only when the operator supplies native session
    id, model, workdir, and prompt — the script never selects them;
-3. §3.6 transcript-path denial probe suite (Read / Glob / Grep /
-   Bash-absolute / MCP / plugin classes against a sibling transcript):
-   every executed record must be DENIED for a valid cprot-v1
-   attestation; any NOT-DENIED record keeps the transcript advisory.
+3. §3.6 transcript-path denial probe suite — EXECUTED, not suggested:
+   the script runs each applicable class (Read / Glob / Grep /
+   Bash-absolute; MCP/plugin when enabled, ABSENT otherwise) against
+   the sibling transcript through real `claude -p` children, captures
+   the structured stream, classifies each outcome
+   (DENIED/NOT-DENIED/UNPROVABLE/ABSENT), and REFUSES the attestation
+   (exit 2) if any executed class was NOT-DENIED. The sibling target
+   is recorded as a SHA-256 hash only; prompts are never written to
+   the evidence; excerpts are sanitized and capped at 256 bytes.
 
 ## Explicitly unverified capabilities (fail-closed today)
 

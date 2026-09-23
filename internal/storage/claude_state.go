@@ -100,9 +100,22 @@ type ClaudeSessionBinding struct {
 
 // InsertClaudeSessionBinding persists a new unmaterialized binding.
 // Fail closed if the session already has one (idempotency is handled by
-// the adapter's creation reservation).
+// the adapter's creation reservation). Direct use is reserved for the
+// adapter contract tests; the production path is BindClaudeSession.
 func (s *Store) InsertClaudeSessionBinding(ctx context.Context, b ClaudeSessionBinding) error {
-	_, err := s.DB().ExecContext(ctx, `
+	tx, err := s.BeginWrite(ctx)
+	if err != nil {
+		return fmt.Errorf("begin binding insert: %w", err)
+	}
+	defer tx.Rollback()
+	if err := insertClaudeSessionBindingTx(ctx, tx.Tx(), b); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func insertClaudeSessionBindingTx(ctx context.Context, tx *sql.Tx, b ClaudeSessionBinding) error {
+	_, err := tx.ExecContext(ctx, `
 INSERT INTO claude_session_bindings
 	(session_id, native_id, materialized, model, workspace, config_root,
 	 template_digest, first_prompt_digest, created_at)
@@ -113,6 +126,80 @@ VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?)`,
 		return fmt.Errorf("insert claude session binding: %w", err)
 	}
 	return nil
+}
+
+// CheckControllerAuthority validates that the presented lease is the
+// run's active controller credential (read-only pre-flight;
+// BindClaudeSession re-validates inside its transaction).
+func (s *Store) CheckControllerAuthority(ctx context.Context, runID, lease string) error {
+	_, err := classifyCredential(ctx, s.readDB, runID, lease, true)
+	return err
+}
+
+// BindClaudeSession is the production session-birth persistence path
+// (§3.3): the adapter does not persist; the service/storage layer
+// records the binding returned by CreateSession under the run
+// controller's authority. Authority is re-validated inside the write
+// transaction; the operation is idempotent by op_id with receipt
+// replay; a session that already has a binding is rejected — one
+// native identity per session.
+func (s *Store) BindClaudeSession(ctx context.Context, opID, callerLease string, b ClaudeSessionBinding) (OperationReceipt, error) {
+	if strings.TrimSpace(opID) == "" || strings.TrimSpace(callerLease) == "" {
+		return OperationReceipt{}, errors.New("binding requires the operation id and the controller lease")
+	}
+	if strings.TrimSpace(b.SessionID) == "" || strings.TrimSpace(b.NativeID) == "" {
+		return OperationReceipt{}, errors.New("binding requires the session id and the native id")
+	}
+	runID, err := s.GetSessionRunID(ctx, b.SessionID)
+	if err != nil {
+		return OperationReceipt{}, fmt.Errorf("session run lookup: %w", err)
+	}
+	fp := computeFingerprint("bind_claude_session", b.SessionID, b.NativeID, b.Model, b.Workspace, b.ConfigRoot, b.TemplateDigest)
+
+	tx, err := s.BeginWrite(ctx)
+	if err != nil {
+		return OperationReceipt{}, err
+	}
+	defer tx.Rollback()
+
+	if _, err := classifyCredential(ctx, tx.Tx(), runID, callerLease, true); err != nil {
+		return OperationReceipt{}, fmt.Errorf("controller authority: %w", err)
+	}
+	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "bind_claude_session", fp); err != nil {
+		return OperationReceipt{}, err
+	} else if receipt != nil {
+		return *receipt, nil
+	}
+
+	var existing string
+	err = tx.Tx().QueryRowContext(ctx,
+		`SELECT native_id FROM claude_session_bindings WHERE session_id = ?`, b.SessionID).Scan(&existing)
+	if err == nil {
+		return OperationReceipt{}, fmt.Errorf("session %s is already bound to native session %s", b.SessionID, existing)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return OperationReceipt{}, fmt.Errorf("query existing binding: %w", err)
+	}
+
+	now := time.Now().UTC()
+	receipt := OperationReceipt{
+		OpID:             opID,
+		CommandType:      "bind_claude_session",
+		CommittedVersion: 1,
+		CreatedAt:        now,
+		Payload:          b.NativeID,
+	}
+	if err := recordJournalEntry(tx.Tx(), opID, "bind_claude_session", fp, runID, b.SessionID, "",
+		"claude_session_binding", receipt, callerLease); err != nil {
+		return OperationReceipt{}, err
+	}
+	if err := insertClaudeSessionBindingTx(ctx, tx.Tx(), b); err != nil {
+		return OperationReceipt{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return OperationReceipt{}, err
+	}
+	return receipt, nil
 }
 
 // GetClaudeSessionBinding returns the binding for a logical session.

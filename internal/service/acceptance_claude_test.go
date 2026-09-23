@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
-	"github.com/CtrlCarlitos/agent-council/internal/adapter/claude"
 	"github.com/CtrlCarlitos/agent-council/internal/council"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
@@ -262,11 +261,12 @@ func adoptAndConnect(t *testing.T, acc *claudeAcceptance, bridge *acceptanceBrid
 	return lease
 }
 
-// createAndBind drives the production CreateSession through the wired
-// adapter and performs the §3.3 service/storage persistence.
-func (acc *claudeAcceptance) createAndBind(t *testing.T, ctx context.Context) adapter.SessionBinding {
+// createAndBind drives the PRODUCTION session-birth path: the service
+// operation owns CreateSession and the §3.3 binding persistence under
+// the run controller's credential.
+func (acc *claudeAcceptance) createAndBind(t *testing.T, ctx context.Context, lease, opID string) adapter.SessionBinding {
 	t.Helper()
-	binding, err := acc.srv.adapter.CreateSession(ctx, adapter.CreateSessionRequest{
+	binding, receipt, err := acc.srv.CreateClaudeSession(ctx, opID, lease, adapter.CreateSessionRequest{
 		SessionID:   claudeAcceptanceSession,
 		Contributor: "claude",
 		Config: adapter.SessionConfig{
@@ -275,26 +275,10 @@ func (acc *claudeAcceptance) createAndBind(t *testing.T, ctx context.Context) ad
 		},
 	})
 	if err != nil {
-		t.Fatalf("native session creation: %v", err)
+		t.Fatalf("native session creation through the service path: %v", err)
 	}
-	runID, err := acc.store.GetSessionRunID(ctx, claudeAcceptanceSession)
-	if err != nil {
-		t.Fatalf("run lookup: %v", err)
-	}
-	templateDigest, err := claude.TemplateDigest(filepath.Join(acc.bindings, "..", "claude-template"))
-	if err != nil {
-		t.Fatalf("template digest: %v", err)
-	}
-	if err := acc.store.InsertClaudeSessionBinding(ctx, storage.ClaudeSessionBinding{
-		SessionID:      claudeAcceptanceSession,
-		NativeID:       binding.NativeSessionID,
-		Model:          "claude-haiku-4-5-20251001",
-		Workspace:      acc.wsRoot,
-		ConfigRoot:     claude.ConfigRootPath(acc.bindings, runID, claudeAcceptanceSession),
-		TemplateDigest: templateDigest,
-		CreatedAt:      time.Now().UTC(),
-	}); err != nil {
-		t.Fatalf("persist binding: %v", err)
+	if receipt.CommandType != "bind_claude_session" || receipt.Payload != binding.NativeSessionID {
+		t.Fatalf("unexpected binding receipt %+v", receipt)
 	}
 	return binding
 }
@@ -315,9 +299,22 @@ func TestAcceptance_Claude_BridgeLifecycle(t *testing.T) {
 	var code int
 	var resp map[string]any
 
-	// 3. Native session birth through the production adapter; the
-	// service/storage layer persists the returned binding (§3.3).
-	binding := acc.createAndBind(t, ctx)
+	// 3. Native session birth through the production service path; the
+	// service operation owns CreateSession and §3.3 persistence under
+	// the controller credential. A wrong credential is refused before
+	// any native identity is minted and no binding appears.
+	if _, _, err := acc.srv.CreateClaudeSession(ctx, "op-bind-cacc-bad", "not-the-lease",
+		adapter.CreateSessionRequest{
+			SessionID:   claudeAcceptanceSession,
+			Contributor: "claude",
+			Config:      adapter.SessionConfig{WorkspaceRoot: acc.wsRoot, Model: "claude-haiku-4-5-20251001"},
+		}); err == nil {
+		t.Fatal("session birth without the controller credential must be refused")
+	}
+	if b, _ := acc.store.GetClaudeSessionBinding(ctx, claudeAcceptanceSession); b != nil {
+		t.Fatal("no binding may exist after an authority refusal")
+	}
+	binding := acc.createAndBind(t, ctx, lease, "op-bind-cacc-1")
 	if binding.NativeSessionID == claudeAcceptanceSession {
 		t.Fatal("native id must be freshly generated and distinct")
 	}
@@ -451,7 +448,7 @@ func TestAcceptance_Claude_ConcurrentDuplicateDispatch(t *testing.T) {
 	ctx := context.Background()
 	bridge := &acceptanceBridge{t: t, client: newTestClient(acc.srv.SocketPath()), token: acc.token}
 	lease := adoptAndConnect(t, acc, bridge)
-	acc.createAndBind(t, ctx)
+	acc.createAndBind(t, ctx, lease, "op-bind-cacc-dup")
 
 	hydrated, err := acc.store.HydrateState(ctx)
 	if err != nil {
@@ -507,10 +504,9 @@ func TestAcceptance_Claude_ConcurrentDuplicateDispatch(t *testing.T) {
 func TestAcceptance_Claude_ApprovalRequiredBoundedRun(t *testing.T) {
 	acc := newClaudeAcceptance(t)
 	ctx := context.Background()
-	binding := acc.createAndBind(t, ctx)
-
 	bridge := &acceptanceBridge{t: t, client: newTestClient(acc.srv.SocketPath()), token: acc.token}
 	lease := adoptAndConnect(t, acc, bridge)
+	binding := acc.createAndBind(t, ctx, lease, "op-bind-cacc-appr")
 
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -520,8 +516,8 @@ func TestAcceptance_Claude_ApprovalRequiredBoundedRun(t *testing.T) {
 	fixture := strings.Join([]string{
 		`{"type":"system","subtype":"hook_started","hook_name":"SessionStart:startup"}`,
 		fmt.Sprintf(`{"type":"system","subtype":"init","session_id":%q,"cwd":%q,"claude_code_version":"2.1.278","model":"claude-haiku-4-5-20251001","permissionMode":"default","tools":["Read","Glob","Grep"],"skills":[],"plugins":[]}`, sid, acc.wsRoot),
-		fmt.Sprintf(`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Write","input":{"path":%q}}]},"session_id":%q}`, filepath.Join(cwd, "outside.txt"), sid),
-		fmt.Sprintf(`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"Claude requested permissions to write to %s, but you haven't granted it yet"}]},"session_id":%q}`, filepath.Join(cwd, "outside.txt"), sid),
+		fmt.Sprintf(`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":%q}}]},"session_id":%q}`, filepath.Join(cwd, "outside.txt"), sid),
+		fmt.Sprintf(`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"Claude requested permissions to read %s, but you haven't granted it yet"}]},"session_id":%q}`, filepath.Join(cwd, "outside.txt"), sid),
 		fmt.Sprintf(`{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":%q,"result":"reached max turns"}`, sid),
 		"",
 	}, "\n")
