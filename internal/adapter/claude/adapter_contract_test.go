@@ -1154,6 +1154,10 @@ func TestClaudeAdapter_FailedTerminalMapping(t *testing.T) {
 		fmt.Sprintf(`{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]},"session_id":%q}`, binding.NativeSessionID),
 		fmt.Sprintf(`{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":%q,"result":"reached max turns"}`, binding.NativeSessionID),
 	))
+	// Keep the turn alive briefly: subscribing must deterministically
+	// win the race against a fast child completing and removing the
+	// live-turn entry.
+	writeKnob(t, h.wsRoot, ".claude-fixture-delay", "200")
 
 	ref := adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-fail"}
 	if _, err := h.adapter.Dispatch(ctx, ref, "prompt"); err != nil {
@@ -1227,6 +1231,7 @@ func TestClaudeAdapter_ObserveDetachAndCompletion(t *testing.T) {
 		t.Fatal("observe before dispatch must fail")
 	}
 
+	writeKnob(t, h.wsRoot, ".claude-fixture-delay", "200")
 	if _, err := h.adapter.Dispatch(ctx, ref, "prompt"); err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
