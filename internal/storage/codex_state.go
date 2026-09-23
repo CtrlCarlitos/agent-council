@@ -363,6 +363,96 @@ WHERE attempt_id = ?
 	return nil
 }
 
+// RecordCodexNativeTurnID binds the in-life native turn id on the
+// attempt (spec §3.5: the turn/started notification carries the
+// server-generated UUIDv7; the adapter maps it durably). The binding is
+// once-only: a conflicting rebinding fails closed.
+func (s *Store) RecordCodexNativeTurnID(ctx context.Context, attemptID, nativeTurnID string) error {
+	res, err := s.DB().ExecContext(ctx, `
+UPDATE codex_turn_attempts SET native_turn_id = ?, transition_version = transition_version + 1,
+	updated_at = ? WHERE attempt_id = ? AND native_turn_id IS NULL`,
+		nativeTurnID, time.Now().UTC().Format(time.RFC3339), attemptID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		var existing sql.NullString
+		if err := s.DB().QueryRowContext(ctx,
+			`SELECT native_turn_id FROM codex_turn_attempts WHERE attempt_id = ?`, attemptID).Scan(&existing); err != nil {
+			return err
+		}
+		if existing.Valid && existing.String == nativeTurnID {
+			return nil // idempotent rebinding of the same id
+		}
+		return fmt.Errorf("attempt %s already carries native turn id %v; refusing %q",
+			attemptID, existing.String, nativeTurnID)
+	}
+	return nil
+}
+
+// RecordCodexFirstAcceptance records the first-acceptance rollout
+// baseline in ONE atomic transaction (spec §3.11): the attempt's
+// baseline (file-identity, byte size, entry count) is written with
+// materialized_baseline, and the session binding flips to materialized
+// with the resolved rollout path and the attempt's prompt digest as
+// first_prompt_digest. Conflicting rebinding (a different rollout path
+// for an already-materialized binding) fails closed.
+func (s *Store) RecordCodexFirstAcceptance(ctx context.Context, sessionID, attemptID, rolloutPath, identity string, size int64, entries int) error {
+	tx, err := s.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := tx.ExecContext(ctx, `
+UPDATE codex_turn_attempts SET baseline_file_identity = ?, baseline_size = ?, baseline_entries = ?,
+	materialized_baseline = 1, transition_version = transition_version + 1, updated_at = ?
+WHERE attempt_id = ? AND materialized_baseline = 0`, identity, size, entries, now, attemptID)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		var mat int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT materialized_baseline FROM codex_turn_attempts WHERE attempt_id = ?`, attemptID).Scan(&mat); err != nil {
+			return fmt.Errorf("first acceptance for unknown attempt %s: %w", attemptID, err)
+		}
+		if mat == 0 {
+			return fmt.Errorf("attempt %s could not accept the baseline", attemptID)
+		}
+		return fmt.Errorf("attempt %s already carries a materialized baseline", attemptID)
+	}
+
+	var mat int
+	var existingPath sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT materialized, rollout_path FROM codex_session_bindings WHERE session_id = ?`,
+		sessionID).Scan(&mat, &existingPath); err != nil {
+		return err
+	}
+	if mat == 1 {
+		if !existingPath.Valid || existingPath.String != rolloutPath {
+			return fmt.Errorf("binding %s is already materialized at %v; refusing rollout path %q",
+				sessionID, existingPath.String, rolloutPath)
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE codex_session_bindings SET materialized = 1, rollout_path = ?,
+	first_prompt_digest = (SELECT prompt_digest FROM codex_turn_attempts WHERE attempt_id = ?)
+WHERE session_id = ? AND materialized = 0`, rolloutPath, attemptID, sessionID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // SetCodexAttemptObservedStatus records the evidence-derived outcome.
 func (s *Store) SetCodexAttemptObservedStatus(ctx context.Context, attemptID, status string) error {
 	_, err := s.DB().ExecContext(ctx, `

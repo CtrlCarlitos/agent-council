@@ -107,6 +107,10 @@ type codexChild struct {
 	stderrDone chan struct{}
 }
 
+// defaultIdleGrace is the park-after-idle grace (controller ruling:
+// default 30s, config-driven via SetIdleGrace).
+const defaultIdleGrace = 30 * time.Second
+
 // CodexServer owns all live app-server children for this adapter
 // instance, keyed by the logical session ID.
 type CodexServer struct {
@@ -114,23 +118,114 @@ type CodexServer struct {
 	launch   ChildLaunchSource
 	policy   CodexLaunchPolicy
 
-	mu       sync.Mutex
-	children map[string]*codexChild
-	starting map[string]chan struct{}
-	parked   map[string]time.Time
+	mu          sync.Mutex
+	children    map[string]*codexChild
+	starting    map[string]chan struct{}
+	parked      map[string]time.Time
+	idleGrace   time.Duration
+	idleTimers  map[string]*time.Timer
+	busy        map[string]bool
+	generations map[string]int64
 }
 
 // NewCodexServer wires the child manager to an executor, a launch source,
-// and the frozen launch policy (handshake attestation compare).
+// and the frozen launch policy (handshake attestation compare). Children
+// park after the idle grace (default 30s) when no turn is active.
 func NewCodexServer(executor execpolicy.PolicyExecutor, launch ChildLaunchSource, policy CodexLaunchPolicy) *CodexServer {
 	return &CodexServer{
-		executor: executor,
-		launch:   launch,
-		policy:   policy,
-		children: make(map[string]*codexChild),
-		starting: make(map[string]chan struct{}),
-		parked:   make(map[string]time.Time),
+		executor:    executor,
+		launch:      launch,
+		policy:      policy,
+		children:    make(map[string]*codexChild),
+		starting:    make(map[string]chan struct{}),
+		parked:      make(map[string]time.Time),
+		idleGrace:   defaultIdleGrace,
+		idleTimers:  make(map[string]*time.Timer),
+		busy:        make(map[string]bool),
+		generations: make(map[string]int64),
 	}
+}
+
+// SetIdleGrace configures the park-after-idle grace (controller ruling:
+// default 30s, config-driven). It affects timers armed after the call.
+func (m *CodexServer) SetIdleGrace(d time.Duration) {
+	m.mu.Lock()
+	m.idleGrace = d
+	m.mu.Unlock()
+}
+
+// markBusy records active work for a session and disarms its idle-park
+// timer: a child with an in-flight turn (or in-flight creation) is never
+// parked under it.
+func (m *CodexServer) markBusy(sessionID adapter.SessionID) {
+	key := string(sessionID)
+	m.mu.Lock()
+	m.busy[key] = true
+	if t, ok := m.idleTimers[key]; ok {
+		t.Stop()
+		delete(m.idleTimers, key)
+	}
+	m.mu.Unlock()
+}
+
+// markIdle clears the busy mark and (re)arms the idle-park timer.
+func (m *CodexServer) markIdle(sessionID adapter.SessionID) {
+	key := string(sessionID)
+	m.mu.Lock()
+	delete(m.busy, key)
+	_, live := m.children[key]
+	grace := m.idleGrace
+	if !live {
+		m.mu.Unlock()
+		return
+	}
+	if t, ok := m.idleTimers[key]; ok {
+		t.Stop()
+	}
+	m.mu.Unlock()
+	m.armIdleTimer(key, grace)
+}
+
+// armIdleTimer schedules park-on-idle for a session. The timer fires
+// only while the session stays non-busy (park re-checks under the lock).
+func (m *CodexServer) armIdleTimer(key string, grace time.Duration) {
+	if grace <= 0 {
+		return
+	}
+	m.mu.Lock()
+	_, live := m.children[key]
+	busy := m.busy[key]
+	if !live || busy {
+		m.mu.Unlock()
+		return
+	}
+	t := time.AfterFunc(grace, func() {
+		m.park(context.Background(), adapter.SessionID(key))
+	})
+	m.idleTimers[key] = t
+	m.mu.Unlock()
+}
+
+// generation reports the current app-server child instance for a session
+// (spec §3.11 child_generation: restarts on park produce a new instance).
+func (m *CodexServer) generation(sessionID adapter.SessionID) int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.generations[string(sessionID)]
+}
+
+// poisonKey terminates a session's child for adapter-side protocol drift
+// (e.g. a confirmed thread id that is not canonical UUIDv7).
+func (m *CodexServer) poisonKey(sessionID adapter.SessionID, cause error) {
+	key := string(sessionID)
+	m.mu.Lock()
+	child, ok := m.children[key]
+	delete(m.children, key)
+	m.mu.Unlock()
+	if !ok {
+		return
+	}
+	m.terminate(key, child, cause)
 }
 
 // start launches (or returns the already-running) child for the session.
@@ -164,6 +259,10 @@ func (m *CodexServer) start(ctx context.Context, sessionID adapter.SessionID) (*
 		m.mu.Unlock()
 		close(launchDone)
 	}()
+
+	m.mu.Lock()
+	m.generations[key]++
+	m.mu.Unlock()
 
 	launchReq, err := m.launch.CodexAppServerLaunch(ctx, sessionID)
 	if err != nil {
@@ -225,7 +324,9 @@ func (m *CodexServer) start(ctx context.Context, sessionID adapter.SessionID) (*
 	m.mu.Lock()
 	m.children[key] = child
 	delete(m.parked, key)
+	grace := m.idleGrace
 	m.mu.Unlock()
+	m.armIdleTimer(key, grace)
 	return child, nil
 }
 
@@ -283,14 +384,22 @@ func (m *CodexServer) terminate(key string, child *codexChild, cause error) {
 // park stops the session's child after idle grace and records the parked
 // session; resume starts a replacement child and re-verifies the binding
 // provider-free (spec §3.2/§3.4 — the adapter layer owns ResumeSession).
+// A fired timer that raced with markBusy re-checks the busy mark under
+// the lock: an active child is never parked under a turn.
 func (m *CodexServer) park(ctx context.Context, sessionID adapter.SessionID) error {
 	key := string(sessionID)
 	m.mu.Lock()
+	if m.busy[key] {
+		delete(m.idleTimers, key)
+		m.mu.Unlock()
+		return nil
+	}
 	child, ok := m.children[key]
 	if ok {
 		delete(m.children, key)
 		m.parked[key] = time.Now().UTC()
 	}
+	delete(m.idleTimers, key)
 	m.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("no codex child to park for session %s", sessionID)
@@ -307,6 +416,11 @@ func (m *CodexServer) stop(ctx context.Context, sessionID adapter.SessionID) {
 	if ok {
 		delete(m.children, key)
 	}
+	if t, tok := m.idleTimers[key]; tok {
+		t.Stop()
+		delete(m.idleTimers, key)
+	}
+	delete(m.busy, key)
 	m.mu.Unlock()
 	if ok {
 		m.terminate(key, child, nil)
@@ -320,6 +434,10 @@ func (m *CodexServer) stopAll(ctx context.Context) {
 	for k, v := range m.children {
 		children = append(children, v)
 		delete(m.children, k)
+	}
+	for k, t := range m.idleTimers {
+		t.Stop()
+		delete(m.idleTimers, k)
 	}
 	m.mu.Unlock()
 	for _, child := range children {
