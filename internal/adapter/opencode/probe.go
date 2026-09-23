@@ -67,7 +67,11 @@ func (a *OpenCodeAdapter) Probe(ctx context.Context) (adapter.ProbeReport, error
 	if err != nil {
 		return report, fmt.Errorf("probe version execution: %w", err)
 	}
-	// Drain stdout to capture the version string.
+	// Drain stdout to capture the version string. StdoutPipe/StderrPipe
+	// readers must reach EOF before Wait reaps the child and closes the
+	// descriptors — reaping first races the scanners and can turn a
+	// complete probe response into an empty capture (same race as the
+	// AC-008 probe fix).
 	var versionOut strings.Builder
 	versionDone := make(chan struct{})
 	go func() {
@@ -77,8 +81,14 @@ func (a *OpenCodeAdapter) Probe(ctx context.Context) (adapter.ProbeReport, error
 			versionOut.WriteString(sc.Text() + "\n")
 		}
 	}()
-	_, waitErr := versionProc.Wait()
+	stderrDone := make(chan struct{})
+	go func() {
+		defer close(stderrDone)
+		_, _ = io.Copy(io.Discard, versionProc.Stderr())
+	}()
 	<-versionDone
+	<-stderrDone
+	_, waitErr := versionProc.Wait()
 	if waitErr != nil {
 		return report, fmt.Errorf("opencode --version failed: %w", waitErr)
 	}
