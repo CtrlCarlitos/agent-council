@@ -464,7 +464,7 @@ func TestWorkspace_PhysicalRootUnderSymlinkedBase(t *testing.T) {
 	}
 	// The reference base must be physical too: on darwin t.TempDir()
 	// itself lives behind /var -> /private/var.
-	realBase, err = filepath.EvalSymlinks(realBase)
+	realBase, err := filepath.EvalSymlinks(realBase)
 	if err != nil {
 		t.Fatalf("resolve real base: %v", err)
 	}
