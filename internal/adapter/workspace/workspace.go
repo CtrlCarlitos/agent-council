@@ -169,12 +169,16 @@ func (m *WorkspaceManager) AllocateWorkspace(runID, sessionID, mode, sourceRepo,
 		return WorkspacePaths{}, ErrWorkspaceEscapesBase
 	}
 
-	// Always provision scratch/ and config/ with mode 0700
-	scratchDir := filepath.Join(sessionDir, "scratch")
+	// Always provision scratch/ and config/ with mode 0700. They are
+	// built on the RESOLVED session directory: the native child's getwd
+	// resolves symlinked ancestors (e.g. macOS /var -> /private/var),
+	// and every correlation (init cwd, transcript derivation) must use
+	// the physical path the child experiences.
+	scratchDir := filepath.Join(realSessionDir, "scratch")
 	if err := os.MkdirAll(scratchDir, 0700); err != nil {
 		return WorkspacePaths{}, fmt.Errorf("failed creating scratch directory: %w", err)
 	}
-	configDir := filepath.Join(sessionDir, "config")
+	configDir := filepath.Join(realSessionDir, "config")
 	if err := os.MkdirAll(configDir, 0700); err != nil {
 		return WorkspacePaths{}, fmt.Errorf("failed creating config directory: %w", err)
 	}

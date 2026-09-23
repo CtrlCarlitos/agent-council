@@ -409,7 +409,7 @@ func (a *ClaudeAdapter) ResumeSession(ctx context.Context, binding adapter.Sessi
 		// §3.4 step 3: the transcript must carry the accepted user
 		// entry matching the attempt records' prompt digests — proof
 		// THIS transcript is THIS session's.
-		return CorrelateTranscriptPrompt(path, attempts)
+		return CorrelateTranscriptPrompt(path, stored.ConfigRoot, attempts)
 	}
 	return nil
 }

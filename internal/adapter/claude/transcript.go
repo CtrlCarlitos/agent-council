@@ -24,12 +24,14 @@ import (
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
-// verifyPathComponentSymlinks rejects symlink components anywhere on
-// the transcript's path — from the file itself up through every parent
-// directory, including the config root and its ancestors (§3.6
-// containment). The transcript is trusted only if every component is a
-// real directory or the final regular file.
-func verifyPathComponentSymlinks(path string) error {
+// verifyPathComponentSymlinks rejects symlink components on the
+// transcript's path from the file itself up to and including the trust
+// root (the per-session config root, §3.6 containment). Components
+// ABOVE the trust root are operator/platform reality (e.g. macOS
+// /var -> /private/var) and are not evidence; if the walk reaches the
+// filesystem root without meeting the trust root, the transcript is
+// not contained in the config root and fails closed.
+func verifyPathComponentSymlinks(path, trustRoot string) error {
 	current := path
 	for {
 		st, err := os.Lstat(current)
@@ -39,9 +41,12 @@ func verifyPathComponentSymlinks(path string) error {
 		if st.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("bound transcript path component %s is a symlink; containment violated", current)
 		}
+		if current == trustRoot {
+			return nil
+		}
 		parent := filepath.Dir(current)
 		if parent == current {
-			return nil
+			return fmt.Errorf("bound transcript %s is not contained in the config root %s", path, trustRoot)
 		}
 		current = parent
 	}
@@ -106,11 +111,11 @@ type TranscriptInspection struct {
 //   - every complete entry is valid JSON; a torn FINAL line without a
 //     newline is a tolerated tail (§3.9);
 //   - at least one `user` entry carries prompt text.
-func InspectTranscript(path string) (*TranscriptInspection, error) {
+func InspectTranscript(path, trustRoot string) (*TranscriptInspection, error) {
 	if !transcriptTrustSupported() {
 		return nil, fmt.Errorf("transcript trust inspection is not supported on %s; failing closed (§3.6)", runtime.GOOS)
 	}
-	if err := verifyPathComponentSymlinks(path); err != nil {
+	if err := verifyPathComponentSymlinks(path, trustRoot); err != nil {
 		return nil, err
 	}
 	st, err := os.Lstat(path)
@@ -242,8 +247,8 @@ func userEntryText(msg struct {
 // under that attempt's identity, to the attempt's stored prompt
 // digest. Entries belonging to uncertain or missing attempts are never
 // authoritative.
-func CorrelateTranscriptPrompt(path string, attempts []*storage.ClaudeTurnAttempt) error {
-	ins, err := InspectTranscript(path)
+func CorrelateTranscriptPrompt(path, trustRoot string, attempts []*storage.ClaudeTurnAttempt) error {
+	ins, err := InspectTranscript(path, trustRoot)
 	if err != nil {
 		return err
 	}

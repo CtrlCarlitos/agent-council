@@ -95,6 +95,9 @@ func TestTemplateDigest_RejectsNonUTF8Path(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows paths are exposed through UTF-16 and cannot represent the invalid UTF-8 filename fixture")
 	}
+	if runtime.GOOS == "darwin" {
+		t.Skip("APFS rejects invalid UTF-8 filenames at creation (illegal byte sequence); the digest rejection runs on Linux")
+	}
 	dir := t.TempDir()
 	bad := filepath.Join(dir, "bad\xff.txt") // 0xff is never valid UTF-8
 	if err := os.WriteFile(bad, []byte("x"), 0o600); err != nil {
