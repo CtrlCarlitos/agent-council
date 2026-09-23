@@ -21,6 +21,8 @@ package codex
 //   {"respond_error": {"method": M, "code": C, "message": S}}
 //   {"emit_on_request": {"method": M, "line": L}}      emit L BEFORE answering M (consume once)
 //   {"emit_after_response": {"method": M, "line": L}}  emit L AFTER answering M (consume once)
+//   {"append_on_request": {"method": M, "path": P, "lines": [...]}}
+//                                                      append lines to file P BEFORE answering M (consume once)
 //   {"emit": L} / {"emit_raw": S} / {"emit_oversized": N}   immediate output
 //   {"stderr": S} / {"delay_ms": N}                    immediate side effects
 //
@@ -76,11 +78,26 @@ type lineRule struct {
 	used   bool
 }
 
+type appendRule struct {
+	Method string   ` + "`json:\"method\"`" + `
+	Path   string   ` + "`json:\"path\"`" + `
+	Lines  []string ` + "`json:\"lines\"`" + `
+	used   bool
+}
+
+type multiLineRule struct {
+	Method string          ` + "`json:\"method\"`" + `
+	Lines  []json.RawMessage ` + "`json:\"lines\"`" + `
+	used   bool
+}
+
 type directive struct {
 	Respond           *respondRule    ` + "`json:\"respond\"`" + `
 	RespondError      *respondErrorRule ` + "`json:\"respond_error\"`" + `
 	EmitOnRequest     *lineRule       ` + "`json:\"emit_on_request\"`" + `
 	EmitAfterResponse *lineRule       ` + "`json:\"emit_after_response\"`" + `
+	AppendOnRequest   *appendRule     ` + "`json:\"append_on_request\"`" + `
+	EmitManyOnRequest *multiLineRule  ` + "`json:\"emit_many_on_request\"`" + `
 	Emit              json.RawMessage ` + "`json:\"emit\"`" + `
 	EmitRaw           string          ` + "`json:\"emit_raw\"`" + `
 	EmitOversized     int64           ` + "`json:\"emit_oversized\"`" + `
@@ -141,6 +158,8 @@ func main() {
 		respErrs  []respondErrorRule
 		onReq     []*lineRule
 		afterResp []*lineRule
+		appends   []*appendRule
+		manyReq   []*multiLineRule
 	)
 	if raw, err := os.ReadFile(".codex-fixture-scenario.jsonl"); err == nil {
 		for _, ln := range strings.Split(string(raw), "\n") {
@@ -160,6 +179,10 @@ func main() {
 				onReq = append(onReq, &lineRule{Method: d.EmitOnRequest.Method, Line: d.EmitOnRequest.Line})
 			case d.EmitAfterResponse != nil:
 				afterResp = append(afterResp, &lineRule{Method: d.EmitAfterResponse.Method, Line: d.EmitAfterResponse.Line})
+			case d.AppendOnRequest != nil:
+				appends = append(appends, &appendRule{Method: d.AppendOnRequest.Method, Path: d.AppendOnRequest.Path, Lines: d.AppendOnRequest.Lines})
+			case d.EmitManyOnRequest != nil:
+				manyReq = append(manyReq, &multiLineRule{Method: d.EmitManyOnRequest.Method, Lines: d.EmitManyOnRequest.Lines})
 			case len(d.Emit) > 0:
 				fmt.Fprintln(os.Stdout, string(d.Emit))
 			case d.EmitRaw != "":
@@ -207,6 +230,30 @@ func main() {
 		for _, r := range onReq {
 			if !r.used && r.Method == req.Method {
 				fmt.Fprintln(os.Stdout, string(r.Line))
+				r.used = true
+				break
+			}
+		}
+
+		for _, r := range manyReq {
+			if !r.used && r.Method == req.Method {
+				for _, l := range r.Lines {
+					fmt.Fprintln(os.Stdout, string(l))
+				}
+				r.used = true
+				break
+			}
+		}
+
+		for _, r := range appends {
+			if !r.used && r.Method == req.Method {
+				f, err := os.OpenFile(r.Path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+				if err == nil {
+					for _, l := range r.Lines {
+						fmt.Fprintln(f, l)
+					}
+					f.Close()
+				}
 				r.used = true
 				break
 			}

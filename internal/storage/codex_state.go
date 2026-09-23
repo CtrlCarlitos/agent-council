@@ -295,7 +295,7 @@ WHERE attempt_id = ? AND launch_count > 0 AND observed_status = 'uncertain'`, at
 	case "dead":
 		_, err := s.DB().ExecContext(ctx, `
 UPDATE codex_attempt_launches SET state = 'dead', known_dead_at = ?, exit_code = ?
-WHERE attempt_id = ? AND reservation_seq = ?`, now, attemptID, seq, exitCode)
+WHERE attempt_id = ? AND reservation_seq = ?`, now, exitCode, attemptID, seq)
 		return err
 	default:
 		return fmt.Errorf("unknown launch state %q", state)
@@ -463,11 +463,13 @@ UPDATE codex_turn_attempts SET observed_status = ?, transition_version = transit
 
 // SetCodexAttemptTerminal records the verified terminal result payload
 // with its evidence-derived observed status: 'completed' for a verified
-// success result, 'failed' for a verified error result. Both are
-// terminal; only the status differs.
+// success result, 'failed' for a verified error result, 'interrupted'
+// for a verified interrupted terminal (§3.9 — the accepted interrupt
+// confirmed by the interrupted turn status). All are terminal; only the
+// status differs.
 func (s *Store) SetCodexAttemptTerminal(ctx context.Context, attemptID, observedStatus, resultPayload, resultUsage string) error {
-	if observedStatus != "completed" && observedStatus != "failed" {
-		return fmt.Errorf("terminal observed status must be completed or failed, got %q", observedStatus)
+	if observedStatus != "completed" && observedStatus != "failed" && observedStatus != "interrupted" {
+		return fmt.Errorf("terminal observed status must be completed, failed, or interrupted, got %q", observedStatus)
 	}
 	// Exactly-once guard: only the first successful write wins (the
 	// WHERE clause requires terminal = 0).
@@ -487,6 +489,86 @@ UPDATE codex_turn_attempts SET terminal = 1, result_payload = ?, result_usage = 
 		return fmt.Errorf("attempt %s already terminal; exactly-once guard prevented overwrite", attemptID)
 	}
 	return nil
+}
+
+// SetCodexAttemptAccepted records the protected-mode acceptance upgrade
+// (spec §3.7): accepted is written ONLY from verified ordered rollout
+// correlation of a protected attempt — advisory attempts keep accepted
+// NULL. The write is once-only; a replay of the same upgrade is
+// idempotent.
+func (s *Store) SetCodexAttemptAccepted(ctx context.Context, attemptID string) error {
+	res, err := s.DB().ExecContext(ctx, `
+UPDATE codex_turn_attempts SET accepted = 1,
+	transition_version = transition_version + 1, updated_at = ?
+WHERE attempt_id = ? AND accepted IS NULL
+  AND rollout_protection = 'protected'`,
+		time.Now().UTC().Format(time.RFC3339), attemptID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		var accepted sql.NullInt64
+		var protection string
+		if err := s.DB().QueryRowContext(ctx,
+			`SELECT accepted, rollout_protection FROM codex_turn_attempts WHERE attempt_id = ?`,
+			attemptID).Scan(&accepted, &protection); err != nil {
+			return err
+		}
+		if accepted.Valid && accepted.Int64 == 1 {
+			return nil // idempotent replay of the same upgrade
+		}
+		return fmt.Errorf(
+			"acceptance upgrade requires a protected attempt without recorded acceptance (attempt %s protection=%q)",
+			attemptID, protection)
+	}
+	return nil
+}
+
+// FindCodexProtectionAttestation returns the attestation id whose
+// durable cprot-v2 row matches the frozen (codex version, platform,
+// profile digest) tuple in force at launch, or "" when none matches.
+// This is the adapter-side freeze check for the §3.7 protected-evidence
+// upgrade; the manifest-digest match is enforced by the production
+// attestation lookup wiring that produced the seam id.
+func (s *Store) FindCodexProtectionAttestation(ctx context.Context, codexVersion, platform, profileDigest string) (string, error) {
+	var id string
+	err := s.DB().QueryRowContext(ctx, `
+SELECT attestation_id FROM codex_protection_attestations
+WHERE codex_version = ? AND platform = ? AND profile_digest = ?
+ORDER BY probed_at DESC LIMIT 1`,
+		codexVersion, platform, profileDigest).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("query codex protection attestation: %w", err)
+	}
+	return id, nil
+}
+
+// CodexAttemptLaunchStates returns the launch reservation states for an
+// attempt in reservation order (reserved|started|start_failed|dead).
+func (s *Store) CodexAttemptLaunchStates(ctx context.Context, attemptID string) ([]string, error) {
+	rows, err := s.DB().QueryContext(ctx, `
+SELECT state FROM codex_attempt_launches
+WHERE attempt_id = ? ORDER BY reservation_seq`, attemptID)
+	if err != nil {
+		return nil, fmt.Errorf("query codex launch states: %w", err)
+	}
+	defer rows.Close()
+	var states []string
+	for rows.Next() {
+		var state string
+		if err := rows.Scan(&state); err != nil {
+			return nil, err
+		}
+		states = append(states, state)
+	}
+	return states, rows.Err()
 }
 
 // GetCodexTurnAttempt returns the current attempt row.

@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -85,12 +86,6 @@ func (e *ErrSessionConfigMismatch) Error() string {
 	return fmt.Sprintf("session %s config mismatch on %s: binding has %q, request has %q",
 		e.SessionID, e.Field, e.Have, e.Want)
 }
-
-// ErrObservationUnavailable is the typed phased-delivery stub for
-// Observe: live turn observation (event streams, approval mirroring,
-// usage) completes in Task 6 (rollout/observe). The turn itself is
-// unaffected: notifications keep flowing into the pump.
-var ErrObservationUnavailable = errors.New("codex turn observation is not wired yet (Task 6: rollout/observe)")
 
 // AttestationLookup reports availability of a valid isolation
 // attestation for the frozen launch tuple (spec §3.3). Production
@@ -196,6 +191,82 @@ type codexTurnRun struct {
 	pump           *EventPump
 	tap            *TurnTap
 	routeInstalled bool
+	child          *codexChild
+	stream         *adapter.BufferedStream
+
+	// usageMu guards the latest cumulative token-usage snapshot
+	// (thread/tokenUsage/updated notifications are cumulative; an older
+	// snapshot never overwrites a newer one — spec §3.9).
+	usageMu   sync.Mutex
+	usageIn   int64
+	usageOut  int64
+	usageSeen bool
+
+	// cancel state: the interrupt request is NOT terminal evidence
+	// (§3.9); only a verified interrupted terminal confirms the cancel.
+	cancelMu        sync.Mutex
+	cancelRequested bool
+	// termCh is closed exactly once, when the run loop commits a
+	// verified terminal classification; termStatus carries the status.
+	termCh     chan string
+	termOnce   sync.Once
+	termStatus string
+	terminated bool
+}
+
+// markCancelRequested records an accepted turn/interrupt request and
+// reports whether this was the first.
+func (r *codexTurnRun) markCancelRequested() bool {
+	r.cancelMu.Lock()
+	defer r.cancelMu.Unlock()
+	if r.cancelRequested {
+		return false
+	}
+	r.cancelRequested = true
+	return true
+}
+
+// notifyTerminal delivers the verified terminal status exactly once.
+func (r *codexTurnRun) notifyTerminal(observed string) {
+	r.termOnce.Do(func() {
+		r.cancelMu.Lock()
+		r.terminated = true
+		r.termStatus = observed
+		r.cancelMu.Unlock()
+		close(r.termCh)
+	})
+}
+
+// terminalStatus returns the verified terminal status once committed.
+func (r *codexTurnRun) terminalStatus() (string, bool) {
+	r.cancelMu.Lock()
+	defer r.cancelMu.Unlock()
+	return r.termStatus, r.terminated
+}
+
+// observeUsage adopts a cumulative usage snapshot under the monotonic
+// rule (an older snapshot never overwrites a newer one) and reports
+// whether it became the latest.
+func (r *codexTurnRun) observeUsage(in, out int64) bool {
+	r.usageMu.Lock()
+	defer r.usageMu.Unlock()
+	if r.usageSeen && in+out < r.usageIn+r.usageOut {
+		return false
+	}
+	r.usageIn, r.usageOut, r.usageSeen = in, out, true
+	return true
+}
+
+// usageResult renders the latest usage snapshot as JSON. Cost is never
+// fabricated: Available=false is structural (spec §3.9).
+func (r *codexTurnRun) usageResult() string {
+	r.usageMu.Lock()
+	in, out, seen := r.usageIn, r.usageOut, r.usageSeen
+	r.usageMu.Unlock()
+	if !seen {
+		return ""
+	}
+	return fmt.Sprintf(`{"input_tokens":%d,"output_tokens":%d,"cost_available":false}`, in, out)
 }
 
 // ── Probe ───────────────────────────────────────────────────────────────
@@ -626,17 +697,16 @@ func (a *CodexAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt
 
 	a.server.markBusy(ref.SessionID)
 
-	// §3.9: the eligibility gate fires at every launch. A dispatch that
-	// needs a replacement child (parked, crashed, or first dispatch after
-	// restart) re-checks the attestation BEFORE any process starts — the
-	// check precedes markBusy so a refused launch leaves no state behind.
-	if !a.server.hasChild(ref.SessionID) {
-		if err := a.checkProductionEligibility(ref.SessionID); err != nil {
-			a.server.markIdle(ref.SessionID)
-			releaseIfRejected()
-			return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
-				Reason: err.Error()}, err
-		}
+	// §3.9: the eligibility gate fires at EVERY launch. The bound launch
+	// is the replacement child a parked/crashed/restarted session needs;
+	// a re-check even with a live child closes the TOCTOU window where
+	// eligibility could lapse between two dispatches sharing a child.
+	// The check precedes markBusy so a refused launch leaves no state.
+	if err := a.checkProductionEligibility(ref.SessionID); err != nil {
+		a.server.markIdle(ref.SessionID)
+		releaseIfRejected()
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
+			Reason: err.Error()}, err
 	}
 
 	// Pre-transmission verification (§3.5 step 1) — FIRST TURN INCLUDED.
@@ -691,6 +761,16 @@ func (a *CodexAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
 			Reason: "rollout baseline: " + err.Error()}, err
 	}
+	// Freeze rollout protection at launch (§3.7 protected-evidence
+	// upgrade): protected only while the isolation attestation in force
+	// matches the frozen tuple; advisory is the default; a lookup
+	// FAILURE is never silently downgraded.
+	protection, attestationID, pErr := a.resolveRolloutProtection(ctx)
+	if pErr != nil {
+		releaseIfRejected()
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
+			Reason: "rollout protection resolution: " + pErr.Error()}, pErr
+	}
 	attemptRow := storage.CodexTurnAttempt{
 		AttemptID: attempt, SessionID: string(ref.SessionID),
 		TurnKey: ref.TurnKey, PromptDigest: promptDigest,
@@ -698,7 +778,8 @@ func (a *CodexAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt
 		BaselineSize:         baseline.size,
 		BaselineEntries:      baseline.entries,
 		BaselineMaterialized: baseline.materialized,
-		RolloutProtection:    "advisory", // Task 6 (rollout trust) freezes protection at launch
+		RolloutProtection:    protection,
+		AttestationID:        attestationID,
 	}
 	if err := a.store.InsertCodexTurnAttempt(ctx, attemptRow); err != nil {
 		releaseIfRejected()
@@ -753,6 +834,9 @@ func (a *CodexAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt
 		nativeThreadID: nativeID,
 		launchSeq:      seq,
 		pump:           child.pump,
+		child:          child,
+		stream:         adapter.NewBufferedStream(ref, adapter.DefaultBufferCapacity),
+		termCh:         make(chan string),
 	}
 	tap, terr := child.pump.InstallTurnRoute(nativeID, turnID)
 	if terr != nil {
@@ -777,11 +861,11 @@ func (a *CodexAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt
 	a.turns[ref] = run
 	a.mu.Unlock()
 
-	// First acceptance: observe the rollout baseline (bounded UUID-suffix
-	// scan; session_meta verified) and materialize the binding. Task 6
-	// generalizes this into ResolveRollout. A gap here leaves the binding
-	// unmaterialized — the next dispatch re-verifies provider-free; the
-	// accepted turn itself is unaffected.
+	// First acceptance: resolve the rollout by the bounded UUID-suffix
+	// scan (session_meta verified, path integrity enforced) and
+	// materialize the binding with the recorded baseline. A gap here
+	// leaves the binding unmaterialized — the next dispatch re-verifies
+	// provider-free; the accepted turn itself is unaffected.
 	if !binding.Materialized {
 		_ = a.recordFirstAcceptance(string(ref.SessionID), attempt, nativeID)
 	}
@@ -862,10 +946,16 @@ func (a *CodexAdapter) awaitTurnStarted(run *codexTurnRun) bool {
 }
 
 // runTurn owns an accepted turn until a verified terminal classification
-// or the route dies. Every exit releases the single-flight slot: the slot
-// guards ACTIVE execution only, while durable attempt state carries the
-// §3.5 block. item/*, usage, and approval traffic is mirrored into the
-// event stream by Task 6; this loop consumes only terminal evidence.
+// or the route dies. It is the SOLE consumer of the turn tap: item/* and
+// token-usage traffic is mirrored into the observation stream (bounded,
+// overflow terminates the OBSERVER tap only — the native stream is
+// unaffected), usage snapshots are adopted monotonically, and terminal
+// evidence is classified once. In protected mode the §3.5 step-3
+// post-launch turn_context confirmation gates the terminal commit: a
+// policy mismatch leaves the attempt Uncertain (drift recorded), while
+// verified correlation upgrades acceptance durably. Every exit releases
+// the single-flight slot: the slot guards ACTIVE execution only, while
+// durable attempt state carries the §3.5 block.
 func (a *CodexAdapter) runTurn(run *codexTurnRun) {
 	defer a.finishTurn(run)
 	bg := context.Background()
@@ -873,36 +963,306 @@ func (a *CodexAdapter) runTurn(run *codexTurnRun) {
 		select {
 		case n, ok := <-run.tap.C():
 			if !ok {
+				a.concludeChildDeath(run, bg)
 				return
 			}
-			switch n.Method {
-			case "turn/completed", "turn/failed":
-				observed, classified := nativeTurnOutcome(n.Params)
-				if !classified {
-					// Unparseable terminal shape: never fabricate an
-					// outcome — the attempt stays uncertain.
-					return
-				}
-				if observed == "" {
-					// interrupted / other statuses are Task 6 cancel
-					// semantics; leave the attempt uncertain.
-					return
-				}
-				if err := a.store.SetCodexAttemptTerminal(bg, run.attemptID, observed, string(n.Params), ""); err != nil {
-					// Terminal persistence failed: the outcome cannot be
-					// resolved, so the attempt stays uncertain and the
-					// durable block persists.
-					return
-				}
+			if a.handleTurnNotification(run, n) {
 				return
 			}
-		case <-run.tap.Done():
-			// Child death or protocol drift: no verified terminal — the
-			// launch is recorded dead and the attempt stays uncertain.
-			_ = a.store.RecordCodexLaunchState(bg, run.attemptID, run.launchSeq, "dead", nil)
+		case <-run.child.conn.Done():
+			// The child's stdout ended (exit): nothing further can
+			// arrive on the stream. Drain what was already routed —
+			// the terminal notification may still be buffered — then
+			// conclude the child death honestly.
+			a.drainAndConclude(run, bg)
 			return
 		}
 	}
+}
+
+// handleTurnNotification processes one routed notification for the
+// turn: mirrors item/usage traffic and applies the terminal semantics.
+// It reports true when the turn reached a classification exit (the run
+// loop must stop; stream and durable state are already finalized).
+func (a *CodexAdapter) handleTurnNotification(run *codexTurnRun, n NativeNotification) bool {
+	a.mirrorTurnNotification(run, n)
+	switch n.Method {
+	case "turn/completed", "turn/failed":
+		status, bodyOK := turnStatusFromBody(n.Params)
+		if !bodyOK {
+			// Unparseable terminal shape: never fabricate an outcome —
+			// the attempt stays uncertain.
+			run.stream.CloseWithErr(errors.New("terminal notification body is unparseable"))
+			return true
+		}
+		if status == "interrupted" {
+			// Verified interrupted terminal (§3.9): the accepted
+			// interrupt confirmed. Terminal, TurnCancelled — the
+			// interrupted turn produced no result.
+			if err := a.store.SetCodexAttemptTerminal(context.Background(), run.attemptID, "interrupted", string(n.Params), run.usageResult()); err != nil {
+				return true
+			}
+			run.notifyTerminal("interrupted")
+			_ = run.stream.SendOrOverflow(adapter.Event{
+				Ref: run.ref, Type: adapter.EventTerminal,
+				Status: council.TurnCancelled, Payload: "",
+			})
+			run.stream.Close()
+			return true
+		}
+		if !isVerifiedTerminalStatus(status) {
+			// Unknown status shapes stay honest: uncertain.
+			run.stream.CloseWithErr(fmt.Errorf("unclassified turn status %q", status))
+			return true
+		}
+		a.commitVerifiedTerminal(run, n, status)
+		return true
+	}
+	return false
+}
+
+// drainAndConclude consumes everything already routed to the tap before
+// the stream ended, then records the child death.
+func (a *CodexAdapter) drainAndConclude(run *codexTurnRun, bg context.Context) {
+	for {
+		select {
+		case n, ok := <-run.tap.C():
+			if !ok {
+				a.concludeChildDeath(run, bg)
+				return
+			}
+			if a.handleTurnNotification(run, n) {
+				return
+			}
+		default:
+			a.concludeChildDeath(run, bg)
+			return
+		}
+	}
+}
+
+// concludeChildDeath records the launch as durably known-dead and ends
+// the observation stream without a verified terminal — the attempt
+// stays uncertain (§3.9).
+func (a *CodexAdapter) concludeChildDeath(run *codexTurnRun, bg context.Context) {
+	_ = a.store.RecordCodexLaunchState(bg, run.attemptID, run.launchSeq, "dead", nil)
+	run.stream.CloseWithErr(errors.New("stream ended without verified result: the native stream ended before a verified terminal"))
+}
+
+// commitVerifiedTerminal applies the §3.5 step-3 protected confirmation
+// and commits the in-life verified terminal. Protected mode requires the
+// rollout turn_context to match the frozen pins (a mismatch means the
+// turn executed under unverified policy ⇒ Uncertain, child terminated,
+// drift recorded) and upgrades acceptance when the durable pdig
+// correlation matches; advisory mode records the same signals as
+// diagnostics only.
+func (a *CodexAdapter) commitVerifiedTerminal(run *codexTurnRun, n NativeNotification, status string) {
+	bg := context.Background()
+
+	attempt, err := a.store.GetCodexTurnAttempt(bg, run.attemptID)
+	if err != nil || attempt == nil {
+		run.stream.CloseWithErr(fmt.Errorf("attempt lookup failed: %v", err))
+		return
+	}
+
+	if attempt.RolloutProtection == "protected" || attempt.RolloutProtection == "advisory" {
+		diagnostic, drift, pdigMatched, ok := a.confirmRolloutTurn(run, attempt)
+		if !ok && attempt.RolloutProtection == "protected" {
+			// The rollout evidence needed for the protected confirmation
+			// was unreadable or corrupt: the turn cannot be classified
+			// from unconfirmable evidence — Uncertain.
+			run.stream.CloseWithErr(errors.New("protected rollout confirmation failed; attempt stays uncertain"))
+			return
+		}
+		if attempt.RolloutProtection == "protected" {
+			if drift != "" {
+				// §3.5 step 3: the turn executed under unverified policy
+				// ⇒ Uncertain; the drift is recorded, the child
+				// terminated, and NO terminal is committed.
+				_ = a.store.SetCodexAttemptObservedStatus(bg, run.attemptID, "uncertain")
+				a.server.stop(bg, run.ref.SessionID)
+				run.stream.CloseWithErr(errors.New("protected turn_context drift: " + drift))
+				return
+			}
+			if pdigMatched {
+				// §3.7 protected acceptance upgrade: the ordered
+				// correlation proved THIS turn's prompt in the rollout.
+				if err := a.store.SetCodexAttemptAccepted(bg, run.attemptID); err != nil {
+					// The acceptance upgrade could not be committed: the
+					// protected evidence is inconsistent — Uncertain.
+					run.stream.CloseWithErr(fmt.Errorf("acceptance upgrade failed: %v", err))
+					return
+				}
+			}
+		} else if diagnostic != "" {
+			// Advisory mode: diagnostic only — the gap is recorded on
+			// the observation stream; the verified in-life terminal
+			// stands.
+			_ = run.stream.SendOrOverflow(adapter.Event{
+				Ref: run.ref, Type: adapter.EventProgress,
+				Status: council.TurnRunning, Payload: truncateEventPayload(diagnostic),
+			})
+		}
+	}
+
+	usageJSON := run.usageResult()
+	if err := a.store.SetCodexAttemptTerminal(bg, run.attemptID, status, string(n.Params), usageJSON); err != nil {
+		// Terminal persistence failed: the outcome cannot be resolved,
+		// so the attempt stays uncertain and the durable block persists.
+		run.stream.CloseWithErr(fmt.Errorf("terminal persistence: %w", err))
+		return
+	}
+	run.notifyTerminal(status)
+	turnStatus := council.TurnCompleted
+	if status == "failed" {
+		turnStatus = council.TurnFailed
+	}
+	_ = run.stream.SendOrOverflow(adapter.Event{
+		Ref: run.ref, Type: adapter.EventTerminal,
+		Status: turnStatus, Payload: truncateEventPayload(string(n.Params)),
+		Usage: usageFromJSON(usageJSON),
+	})
+	run.stream.Close()
+}
+
+// confirmRolloutTurn reads the rollout tail past the attempt's baseline
+// and returns (diagnostic, drift, pdigMatched, ok): the §3.5 step-3
+// turn_context signal for the attempt's protection class and whether
+// the §3.7 ordered correlation matched the attempt's stored prompt
+// digest. ok=false marks an unreadable or corrupt rollout (protected
+// mode treats that as Uncertain); drift carries the first pinned field
+// the native turn_context disagreed on.
+func (a *CodexAdapter) confirmRolloutTurn(run *codexTurnRun, attempt *storage.CodexTurnAttempt) (diagnostic, drift string, pdigMatched, ok bool) {
+	binding, err := a.store.GetCodexSessionBinding(context.Background(), string(run.ref.SessionID))
+	if err != nil || binding == nil || !binding.Materialized || binding.RolloutPath == nil {
+		return "", "", false, false
+	}
+	entries, err := readRolloutTail(*binding.RolloutPath, attempt.BaselineSize)
+	if err != nil {
+		return "", "", false, false
+	}
+	if len(entries) == 0 {
+		return "", "", false, true
+	}
+	pins, err := RolloutPinsFor(a.policy, binding.Model, binding.Workspace)
+	if err != nil {
+		return "", "", false, false
+	}
+	ev, err := CorrelateRolloutTurn(entries, pins, run.nativeThreadID, run.ref.TurnKey, run.attemptID, attempt.PromptDigest)
+	if err != nil {
+		return "", "", false, false
+	}
+	if ev.Drift != nil {
+		return fmt.Sprintf("rollout turn_context drift on %s: frozen %q, native %q",
+			ev.Drift.Field, ev.Drift.Want, ev.Drift.Have), rollDriftText(ev.Drift), ev.PromptDigestMatch, true
+	}
+	if ev.TurnContextMatch && ev.PromptDigestMatch {
+		return "", "", true, true
+	}
+	return "rollout correlation incomplete: turn_context match=" +
+		fmt.Sprint(ev.TurnContextMatch) + " prompt digest match=" + fmt.Sprint(ev.PromptDigestMatch), "", false, true
+}
+
+func rollDriftText(d *RolloutPinDrift) string {
+	return d.Field + ": frozen " + d.Want + ", native " + d.Have
+}
+
+// mirrorTurnNotification fans one routed notification into the bounded
+// observation stream: item/* notifications become progress events
+// (payload clamped with a visible truncation marker), and cumulative
+// token-usage snapshots are adopted monotonically and mirrored as
+// usage-bearing progress events. An overflow closes the OBSERVER stream
+// only; the native stream and the turn are unaffected (AC-006).
+func (a *CodexAdapter) mirrorTurnNotification(run *codexTurnRun, n NativeNotification) {
+	if strings.HasPrefix(n.Method, "item/") {
+		_ = run.stream.SendOrOverflow(adapter.Event{
+			Ref: run.ref, Type: adapter.EventProgress,
+			Status:  council.TurnRunning,
+			Payload: truncateEventPayload(string(n.Params)),
+		})
+		return
+	}
+	if n.Method == "thread/tokenUsage/updated" {
+		if in, out, ok := parseTokenUsageSnapshot(n.Params); ok && run.observeUsage(in, out) {
+			_ = run.stream.SendOrOverflow(adapter.Event{
+				Ref: run.ref, Type: adapter.EventProgress,
+				Status:  council.TurnRunning,
+				Payload: "token usage snapshot",
+				Usage: adapter.ExecutionUsage{
+					InputTokens:  adapter.UsageMetric[int64]{Value: in, Available: true},
+					OutputTokens: adapter.UsageMetric[int64]{Value: out, Available: true},
+					TotalCostUSD: adapter.UsageMetric[float64]{Available: false},
+				},
+			})
+		}
+	}
+}
+
+// parseTokenUsageSnapshot extracts the cumulative token counts from a
+// thread/tokenUsage/updated notification, tolerating the observed
+// nesting variants (info.total.token_usage, total.token_usage, flat).
+func parseTokenUsageSnapshot(params json.RawMessage) (in, out int64, ok bool) {
+	if len(params) == 0 {
+		return 0, 0, false
+	}
+	var p struct {
+		Info *struct {
+			Total *struct {
+				TokenUsage *struct {
+					InputTokens  *int64 `json:"input_tokens"`
+					OutputTokens *int64 `json:"output_tokens"`
+				} `json:"token_usage"`
+			} `json:"total"`
+		} `json:"info"`
+		Total *struct {
+			TokenUsage *struct {
+				InputTokens  *int64 `json:"input_tokens"`
+				OutputTokens *int64 `json:"output_tokens"`
+			} `json:"token_usage"`
+		} `json:"total"`
+		InputTokens  *int64 `json:"input_tokens"`
+		OutputTokens *int64 `json:"output_tokens"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return 0, 0, false
+	}
+	switch {
+	case p.Info != nil && p.Info.Total != nil && p.Info.Total.TokenUsage != nil &&
+		p.Info.Total.TokenUsage.InputTokens != nil && p.Info.Total.TokenUsage.OutputTokens != nil:
+		return *p.Info.Total.TokenUsage.InputTokens, *p.Info.Total.TokenUsage.OutputTokens, true
+	case p.Total != nil && p.Total.TokenUsage != nil &&
+		p.Total.TokenUsage.InputTokens != nil && p.Total.TokenUsage.OutputTokens != nil:
+		return *p.Total.TokenUsage.InputTokens, *p.Total.TokenUsage.OutputTokens, true
+	case p.InputTokens != nil && p.OutputTokens != nil:
+		return *p.InputTokens, *p.OutputTokens, true
+	default:
+		return 0, 0, false
+	}
+}
+
+// usageFromJSON parses a stored result_usage snapshot into the AC-006
+// usage shape. Cost is ALWAYS Available=false — it is never fabricated.
+func usageFromJSON(raw string) adapter.ExecutionUsage {
+	usage := adapter.ExecutionUsage{
+		TotalCostUSD: adapter.UsageMetric[float64]{Available: false},
+	}
+	if strings.TrimSpace(raw) == "" {
+		return usage
+	}
+	var parsed struct {
+		InputTokens  *int64 `json:"input_tokens"`
+		OutputTokens *int64 `json:"output_tokens"`
+	}
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return usage
+	}
+	if parsed.InputTokens != nil {
+		usage.InputTokens = adapter.UsageMetric[int64]{Value: *parsed.InputTokens, Available: true}
+	}
+	if parsed.OutputTokens != nil {
+		usage.OutputTokens = adapter.UsageMetric[int64]{Value: *parsed.OutputTokens, Available: true}
+	}
+	return usage
 }
 
 // finishTurn releases everything an accepted turn held.
@@ -917,44 +1277,176 @@ func (a *CodexAdapter) finishTurn(run *codexTurnRun) {
 	a.server.markIdle(run.ref.SessionID)
 }
 
-// ── Phased-delivery surfaces (Task 6: rollout trust + observe/cancel/
-// collect/reconcile). The stubs are honest classifications, never
-// fabricated results: Cancel reports CancelUnknown (an interrupt request
-// is NOT terminal evidence, §3.9), Collect reads only durable state,
-// Reconcile refuses to claim more than durable evidence proves.
+// ── Observe / Cancel / Collect (§3.9) ───────────────────────────────────
+//
+// Observe hands out the turn's bounded observation stream: events mirror
+// item/* progress and cumulative token-usage snapshots, and terminate
+// with the verified terminal event. Overflow terminates the OBSERVER tap
+// only (ErrBufferOverflow) — the native stream and the turn are
+// unaffected; cancelling the caller's context detaches the observer and
+// never touches the turn (AC-006: client disconnect is not
+// cancellation).
 
-// Observe is completed by Task 6 (rollout/observe): live event streams,
-// approval mirroring, and usage mirroring. The underlying turn is NOT
-// affected — notifications keep flowing into the pump, and a
-// disconnected observer never cancels a worker (AC-006).
 func (a *CodexAdapter) Observe(ctx context.Context, ref adapter.TurnRef) (adapter.Stream, error) {
 	a.mu.Lock()
-	_, live := a.turns[ref]
+	run, live := a.turns[ref]
 	a.mu.Unlock()
-	if !live {
+	if !live || run == nil || run.stream == nil {
 		return nil, fmt.Errorf("turn %s/%s is not dispatched or already completed", ref.SessionID, ref.TurnKey)
 	}
-	return nil, ErrObservationUnavailable
+	// Detach watcher: the observer's context bounds only its own
+	// observation. Cancelling it closes this stream (release the
+	// buffers); the turn, the tap, and the child continue.
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = run.stream.Close()
+		case <-run.stream.Done():
+		}
+	}()
+	return run.stream, nil
 }
 
-// Cancel is completed by Task 6 (turn/interrupt with verified
-// interrupted-terminal evidence). Until then any cancel reports
-// CancelUnknown — a disposition that provably claims nothing.
+// cancelTerminalGrace bounds the wait for a verified terminal after an
+// accepted turn/interrupt. Package-level so tests can shorten it. When
+// it fires, the child is gracefully terminated then killed; without a
+// verified terminal the attempt stays Uncertain (§3.9).
+var cancelTerminalGrace = 5 * time.Second
+
+// Cancel applies the §3.9 interruption semantics: an accepted
+// turn/interrupt request is CancelRequested (the slot is NOT released —
+// the turn may still run); only a verified interrupted terminal is
+// CancelConfirmed; a turn already at a verified terminal is
+// CancelAlreadyTerminal; a definitive native refusal is CancelRejected;
+// a lost or timed-out interruption escalates to graceful terminate →
+// kill and reports CancelUnknown (the attempt stays Uncertain without
+// terminal evidence).
 func (a *CodexAdapter) Cancel(ctx context.Context, ref adapter.TurnRef) (adapter.CancelOutcome, error) {
 	a.mu.Lock()
-	_, live := a.turns[ref]
+	run := a.turns[ref]
 	a.mu.Unlock()
-	if !live {
+
+	if run == nil {
+		// Not live: durable state decides between already-terminal and
+		// unknown — never a fabricated disposition.
+		attempt, err := a.store.GetLatestCodexTurnAttempt(ctx, string(ref.SessionID), ref.TurnKey)
+		if err == nil && attempt != nil && attempt.Terminal {
+			return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelAlreadyTerminal,
+				Reason: "turn already reached a verified terminal (" + attempt.ObservedStatus + ")"}, nil
+		}
 		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown,
 			Reason: "turn not dispatched"}, nil
 	}
-	return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown,
-		Reason: "codex interruption wiring completes in Task 6 (rollout/observe)"}, nil
+	if _, terminal := run.terminalStatus(); terminal {
+		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelAlreadyTerminal,
+			Reason: "turn already reached a verified terminal"}, nil
+	}
+
+	// The interrupt rides an adapter-owned bounded context: a
+	// disconnected controller cannot abandon the request mid-write.
+	ictx, icancel := context.WithTimeout(context.WithoutCancel(ctx), dispatchAckTimeout)
+	defer icancel()
+	err := run.child.client.TurnInterrupt(ictx, run.nativeThreadID, run.tap.TurnID())
+	if err != nil {
+		var rpcErr *RPCError
+		if errors.As(err, &rpcErr) {
+			// Definitive native refusal of the interrupt itself.
+			return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelRejected,
+				Reason: "turn/interrupt was refused: " + rpcErr.Error()}, nil
+		}
+		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown,
+			Reason: "turn/interrupt outcome ambiguous: " + err.Error()}, nil
+	}
+	if run.markCancelRequested() {
+		_ = run.stream.SendOrOverflow(adapter.Event{
+			Ref: run.ref, Type: adapter.EventProgress,
+			Status: council.TurnCancelling, Payload: "turn/interrupt accepted",
+		})
+	}
+
+	// Bounded wait for the verified terminal. The request alone is NOT
+	// evidence: only the interrupted terminal confirms the cancel.
+	timer := time.NewTimer(cancelTerminalGrace)
+	defer timer.Stop()
+	awaitBuffered := func() (string, bool) {
+		// The run loop drains buffered notifications when the child's
+		// stream ends; give that a brief beat before concluding.
+		deadline := time.Now().Add(250 * time.Millisecond)
+		for {
+			if observed, ok := run.terminalStatus(); ok {
+				return observed, true
+			}
+			if time.Now().After(deadline) {
+				return "", false
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	for {
+		select {
+		case <-run.termCh:
+			// The channel closes exactly once when a verified terminal
+			// is committed; the status lives on the run.
+			if observed, ok := run.terminalStatus(); ok && observed == "interrupted" {
+				return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelConfirmed,
+					Reason: "verified interrupted terminal"}, nil
+			} else if ok {
+				return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelAlreadyTerminal,
+					Reason: "turn reached a verified terminal around the interrupt"}, nil
+			}
+			return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown,
+				Reason: "terminal signal lost"}, nil
+		case <-run.tap.Done():
+			if observed, ok := awaitBuffered(); ok {
+				if observed == "interrupted" {
+					return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelConfirmed,
+						Reason: "verified interrupted terminal"}, nil
+				}
+				return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelAlreadyTerminal,
+					Reason: "turn reached a verified terminal (" + observed + ") around the interrupt"}, nil
+			}
+			return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown,
+				Reason: "native stream ended after the interrupt without a verified terminal"}, nil
+		case <-run.child.conn.Done():
+			if observed, ok := awaitBuffered(); ok {
+				if observed == "interrupted" {
+					return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelConfirmed,
+						Reason: "verified interrupted terminal"}, nil
+				}
+				return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelAlreadyTerminal,
+					Reason: "turn reached a verified terminal (" + observed + ") around the interrupt"}, nil
+			}
+			return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown,
+				Reason: "native stream ended after the interrupt without a verified terminal"}, nil
+		case <-ctx.Done():
+			// The requesting controller went away: the request stands,
+			// the in-life escalation remains armed, the slot is NOT
+			// released.
+			return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelRequested,
+				Reason: "turn/interrupt accepted; awaiting the verified terminal"}, nil
+		case <-timer.C:
+			// Deadline exceeded: graceful terminate → kill (§3.9).
+			// Without a verified terminal the attempt stays Uncertain.
+			a.server.stop(context.Background(), ref.SessionID)
+			if observed, ok := awaitBuffered(); ok {
+				if observed == "interrupted" {
+					return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelConfirmed,
+						Reason: "verified interrupted terminal"}, nil
+				}
+				return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelAlreadyTerminal,
+					Reason: "turn reached a verified terminal (" + observed + ") during termination"}, nil
+			}
+			return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown,
+				Reason: "interrupt accepted but no terminal arrived within the bound; child terminated — attempt uncertain"}, nil
+		}
+	}
 }
 
-// Collect reports from durable state only: a verified terminal is
-// returned, anything else stays pending. Usage mirroring and result
-// shaping complete in Task 6.
+// Collect reports from durable state only, gated on THIS turn's verified
+// terminal (the route-bound native turn id from dispatch): ResultPending
+// until then; a verified terminal returns the recorded result payload
+// and usage; a stored payload that is not well-formed JSON evidence is
+// ResultMalformed, never reinterpreted. Cost is always Available=false.
 func (a *CodexAdapter) Collect(ctx context.Context, ref adapter.TurnRef) (adapter.TurnResult, error) {
 	attempt, err := a.store.GetLatestCodexTurnAttempt(ctx, string(ref.SessionID), ref.TurnKey)
 	if err != nil {
@@ -965,45 +1457,57 @@ func (a *CodexAdapter) Collect(ctx context.Context, ref adapter.TurnRef) (adapte
 		return adapter.TurnResult{Ref: ref, Status: council.TurnRunning,
 			ResultStatus: adapter.ResultUnavailable}, errors.New("turn not dispatched")
 	}
-	if attempt.Terminal && attempt.ResultPayload != nil {
-		status := council.TurnCompleted
-		resultStatus := adapter.ResultAvailable
-		if attempt.ObservedStatus == "failed" {
-			status = council.TurnFailed
-			resultStatus = adapter.ResultFailed
-		}
-		return adapter.TurnResult{
-			Ref: ref, Status: status,
-			ResultStatus: resultStatus,
+	if !attempt.Terminal || attempt.ResultPayload == nil {
+		return adapter.TurnResult{Ref: ref, Status: council.TurnRunning,
+			ResultStatus: adapter.ResultPending}, nil
+	}
+	// Terminal gating: a terminal not attributable to THIS turn's bound
+	// native turn id is not collectable evidence.
+	if attempt.NativeTurnID == nil || strings.TrimSpace(*attempt.NativeTurnID) == "" {
+		return adapter.TurnResult{Ref: ref, Status: council.TurnRunning,
+			ResultStatus: adapter.ResultUnavailable}, nil
+	}
+	// Malformed evidence is reported, never reinterpreted.
+	var sanity map[string]any
+	if err := json.Unmarshal([]byte(*attempt.ResultPayload), &sanity); err != nil {
+		return adapter.TurnResult{Ref: ref, Status: council.TurnRunning,
+			ResultStatus: adapter.ResultMalformed}, nil
+	}
+	usage := usageFromJSON(ptrStr(attempt.ResultUsage))
+	switch attempt.ObservedStatus {
+	case "completed":
+		return adapter.TurnResult{Ref: ref, Status: council.TurnCompleted,
+			ResultStatus: adapter.ResultAvailable,
 			Output:       *attempt.ResultPayload,
+			Usage:        usage,
 			CompletedAt:  time.Now().UTC(),
 		}, nil
+	case "failed":
+		return adapter.TurnResult{Ref: ref, Status: council.TurnFailed,
+			ResultStatus: adapter.ResultFailed,
+			Output:       *attempt.ResultPayload,
+			Usage:        usage,
+			CompletedAt:  time.Now().UTC(),
+		}, nil
+	case "interrupted":
+		// Verified interrupted terminal (§3.9): TurnCancelled, and the
+		// turn produced no consumable result.
+		return adapter.TurnResult{Ref: ref, Status: council.TurnCancelled,
+			ResultStatus: adapter.ResultUnavailable,
+			Usage:        usage,
+			CompletedAt:  time.Now().UTC(),
+		}, nil
+	default:
+		return adapter.TurnResult{Ref: ref, Status: council.TurnRunning,
+			ResultStatus: adapter.ResultUnavailable}, nil
 	}
-	return adapter.TurnResult{Ref: ref, Status: council.TurnRunning,
-		ResultStatus: adapter.ResultPending}, nil
 }
 
-// Reconcile is completed by Task 6 (protected-mode rollout terminal
-// records, verified absence, one-redispatch authorization). Until then
-// the only claims it makes are the live in-process run (reachable-active)
-// and Uncertain for everything else — child unreachable is host
-// visibility lost, never definitive failure (§3.2/§3.10).
-func (a *CodexAdapter) Reconcile(ctx context.Context, ref adapter.RecoveryRef) (adapter.ReconciliationOutcome, error) {
-	a.mu.Lock()
-	_, live := a.turns[ref.TurnRef]
-	a.mu.Unlock()
-	if live {
-		return adapter.ReconciliationOutcome{Ref: ref,
-			Reachability: council.VisibilityReachable,
-			Status:       adapter.ReconciliationReachableActive,
-			Observed:     council.TurnRunning,
-		}, nil
+func ptrStr(s *string) string {
+	if s == nil {
+		return ""
 	}
-	return adapter.ReconciliationOutcome{Ref: ref,
-		Reachability: council.VisibilityHostLost,
-		Status:       adapter.ReconciliationUncertain,
-		Observed:     council.TurnRunning,
-	}, nil
+	return *s
 }
 
 // ── Single-flight ───────────────────────────────────────────────────────
@@ -1117,44 +1621,36 @@ func nativeTurnIDFromResult(raw json.RawMessage) string {
 	return r.ID
 }
 
-// nativeTurnOutcome classifies a turn/completed|turn/failed notification
-// body: "completed" or "failed" for a parseable terminal status, ""
-// (uncategorized) for interrupted or unknown statuses, and !ok for an
-// unparseable body (never fabricate an outcome from an unknown shape).
-// The verified evidence carries the turn status BOTH as a plain string
-// (turn/completed rollout/fixture shape) and as an object
-// ({"type":"inProgress"} in the turn/start result); both parse.
-func nativeTurnOutcome(params json.RawMessage) (observed string, ok bool) {
-	if len(params) == 0 {
-		return "", false
-	}
-	var p struct {
-		Turn *struct {
-			Status json.RawMessage `json:"status"`
-		} `json:"turn"`
-	}
-	if err := json.Unmarshal(params, &p); err != nil || p.Turn == nil {
-		return "", false
-	}
-	status := strings.Trim(string(p.Turn.Status), `" `)
-	if len(p.Turn.Status) > 0 && p.Turn.Status[0] == '{' {
-		var st ThreadStatus
-		if err := json.Unmarshal(p.Turn.Status, &st); err != nil {
-			return "", false
-		}
-		status = st.Type
-	}
-	switch status {
-	case "completed":
-		return "completed", true
-	case "failed":
-		return "failed", true
-	default:
-		return "", true
-	}
-}
+// ── Rollout baseline (first acceptance; §3.7) ───────────────────────────
 
-// ── Rollout baseline (first acceptance; Task 6 generalizes) ─────────────
+// resolveRolloutProtection freezes the rollout protection class for a
+// new attempt (§3.7): the isolation-attestation seam must report a valid
+// attestation AND a durable cprot-v2 row must exist matching the frozen
+// (codex version, platform, profile) tuple for the same id. Advisory is
+// the default; the unverified platform degrades to integrity=unverified.
+// A lookup FAILURE is returned — protection is never silently
+// downgraded by an error (the AC-008 rule).
+func (a *CodexAdapter) resolveRolloutProtection(ctx context.Context) (string, *string, error) {
+	seamID, seamOK := "", false
+	if a.attestation != nil {
+		seamID, seamOK = a.attestation()
+	}
+	rowID := ""
+	if seamOK && strings.TrimSpace(seamID) != "" {
+		var err error
+		rowID, err = a.store.FindCodexProtectionAttestation(ctx,
+			a.policy.AppServerVersion, codexPlatformIdentity(), a.profileDigest)
+		if err != nil {
+			return "", nil, err
+		}
+	}
+	class, id := rolloutProtectionClass(runtime.GOOS, seamOK, seamID, rowID)
+	if id == "" {
+		return class, nil, nil
+	}
+	frozen := id
+	return class, &frozen, nil
+}
 
 type attemptBaseline struct {
 	identity     string
@@ -1182,13 +1678,13 @@ func (a *CodexAdapter) observeAttemptBaseline(ctx context.Context, binding *stor
 	return attemptBaseline{identity: identity, size: size, entries: entries, materialized: true}, nil
 }
 
-// recordFirstAcceptance locates the rollout by a bounded UUID-suffix scan
-// under the frozen CODEX_HOME sessions root, verifies
-// session_meta.session_id == native id, and records the baseline
-// (file-identity, byte size, entry count) plus the binding
+// recordFirstAcceptance resolves the rollout via ResolveRollout
+// (bounded UUID-suffix scan under the frozen CODEX_HOME sessions root,
+// session_meta verified, path integrity enforced) and records the
+// baseline (file-identity, byte size, entry count) plus the binding
 // materialization in one durable transition.
 func (a *CodexAdapter) recordFirstAcceptance(sessionID, attemptID, nativeID string) error {
-	path, err := locateRollout(a.policy.ExpectedCodexHome, nativeID)
+	path, err := ResolveRollout(a.policy.ExpectedCodexHome, nativeID)
 	if err != nil {
 		return err
 	}

@@ -130,6 +130,48 @@ func TestCodexState_CrashAfterReservationBeforeStart(t *testing.T) {
 	}
 }
 
+// Regression (AC-009 Task 6): RecordCodexLaunchState("dead") must
+// actually match the attempt row — the argument binding for the dead
+// case was reordered (known_dead_at received the timestamp but
+// attempt_id/reservation_seq/exit_code were swapped), silently updating
+// zero rows and breaking every verified-absence and known-dead-child
+// path downstream.
+func TestCodexState_LaunchDeadStateRecorded(t *testing.T) {
+	store := openCodexStore(t)
+	ctx := context.Background()
+
+	if err := store.InsertCodexTurnAttempt(ctx, codexAttemptFixture("att-dead", "sess-dead", "t-dead")); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if _, err := store.ReserveCodexLaunch(ctx, "att-dead", "fixture", 0); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if err := store.RecordCodexLaunchState(ctx, "att-dead", 1, "started", nil); err != nil {
+		t.Fatalf("record started: %v", err)
+	}
+	exit := 1
+	if err := store.RecordCodexLaunchState(ctx, "att-dead", 1, "dead", &exit); err != nil {
+		t.Fatalf("record dead: %v", err)
+	}
+
+	states, err := store.CodexAttemptLaunchStates(ctx, "att-dead")
+	if err != nil || len(states) != 1 {
+		t.Fatalf("launch states: %v err=%v", states, err)
+	}
+	if states[0] != "dead" {
+		t.Fatalf("the dead state must be recorded on the reserved row, got %q", states[0])
+	}
+	var knownDead, exitCode interface{}
+	if err := store.DB().QueryRowContext(ctx,
+		`SELECT known_dead_at, exit_code FROM codex_attempt_launches WHERE attempt_id = ? AND reservation_seq = 1`,
+		"att-dead").Scan(&knownDead, &exitCode); err != nil {
+		t.Fatalf("query launch row: %v", err)
+	}
+	if knownDead == nil || exitCode == nil {
+		t.Fatalf("dead evidence must carry known_dead_at and the exit code: %v %v", knownDead, exitCode)
+	}
+}
+
 // Crash boundary (c): Start succeeded but started_at never persisted —
 // the reserved row with started_at NULL means possibly-running; the
 // attempt must remain uncertain and no redispatch is authorized.

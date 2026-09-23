@@ -998,7 +998,10 @@ func TestCodexAdapter_IdleGraceParksChild(t *testing.T) {
 	}
 }
 
-// ── Phased-delivery surfaces (Task 6 completes) ─────────────────────────
+// ── Task 6 surfaces: honesty for undispatched turns ─────────────────────
+//
+// (The live-turn behavior of Observe/Cancel/Collect/Reconcile is covered
+// by rollout_test.go and reconcile_test.go.)
 
 func TestCodexAdapter_PhasedSurfacesHonest(t *testing.T) {
 	h := newAdapterHarness(t)
@@ -1027,16 +1030,14 @@ func TestCodexAdapter_PhasedSurfacesHonest(t *testing.T) {
 		t.Fatalf("reconcile must stay uncertain, got %+v err=%v", ro, err)
 	}
 
-	// Live turn: Observe reports the typed Task 6 boundary; Cancel stays
-	// honest; the accepted turn keeps the slot until terminal.
+	// Live turn: Observe hands out the bounded stream; the accepted turn
+	// keeps the slot until terminal.
 	if out, err := h.dispatch(t, "t-phase", "prompt"); err != nil || out.Status != adapter.DispatchAccepted {
 		t.Fatalf("dispatch: %+v err=%v", out, err)
 	}
-	if _, err := h.adapter.Observe(context.Background(), ref); !errors.Is(err, ErrObservationUnavailable) {
-		t.Fatalf("live observe must carry the typed Task 6 boundary, got %v", err)
-	}
-	if co, err := h.adapter.Cancel(context.Background(), ref); err != nil || co.Disposition != adapter.CancelUnknown {
-		t.Fatalf("live cancel must stay CancelUnknown, got %+v err=%v", co, err)
+	stream, err := h.adapter.Observe(context.Background(), ref)
+	if err != nil || stream == nil {
+		t.Fatalf("live observe must return the turn stream, got %v", err)
 	}
 	waitAttempt(t, h, "t-phase", func(a *storage.CodexTurnAttempt) bool { return a.NativeTurnID != nil })
 }
