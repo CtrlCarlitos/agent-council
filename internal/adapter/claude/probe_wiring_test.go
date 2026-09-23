@@ -146,8 +146,9 @@ func TestClaudeAdapter_ProbeDetectsHelpDrift(t *testing.T) {
 }
 
 // Flag matching is exact-token: a decoy flag like --resume-other does
-// not satisfy the required --resume, and the choice sets (stream-json,
-// default) must be present as tokens.
+// not satisfy the required --resume. Choice sets are parsed per flag
+// and compared as COMPLETE sets against the v8-verified values:
+// missing, unexpected, or reassigned choices are protocol drift.
 func TestClaudeAdapter_ProbeRejectsDecoyFlagsAndMissingChoices(t *testing.T) {
 	h := newAdapterHarness(t)
 
@@ -156,7 +157,7 @@ func TestClaudeAdapter_ProbeRejectsDecoyFlagsAndMissingChoices(t *testing.T) {
 	body := "#!/bin/sh\ncase \"$1\" in\n" +
 		"  --version) echo \"9.9.9 (Claude Code)\" ;;\n" +
 		"  --help) echo \"Usage: claude\"; " +
-		"echo \"  -p, --print --output-format --verbose --session-id --resume-other --model --max-turns --permission-mode --allowedTools --disallowedTools\" ;;\n" +
+		"echo \"  -p, --print --output-format (choices: text, json, stream-json) --verbose --session-id --resume-other --model --max-turns --permission-mode (choices: acceptEdits, auto, bypassPermissions, manual, dontAsk, plan) --allowedTools --disallowedTools\" ;;\n" +
 		"esac\n"
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatalf("write decoy stub: %v", err)
@@ -173,16 +174,17 @@ func TestClaudeAdapter_ProbeRejectsDecoyFlagsAndMissingChoices(t *testing.T) {
 		t.Fatalf("a decoy --resume-other must not satisfy --resume, got %v", err)
 	}
 
-	// Full flag surface but missing the choice tokens: rejected.
-	choicesDir := t.TempDir()
-	script2 := filepath.Join(choicesDir, "claude")
+	// A reduced permission-mode set (the old fixture text advertising
+	// "default") is unexpected-and-missing at once: rejected.
+	reducedDir := t.TempDir()
+	script2 := filepath.Join(reducedDir, "claude")
 	body2 := "#!/bin/sh\ncase \"$1\" in\n" +
 		"  --version) echo \"9.9.9 (Claude Code)\" ;;\n" +
 		"  --help) echo \"Usage: claude\"; " +
-		"echo \"  -p, --print --output-format --verbose --session-id --resume --model --max-turns --permission-mode --allowedTools --disallowedTools\" ;;\n" +
+		"echo \"  -p, --print --output-format (choices: text, json, stream-json) --verbose --session-id --resume --model --max-turns --permission-mode (choices: default, acceptEdits, plan) --allowedTools --disallowedTools\" ;;\n" +
 		"esac\n"
 	if err := os.WriteFile(script2, []byte(body2), 0o755); err != nil {
-		t.Fatalf("write choices stub: %v", err)
+		t.Fatalf("write reduced stub: %v", err)
 	}
 
 	template2 := NewOperatorProbeLaunchTemplate(script2, t.TempDir(), probeProfile())
@@ -192,7 +194,33 @@ func TestClaudeAdapter_ProbeRejectsDecoyFlagsAndMissingChoices(t *testing.T) {
 	}
 
 	_, err = adp2.Probe(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "missing required choice") {
-		t.Fatalf("missing choice tokens must fail the probe, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "--permission-mode") ||
+		!strings.Contains(err.Error(), "frozen verified set") {
+		t.Fatalf("reduced permission-mode choices must fail the probe, got %v", err)
+	}
+
+	// A reassigned choice set — output-format advertising permission
+	// choices — is rejected even though every value exists somewhere.
+	reassignedDir := t.TempDir()
+	script3 := filepath.Join(reassignedDir, "claude")
+	body3 := "#!/bin/sh\ncase \"$1\" in\n" +
+		"  --version) echo \"9.9.9 (Claude Code)\" ;;\n" +
+		"  --help) echo \"Usage: claude\"; " +
+		"echo \"  -p, --print --output-format (choices: acceptEdits, auto, bypassPermissions, manual, dontAsk, plan) --verbose --session-id --resume --model --max-turns --permission-mode (choices: acceptEdits, auto, bypassPermissions, manual, dontAsk, plan) --allowedTools --disallowedTools\" ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(script3, []byte(body3), 0o755); err != nil {
+		t.Fatalf("write reassigned stub: %v", err)
+	}
+
+	template3 := NewOperatorProbeLaunchTemplate(script3, t.TempDir(), probeProfile())
+	adp3, err := NewProductionClaudeAdapter(h.store, h.wm, execpolicy.New(), template3, h.configBase, h.template, h.wsRoot)
+	if err != nil {
+		t.Fatalf("production construction: %v", err)
+	}
+
+	_, err = adp3.Probe(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "--output-format") ||
+		!strings.Contains(err.Error(), "frozen verified set") {
+		t.Fatalf("reassigned output-format choices must fail the probe, got %v", err)
 	}
 }

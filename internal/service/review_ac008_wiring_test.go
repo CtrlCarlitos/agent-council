@@ -26,7 +26,7 @@ func compileClaudeStubForService(t *testing.T) string {
 	body := "#!/bin/sh\ncase \"$1\" in\n" +
 		"  --version) echo \"2.1.278 (Claude Code)\" ;;\n" +
 		"  --help) echo \"Usage: claude [options]\"; " +
-		"echo \"  -p, --print --output-format (choices: text, json, stream-json) --verbose --session-id --resume --model --max-turns --permission-mode (choices: default, acceptEdits, plan) --allowedTools --disallowedTools\" ;;\n" +
+		"echo \"  -p, --print --output-format (choices: text, json, stream-json) --verbose --session-id --resume --model --max-turns --permission-mode (choices: acceptEdits, auto, bypassPermissions, manual, dontAsk, plan) --allowedTools --disallowedTools\" ;;\n" +
 		"esac\n"
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatalf("write claude stub: %v", err)

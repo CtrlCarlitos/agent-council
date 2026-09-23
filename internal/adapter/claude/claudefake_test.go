@@ -47,7 +47,7 @@ var claudeFixtureSourceLines = []string{
 	"\t\"  --resume <session-id>       Resume a session\\n\" +",
 	"\t\"  --model <model>             Model\\n\" +",
 	"\t\"  --max-turns <n>             Max turns\\n\" +",
-	"\t\"  --permission-mode <mode>    Permission mode (choices: default, acceptEdits, plan)\\n\" +",
+	"\t\"  --permission-mode <mode>    Permission mode (choices: acceptEdits, auto, bypassPermissions, manual, dontAsk, plan)\\n\" +",
 	"\t\"  --disallowedTools <tools>   Denied tools\\n\" +",
 	"\t\"  --allowedTools <tools>      Allowed tools\\n\"",
 	"",

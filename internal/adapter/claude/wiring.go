@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
@@ -56,9 +57,16 @@ var requiredHelpFlags = []string{
 	"--disallowedTools", "--permission-mode",
 }
 
-// requiredHelpChoices are the choice values the frozen launch shape
-// depends on: stream-json output and default permission mode.
-var requiredHelpChoices = []string{"stream-json", "default"}
+// verifiedHelpChoiceSets are the COMPLETE choice sets recorded by the
+// v8 research (§2.1) for the flags whose values the frozen launch
+// depends on. The probe parses each flag's declared choices and
+// requires exact set equality: missing, unexpected, or reassigned
+// choices are protocol drift. Note "default" is deliberately absent —
+// it is the behavior when --permission-mode is omitted, not a choice.
+var verifiedHelpChoiceSets = map[string]map[string]struct{}{
+	"--output-format":   setOf([]string{"text", "json", "stream-json"}),
+	"--permission-mode": setOf([]string{"acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"}),
+}
 
 type operatorProbeLaunchTemplate struct {
 	binaryPath  string
@@ -200,12 +208,68 @@ func (a *ClaudeAdapter) Probe(ctx context.Context) (adapter.ProbeReport, error) 
 			return report, fmt.Errorf("claude --help is missing required launch flag %q (protocol drift)", flag)
 		}
 	}
-	for _, choice := range requiredHelpChoices {
-		if _, ok := tokens[choice]; !ok {
-			return report, fmt.Errorf("claude --help is missing required choice %q (protocol drift)", choice)
+	for flag, verified := range verifiedHelpChoiceSets {
+		choices, ok := parseHelpChoices(helpOut, flag)
+		if !ok {
+			return report, fmt.Errorf("claude --help does not document choices for %q (protocol drift)", flag)
+		}
+		if !sameStringSet(choices, verified) {
+			return report, fmt.Errorf(
+				"claude --help choices for %q are %v; the frozen verified set is %v (protocol drift)",
+				flag, sortedStrings(choices), sortedStrings(verified))
 		}
 	}
 	return report, nil
+}
+
+// parseHelpChoices extracts the choice set a flag declares in --help
+// output: the first line whose exact token set contains flag and that
+// carries a "(choices: a, b, c)" segment.
+func parseHelpChoices(help, flag string) (map[string]struct{}, bool) {
+	for _, line := range strings.Split(help, "\n") {
+		if _, ok := helpTokens(line)[flag]; !ok {
+			continue
+		}
+		idx := strings.Index(line, "(choices:")
+		if idx < 0 {
+			continue
+		}
+		inside := line[idx+len("(choices:"):]
+		if end := strings.Index(inside, ")"); end >= 0 {
+			inside = inside[:end]
+		}
+		choices := make(map[string]struct{})
+		for _, part := range strings.Split(inside, ",") {
+			if c := strings.TrimSpace(part); c != "" {
+				choices[c] = struct{}{}
+			}
+		}
+		if len(choices) > 0 {
+			return choices, true
+		}
+	}
+	return nil, false
+}
+
+func sameStringSet(a, b map[string]struct{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for v := range a {
+		if _, ok := b[v]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func sortedStrings(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for v := range set {
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // helpTokens tokenizes --help output into exact flag and choice tokens:
