@@ -123,8 +123,15 @@ type pendingCreation struct {
 }
 
 func (pc *pendingCreation) finish(err error) {
-	pc.outcome = err
-	pc.once.Do(func() { close(pc.done) })
+	// The outcome write lives inside once.Do: the FIRST finisher wins
+	// atomically, and the close(done) release makes the write visible to
+	// every reader that observes the channel. A write outside Do would
+	// race concurrent finishes (poison under the pump lock vs
+	// Abandon/Complete outside it) and could overwrite a terminal outcome.
+	pc.once.Do(func() {
+		pc.outcome = err
+		close(pc.done)
+	})
 }
 
 // EventPump owns the route tables for one child's notification stream.
@@ -293,8 +300,17 @@ func (p *EventPump) CompleteCreation(resultThreadID string) error {
 		return drift
 	}
 
-	// Confirm: publish the binding.
 	p.mu.Lock()
+	if pc.abandoned {
+		// The reservation was abandoned between the done-checks and the
+		// confirm: the native thread identity is uncertain — never
+		// publish the binding. Wait for the abandonment's finish (it
+		// writes the outcome before closing done) and report it.
+		p.mu.Unlock()
+		<-pc.done
+		return pc.outcome
+	}
+	// Confirm: publish the binding.
 	p.threads[resultThreadID] = &threadRoute{turns: make(map[string]*TurnTap)}
 	p.creation = nil
 	p.mu.Unlock()

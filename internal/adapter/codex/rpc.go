@@ -418,7 +418,10 @@ func (c *Conn) Close() {
 }
 
 // finish terminates the read loop: pending calls fail, Done closes, and
-// the fatal handler (if any) fires once with the terminal cause.
+// the fatal handler (if any) fires once with the terminal cause. A nil
+// cause (clean stream end) still fails every pending call with
+// ErrConnClosed — a call pending at unexpected child death must never
+// return nil with a zero result (fail closed, spec §3.9).
 func (c *Conn) finish(cause error) {
 	c.mu.Lock()
 	if c.poison == nil {
@@ -429,8 +432,12 @@ func (c *Conn) finish(cause error) {
 	c.pending = make(map[int64]*pendingCall)
 	c.mu.Unlock()
 	c.w.markFull()
+	failure := cause
+	if failure == nil {
+		failure = fmt.Errorf("%w (pending at child stream end)", ErrConnClosed)
+	}
 	for _, p := range pending {
-		p.ch <- pendingResult{err: cause}
+		p.ch <- pendingResult{err: failure}
 	}
 	c.doneOnce.Do(func() { close(c.done) })
 	if cause != nil {

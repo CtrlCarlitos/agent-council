@@ -9,6 +9,7 @@ package codex
 
 import (
 	"errors"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -259,6 +260,122 @@ func TestPump_UnboundThreadNotificationDrift(t *testing.T) {
 	case <-fatal:
 	case <-time.After(time.Second):
 		t.Fatal("unbound-thread notification must fire the fatal handler")
+	}
+}
+
+// The first finisher of a creation reservation owns its terminal outcome:
+// a drift poison (finished synchronously under the pump lock) must not be
+// overwritable by a later AbandonCreation.
+func TestPump_FirstFinisherOutcomeWins(t *testing.T) {
+	withGrace(t, 2*time.Second)
+	p := NewEventPump()
+	p.SetFatalHandler(func(error) {})
+
+	if err := p.ReserveCreation(1); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	// Unbound-thread notification: drift; poison finishes the pending
+	// creation with the drift cause synchronously.
+	p.HandleNotification("turn/started", []byte(`{"threadId":"`+fixtureThreadB+`","turnId":"`+fixtureTurnA+`"}`))
+
+	// A late abandon runs after the drift finish: the outcome must stay
+	// the drift cause, never be rewritten to abandoned.
+	p.AbandonCreation()
+
+	outcome := p.CreationOutcome()
+	var drift *ErrProtocolDrift
+	if !errors.As(outcome, &drift) {
+		t.Fatalf("first finisher's outcome must win, got %T: %v", outcome, outcome)
+	}
+	if errors.Is(outcome, ErrCreationAbandoned) {
+		t.Fatal("late abandon must not overwrite the terminal drift outcome")
+	}
+}
+
+// CompleteCreation must re-check the abandoned flag under its confirm
+// lock: a creation abandoned while the confirm path is already past its
+// done-checks must bail with the abandoned outcome and never publish a
+// binding for an uncertain thread. The interleave is forced by spawning
+// the confirm caller while the pump lock is held (it parks at its first
+// lock, after the done-checks) with the flag already set, so the only
+// question left to the scheduler is which contender wins the confirm lock
+// — and both pre-fix answers are wrong.
+func TestPump_AbandonDuringConfirmWindow(t *testing.T) {
+	withGrace(t, 2*time.Second)
+	for attempt := 0; attempt < 25; attempt++ {
+		p := NewEventPump()
+		p.SetFatalHandler(func(error) {})
+		if err := p.ReserveCreation(1); err != nil {
+			t.Fatalf("attempt %d: reserve: %v", attempt, err)
+		}
+		p.HandleNotification("thread/started", []byte(threadStartedParams(fixtureThreadA)))
+
+		p.mu.Lock()
+		pc := p.creation
+		if pc == nil {
+			p.mu.Unlock()
+			t.Fatalf("attempt %d: reservation vanished", attempt)
+		}
+		pc.abandoned = true // the flag AbandonCreation sets under the same lock
+		retCh := make(chan error, 1)
+		go func() { retCh <- p.CompleteCreation(fixtureThreadA) }()
+		runtime.Gosched() // let the confirm path park at the pump lock
+		p.mu.Unlock()
+		// Hand the P to the confirm path so it advances past its
+		// done-checks (the flag is set, done is still open) before the
+		// abandonment's finish can close it.
+		runtime.Gosched()
+		runtime.Gosched()
+		runtime.Gosched()
+
+		// Complete the abandonment: closes done with the abandoned outcome.
+		p.AbandonCreation()
+
+		select {
+		case err := <-retCh:
+			if !errors.Is(err, ErrCreationAbandoned) {
+				t.Fatalf("attempt %d: confirm in the abandoned window must bail with the abandoned outcome, got %v", attempt, err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("attempt %d: CompleteCreation never returned", attempt)
+		}
+		if _, err := p.InstallTurnRoute(fixtureThreadA, fixtureTurnA); err == nil {
+			t.Fatalf("attempt %d: binding published for an abandoned (uncertain) creation", attempt)
+		}
+	}
+}
+
+// Consistency loop over forced interleavings: the confirm caller's terminal
+// view and the routing table must always agree — abandoned ⇒ no binding,
+// confirmed ⇒ binding present.
+func TestPump_ConfirmAbandonRaceInvariant(t *testing.T) {
+	withGrace(t, 2*time.Second)
+	for i := 0; i < 300; i++ {
+		p := NewEventPump()
+		p.SetFatalHandler(func(error) {})
+		if err := p.ReserveCreation(1); err != nil {
+			t.Fatalf("iteration %d: reserve: %v", i, err)
+		}
+		p.HandleNotification("thread/started", []byte(threadStartedParams(fixtureThreadA)))
+
+		retCh := make(chan error, 1)
+		go func() { retCh <- p.CompleteCreation(fixtureThreadA) }()
+		p.AbandonCreation()
+		err := <-retCh
+
+		_, installErr := p.InstallTurnRoute(fixtureThreadA, fixtureTurnA)
+		switch {
+		case errors.Is(err, ErrCreationAbandoned):
+			if installErr == nil {
+				t.Fatalf("iteration %d: binding published for an abandoned (uncertain) creation", i)
+			}
+		case err == nil:
+			if installErr != nil {
+				t.Fatalf("iteration %d: confirmed creation must publish the binding: %v", i, installErr)
+			}
+		default:
+			t.Fatalf("iteration %d: unexpected terminal outcome %v", i, err)
+		}
 	}
 }
 

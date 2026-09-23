@@ -267,6 +267,34 @@ func TestConn_UnterminatedFinalFrameIsPoison(t *testing.T) {
 	}
 }
 
+// A call still pending when the child's stdout ends CLEANLY (EOF, no torn
+// bytes, no poison) must fail closed with ErrConnClosed — never return
+// nil with a zero result (which would read as success, e.g. an
+// authenticated account/read).
+func TestConn_CleanEOFFailsPendingCallsClosed(t *testing.T) {
+	peer, conn := newScriptedPeer(t)
+
+	errCh := make(chan error, 1)
+	go func() {
+		var out map[string]any
+		errCh <- conn.Call(context.Background(), "account/read", struct{}{}, &out)
+	}()
+	peer.nextRequest(3 * time.Second) // the call is pending on the wire
+	_ = peer.out.Close()              // clean stream end, no torn bytes
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrConnClosed) {
+			t.Fatalf("pending call at clean EOF must fail with ErrConnClosed, got %T: %v", err, err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("pending call never completed at clean stream end")
+	}
+	if conn.Fatal() != nil {
+		t.Fatalf("clean EOF must not poison the connection: %v", conn.Fatal())
+	}
+}
+
 func TestConn_DuplicatePendingIDRejected(t *testing.T) {
 	_, conn := newScriptedPeer(t)
 	id := conn.AllocateID()
