@@ -1,0 +1,2 @@
+{"emit": {"jsonrpc":"2.0","method":"remoteControl/status/changed","params":{"status":"disabled","serverName":"codex","installationId":"fixture-install","environmentId":"fixture-env"}}}
+{"respond": {"method":"initialize","result":{"userAgent":"agent-council/0.154.0 (fixture; x86_64) (agent-council; test)","codexHome":"/home/fixture/.codex","platformFamily":"unix","platformOs":"linux"}}}
