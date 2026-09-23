@@ -144,3 +144,70 @@ func TestCodexTest_FixtureAdapterRetainsDriftDetection(t *testing.T) {
 		t.Fatalf("drift must be typed ErrProfileDrift on model, got %T: %v", err, err)
 	}
 }
+
+// The emit_many directives are HONORED, not silently dropped: one
+// emit_many_on_request on turn/start carries BOTH the turn/started and
+// turn/completed notifications before the response. The native turn id
+// binding proves line 1 arrived; the verified terminal proves line 2
+// arrived. The child drops unknown directives without error, so if this
+// scenario ever degrades to a no-op the turn never reaches a terminal
+// and this test fails on the collect deadline.
+func TestCodexTest_FixtureAdapterHonorsEmitManyDirective(t *testing.T) {
+	f, err := NewFixtureAdapter(FixtureOptions{})
+	if err != nil {
+		t.Fatalf("new fixture adapter: %v", err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+
+	// No child has started yet: restage with the multi-line directive.
+	lines := append([]string{authOKLine()}, threadStartRules(fixtureThreadID, f.WorkspaceRoot, f.Model)...)
+	lines = append(lines, resumeRule(fixtureThreadID, f.WorkspaceRoot, f.Model, nil))
+	lines = append(lines,
+		`{"emit_many_on_request": {"method":"turn/start","lines":[`+
+			`{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"`+fixtureThreadID+`","turnId":"`+fixtureTurnID+`"}},`+
+			`{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"`+fixtureThreadID+`","turn":{"id":"`+fixtureTurnID+`","items":[],"status":"completed","durationMs":100}}}`+
+			`]}}`,
+		`{"respond": {"method":"turn/start","result":{"id":"`+fixtureTurnID+`","threadId":"`+fixtureThreadID+`","status":{"type":"inProgress"}}}}`)
+	if err := f.StageScenario(lines...); err != nil {
+		t.Fatalf("stage emit_many scenario: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := f.SeedSession(ctx, fixtureSessionID); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	binding, err := f.Adapter.CreateSession(ctx, f.NewCreateRequest(fixtureSessionID))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := f.PersistBinding(ctx, binding); err != nil {
+		t.Fatalf("persist binding: %v", err)
+	}
+
+	ref := adapter.TurnRef{SessionID: fixtureSessionID, TurnKey: "t-many"}
+	out, err := f.Adapter.Dispatch(ctx, ref, "prompt")
+	if err != nil || out.Status != adapter.DispatchAccepted {
+		t.Fatalf("dispatch: status=%+v err=%v", out, err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		att, err := f.Store.GetLatestCodexTurnAttempt(ctx, fixtureSessionID, ref.TurnKey)
+		if err != nil {
+			t.Fatalf("attempt lookup: %v", err)
+		}
+		if att != nil && att.Terminal && att.NativeTurnID != nil && *att.NativeTurnID == fixtureTurnID {
+			// Both emitted lines took effect: the turn/started notification
+			// bound the native turn id, and the turn/completed notification
+			// classified the terminal.
+			if att.ObservedStatus != "completed" {
+				t.Fatalf("terminal classification: %q", att.ObservedStatus)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("emit_many lines never took effect: attempt=%+v", att)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}

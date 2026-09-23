@@ -11,11 +11,10 @@ package codextest
 // The fixture `codex` executable below is the harness copy of the
 // scripted JSON-RPC 2.0 stub in internal/adapter/codex/codexfake_test.go
 // (the codex package's internal test files cannot import this package —
-// import cycle — so the source is carried here verbatim; both copies are
-// continuously exercised by their respective suites). It speaks JSON-RPC
-// 2.0 over stdio (one object per line), launched through the real
-// PolicyExecutor exactly like the native app-server child, replaying
-// staged scenario directives.
+// import cycle — so the source is carried here verbatim). The two copies
+// are held byte-identical by TestCodexTest_FixtureSourceByteIdenticalToFakeChild
+// (guard_test.go): the child silently drops unknown directives, so
+// one-sided drift would turn a staged scenario into a silent no-op.
 //
 // Built-in behavior (no scenario needed):
 //   - initialize is always answered with the recorded handshake shape,
@@ -29,6 +28,10 @@ package codextest
 //   {"respond_error": {"method": M, "code": C, "message": S}}
 //   {"emit_on_request": {"method": M, "line": L}}      emit L BEFORE answering M (consume once)
 //   {"emit_after_response": {"method": M, "line": L}}  emit L AFTER answering M (consume once)
+//   {"emit_many_on_request": {"method": M, "lines": [...]}}
+//                                                      emit all L BEFORE answering M (consume once)
+//   {"emit_many_after_response": {"method": M, "lines": [...]}}
+//                                                      emit all L AFTER answering M (consume once)
 //   {"append_on_request": {"method": M, "path": P, "lines": [...]}}
 //                                                      append lines to file P BEFORE answering M
 //   {"emit": L} / {"emit_raw": S} / {"emit_oversized": N}   immediate output
@@ -40,6 +43,7 @@ package codextest
 //   .codex-fixture-replies      verbatim reply frames
 //   .codex-fixture-terminated   written on graceful SIGTERM (with pid)
 //   .codex-fixture-platform     overrides platformOs (handshake mismatch)
+//   .codex-fixture-heavy-stderr 200KiB stderr before serving (drain evidence)
 
 import (
 	"context"
@@ -77,42 +81,50 @@ import (
 )
 
 type respondRule struct {
-	Method  string          ` + "`json:\"method\"`" + `
-	Result  json.RawMessage ` + "`json:\"result\"`" + `
-	DelayMs int64           ` + "`json:\"delay_ms\"`" + `
+	Method  string          ` + "`" + `json:"method"` + "`" + `
+	Result  json.RawMessage ` + "`" + `json:"result"` + "`" + `
+	DelayMs int64           ` + "`" + `json:"delay_ms"` + "`" + `
 }
 
 type respondErrorRule struct {
-	Method  string ` + "`json:\"method\"`" + `
-	Code    int    ` + "`json:\"code\"`" + `
-	Message string ` + "`json:\"message\"`" + `
-	DelayMs int64  ` + "`json:\"delay_ms\"`" + `
+	Method  string ` + "`" + `json:"method"` + "`" + `
+	Code    int    ` + "`" + `json:"code"` + "`" + `
+	Message string ` + "`" + `json:"message"` + "`" + `
+	DelayMs int64  ` + "`" + `json:"delay_ms"` + "`" + `
 }
 
 type lineRule struct {
-	Method string          ` + "`json:\"method\"`" + `
-	Line   json.RawMessage ` + "`json:\"line\"`" + `
+	Method string          ` + "`" + `json:"method"` + "`" + `
+	Line   json.RawMessage ` + "`" + `json:"line"` + "`" + `
 	used   bool
 }
 
 type appendRule struct {
-	Method string   ` + "`json:\"method\"`" + `
-	Path   string   ` + "`json:\"path\"`" + `
-	Lines  []string ` + "`json:\"lines\"`" + `
+	Method string   ` + "`" + `json:"method"` + "`" + `
+	Path   string   ` + "`" + `json:"path"` + "`" + `
+	Lines  []string ` + "`" + `json:"lines"` + "`" + `
+	used   bool
+}
+
+type multiLineRule struct {
+	Method string            ` + "`" + `json:"method"` + "`" + `
+	Lines  []json.RawMessage ` + "`" + `json:"lines"` + "`" + `
 	used   bool
 }
 
 type directive struct {
-	Respond           *respondRule      ` + "`json:\"respond\"`" + `
-	RespondError      *respondErrorRule ` + "`json:\"respond_error\"`" + `
-	EmitOnRequest     *lineRule         ` + "`json:\"emit_on_request\"`" + `
-	EmitAfterResponse *lineRule         ` + "`json:\"emit_after_response\"`" + `
-	AppendOnRequest   *appendRule       ` + "`json:\"append_on_request\"`" + `
-	Emit              json.RawMessage   ` + "`json:\"emit\"`" + `
-	EmitRaw           string            ` + "`json:\"emit_raw\"`" + `
-	EmitOversized     int64             ` + "`json:\"emit_oversized\"`" + `
-	Stderr            string            ` + "`json:\"stderr\"`" + `
-	DelayMs           int64             ` + "`json:\"delay_ms\"`" + `
+	Respond           *respondRule      ` + "`" + `json:"respond"` + "`" + `
+	RespondError      *respondErrorRule ` + "`" + `json:"respond_error"` + "`" + `
+	EmitOnRequest     *lineRule         ` + "`" + `json:"emit_on_request"` + "`" + `
+	EmitAfterResponse *lineRule         ` + "`" + `json:"emit_after_response"` + "`" + `
+	AppendOnRequest   *appendRule       ` + "`" + `json:"append_on_request"` + "`" + `
+	EmitManyOnRequest *multiLineRule    ` + "`" + `json:"emit_many_on_request"` + "`" + `
+	EmitManyAfterResp *multiLineRule    ` + "`" + `json:"emit_many_after_response"` + "`" + `
+	Emit              json.RawMessage   ` + "`" + `json:"emit"` + "`" + `
+	EmitRaw           string            ` + "`" + `json:"emit_raw"` + "`" + `
+	EmitOversized     int64             ` + "`" + `json:"emit_oversized"` + "`" + `
+	Stderr            string            ` + "`" + `json:"stderr"` + "`" + `
+	DelayMs           int64             ` + "`" + `json:"delay_ms"` + "`" + `
 }
 
 func appendLine(name, line string) {
@@ -125,6 +137,9 @@ func appendLine(name, line string) {
 }
 
 func main() {
+	for _, a := range os.Args[1:] {
+		_ = a
+	}
 	appendLine(".codex-fixture-args", strings.Join(os.Args[1:], "\x1f"))
 
 	ch := make(chan os.Signal, 1)
@@ -135,7 +150,11 @@ func main() {
 		os.Exit(0)
 	}()
 
-	fmt.Fprint(os.Stderr, "codex fixture stderr noise\n")
+	if _, err := os.Stat(".codex-fixture-heavy-stderr"); err == nil {
+		fmt.Fprint(os.Stderr, strings.Repeat("x", 200<<10))
+	} else {
+		fmt.Fprint(os.Stderr, "codex fixture stderr noise\n")
+	}
 
 	codexHome := os.Getenv("CODEX_HOME")
 	if codexHome == "" {
@@ -155,12 +174,15 @@ func main() {
 		"platformOs":     platformOS,
 	}
 
+	// Load scenario directives.
 	var (
 		responds  []respondRule
 		respErrs  []respondErrorRule
 		onReq     []*lineRule
 		afterResp []*lineRule
 		appends   []*appendRule
+		manyReq   []*multiLineRule
+		manyAfter []*multiLineRule
 	)
 	if raw, err := os.ReadFile(".codex-fixture-scenario.jsonl"); err == nil {
 		for _, ln := range strings.Split(string(raw), "\n") {
@@ -182,6 +204,10 @@ func main() {
 				afterResp = append(afterResp, &lineRule{Method: d.EmitAfterResponse.Method, Line: d.EmitAfterResponse.Line})
 			case d.AppendOnRequest != nil:
 				appends = append(appends, &appendRule{Method: d.AppendOnRequest.Method, Path: d.AppendOnRequest.Path, Lines: d.AppendOnRequest.Lines})
+			case d.EmitManyOnRequest != nil:
+				manyReq = append(manyReq, &multiLineRule{Method: d.EmitManyOnRequest.Method, Lines: d.EmitManyOnRequest.Lines})
+			case d.EmitManyAfterResp != nil:
+				manyAfter = append(manyAfter, &multiLineRule{Method: d.EmitManyAfterResp.Method, Lines: d.EmitManyAfterResp.Lines})
 			case len(d.Emit) > 0:
 				fmt.Fprintln(os.Stdout, string(d.Emit))
 			case d.EmitRaw != "":
@@ -212,14 +238,16 @@ func main() {
 			continue
 		}
 		var req struct {
-			ID     json.RawMessage ` + "`json:\"id\"`" + `
-			Method string          ` + "`json:\"method\"`" + `
-			Params json.RawMessage ` + "`json:\"params\"`" + `
+			ID     json.RawMessage ` + "`" + `json:"id"` + "`" + `
+			Method string          ` + "`" + `json:"method"` + "`" + `
+			Params json.RawMessage ` + "`" + `json:"params"` + "`" + `
 		}
 		if err := json.Unmarshal([]byte(line), &req); err != nil {
 			continue
 		}
 		if req.Method == "" {
+			// A response frame (Council's reply to a server→client
+			// request): log verbatim as approval-payload evidence.
 			appendLine(".codex-fixture-replies", line)
 			continue
 		}
@@ -237,6 +265,17 @@ func main() {
 				break
 			}
 		}
+
+		for _, r := range manyReq {
+			if !r.used && r.Method == req.Method {
+				for _, l := range r.Lines {
+					fmt.Fprintln(os.Stdout, string(l))
+				}
+				r.used = true
+				break
+			}
+		}
+
 		for _, r := range appends {
 			if !r.used && r.Method == req.Method {
 				f, err := os.OpenFile(r.Path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
@@ -279,6 +318,15 @@ func main() {
 			answered = true
 		}
 
+		for _, r := range manyAfter {
+			if !r.used && r.Method == req.Method {
+				for _, l := range r.Lines {
+					fmt.Fprintln(os.Stdout, string(l))
+				}
+				r.used = true
+				break
+			}
+		}
 		for _, r := range afterResp {
 			if !r.used && r.Method == req.Method {
 				fmt.Fprintln(os.Stdout, string(r.Line))
