@@ -48,13 +48,18 @@ CI-excluded:
    id, model, workdir, and prompt — the script never selects them;
 3. §3.6 transcript-path denial probe suite — EXECUTED, not suggested:
    the script runs each applicable class (Read / Glob / Grep /
-   Bash-absolute; MCP/plugin when enabled, ABSENT otherwise) against
-   the sibling transcript through real `claude -p` children, captures
-   the structured stream, classifies each outcome
-   (DENIED/NOT-DENIED/UNPROVABLE/ABSENT), and REFUSES the attestation
-   (exit 2) if any executed class was NOT-DENIED. The sibling target
-   is recorded as a SHA-256 hash only; prompts are never written to
-   the evidence; excerpts are sanitized and capped at 256 bytes.
+   Bash-absolute; every MCP/plugin tool listed in an explicit
+   operator-derived inventory) against the sibling transcript through
+   real `claude -p` children, captures the structured stream, and
+   classifies each outcome (DENIED / NOT-DENIED / UNPROVABLE /
+   ABSENT). Protected evidence requires EVERY enabled path
+   affirmatively denied: the suite REFUSES the attestation (exit 2)
+   on any NOT-DENIED or UNPROVABLE executed class, or on an unproven
+   MCP/plugin inventory (unset variable). ABSENT is accepted only
+   from an affirmative empty inventory derived from the frozen
+   profile. The sibling target is recorded as a SHA-256 hash only;
+   prompts are never written to the evidence; excerpts are sanitized
+   and capped at 256 bytes.
 
 ## Explicitly unverified capabilities (fail-closed today)
 
