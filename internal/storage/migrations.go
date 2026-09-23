@@ -13,10 +13,11 @@ import (
 var schemaSQL string
 
 // schema.sql is the frozen released v1 schema; schemaV2DDL is the immutable
-// v2 migration body; schemaV3DDL is the immutable v3 migration body.
+// v2 migration body; schemaV3DDL is the immutable v3 migration body;
+// claudeStateV4DDL and codexStateV5DDL are the immutable v4/v5 bodies.
 // Fresh databases apply v1 then v2 then v3 sequentially — there
 // is no separate "latest schema" path that could diverge from upgrading.
-const currentSchemaVersion = 4
+const currentSchemaVersion = 5
 
 func schemaChecksum() string {
 	sum := sha256.Sum256([]byte(schemaSQL))
@@ -154,7 +155,7 @@ VALUES (2, 'controller_leases_provenance', ?, ?);`, schemaV2Checksum(), now)
 		}
 	}
 
-	if currentVer >= 4 {
+	if currentVer >= 5 {
 		// Fully migrated: nothing to do.
 		return nil
 	}
@@ -169,15 +170,27 @@ VALUES (2, 'controller_leases_provenance', ?, ?);`, schemaV2Checksum(), now)
 		if recordedV3Checksum != schemaV3Checksum() {
 			return ErrMigrationChecksumMismatch
 		}
-		// v3 verified: apply v4 (AC-008 Claude adapter state) only.
-		if _, err := tx.Tx().Exec(claudeStateV4DDL); err != nil {
-			return fmt.Errorf("execute schema v4: %w", err)
+		if currentVer < 4 {
+			// v3 verified: apply v4 (AC-008 Claude adapter state).
+			if _, err := tx.Tx().Exec(claudeStateV4DDL); err != nil {
+				return fmt.Errorf("execute schema v4: %w", err)
+			}
+			now := time.Now().UTC().Format(time.RFC3339Nano)
+			if _, err := tx.Tx().Exec(`
+INSERT INTO schema_migrations (version, name, checksum, applied_at)
+VALUES (4, 'claude_adapter_state', ?, ?);`, "claude-state-v4", now); err != nil {
+				return fmt.Errorf("record migration v4: %w", err)
+			}
+		}
+		// Apply v5: AC-009 Codex adapter durable state tables.
+		if _, err := tx.Tx().Exec(codexStateV5DDL); err != nil {
+			return fmt.Errorf("execute schema v5: %w", err)
 		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		if _, err := tx.Tx().Exec(`
 INSERT INTO schema_migrations (version, name, checksum, applied_at)
-VALUES (4, 'claude_adapter_state', ?, ?);`, "claude-state-v4", now); err != nil {
-			return fmt.Errorf("record migration v4: %w", err)
+VALUES (5, 'codex_adapter_state', ?, ?);`, "codex-state-v5", now); err != nil {
+			return fmt.Errorf("record migration v5: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit migration: %w", err)
@@ -225,6 +238,17 @@ VALUES (3, 'run_profiles_proposal_sets', ?, ?);`, schemaV3Checksum(), now)
 INSERT INTO schema_migrations (version, name, checksum, applied_at)
 VALUES (4, 'claude_adapter_state', ?, ?);`, "claude-state-v4", now); err != nil {
 		return fmt.Errorf("record migration v4: %w", err)
+	}
+
+	// Apply v5: AC-009 Codex adapter durable state tables.
+	if _, err := tx.Tx().Exec(codexStateV5DDL); err != nil {
+		return fmt.Errorf("execute schema v5: %w", err)
+	}
+	now = time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.Tx().Exec(`
+INSERT INTO schema_migrations (version, name, checksum, applied_at)
+VALUES (5, 'codex_adapter_state', ?, ?);`, "codex-state-v5", now); err != nil {
+		return fmt.Errorf("record migration v5: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -300,4 +324,73 @@ CREATE TABLE IF NOT EXISTS claude_protection_attestations (
 	actor              TEXT NOT NULL
 );
 
+`
+
+// codexStateV5DDL creates the AC-009 Codex adapter durable state tables
+// (bindings, turn attempts, launch reservations, cprot-v2 attestations).
+const codexStateV5DDL = `
+CREATE TABLE IF NOT EXISTS codex_session_bindings (
+	session_id         TEXT PRIMARY KEY,
+	native_id          TEXT NOT NULL UNIQUE
+	                   CHECK (native_id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-7[0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
+	materialized       INTEGER NOT NULL DEFAULT 0,
+	model              TEXT NOT NULL,
+	workspace          TEXT NOT NULL,
+	rollout_path       TEXT,
+	profile_digest     TEXT NOT NULL,
+	first_prompt_digest TEXT,
+	created_at         TIMESTAMP NOT NULL
+);
+CREATE TABLE IF NOT EXISTS codex_turn_attempts (
+	attempt_id         TEXT NOT NULL,
+	session_id         TEXT NOT NULL,
+	turn_key           TEXT NOT NULL,
+	transition_version INTEGER NOT NULL DEFAULT 1,
+	native_turn_id     TEXT,
+	baseline_file_identity TEXT NOT NULL DEFAULT '',
+	baseline_size      INTEGER NOT NULL DEFAULT 0,
+	baseline_entries   INTEGER NOT NULL DEFAULT 0,
+	materialized_baseline INTEGER NOT NULL DEFAULT 0,
+	rollout_protection TEXT NOT NULL DEFAULT 'advisory',
+	protection_attestation_id TEXT,
+	prompt_digest      TEXT NOT NULL,
+	launch_count       INTEGER NOT NULL DEFAULT 0 CHECK (launch_count BETWEEN 0 AND 2),
+	absence_redispatch_consumed INTEGER NOT NULL DEFAULT 0,
+	absence_verified        TEXT NOT NULL DEFAULT '',
+	accepted           INTEGER,
+	terminal           INTEGER NOT NULL DEFAULT 0,
+	result_payload     TEXT,
+	result_usage       TEXT,
+	observed_status    TEXT NOT NULL DEFAULT 'uncertain',
+	uncertainty_disposition TEXT,
+	created_at         TIMESTAMP NOT NULL,
+	updated_at         TIMESTAMP NOT NULL,
+	UNIQUE(session_id, turn_key, attempt_id)
+);
+CREATE TABLE IF NOT EXISTS codex_attempt_launches (
+	attempt_id         TEXT NOT NULL,
+	reservation_seq    INTEGER NOT NULL,
+	state              TEXT NOT NULL DEFAULT 'reserved',
+	started_at         TIMESTAMP,
+	start_failed_at    TIMESTAMP,
+	first_stdin_byte_at TIMESTAMP,
+	known_dead_at      TIMESTAMP,
+	exit_code          INTEGER,
+	child_generation   INTEGER NOT NULL DEFAULT 0,
+	executor_identity  TEXT NOT NULL,
+	UNIQUE(attempt_id, reservation_seq)
+);
+CREATE TABLE IF NOT EXISTS codex_protection_attestations (
+	attestation_id     TEXT PRIMARY KEY
+	                   CHECK (length(attestation_id) = 80
+	                          AND attestation_id LIKE 'cprot-v2:sha256:%'
+	                          AND substr(attestation_id, 17) NOT GLOB '*[^0-9a-f]*'),
+	codex_version      TEXT NOT NULL,
+	platform           TEXT NOT NULL,
+	manifest_digest    TEXT NOT NULL,
+	profile_digest     TEXT NOT NULL,
+	probe_results      TEXT NOT NULL,
+	probed_at          TIMESTAMP NOT NULL,
+	actor              TEXT NOT NULL
+);
 `

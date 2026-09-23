@@ -461,16 +461,17 @@ func TestClaudeState_UnresolvedAttemptsReported(t *testing.T) {
 	}
 }
 
-// The schema-v4 migration must be asserted exactly: at least one test
-// pins the version to 4 to prevent v4 migration omission from passing.
-func TestClaudeState_SchemaVersionIsExactly4(t *testing.T) {
+// The schema version must be asserted exactly: at least one test pins
+// the current version to 5 (AC-009 advanced the AC-008 pin) to prevent
+// migration omission from passing.
+func TestClaudeState_SchemaVersionIsExactly5(t *testing.T) {
 	store := openClaudeStore(t)
 	ver, err := store.CurrentSchemaVersion()
 	if err != nil {
 		t.Fatalf("schema version: %v", err)
 	}
-	if ver != 4 {
-		t.Fatalf("expected schema version exactly 4, got %d", ver)
+	if ver != 5 {
+		t.Fatalf("expected schema version exactly 5, got %d", ver)
 	}
 	// The AC-008 tables must exist.
 	for _, table := range []string{
