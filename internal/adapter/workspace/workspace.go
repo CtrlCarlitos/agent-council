@@ -202,7 +202,10 @@ func (m *WorkspaceManager) AllocateWorkspace(runID, sessionID, mode, sourceRepo,
 			return WorkspacePaths{}, fmt.Errorf("%w: %v", ErrInvalidSourceRepo, err)
 		}
 
-		sourceDir := filepath.Join(sessionDir, "source")
+		// Built on the RESOLVED session directory: the native child's
+		// getwd resolves symlinked ancestors, so every mode must pin the
+		// physical path (same contract as the none-mode scratch/config).
+		sourceDir := filepath.Join(realSessionDir, "source")
 		targetCommit := commit
 		if targetCommit == "" {
 			targetCommit = "HEAD"
@@ -245,7 +248,7 @@ func (m *WorkspaceManager) AllocateWorkspace(runID, sessionID, mode, sourceRepo,
 		}
 
 		branch = fmt.Sprintf("council/%s/%s", runID, sessionID)
-		worktreeDir := filepath.Join(sessionDir, "worktree")
+		worktreeDir := filepath.Join(realSessionDir, "worktree")
 
 		targetCommit := commit
 		if targetCommit == "" {
