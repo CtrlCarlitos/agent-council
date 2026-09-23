@@ -67,6 +67,9 @@ type ClaudeAdapter struct {
 	// adapter-owned (not a package global) so tests can instrument it
 	// without racing parallel production-path callers.
 	materialize func(templateDir, base, runID, sessionID string) (string, string, error)
+	// probeTemplate runs the operator-owned contract probes. Nil until
+	// wired by NewProductionClaudeAdapter; Probe fails closed on nil.
+	probeTemplate ClaudeProbeLaunchTemplate
 
 	mu        sync.Mutex
 	turns     map[adapter.TurnRef]*turnRun

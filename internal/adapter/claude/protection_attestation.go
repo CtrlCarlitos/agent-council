@@ -144,16 +144,44 @@ func (a ProtectionAttestation) Validate() error {
 	return nil
 }
 
-// Digest computes cprot-v1:sha256:<hex> over the canonical attestation
-// frame. Any probe record with denied=false invalidates the attestation
-// (protected evidence requires every path proven denied).
-func (a ProtectionAttestation) Digest() (string, error) {
+// EncodeProbeRecords produces the canonical framed probe-record list
+// (uint32-BE count, then per record the six length-prefixed fields in
+// fixed order, byte-wise sorted). This is the cprot-v1 encoding
+// persisted in claude_protection_attestations.probe_results — never
+// free-form JSON.
+func (a ProtectionAttestation) EncodeProbeRecords() ([]byte, error) {
 	if err := a.Validate(); err != nil {
-		return "", err
+		return nil, err
 	}
+	canonical := canonicalProbeRecords(a.Records)
+	buf := make([]byte, 0, 256)
+	field := func(s string) {
+		buf = append(buf, u32be(uint32(len(s)))...)
+		buf = append(buf, s...)
+	}
+	buf = append(buf, u32be(uint32(len(canonical)))...)
+	for _, r := range canonical {
+		className, err := r.ToolClass.canonicalName()
+		if err != nil {
+			return nil, err
+		}
+		field(className)          // 1. tool_class (canonical name)
+		field(r.ToolName)         // 2. tool_name
+		field(probeTargetLiteral) // 3. target (fixed literal)
+		if r.Denied {             // 4. denied (one byte)
+			buf = append(buf, 1)
+		} else {
+			buf = append(buf, 0)
+		}
+		field(string(r.EnforcingCapability)) // 5. enforcing capability
+		field(r.DenialText)                  // 6. excerpt
+	}
+	return buf, nil
+}
 
-	canonical := make([]ProbeRecord, 0, len(a.Records))
-	for _, r := range a.Records {
+func canonicalProbeRecords(records []ProbeRecord) []ProbeRecord {
+	canonical := make([]ProbeRecord, 0, len(records))
+	for _, r := range records {
 		canonical = append(canonical, ProbeRecord{
 			ToolClass:           r.ToolClass,
 			ToolName:            strings.TrimSpace(r.ToolName),
@@ -168,6 +196,20 @@ func (a ProtectionAttestation) Digest() (string, error) {
 		}
 		return canonical[i].ToolName < canonical[j].ToolName
 	})
+	return canonical
+}
+
+// Digest computes cprot-v1:sha256:<hex> over the canonical attestation
+// frame. Any probe record with denied=false invalidates the attestation
+// (protected evidence requires every path proven denied).
+func (a ProtectionAttestation) Digest() (string, error) {
+	if err := a.Validate(); err != nil {
+		return "", err
+	}
+	records, err := a.EncodeProbeRecords()
+	if err != nil {
+		return "", err
+	}
 
 	buf := make([]byte, 0, 256)
 	field := func(s string) {
@@ -181,20 +223,7 @@ func (a ProtectionAttestation) Digest() (string, error) {
 	field(a.Platform)
 	field(a.ManifestDigest)
 	field(a.TemplateDigest)
-	buf = append(buf, u32be(uint32(len(canonical)))...)
-	for _, r := range canonical {
-		className, _ := r.ToolClass.canonicalName()
-		field(className)          // 1. tool_class (canonical name)
-		field(r.ToolName)         // 2. tool_name
-		field(probeTargetLiteral) // 3. target (fixed literal)
-		if r.Denied {             // 4. denied (one byte)
-			buf = append(buf, 1)
-		} else {
-			buf = append(buf, 0)
-		}
-		field(string(r.EnforcingCapability)) // 5. enforcing capability
-		field(r.DenialText)                  // 6. excerpt
-	}
+	buf = append(buf, records...)
 	field(a.ProbedAt)
 	field(a.Actor)
 

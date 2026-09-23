@@ -14,11 +14,97 @@ import (
 	"time"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
+	"github.com/CtrlCarlitos/agent-council/internal/adapter/claude"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/execpolicy"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/opencode"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/workspace"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
+
+// resolveClaudeProbeScratchRoot validates and prepares the configured
+// Claude contract-probe scratch root. Mirrors the OpenCode probe
+// scratch family: operator-provided, disjoint from StateDir and
+// WorkspaceBaseDir (resolved, pre- and post-creation), operator-only
+// permissions.
+func resolveClaudeProbeScratchRoot(cfg ServerConfig) (string, error) {
+	root := strings.TrimSpace(cfg.ClaudeProbeScratchRoot)
+	if root == "" {
+		return "", fmt.Errorf("ClaudeProbeScratchRoot is required when ClaudeBinaryPath is configured")
+	}
+	root = filepath.Clean(root)
+
+	bases := map[string]string{}
+	for name, base := range map[string]string{
+		"StateDir":         cfg.StateDir,
+		"WorkspaceBaseDir": cfg.WorkspaceBaseDir,
+	} {
+		base = strings.TrimSpace(base)
+		if base == "" {
+			continue
+		}
+		bases[name] = filepath.Clean(base)
+	}
+
+	resolved, err := resolveExistingPath(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve claude probe scratch root: %w", err)
+	}
+	if err := checkScratchContainment(bases, resolved); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", fmt.Errorf("create claude probe scratch root: %w", err)
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		return "", fmt.Errorf("secure claude probe scratch root: %w", err)
+	}
+	resolvedFinal, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve claude probe scratch root after creation: %w", err)
+	}
+	if err := checkScratchContainment(bases, resolvedFinal); err != nil {
+		return "", err
+	}
+	return root, nil
+}
+
+// resolveClaudeTemplateDir validates the configured frozen config
+// template: required, pre-provisioned, a real directory. The service
+// never creates or mutates it — materialization reads it at session
+// creation.
+func resolveClaudeTemplateDir(cfg ServerConfig) (string, error) {
+	dir := strings.TrimSpace(cfg.ClaudeTemplateDir)
+	if dir == "" {
+		return "", fmt.Errorf("ClaudeTemplateDir is required when ClaudeBinaryPath is configured")
+	}
+	dir = filepath.Clean(dir)
+	st, err := os.Stat(dir)
+	if err != nil {
+		return "", fmt.Errorf("claude config template %s is missing: %w", dir, err)
+	}
+	if !st.IsDir() {
+		return "", fmt.Errorf("claude config template %s is not a directory", dir)
+	}
+	return dir, nil
+}
+
+// resolveClaudeEvidenceRoot validates the configured trusted universe
+// evidence root: required and a real directory.
+func resolveClaudeEvidenceRoot(cfg ServerConfig) (string, error) {
+	dir := strings.TrimSpace(cfg.ClaudeEvidenceRoot)
+	if dir == "" {
+		return "", fmt.Errorf("ClaudeEvidenceRoot is required when ClaudeBinaryPath is configured")
+	}
+	dir = filepath.Clean(dir)
+	st, err := os.Stat(dir)
+	if err != nil {
+		return "", fmt.Errorf("claude evidence root %s is missing: %w", dir, err)
+	}
+	if !st.IsDir() {
+		return "", fmt.Errorf("claude evidence root %s is not a directory", dir)
+	}
+	return dir, nil
+}
 
 type ServerConfig struct {
 	StateDir         string
@@ -45,6 +131,28 @@ type ServerConfig struct {
 	// set; validated to be disjoint from StateDir and WorkspaceBaseDir
 	// and secured to operator-only permissions.
 	ClaudeConfigBaseDir string
+
+	// ClaudeTemplateDir is the operator-provisioned frozen config
+	// template CreateSession materializes per-session config roots
+	// from. Required when ClaudeBinaryPath is set; it must already
+	// exist — the service never synthesizes or mutates the template.
+	ClaudeTemplateDir string
+
+	// ClaudeEvidenceRoot is the trusted service-owned root holding the
+	// pinned native-tool-universe evidence file. Required when
+	// ClaudeBinaryPath is set.
+	ClaudeEvidenceRoot string
+
+	// ClaudeProbeProfile is the operator-approved canonical profile the
+	// Claude contract probes (--version, --help) launch with. Required
+	// when ClaudeBinaryPath is set.
+	ClaudeProbeProfile storage.CanonicalProfile
+
+	// ClaudeProbeScratchRoot is the operator-provisioned directory for
+	// Claude contract-probe children. Required when ClaudeBinaryPath is
+	// set; disjoint from StateDir and WorkspaceBaseDir, operator-only
+	// permissions.
+	ClaudeProbeScratchRoot string
 
 	// OpenCodeProbeScratchRoot is the operator-provisioned directory for
 	// probe scratch directories. Required when OpenCodeBinaryPath is set;
@@ -123,6 +231,9 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 	// production OpenCode adapter with fail-closed seams backed by the same
 	// workspace manager and policy executor the service uses.
 	if adp == nil && strings.TrimSpace(cfg.OpenCodeBinaryPath) != "" {
+		if strings.TrimSpace(cfg.ClaudeBinaryPath) != "" {
+			return nil, errors.New("only one persistent contributor adapter can be wired per service instance (OpenCode and Claude are both configured)")
+		}
 		scratchRoot, scratchErr := resolveOpenCodeProbeScratchRoot(cfg)
 		if scratchErr != nil {
 			return nil, fmt.Errorf("OpenCode probe scratch root: %w", scratchErr)
@@ -136,6 +247,35 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 		adp, opErr = opencode.NewProductionOpenCodeAdapter(store, wm, pe, probeTemplate, opts...)
 		if opErr != nil {
 			return nil, fmt.Errorf("OpenCode adapter construction: %w", opErr)
+		}
+	}
+
+	// If no adapter is provided but Claude is configured, construct the
+	// production Claude adapter (AC-008) with fail-closed configuration
+	// validation: config base, template dir, evidence root, probe
+	// scratch root, and probe profile are all required.
+	if adp == nil && strings.TrimSpace(cfg.ClaudeBinaryPath) != "" {
+		configBase, err := resolveClaudeConfigBaseDir(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("Claude config base: %w", err)
+		}
+		scratchRoot, err := resolveClaudeProbeScratchRoot(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("Claude probe scratch root: %w", err)
+		}
+		templateDir, err := resolveClaudeTemplateDir(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("Claude config template: %w", err)
+		}
+		evidenceRoot, err := resolveClaudeEvidenceRoot(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("Claude evidence root: %w", err)
+		}
+		probeTemplate := claude.NewOperatorProbeLaunchTemplate(cfg.ClaudeBinaryPath, scratchRoot, cfg.ClaudeProbeProfile)
+		var clErr error
+		adp, clErr = claude.NewProductionClaudeAdapter(store, wm, pe, probeTemplate, configBase, templateDir, evidenceRoot)
+		if clErr != nil {
+			return nil, fmt.Errorf("Claude adapter construction: %w", clErr)
 		}
 	}
 
