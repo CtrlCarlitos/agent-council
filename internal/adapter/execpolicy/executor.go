@@ -45,6 +45,29 @@ type LaunchRequest struct {
 	// an `opencode serve` child. The executor accepts it only on that exact
 	// launch shape and injects it after the scrub pass.
 	GeneratedServerEnv *GeneratedServerEnv
+	// ClaudeConfigDir carries the per-session Claude config root for an
+	// exact `claude -p` launch. The executor accepts it only on that
+	// shape, injects it as CLAUDE_CONFIG_DIR after the scrub pass, and
+	// keeps it out of captured event payloads.
+	ClaudeConfigDir string
+	// ClaudeConfigBaseDir is the trusted base the config dir must be
+	// contained in (service-validated). Required whenever
+	// ClaudeConfigDir is set; verified symlink-safe before injection.
+	ClaudeConfigBaseDir string
+	// PromptDigest is the frozen prompt hash for durable acceptance
+	// correlation (AC-008 §3.5). Recorded on the attempt, never sent to
+	// the native side.
+	PromptDigest string
+	// UniverseTools carries the pinned native tool universe for parser
+	// drift checks (AC-008 §3.8). Set by the Claude launch source.
+	UniverseTools []string
+	// Model is the frozen native model identity the launch pins via
+	// --model (AC-008 §3.7). The stream parser validates the init
+	// event's model against it. Set by the Claude launch source.
+	Model string
+	// ProfileDigest is the frozen run-profile digest in force for this
+	// launch (AC-008 §3.6 manifest-digest binding for attestations).
+	ProfileDigest string
 }
 
 // CapabilityChecker verifies whether the host environment supports required isolation capabilities.
@@ -122,7 +145,7 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 	}
 
 	// 2. Validate profile algorithm version
-	if req.Profile.AlgoVersion != "" && req.Profile.AlgoVersion != "cprof-v1" {
+	if req.Profile.AlgoVersion != "" && req.Profile.AlgoVersion != "cprof-v1" && req.Profile.AlgoVersion != "cprof-v2" {
 		return nil, fmt.Errorf("%w: invalid profile algo_version %q", ErrInvalidLaunchRequest, req.Profile.AlgoVersion)
 	}
 
@@ -297,6 +320,19 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 	// the secret filter cannot strip them (Gate-spec: these are Council-
 	// generated transport credentials, not inherited secrets).
 	scrubbedEnv = appendGeneratedServerEnv(scrubbedEnv, req)
+
+	// Typed Claude config-dir extension: validated against the exact
+	// Claude launch shape, then injected as CLAUDE_CONFIG_DIR after the
+	// scrub pass (AC-008 §3.7).
+	if req.ClaudeConfigDir != "" {
+		if err := validateClaudeConfigDir(req); err != nil {
+			if proxyToClose != nil {
+				_ = proxyToClose.Close()
+			}
+			return nil, err
+		}
+		scrubbedEnv = append(scrubbedEnv, "CLAUDE_CONFIG_DIR="+req.ClaudeConfigDir)
+	}
 
 	cmd := exec.CommandContext(ctx, req.Command, req.Args...)
 	cmd.Dir = req.Paths.Root

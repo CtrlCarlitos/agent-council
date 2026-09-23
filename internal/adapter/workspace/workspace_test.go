@@ -445,3 +445,57 @@ func TestWorkspace_SiblingIsolation(t *testing.T) {
 		t.Errorf("unexpected branch for worker 2: %q", b2)
 	}
 }
+
+// Under a symlinked workspace base (the macOS /var -> /private/var
+// shape), every mode must return the child-visible PHYSICAL root: the
+// native child's getwd resolves symlinked ancestors, and the frozen
+// workspace root must agree with it (AC-008 pins this root as cwd).
+func TestWorkspace_PhysicalRootUnderSymlinkedBase(t *testing.T) {
+	repoDir, headCommit := createTestGitRepo(t)
+
+	dir := t.TempDir()
+	realBase := filepath.Join(dir, "real-base")
+	if err := os.MkdirAll(realBase, 0o700); err != nil {
+		t.Fatalf("mkdir real base: %v", err)
+	}
+	linkBase := filepath.Join(dir, "link-base")
+	if err := os.Symlink(realBase, linkBase); err != nil {
+		t.Fatalf("symlink base: %v", err)
+	}
+	// The reference base must be physical too: on darwin t.TempDir()
+	// itself lives behind /var -> /private/var.
+	realBase, err := filepath.EvalSymlinks(realBase)
+	if err != nil {
+		t.Fatalf("resolve real base: %v", err)
+	}
+	stateDir := filepath.Join(dir, "state")
+
+	for _, mode := range []string{"none", "readonly", "isolated_branch"} {
+		t.Run(mode, func(t *testing.T) {
+			mgr, err := workspace.NewWorkspaceManager(stateDir, linkBase)
+			if err != nil {
+				t.Fatalf("workspace manager: %v", err)
+			}
+			paths, err := mgr.AllocateWorkspace("run-sym", "sess-"+mode, mode, repoDir, headCommit)
+			if err != nil {
+				t.Fatalf("allocate %s: %v", mode, err)
+			}
+			// CloseWorkspace restores permissions so TempDir cleanup can
+			// remove the read-only source.
+			defer func() { _ = mgr.CloseWorkspace("run-sym", "sess-"+mode) }()
+			// The returned root must already BE the physical path: a
+			// second EvalSymlinks must be the identity.
+			resolved, err := filepath.EvalSymlinks(paths.Root)
+			if err != nil {
+				t.Fatalf("resolve root: %v", err)
+			}
+			if resolved != paths.Root {
+				t.Fatalf("%s root %s is lexical; the child-visible physical path is %s", mode, paths.Root, resolved)
+			}
+			// Physical containment under the resolved base.
+			if !strings.HasPrefix(resolved, realBase+string(filepath.Separator)) {
+				t.Fatalf("%s root %s must live under the physical base %s", mode, resolved, realBase)
+			}
+		})
+	}
+}
