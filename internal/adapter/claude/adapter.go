@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -473,10 +474,23 @@ func (a *ClaudeAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, promp
 			Reason: err.Error()}, err
 	}
 
+	// Freeze transcript protection at baseline: an attestation matching
+	// the four binding fields in force (probed CLI version, platform,
+	// manifest digest, template digest) upgrades the attempt to
+	// protected and freezes its id; no match means advisory. A lookup
+	// FAILURE is never silently downgraded — the dispatch is rejected.
+	attestationID, protection, pErr := a.resolveTranscriptProtection(ctx, launch, binding.TemplateDigest)
+	if pErr != nil {
+		releaseIfRejected()
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
+			Reason: pErr.Error()}, pErr
+	}
+
 	baseline := storage.ClaudeTurnAttempt{
 		AttemptID: attempt, SessionID: string(ref.SessionID),
 		TurnKey: ref.TurnKey, NativeID: nativeID, PromptDigest: promptDigest,
-		BaselineMaterialized: false, TranscriptProtection: "advisory",
+		BaselineMaterialized: false, TranscriptProtection: protection,
+		AttestationID: attestationID,
 	}
 	if err := a.store.InsertClaudeTurnAttempt(ctx, baseline); err != nil {
 		releaseIfRejected()
@@ -674,6 +688,33 @@ func drainReader(r interface{ Read([]byte) (int, error) }) {
 			return
 		}
 	}
+}
+
+// resolveTranscriptProtection selects the transcript-protection class
+// for a new attempt: an attestation matching the launch's frozen
+// (claude version, platform, manifest digest) and the binding's frozen
+// template digest upgrades the attempt to protected with its id frozen;
+// no matching attestation keeps the attempt advisory. Lookup failures
+// are returned — protection is never silently downgraded by an error.
+func (a *ClaudeAdapter) resolveTranscriptProtection(ctx context.Context, launch execpolicy.LaunchRequest, templateDigest string) (string, string, error) {
+	id, err := a.store.FindClaudeProtectionAttestation(ctx,
+		launch.Profile.ToolkitManifest.ToolkitManifest.ProbedCLIVersion,
+		platformIdentity(),
+		launch.ProfileDigest,
+		templateDigest)
+	if err != nil {
+		return "", "", err
+	}
+	if id == "" {
+		return "", "advisory", nil
+	}
+	return id, "protected", nil
+}
+
+// platformIdentity is the attestation binding string for the running
+// platform (§3.6: os/arch).
+func platformIdentity() string {
+	return runtime.GOOS + "/" + runtime.GOARCH
 }
 
 // observeAndMarkMaterialized enforces the §3.3 evidence boundary: the

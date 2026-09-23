@@ -26,7 +26,7 @@ func compileClaudeStubForService(t *testing.T) string {
 	body := "#!/bin/sh\ncase \"$1\" in\n" +
 		"  --version) echo \"2.1.278 (Claude Code)\" ;;\n" +
 		"  --help) echo \"Usage: claude [options]\"; " +
-		"echo \"  -p, --output-format --verbose --session-id --resume --model --max-turns --allowedTools --disallowedTools\" ;;\n" +
+		"echo \"  -p, --print --output-format (choices: text, json, stream-json) --verbose --session-id --resume --model --max-turns --permission-mode (choices: default, acceptEdits, plan) --allowedTools --disallowedTools\" ;;\n" +
 		"esac\n"
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatalf("write claude stub: %v", err)
@@ -101,6 +101,16 @@ func TestServiceWiring_ClaudeConfigurationFailClosed(t *testing.T) {
 		{"missing template on disk", func(c *ServerConfig) { c.ClaudeTemplateDir = filepath.Join(dir, "absent-template") }, "is missing"},
 		{"missing evidence root", func(c *ServerConfig) { c.ClaudeEvidenceRoot = "" }, "ClaudeEvidenceRoot is required"},
 		{"missing probe profile", func(c *ServerConfig) { c.ClaudeProbeProfile = storage.CanonicalProfile{} }, "non-empty canonical profile"},
+		// §3.7: the probe scratch and the config base must be disjoint
+		// in BOTH directions, on resolved paths.
+		{"scratch inside config base", func(c *ServerConfig) {
+			c.ClaudeProbeScratchRoot = filepath.Join(base.ClaudeConfigBaseDir, "scratch")
+		}, "must be disjoint"},
+		{"config base inside scratch", func(c *ServerConfig) {
+			scratch := filepath.Join(dir, "scratch-root")
+			c.ClaudeProbeScratchRoot = scratch
+			c.ClaudeConfigBaseDir = filepath.Join(scratch, "config")
+		}, "must be disjoint"},
 	}
 	for _, tc := range mutations {
 		cfg := base
@@ -202,15 +212,32 @@ func TestServiceAttestation_OperatorAuthorityAndIdempotency(t *testing.T) {
 	srv, store := newAttestationServer(t)
 	ctx := context.Background()
 
-	// Missing actor: refused before any write.
+	// Missing operator credential: refused before any write — a claimed
+	// actor alone authorizes nothing.
 	if _, err := srv.RecordClaudeProbeAttestation(ctx, ClaudeProbeAttestationRequest{
-		OpID: "op-att-1", RunID: attestationRunID, Attestation: validServiceAttestation("operator-test"),
+		OpID: "op-att-1", Actor: "operator-test", RunID: attestationRunID,
+		Attestation: validServiceAttestation("operator-test"),
+	}); err == nil || !strings.Contains(err.Error(), "operator credential") {
+		t.Fatalf("missing operator credential must be refused, got %v", err)
+	}
+	// Wrong credential: refused.
+	if _, err := srv.RecordClaudeProbeAttestation(ctx, ClaudeProbeAttestationRequest{
+		OpID: "op-att-1", OperatorToken: "not-the-operator-token", Actor: "operator-test",
+		RunID: attestationRunID, Attestation: validServiceAttestation("operator-test"),
+	}); err == nil || !strings.Contains(err.Error(), "operator credential is invalid") {
+		t.Fatalf("invalid operator credential must be refused, got %v", err)
+	}
+	// Credential without the actor attribution: refused.
+	if _, err := srv.RecordClaudeProbeAttestation(ctx, ClaudeProbeAttestationRequest{
+		OpID: "op-att-1", OperatorToken: "tok-attest", RunID: attestationRunID,
+		Attestation: validServiceAttestation("operator-test"),
 	}); err == nil || !strings.Contains(err.Error(), "operator actor") {
 		t.Fatalf("missing actor must be refused, got %v", err)
 	}
-	// Actor mismatch: refused.
+	// Credential plus actor mismatch: refused.
 	if _, err := srv.RecordClaudeProbeAttestation(ctx, ClaudeProbeAttestationRequest{
-		OpID: "op-att-1", Actor: "someone-else", RunID: attestationRunID, Attestation: validServiceAttestation("operator-test"),
+		OpID: "op-att-1", OperatorToken: "tok-attest", Actor: "someone-else",
+		RunID: attestationRunID, Attestation: validServiceAttestation("operator-test"),
 	}); err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("actor mismatch must be refused, got %v", err)
 	}
@@ -218,7 +245,7 @@ func TestServiceAttestation_OperatorAuthorityAndIdempotency(t *testing.T) {
 	invalid := validServiceAttestation("operator-test")
 	invalid.Records[0].Denied = false
 	if _, err := srv.RecordClaudeProbeAttestation(ctx, ClaudeProbeAttestationRequest{
-		OpID: "op-att-1", Actor: "operator-test", RunID: attestationRunID, Attestation: invalid,
+		OpID: "op-att-1", OperatorToken: "tok-attest", Actor: "operator-test", RunID: attestationRunID, Attestation: invalid,
 	}); err == nil {
 		t.Fatal("denied=false attestation must be refused")
 	}
@@ -226,7 +253,7 @@ func TestServiceAttestation_OperatorAuthorityAndIdempotency(t *testing.T) {
 	// Valid recording: receipt, durable row, journal entry.
 	att := validServiceAttestation("operator-test")
 	receipt, err := srv.RecordClaudeProbeAttestation(ctx, ClaudeProbeAttestationRequest{
-		OpID: "op-att-1", Actor: "operator-test", RunID: attestationRunID, Attestation: att,
+		OpID: "op-att-1", OperatorToken: "tok-attest", Actor: "operator-test", RunID: attestationRunID, Attestation: att,
 	})
 	if err != nil {
 		t.Fatalf("valid attestation: %v", err)
@@ -256,7 +283,7 @@ func TestServiceAttestation_OperatorAuthorityAndIdempotency(t *testing.T) {
 
 	// Idempotent replay: same op_id and evidence returns the receipt.
 	replay, err := srv.RecordClaudeProbeAttestation(ctx, ClaudeProbeAttestationRequest{
-		OpID: "op-att-1", Actor: "operator-test", RunID: attestationRunID, Attestation: att,
+		OpID: "op-att-1", OperatorToken: "tok-attest", Actor: "operator-test", RunID: attestationRunID, Attestation: att,
 	})
 	if err != nil {
 		t.Fatalf("replay: %v", err)
@@ -269,14 +296,14 @@ func TestServiceAttestation_OperatorAuthorityAndIdempotency(t *testing.T) {
 	changed := validServiceAttestation("operator-test")
 	changed.ProbedAt = "2026-09-22T01:00:00Z"
 	if _, err := srv.RecordClaudeProbeAttestation(ctx, ClaudeProbeAttestationRequest{
-		OpID: "op-att-1", Actor: "operator-test", RunID: attestationRunID, Attestation: changed,
+		OpID: "op-att-1", OperatorToken: "tok-attest", Actor: "operator-test", RunID: attestationRunID, Attestation: changed,
 	}); err == nil {
 		t.Fatal("op_id reuse with different evidence must conflict")
 	}
 
 	// Same evidence under a new op_id: the row already exists — rejected.
 	if _, err := srv.RecordClaudeProbeAttestation(ctx, ClaudeProbeAttestationRequest{
-		OpID: "op-att-2", Actor: "operator-test", RunID: attestationRunID, Attestation: att,
+		OpID: "op-att-2", OperatorToken: "tok-attest", Actor: "operator-test", RunID: attestationRunID, Attestation: att,
 	}); err == nil || !strings.Contains(err.Error(), "already recorded") {
 		t.Fatalf("duplicate attestation identity must be rejected, got %v", err)
 	}
@@ -291,7 +318,7 @@ func TestServiceAttestation_AttemptFreezing(t *testing.T) {
 	ctx := context.Background()
 
 	if _, err := srv.RecordClaudeProbeAttestation(ctx, ClaudeProbeAttestationRequest{
-		OpID: "op-att-freeze", Actor: "operator-test", RunID: attestationRunID, Attestation: validServiceAttestation("operator-test"),
+		OpID: "op-att-freeze", OperatorToken: "tok-attest", Actor: "operator-test", RunID: attestationRunID, Attestation: validServiceAttestation("operator-test"),
 	}); err != nil {
 		t.Fatalf("record attestation: %v", err)
 	}

@@ -9,6 +9,7 @@ package service
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"strings"
@@ -21,7 +22,13 @@ import (
 // attestation recording: the idempotency op_id, the acting operator
 // identity, and the typed cprot-v1 attestation.
 type ClaudeProbeAttestationRequest struct {
-	OpID        string
+	OpID string
+	// OperatorToken is the operator credential (the service auth
+	// token). Authority is validated against the configured service
+	// token before any write; a claimed actor alone authorizes nothing.
+	OperatorToken string
+	// Actor is the operator identity attributed on the record and its
+	// journal entry. It must match the attestation's recorded actor.
 	Actor       string
 	RunID       string // the run the probe was performed for (journal provenance)
 	Attestation claude.ProtectionAttestation
@@ -39,8 +46,18 @@ func (s *Server) RecordClaudeProbeAttestation(ctx context.Context, req ClaudePro
 	if strings.TrimSpace(req.OpID) == "" {
 		return storage.OperationReceipt{}, errors.New("attestation operation requires an op_id")
 	}
-	// Operator authority (AC-004): the acting operator identity is
-	// mandatory and must match the attestation's recorded actor.
+	// Operator authority (AC-004): the caller must present the
+	// operator credential — the configured service auth token —
+	// compared in constant time. A claimed actor alone authorizes
+	// nothing.
+	if req.OperatorToken == "" {
+		return storage.OperationReceipt{}, errors.New("attestation operation requires the operator credential")
+	}
+	if subtle.ConstantTimeCompare([]byte(req.OperatorToken), []byte(s.cfg.AuthToken)) != 1 {
+		return storage.OperationReceipt{}, errors.New("operator credential is invalid; refusing to record the attestation")
+	}
+	// The acting operator identity is mandatory and must match the
+	// attestation's recorded actor (attribution, journal-linked).
 	if strings.TrimSpace(req.Actor) == "" {
 		return storage.OperationReceipt{}, errors.New("attestation operation requires the operator actor")
 	}

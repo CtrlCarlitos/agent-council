@@ -144,3 +144,55 @@ func TestClaudeAdapter_ProbeDetectsHelpDrift(t *testing.T) {
 		t.Fatalf("drifted help surface must fail the probe, got %v", err)
 	}
 }
+
+// Flag matching is exact-token: a decoy flag like --resume-other does
+// not satisfy the required --resume, and the choice sets (stream-json,
+// default) must be present as tokens.
+func TestClaudeAdapter_ProbeRejectsDecoyFlagsAndMissingChoices(t *testing.T) {
+	h := newAdapterHarness(t)
+
+	driftDir := t.TempDir()
+	script := filepath.Join(driftDir, "claude")
+	body := "#!/bin/sh\ncase \"$1\" in\n" +
+		"  --version) echo \"9.9.9 (Claude Code)\" ;;\n" +
+		"  --help) echo \"Usage: claude\"; " +
+		"echo \"  -p, --print --output-format --verbose --session-id --resume-other --model --max-turns --permission-mode --allowedTools --disallowedTools\" ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("write decoy stub: %v", err)
+	}
+
+	template := NewOperatorProbeLaunchTemplate(script, t.TempDir(), probeProfile())
+	adp, err := NewProductionClaudeAdapter(h.store, h.wm, execpolicy.New(), template, h.configBase, h.template, h.wsRoot)
+	if err != nil {
+		t.Fatalf("production construction: %v", err)
+	}
+
+	_, err = adp.Probe(context.Background())
+	if err == nil || !strings.Contains(err.Error(), `"--resume"`) {
+		t.Fatalf("a decoy --resume-other must not satisfy --resume, got %v", err)
+	}
+
+	// Full flag surface but missing the choice tokens: rejected.
+	choicesDir := t.TempDir()
+	script2 := filepath.Join(choicesDir, "claude")
+	body2 := "#!/bin/sh\ncase \"$1\" in\n" +
+		"  --version) echo \"9.9.9 (Claude Code)\" ;;\n" +
+		"  --help) echo \"Usage: claude\"; " +
+		"echo \"  -p, --print --output-format --verbose --session-id --resume --model --max-turns --permission-mode --allowedTools --disallowedTools\" ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(script2, []byte(body2), 0o755); err != nil {
+		t.Fatalf("write choices stub: %v", err)
+	}
+
+	template2 := NewOperatorProbeLaunchTemplate(script2, t.TempDir(), probeProfile())
+	adp2, err := NewProductionClaudeAdapter(h.store, h.wm, execpolicy.New(), template2, h.configBase, h.template, h.wsRoot)
+	if err != nil {
+		t.Fatalf("production construction: %v", err)
+	}
+
+	_, err = adp2.Probe(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "missing required choice") {
+		t.Fatalf("missing choice tokens must fail the probe, got %v", err)
+	}
+}

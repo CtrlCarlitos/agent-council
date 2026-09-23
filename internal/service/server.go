@@ -52,6 +52,9 @@ func resolveClaudeProbeScratchRoot(cfg ServerConfig) (string, error) {
 	if err := checkScratchContainment(bases, resolved); err != nil {
 		return "", err
 	}
+	if err := checkClaudeScratchConfigBaseDisjoint(cfg, resolved); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return "", fmt.Errorf("create claude probe scratch root: %w", err)
 	}
@@ -65,7 +68,31 @@ func resolveClaudeProbeScratchRoot(cfg ServerConfig) (string, error) {
 	if err := checkScratchContainment(bases, resolvedFinal); err != nil {
 		return "", err
 	}
+	if err := checkClaudeScratchConfigBaseDisjoint(cfg, resolvedFinal); err != nil {
+		return "", err
+	}
 	return root, nil
+}
+
+// checkClaudeScratchConfigBaseDisjoint rejects the probe scratch root
+// and the Claude config base overlapping in EITHER direction (§3.7):
+// the scratch must not live inside the config base, and the config
+// base must not live inside the scratch, on resolved paths.
+func checkClaudeScratchConfigBaseDisjoint(cfg ServerConfig, resolvedScratch string) error {
+	configBase := strings.TrimSpace(cfg.ClaudeConfigBaseDir)
+	if configBase == "" {
+		return nil
+	}
+	resolvedConfig, err := resolveExistingPath(filepath.Clean(configBase))
+	if err != nil {
+		return fmt.Errorf("resolve claude config base: %w", err)
+	}
+	if pathContains(resolvedConfig, resolvedScratch) || pathContains(resolvedScratch, resolvedConfig) {
+		return fmt.Errorf(
+			"claude probe scratch root %s overlaps the claude config base %s: the two must be disjoint in both directions",
+			resolvedScratch, resolvedConfig)
+	}
+	return nil
 }
 
 // resolveClaudeTemplateDir validates the configured frozen config

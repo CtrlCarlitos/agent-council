@@ -65,6 +65,9 @@ type LaunchRequest struct {
 	// --model (AC-008 §3.7). The stream parser validates the init
 	// event's model against it. Set by the Claude launch source.
 	Model string
+	// ProfileDigest is the frozen run-profile digest in force for this
+	// launch (AC-008 §3.6 manifest-digest binding for attestations).
+	ProfileDigest string
 }
 
 // CapabilityChecker verifies whether the host environment supports required isolation capabilities.

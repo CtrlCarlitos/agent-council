@@ -9,6 +9,7 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -28,6 +29,26 @@ type ClaudeProtectionAttestationRecord struct {
 	ProbeResults   string // canonical cprot-v1 framed record list
 	ProbedAt       string // RFC3339 UTC
 	Actor          string // operator identity (journal-linked)
+}
+
+// FindClaudeProtectionAttestation returns the attestation id matching
+// the four binding fields in force (probed CLI version, platform,
+// manifest digest, template digest), or "" when none matches. This is
+// the lookup Dispatch uses to freeze protection on new attempts.
+func (s *Store) FindClaudeProtectionAttestation(ctx context.Context, claudeVersion, platform, manifestDigest, templateDigest string) (string, error) {
+	var id string
+	err := s.DB().QueryRowContext(ctx, `
+SELECT attestation_id FROM claude_protection_attestations
+WHERE claude_version = ? AND platform = ? AND manifest_digest = ? AND template_digest = ?
+ORDER BY probed_at DESC LIMIT 1`,
+		claudeVersion, platform, manifestDigest, templateDigest).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("query claude protection attestation: %w", err)
+	}
+	return id, nil
 }
 
 // RecordClaudeProtectionAttestation persists the attestation row and

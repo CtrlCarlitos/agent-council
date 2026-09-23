@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -832,6 +833,100 @@ func TestClaudeAdapter_RestartBlockingAndDispositionUnblock(t *testing.T) {
 	if result.Status != council.TurnCompleted {
 		t.Fatalf("post-disposition turn must complete, got %+v", result)
 	}
+}
+
+// Protection freezing through the production dispatch path: attempts
+// launch advisory when no matching attestation exists, and upgrade to
+// protected with the attestation id frozen at baseline once an
+// attestation matching (version, platform, manifest digest, template
+// digest) is recorded.
+func TestClaudeAdapter_FreezesMatchingAttestation(t *testing.T) {
+	h := newAdapterHarness(t)
+	ctx := context.Background()
+	h.createSession(t, string(h.sessionID))
+
+	// No attestation yet: the attempt is advisory with no frozen id.
+	advRef := adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-adv"}
+	if _, err := h.adapter.Dispatch(ctx, advRef, "prompt"); err != nil {
+		t.Fatalf("dispatch advisory: %v", err)
+	}
+	adv := waitTerminal(t, h, advRef)
+	if adv.Status != council.TurnCompleted {
+		t.Fatalf("advisory turn must complete, got %+v", adv)
+	}
+	advAttempt, err := h.store.GetLatestClaudeTurnAttempt(ctx, string(h.sessionID), "t-adv")
+	if err != nil || advAttempt == nil {
+		t.Fatalf("get advisory attempt: %v", err)
+	}
+	if advAttempt.TranscriptProtection != "advisory" || advAttempt.AttestationID != "" {
+		t.Fatalf("without a matching attestation the attempt must be advisory, got %q id=%q",
+			advAttempt.TranscriptProtection, advAttempt.AttestationID)
+	}
+
+	// Record an attestation matching the four binding fields in force.
+	profileRec, err := h.store.GetRunProfile(ctx, "run-adapter")
+	if err != nil {
+		t.Fatalf("run profile: %v", err)
+	}
+	templateDigest, err := TemplateDigest(h.template)
+	if err != nil {
+		t.Fatalf("template digest: %v", err)
+	}
+	att := ProtectionAttestation{
+		ClaudeVersion:  "2.1.278",
+		Platform:       runtime.GOOS + "/" + runtime.GOARCH,
+		ManifestDigest: profileRec.ProfileDigest,
+		TemplateDigest: templateDigest,
+		Records: []ProbeRecord{{
+			ToolClass:           ProbeRead,
+			ToolName:            "Read",
+			Denied:              true,
+			EnforcingCapability: CapCwdBoundary,
+			DenialText:          "Claude requested permissions to read the sibling transcript",
+		}},
+		ProbedAt: "2026-09-22T00:00:00Z",
+		Actor:    "operator-test",
+	}
+	digest, err := att.Digest()
+	if err != nil {
+		t.Fatalf("attestation digest: %v", err)
+	}
+	if _, err := h.store.RecordClaudeProtectionAttestation(ctx, "op-att-adapter", storage.ClaudeProtectionAttestationRecord{
+		AttestationID:  digest,
+		RunID:          "run-adapter",
+		ClaudeVersion:  att.ClaudeVersion,
+		Platform:       att.Platform,
+		ManifestDigest: att.ManifestDigest,
+		TemplateDigest: att.TemplateDigest,
+		ProbeResults:   string(mustEncodeProbeRecords(t, att)),
+		ProbedAt:       att.ProbedAt,
+		Actor:          att.Actor,
+	}); err != nil {
+		t.Fatalf("record attestation: %v", err)
+	}
+
+	protRef := adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-prot"}
+	if _, err := h.adapter.Dispatch(ctx, protRef, "prompt"); err != nil {
+		t.Fatalf("dispatch protected: %v", err)
+	}
+	waitTerminal(t, h, protRef)
+	protAttempt, err := h.store.GetLatestClaudeTurnAttempt(ctx, string(h.sessionID), "t-prot")
+	if err != nil || protAttempt == nil {
+		t.Fatalf("get protected attempt: %v", err)
+	}
+	if protAttempt.TranscriptProtection != "protected" || protAttempt.AttestationID != digest {
+		t.Fatalf("dispatch must freeze the matching attestation, got protection=%q id=%q",
+			protAttempt.TranscriptProtection, protAttempt.AttestationID)
+	}
+}
+
+func mustEncodeProbeRecords(t *testing.T, a ProtectionAttestation) []byte {
+	t.Helper()
+	encoded, err := a.EncodeProbeRecords()
+	if err != nil {
+		t.Fatalf("encode probe records: %v", err)
+	}
+	return encoded
 }
 
 // ── Dispatch identity selection ─────────────────────────────────────────

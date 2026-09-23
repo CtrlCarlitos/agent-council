@@ -47,6 +47,7 @@ var claudeFixtureSourceLines = []string{
 	"\t\"  --resume <session-id>       Resume a session\\n\" +",
 	"\t\"  --model <model>             Model\\n\" +",
 	"\t\"  --max-turns <n>             Max turns\\n\" +",
+	"\t\"  --permission-mode <mode>    Permission mode (choices: default, acceptEdits, plan)\\n\" +",
 	"\t\"  --disallowedTools <tools>   Denied tools\\n\" +",
 	"\t\"  --allowedTools <tools>      Allowed tools\\n\"",
 	"",
@@ -210,7 +211,7 @@ func TestClaudeFixture_ContractProbes(t *testing.T) {
 	}
 	for _, required := range []string{
 		"-p", "--output-format", "--verbose", "--session-id", "--resume",
-		"--model", "--max-turns", "--disallowedTools",
+		"--model", "--max-turns", "--disallowedTools", "--permission-mode",
 	} {
 		if !strings.Contains(string(help), required) {
 			t.Fatalf("--help must document %s", required)

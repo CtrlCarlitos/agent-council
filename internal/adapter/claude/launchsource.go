@@ -176,5 +176,6 @@ func (s *ClaudeTurnLaunchSource) ClaudeTurnLaunch(ctx context.Context, sessionID
 		PromptDigest:        promptDigest,
 		UniverseTools:       universe.Tools,
 		Model:               model,
+		ProfileDigest:       profileRec.ProfileDigest,
 	}, nil
 }

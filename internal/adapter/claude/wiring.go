@@ -47,13 +47,18 @@ type ClaudeProbeLaunchTemplate interface {
 	HelpLaunch(ctx context.Context) (execpolicy.LaunchRequest, error)
 }
 
-// requiredHelpFlags is the frozen launch-contract surface: a --help
-// output missing any of these flags is protocol drift and fails the
-// probe.
+// requiredHelpFlags is the frozen launch-contract surface: every flag
+// must appear as an EXACT token in --help output (a substring such as
+// "--resume-other" does not satisfy "--resume").
 var requiredHelpFlags = []string{
-	"-p", "--output-format", "--verbose", "--session-id", "--resume",
-	"--model", "--max-turns", "--allowedTools", "--disallowedTools",
+	"-p", "--print", "--output-format", "--verbose", "--session-id",
+	"--resume", "--model", "--max-turns", "--allowedTools",
+	"--disallowedTools", "--permission-mode",
 }
+
+// requiredHelpChoices are the choice values the frozen launch shape
+// depends on: stream-json output and default permission mode.
+var requiredHelpChoices = []string{"stream-json", "default"}
 
 type operatorProbeLaunchTemplate struct {
 	binaryPath  string
@@ -189,16 +194,42 @@ func (a *ClaudeAdapter) Probe(ctx context.Context) (adapter.ProbeReport, error) 
 	if err != nil {
 		return report, fmt.Errorf("help probe: %w", err)
 	}
+	tokens := helpTokens(helpOut)
 	for _, flag := range requiredHelpFlags {
-		if !strings.Contains(helpOut, flag) {
+		if _, ok := tokens[flag]; !ok {
 			return report, fmt.Errorf("claude --help is missing required launch flag %q (protocol drift)", flag)
+		}
+	}
+	for _, choice := range requiredHelpChoices {
+		if _, ok := tokens[choice]; !ok {
+			return report, fmt.Errorf("claude --help is missing required choice %q (protocol drift)", choice)
 		}
 	}
 	return report, nil
 }
 
+// helpTokens tokenizes --help output into exact flag and choice tokens:
+// split on whitespace and commas, trim surrounding punctuation so
+// "(choices: text, json, stream-json)" yields the exact token
+// "stream-json" and "-p, --print" yields "-p" and "--print".
+func helpTokens(help string) map[string]struct{} {
+	tokens := make(map[string]struct{})
+	trim := func(s string) string { return strings.Trim(s, "()[]<>,") }
+	for _, line := range strings.Split(help, "\n") {
+		for _, field := range strings.Fields(line) {
+			for _, part := range strings.Split(field, ",") {
+				if tok := trim(part); tok != "" {
+					tokens[tok] = struct{}{}
+				}
+			}
+		}
+	}
+	return tokens
+}
+
 // runContractProbe starts one probe child, drains stderr for the child
-// lifetime, captures stdout, and reaps the process.
+// lifetime, captures stdout, and reaps the process. A stdout read
+// failure is a probe failure: truncated output never passes.
 func runContractProbe(
 	ctx context.Context,
 	executor execpolicy.PolicyExecutor,
@@ -213,6 +244,7 @@ func runContractProbe(
 		return "", fmt.Errorf("probe execution: %w", err)
 	}
 	var out strings.Builder
+	var scanErr error
 	outDone := make(chan struct{})
 	go func() {
 		defer close(outDone)
@@ -220,12 +252,16 @@ func runContractProbe(
 		for sc.Scan() {
 			out.WriteString(sc.Text() + "\n")
 		}
+		scanErr = sc.Err()
 	}()
 	go drainReader(proc.Stderr())
 	_, waitErr := proc.Wait()
 	<-outDone
 	if waitErr != nil {
 		return "", fmt.Errorf("probe child failed: %w", waitErr)
+	}
+	if scanErr != nil {
+		return "", fmt.Errorf("probe stdout read failed: %w", scanErr)
 	}
 	return out.String(), nil
 }
