@@ -120,6 +120,12 @@ type CodexAdapter struct {
 	profileDigest string
 	identity      DispatchIdentitySource
 	attestation   AttestationLookup
+	// fixtureScope is the explicit test-only construction marker (spec
+	// §3.3): set ONLY by NewFixtureScopedAdapter, never inferred. It
+	// skips the production-eligibility gate and nothing else — every
+	// protocol validation stays in force. The production constructor
+	// rejects the marker, so production wiring can never set it.
+	fixtureScope bool
 
 	mu        sync.Mutex
 	turns     map[adapter.TurnRef]*codexTurnRun
@@ -141,7 +147,11 @@ var _ adapter.Adapter = (*CodexAdapter)(nil)
 // frozen launch policy (ValidateCodexHarness output), frozen profile
 // digest, attempt-identity source, and the production-eligibility
 // attestation lookup (spec §3.3). A nil attestation lookup fails closed
-// on CreateSession — production wiring must supply it.
+// on CreateSession — production wiring must supply it. The variadic
+// option surface is the NON-production construction seam only: handing
+// the test-only fixture option to this constructor fails closed with a
+// typed ErrFixtureModeProhibited — production construction has no path
+// to fixture mode, and the service wiring passes no options at all.
 func NewCodexAdapter(
 	store *storage.Store,
 	server *CodexServer,
@@ -149,6 +159,32 @@ func NewCodexAdapter(
 	profileDigest string,
 	identity DispatchIdentitySource,
 	attestation AttestationLookup,
+	opts ...ConstructionOption,
+) (*CodexAdapter, error) {
+	var settings constructionSettings
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		opt(&settings)
+	}
+	if settings.fixtureScope {
+		return nil, &ErrFixtureModeProhibited{Reason: "NewCodexAdapter is the production constructor; the test-only fixture scope is built through the codextest package (spec §3.3)"}
+	}
+	return buildCodexAdapter(store, server, policy, profileDigest, identity, attestation, false), nil
+}
+
+// buildCodexAdapter is the shared construction body: identical for the
+// production and the test-only fixture scope except the explicit marker
+// that selects eligibility enforcement.
+func buildCodexAdapter(
+	store *storage.Store,
+	server *CodexServer,
+	policy CodexLaunchPolicy,
+	profileDigest string,
+	identity DispatchIdentitySource,
+	attestation AttestationLookup,
+	fixtureScope bool,
 ) *CodexAdapter {
 	a := &CodexAdapter{
 		store:         store,
@@ -157,6 +193,7 @@ func NewCodexAdapter(
 		profileDigest: profileDigest,
 		identity:      identity,
 		attestation:   attestation,
+		fixtureScope:  fixtureScope,
 		turns:         make(map[adapter.TurnRef]*codexTurnRun),
 		singleFlt:     make(map[string]*codexSlot),
 		creations:     make(map[adapter.SessionID]*codexCreationCall),
@@ -565,6 +602,13 @@ func (a *CodexAdapter) bindingFor(req adapter.CreateSessionRequest, nativeID str
 // replacement child (§3.9: "at every launch"). A nil lookup fails
 // closed; there is no inference of eligibility from absent evidence.
 func (a *CodexAdapter) checkProductionEligibility(sessionID adapter.SessionID) error {
+	if a.fixtureScope {
+		// Test-only construction mode (spec §3.3): production eligibility
+		// was skipped EXPLICITLY at construction — never inferred — while
+		// every protocol validation stays in force. Reachable only from
+		// adapters built by NewFixtureScopedAdapter.
+		return nil
+	}
 	if a.attestation == nil {
 		return &ErrProductionEligibilityMissing{
 			SessionID: sessionID,

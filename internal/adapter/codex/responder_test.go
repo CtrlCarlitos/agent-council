@@ -137,7 +137,10 @@ func newResponderHarness(t *testing.T) *responderHarness {
 	t.Cleanup(func() { _ = store.Close() })
 	server := NewCodexServer(execpolicy.New(), nil, CodexLaunchPolicy{})
 	h := &responderHarness{store: store, server: server}
-	h.adapter = NewCodexAdapter(store, server, CodexLaunchPolicy{}, "cprof-v3:sha256:test", nil, nil)
+	h.adapter, err = NewCodexAdapter(store, server, CodexLaunchPolicy{}, "cprof-v3:sha256:test", nil, nil)
+	if err != nil {
+		t.Fatalf("new codex adapter: %v", err)
+	}
 	return h
 }
 

@@ -470,6 +470,14 @@ func (m *CodexServer) stopAll(ctx context.Context) {
 	}
 }
 
+// Close terminates every live child gracefully — SIGTERM, then the
+// force-kill split with pipes drained before the wait — and clears all
+// idle-park timers. It is the service-side teardown seam (production
+// wiring) and the seam the test-only codextest harness cleans up through.
+func (m *CodexServer) Close(ctx context.Context) {
+	m.stopAll(ctx)
+}
+
 // child returns the running child for a session.
 func (m *CodexServer) child(sessionID adapter.SessionID) (*codexChild, error) {
 	m.mu.Lock()

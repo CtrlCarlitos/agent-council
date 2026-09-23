@@ -390,8 +390,11 @@ func TestCodexAdapter_UncertainAttemptBlocksAcrossReopen(t *testing.T) {
 
 	freshServer := NewCodexServer(execpolicy.New(), lifecycleLaunchSource{scratch: h.scratch}, h.policy)
 	t.Cleanup(func() { freshServer.stopAll(context.Background()) })
-	fresh := NewCodexAdapter(reopened, freshServer, h.policy, h.profileDigest, codexIdentity{fn: defaultIdentity},
+	fresh, err := NewCodexAdapter(reopened, freshServer, h.policy, h.profileDigest, codexIdentity{fn: defaultIdentity},
 		func() (string, bool) { return testAttestationID(), true })
+	if err != nil {
+		t.Fatalf("new codex adapter: %v", err)
+	}
 	out, err := fresh.Dispatch(context.Background(), adapter.TurnRef{
 		SessionID: testSessionID, TurnKey: "t-after-restart",
 	}, "prompt")

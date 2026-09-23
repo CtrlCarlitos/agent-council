@@ -136,7 +136,10 @@ func newAdapterHarnessScenario(t *testing.T, lines []string) *adapterHarness {
 		}
 		return testAttestationID(), true
 	}
-	h.adapter = NewCodexAdapter(store, server, policy, digest, codexIdentity{fn: defaultIdentity}, att)
+	h.adapter, err = NewCodexAdapter(store, server, policy, digest, codexIdentity{fn: defaultIdentity}, att)
+	if err != nil {
+		t.Fatalf("new codex adapter: %v", err)
+	}
 
 	if lines == nil {
 		lines = append([]string{authOKLine()}, threadStartRules(testThreadID, wsRoot, model)...)
@@ -383,8 +386,11 @@ func TestCodexAdapter_CreateSessionEligibilityMissingPreChild(t *testing.T) {
 // attestation lookup behaves exactly like a missing attestation.
 func TestCodexAdapter_CreateSessionNilAttestationFailsClosed(t *testing.T) {
 	h := newAdapterHarness(t)
-	bare := NewCodexAdapter(h.store, h.server, h.policy, h.profileDigest, codexIdentity{fn: defaultIdentity}, nil)
-	_, err := bare.CreateSession(context.Background(), adapter.CreateSessionRequest{
+	bare, err := NewCodexAdapter(h.store, h.server, h.policy, h.profileDigest, codexIdentity{fn: defaultIdentity}, nil)
+	if err != nil {
+		t.Fatalf("bare production construction: %v", err)
+	}
+	_, err = bare.CreateSession(context.Background(), adapter.CreateSessionRequest{
 		SessionID:   testSessionID,
 		Contributor: "codex",
 		Config:      adapter.SessionConfig{WorkspaceRoot: h.wsRoot, Model: h.model},
@@ -661,7 +667,10 @@ func TestCodexAdapter_ResumeSessionMismatchFailsClosed(t *testing.T) {
 	}
 
 	// A drifted frozen profile must refuse to resume the binding.
-	other := NewCodexAdapter(h.store, h.server, h.policy, "cprof-v3:sha256:"+strings.Repeat("be", 32), codexIdentity{fn: defaultIdentity}, func() (string, bool) { return testAttestationID(), true })
+	other, err := NewCodexAdapter(h.store, h.server, h.policy, "cprof-v3:sha256:"+strings.Repeat("be", 32), codexIdentity{fn: defaultIdentity}, func() (string, bool) { return testAttestationID(), true })
+	if err != nil {
+		t.Fatalf("other production construction: %v", err)
+	}
 	if err := other.ResumeSession(context.Background(), binding); !errors.As(err, &mismatch) || mismatch.Field != "profile_digest" {
 		t.Fatalf("profile digest drift must fail closed, got %v", err)
 	}
