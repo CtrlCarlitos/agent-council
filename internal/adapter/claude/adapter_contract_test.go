@@ -1271,6 +1271,14 @@ func TestClaudeAdapter_CancelSemantics(t *testing.T) {
 		t.Fatalf("dispatch: %v", err)
 	}
 
+	// Subscribe BEFORE cancelling: a dead turn is no longer observable
+	// (the live-turn entry is removed at process death), so observing
+	// after Cancel would race the removal.
+	stream, err := h.adapter.Observe(ctx, ref)
+	if err != nil {
+		t.Fatalf("observe: %v", err)
+	}
+
 	out, err := h.adapter.Cancel(ctx, ref)
 	if err != nil {
 		t.Fatalf("cancel: %v", err)
@@ -1279,10 +1287,6 @@ func TestClaudeAdapter_CancelSemantics(t *testing.T) {
 		t.Fatalf("terminate without a result is CancelUnknown, got %v", out.Disposition)
 	}
 
-	stream, err := h.adapter.Observe(ctx, ref)
-	if err != nil {
-		t.Fatalf("observe: %v", err)
-	}
 	drainStream(t, stream)
 
 	attempt, err := h.store.GetLatestClaudeTurnAttempt(ctx, string(h.sessionID), "t-cancel")
