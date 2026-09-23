@@ -281,6 +281,32 @@ func TestCanonicalProfileV3_GranularShapeEvidenceWired(t *testing.T) {
 	if digest == "" {
 		t.Fatal("freeze must produce a digest")
 	}
+
+	// Fail-closed regression: with ANY one granular key's shape evidence
+	// missing from the registry, freeze must REJECT the granular policy
+	// (the registry is package state; the entry is restored before the
+	// subtest returns so other tests are unaffected).
+	t.Run("unpinnedKeyRejectedAtFreeze", func(t *testing.T) {
+		key := granularApprovalKeys[0]
+		saved, had := granularShapeEvidence[key]
+		delete(granularShapeEvidence, key)
+		t.Cleanup(func() {
+			if had {
+				granularShapeEvidence[key] = saved
+			} else {
+				delete(granularShapeEvidence, key)
+			}
+		})
+		q := v3Profile()
+		q.Harnesses["codex"].Codex.ApprovalPolicy = CodexApprovalPolicy{Kind: "granular", Granular: granularFixture()}
+		_, _, err := ComputeProfileDigest(q)
+		if err == nil {
+			t.Fatalf("granular approval_policy with unpinned key %q must be rejected at freeze", key)
+		}
+		if !strings.Contains(err.Error(), "no committed schema-derived shape evidence") {
+			t.Fatalf("rejection must name the missing shape evidence, got %v", err)
+		}
+	})
 }
 
 // An in-memory tagged union with the granular kind but no granular
