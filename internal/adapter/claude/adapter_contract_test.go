@@ -941,9 +941,18 @@ func TestClaudeAdapter_FirstTurnThenResumeSelection(t *testing.T) {
 
 	h.createSession(t, string(h.sessionID))
 
+	// Keep the turn alive so the subscription below deterministically
+	// wins, and drain the stream fully: runTurn closes it only AFTER
+	// terminal persistence and first-turn materialization complete.
+	writeKnob(t, h.wsRoot, ".claude-fixture-delay", "200")
 	if _, err := h.adapter.Dispatch(ctx, adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-1"}, "prompt one"); err != nil {
 		t.Fatalf("dispatch t-1: %v", err)
 	}
+	stream, err := h.adapter.Observe(ctx, adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-1"})
+	if err != nil {
+		t.Fatalf("observe t-1: %v", err)
+	}
+	drainStream(t, stream)
 	result := waitTerminal(t, h, adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-1"})
 	if result.Status != council.TurnCompleted || result.Output != "fixture response" {
 		t.Fatalf("t-1 result: %+v", result)
@@ -977,9 +986,15 @@ func TestClaudeAdapter_FirstTurnThenResumeSelection(t *testing.T) {
 		t.Fatalf("resume must correlate the transcript's accepted user entry: %v", err)
 	}
 
+	writeKnob(t, h.wsRoot, ".claude-fixture-delay", "200")
 	if _, err := h.adapter.Dispatch(ctx, adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-2"}, "prompt two"); err != nil {
 		t.Fatalf("dispatch t-2: %v", err)
 	}
+	stream2, err := h.adapter.Observe(ctx, adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-2"})
+	if err != nil {
+		t.Fatalf("observe t-2: %v", err)
+	}
+	drainStream(t, stream2)
 	result2 := waitTerminal(t, h, adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-2"})
 	if result2.Status != council.TurnCompleted {
 		t.Fatalf("t-2 result: %+v", result2)
@@ -1007,10 +1022,16 @@ func TestClaudeAdapter_MaterializationRequiresTranscriptObservation(t *testing.T
 		fmt.Sprintf(`{"type":"result","subtype":"success","is_error":false,"session_id":%q,"result":"fixture response"}`, binding.NativeSessionID),
 	))
 
+	writeKnob(t, h.wsRoot, ".claude-fixture-delay", "200")
 	ref := adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-no-transcript"}
 	if _, err := h.adapter.Dispatch(ctx, ref, "prompt"); err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
+	stream, err := h.adapter.Observe(ctx, ref)
+	if err != nil {
+		t.Fatalf("observe: %v", err)
+	}
+	drainStream(t, stream)
 	result := waitTerminal(t, h, ref)
 	if result.Status != council.TurnCompleted {
 		t.Fatalf("verified result must complete the turn, got %+v", result)
@@ -1036,9 +1057,15 @@ func TestClaudeAdapter_PreMaterializedBindingResumes(t *testing.T) {
 		t.Fatalf("mark materialized: %v", err)
 	}
 
+	writeKnob(t, h.wsRoot, ".claude-fixture-delay", "200")
 	if _, err := h.adapter.Dispatch(ctx, adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-1"}, "prompt"); err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
+	stream, err := h.adapter.Observe(ctx, adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-1"})
+	if err != nil {
+		t.Fatalf("observe: %v", err)
+	}
+	drainStream(t, stream)
 	waitTerminal(t, h, adapter.TurnRef{SessionID: h.sessionID, TurnKey: "t-1"})
 
 	invocations := fixtureArgLines(t, h.wsRoot)
