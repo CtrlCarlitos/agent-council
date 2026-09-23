@@ -160,6 +160,9 @@ func canonicalApprovalPolicyEncoding(p storage.CodexApprovalPolicy) (string, err
 		}
 		return string(b), nil
 	case storage.CodexApprovalKindGranular:
+		if p.Granular == nil {
+			return "", fmt.Errorf("approval_policy granular kind carries no granular object")
+		}
 		raws := map[string]json.RawMessage{
 			"mcp_elicitations":    p.Granular.McpElicitations,
 			"request_permissions": p.Granular.RequestPermissions,

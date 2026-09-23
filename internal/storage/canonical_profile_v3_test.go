@@ -264,6 +264,20 @@ func TestCanonicalProfileV3_GranularUnpinnedShapeRejectedAtFreeze(t *testing.T) 
 	}
 }
 
+// An in-memory tagged union with the granular kind but no granular
+// object fails closed with a validation error, not a nil dereference.
+func TestCanonicalProfileV3_GranularNilObjectRejectedAtFreeze(t *testing.T) {
+	p := v3Profile()
+	p.Harnesses["codex"].Codex.ApprovalPolicy = CodexApprovalPolicy{Kind: "granular", Granular: nil}
+	_, _, err := ComputeProfileDigest(p)
+	if err == nil {
+		t.Fatal("granular approval_policy without a granular object must be rejected at freeze")
+	}
+	if !strings.Contains(err.Error(), "granular") {
+		t.Fatalf("rejection must name the missing granular object, got %v", err)
+	}
+}
+
 // Granular canonical byte-equality: two granular policies whose canonical
 // encodings are byte-identical are equal; any byte difference (key order
 // folded away, value or number-literal differences kept) is a different

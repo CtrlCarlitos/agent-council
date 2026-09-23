@@ -392,6 +392,9 @@ func canonicalJSONValue(raw json.RawMessage) (any, error) {
 // JSON. Equality of two granular policies is byte equality of the
 // resulting encoding.
 func canonicalGranularApproval(g *CodexGranularApproval) (map[string]any, error) {
+	if g == nil {
+		return nil, fmt.Errorf("approval_policy granular kind carries no granular object")
+	}
 	raws := map[string]json.RawMessage{
 		"mcp_elicitations":    g.McpElicitations,
 		"request_permissions": g.RequestPermissions,

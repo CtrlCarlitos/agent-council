@@ -157,6 +157,21 @@ func TestValidateCodexHarness_RequiresCompleteBlock(t *testing.T) {
 	}
 }
 
+// An in-memory tagged union with the granular kind but no granular
+// object fails closed with the typed error, not a nil dereference.
+func TestValidateCodexHarness_GranularNilObjectRejectedTyped(t *testing.T) {
+	p, root := evidenceRootForCodex(t, v3CodexProfile())
+	p.Harnesses["codex"].Codex.ApprovalPolicy = storage.CodexApprovalPolicy{Kind: "granular", Granular: nil}
+	_, err := ValidateCodexHarness(p, root)
+	var unsupported *ErrUnsupportedProfile
+	if err == nil || !errors.As(err, &unsupported) {
+		t.Fatalf("nil granular object must fail with typed ErrUnsupportedProfile, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "granular") {
+		t.Fatalf("rejection must name the missing granular object, got %v", err)
+	}
+}
+
 // The event universe file is re-hashed at validation and must match the
 // frozen digest; a valid profile yields the launch policy with the
 // frozen values, including the canonical approval-policy encoding.
