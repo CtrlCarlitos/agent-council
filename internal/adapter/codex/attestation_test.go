@@ -128,40 +128,36 @@ func TestProtectionAttestation_CanonicalOrderAndDeterminism(t *testing.T) {
 }
 
 func TestProtectionAttestation_ExcerptNormalizationAndTruncation(t *testing.T) {
-	long := strings.Repeat("é", 200) // 400 bytes of valid UTF-8
+	// 85×"明" (3 bytes each = 255 bytes) + "é" (2 bytes) = 257 bytes:
+	// the 256-byte cut lands on the FIRST byte of "é", so truncation
+	// must execute the partial-rune strip and keep exactly the
+	// 255-byte whole-rune prefix (明 ×85).
+	splitting := strings.Repeat("明", 85) + "é"
 
-	// Raw inputs: untrimmed whitespace and an over-length excerpt whose
-	// 256-byte truncation lands mid-code-point.
+	// Raw inputs: untrimmed whitespace and the over-length excerpt
+	// whose 256-byte cut splits a code point.
 	raw := validAttestation()
 	raw.ProbeRecords[1].ToolName = " shell "
 	raw.ProbeRecords[1].DenialText = "  Read-only   file\tsystem  "
-	raw.ProbeRecords[2].DenialText = long
+	raw.ProbeRecords[2].DenialText = splitting
 	d1, err := raw.Digest()
 	if err != nil {
 		t.Fatalf("digest: %v", err)
 	}
 
-	// The equivalent normalized inputs must produce the same digest.
+	// The equivalent normalized inputs — with the truncated excerpt
+	// pinned to exactly the expected 255-byte valid UTF-8 prefix —
+	// must produce the same digest.
 	normalized := validAttestation()
 	normalized.ProbeRecords[1].ToolName = "shell"
 	normalized.ProbeRecords[1].DenialText = "Read-only file system"
-	normalized.ProbeRecords[2].DenialText = strings.Repeat("é", 128) // exactly 256 bytes
+	normalized.ProbeRecords[2].DenialText = strings.Repeat("明", 85) // exactly 255 bytes
 	d2, err := normalized.Digest()
 	if err != nil {
 		t.Fatalf("normalized digest: %v", err)
 	}
 	if d1 != d2 {
-		t.Fatalf("normalized inputs must be canonical: %q vs %q", d1, d2)
-	}
-
-	// The truncation result never splits a code point: encoding the
-	// canonical record list must remain valid UTF-8 throughout.
-	records, err := normalized.EncodeProbeRecords()
-	if err != nil {
-		t.Fatalf("encode records: %v", err)
-	}
-	if !strings.ContainsFunc(string(records), func(r rune) bool { return r == 'é' }) {
-		t.Fatal("truncated excerpt must retain whole code points")
+		t.Fatalf("truncation must keep exactly the 255-byte whole-rune prefix: %q vs %q", d1, d2)
 	}
 }
 
@@ -211,6 +207,18 @@ func TestProtectionAttestation_Rejections(t *testing.T) {
 		{"empty method name", func(a *ProtectionAttestation) {
 			a.ApprovalDenies[0].MethodName = " "
 		}, "empty method name"},
+		{"non-UTF-8 codex version", func(a *ProtectionAttestation) {
+			a.CodexVersion = "0.154.\xff"
+		}, "not valid UTF-8"},
+		{"non-UTF-8 tool name", func(a *ProtectionAttestation) {
+			a.ProbeRecords[0].ToolName = "view_\xffile"
+		}, "not valid UTF-8"},
+		{"non-UTF-8 denial text", func(a *ProtectionAttestation) {
+			a.ProbeRecords[0].DenialText = "denied \xff badly"
+		}, "not valid UTF-8"},
+		{"non-UTF-8 method name", func(a *ProtectionAttestation) {
+			a.ApprovalDenies[0].MethodName = "exec\xffCommandApproval"
+		}, "not valid UTF-8"},
 		{"missing codex version", func(a *ProtectionAttestation) { a.CodexVersion = " " }, "probed codex version"},
 		{"missing platform os", func(a *ProtectionAttestation) { a.PlatformOS = "" }, "platform os"},
 		{"missing platform family", func(a *ProtectionAttestation) { a.PlatformFamily = "" }, "platform family"},

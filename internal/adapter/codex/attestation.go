@@ -116,14 +116,36 @@ type ProtectionAttestation struct {
 
 const maxExcerptBytes = 256
 
-// Validate enforces the attestation invariants: non-empty binding
-// fields, RFC3339-UTC probed_at, known enums, complete denial records
+// Validate enforces the attestation invariants: valid UTF-8 in every
+// string field, non-empty binding fields, RFC3339-UTC probed_at, known
+// enums, complete denial records
 // (denied=true, named capability, non-empty excerpt), class-bound
 // operations, and no duplicate record keys. A sibling_read record with
 // operation ≠ read, a self_mutation record with a non-mutation
 // operation, or any denied=false probe record invalidates the whole
 // attestation.
 func (a ProtectionAttestation) Validate() error {
+	// The framing family is UTF-8 everywhere (spec §3.7): any string
+	// field carrying invalid UTF-8 fails closed before encoding —
+	// invalid bytes must never reach the canonical frame, and an
+	// over-length invalid excerpt would otherwise truncate silently.
+	binding := []struct {
+		name  string
+		value string
+	}{
+		{"codex version", a.CodexVersion},
+		{"platform os", a.PlatformOS},
+		{"platform family", a.PlatformFamily},
+		{"manifest digest", a.ManifestDigest},
+		{"profile digest", a.ProfileDigest},
+		{"probed_at", a.ProbedAt},
+		{"actor", a.Actor},
+	}
+	for _, f := range binding {
+		if !utf8.ValidString(f.value) {
+			return fmt.Errorf("attestation %s is not valid UTF-8", f.name)
+		}
+	}
 	if strings.TrimSpace(a.CodexVersion) == "" {
 		return fmt.Errorf("attestation requires the probed codex version")
 	}
@@ -165,6 +187,9 @@ func (a ProtectionAttestation) Validate() error {
 		default:
 			return fmt.Errorf("probe record %d (%s): unknown tool class %d", i, r.ToolName, r.ToolClass)
 		}
+		if !utf8.ValidString(r.ToolName) {
+			return fmt.Errorf("probe record %d: tool name is not valid UTF-8", i)
+		}
 		name := strings.TrimSpace(r.ToolName)
 		if name == "" {
 			return fmt.Errorf("probe record %d: empty tool name", i)
@@ -187,6 +212,9 @@ func (a ProtectionAttestation) Validate() error {
 		if !r.Denied {
 			return fmt.Errorf("probe record %d (%s): a path that was not denied invalidates protected evidence", i, name)
 		}
+		if !utf8.ValidString(r.DenialText) {
+			return fmt.Errorf("probe record %d (%s): denial text is not valid UTF-8", i, name)
+		}
 		if strings.TrimSpace(r.DenialText) == "" {
 			return fmt.Errorf("probe record %d (%s): empty denial text", i, name)
 		}
@@ -199,6 +227,9 @@ func (a ProtectionAttestation) Validate() error {
 
 	methods := make(map[string]struct{}, len(a.ApprovalDenies))
 	for i, r := range a.ApprovalDenies {
+		if !utf8.ValidString(r.MethodName) {
+			return fmt.Errorf("approval deny record %d: method name is not valid UTF-8", i)
+		}
 		method := strings.TrimSpace(r.MethodName)
 		if method == "" {
 			return fmt.Errorf("approval deny record %d: empty method name", i)
