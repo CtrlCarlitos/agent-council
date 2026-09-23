@@ -44,12 +44,15 @@ func (e *ErrUnsupportedProfile) Error() string {
 }
 
 // ValidateForClaude fails closed for any profile that does not carry the
-// cprof-v2 algorithm with a complete toolkit manifest.
+// cprof-v2 or cprof-v3 algorithm with a complete toolkit manifest. The
+// additive codex block (cprof-v3 only) is ignored here: one run profile
+// serves all four harnesses, and Claude contributors on a v3 run remain
+// valid (AC-009 spec §3.8 compatibility matrix).
 func (p CanonicalProfile) ValidateForClaude() error {
-	if p.AlgoVersion != "cprof-v2" {
+	if p.AlgoVersion != "cprof-v2" && p.AlgoVersion != "cprof-v3" {
 		return &ErrUnsupportedProfile{
 			AlgoVersion: p.AlgoVersion,
-			Reason:      "the Claude adapter requires cprof-v2 with a frozen toolkit manifest",
+			Reason:      "the Claude adapter requires cprof-v2 or cprof-v3 with a frozen toolkit manifest",
 		}
 	}
 	if p.ToolkitManifest == nil {
@@ -80,7 +83,7 @@ func (p CanonicalProfile) ValidateForClaude() error {
 	if err := validateManifestList("expected_plugins", m.ExpectedPlugins, false); err != nil {
 		return &ErrUnsupportedProfile{AlgoVersion: p.AlgoVersion, Reason: err.Error()}
 	}
-	if err := validateSHA256Digest(m.UniverseEvidenceDigest); err != nil {
+	if err := ValidateSHA256Digest(m.UniverseEvidenceDigest); err != nil {
 		return &ErrUnsupportedProfile{AlgoVersion: p.AlgoVersion, Reason: "universe_evidence_digest: " + err.Error()}
 	}
 	if m.TurnsBound <= 0 {
@@ -109,8 +112,8 @@ func validateUniverseEvidencePath(p string) error {
 	return nil
 }
 
-// validateSHA256Digest requires the exact form sha256:<64 lowercase hex>.
-func validateSHA256Digest(d string) error {
+// ValidateSHA256Digest requires the exact form sha256:<64 lowercase hex>.
+func ValidateSHA256Digest(d string) error {
 	const prefix = "sha256:"
 	if !strings.HasPrefix(d, prefix) {
 		return fmt.Errorf("must be %s<64 lowercase hex>", prefix)

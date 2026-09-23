@@ -144,8 +144,9 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 		return nil, fmt.Errorf("%w: root %q does not exist or is not a directory", ErrInvalidDirectory, req.Paths.Root)
 	}
 
-	// 2. Validate profile algorithm version
-	if req.Profile.AlgoVersion != "" && req.Profile.AlgoVersion != "cprof-v1" && req.Profile.AlgoVersion != "cprof-v2" {
+	// 2. Validate profile algorithm version (v3 is additive: manifest
+	// and codex block are carried, not acted on, by this gate)
+	if req.Profile.AlgoVersion != "" && req.Profile.AlgoVersion != "cprof-v1" && req.Profile.AlgoVersion != "cprof-v2" && req.Profile.AlgoVersion != "cprof-v3" {
 		return nil, fmt.Errorf("%w: invalid profile algo_version %q", ErrInvalidLaunchRequest, req.Profile.AlgoVersion)
 	}
 
