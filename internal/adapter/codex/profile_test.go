@@ -91,6 +91,154 @@ func evidenceRootForCodex(t *testing.T, p storage.CanonicalProfile) (storage.Can
 	return p, root
 }
 
+// stageToolInventory writes the Council-shaped native tool-inventory
+// capture under the evidence root and pins the profile to it.
+func stageToolInventory(t *testing.T, p storage.CanonicalProfile, root string, inv NativeToolInventory) storage.CanonicalProfile {
+	t.Helper()
+	raw, err := json.Marshal(inv)
+	if err != nil {
+		t.Fatalf("marshal inventory: %v", err)
+	}
+	rel := "docs/superpowers/evidence/ac009-native-tool-inventory-0.154.0.json"
+	full := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(full, raw, 0o600); err != nil {
+		t.Fatalf("write inventory: %v", err)
+	}
+	p.Harnesses["codex"].Codex.ToolInventoryPath = rel
+	p.Harnesses["codex"].Codex.ToolInventoryDigest = fmt.Sprintf("sha256:%x", sha256.Sum256(raw))
+	return p
+}
+
+// The frozen MCP/plugin inventories are PROVEN complete, not asserted:
+// a profile enabling any server or plugin tool must carry the digest-
+// bound native inventory capture, and its server, tool, and plugin sets
+// must equal the frozen lists exactly. Omitting an enabled tool from the
+// profile no longer passes.
+func TestValidateCodexHarness_ToolInventoryMustBeProvenComplete(t *testing.T) {
+	enabled := func() (storage.CanonicalProfile, string) {
+		p, root := evidenceRootForCodex(t, v3CodexProfile())
+		c := p.Harnesses["codex"].Codex
+		c.ExpectedMCPServers = []string{"context7"}
+		c.ExpectedMCPTools = []string{"context7/toolA", "context7/toolB"}
+		c.ExpectedPluginTools = []string{"skill:review"}
+		return p, root
+	}
+	full := NativeToolInventory{
+		CodexCLIVersion: "0.154.0",
+		MCPServers:      map[string][]string{"context7": {"toolB", "toolA"}},
+		PluginTools:     []string{"skill:review"},
+	}
+
+	// Enabled without evidence: refused.
+	p, root := enabled()
+	if _, err := ValidateCodexHarness(p, root); err == nil || !strings.Contains(err.Error(), "no tool_inventory_path/tool_inventory_digest") {
+		t.Fatalf("an MCP/plugin-enabled profile without inventory evidence must be refused, got %v", err)
+	}
+	// Enabled with matching evidence: accepted, policy carries the lists.
+	p, root = enabled()
+	p = stageToolInventory(t, p, root, full)
+	policy, err := ValidateCodexHarness(p, root)
+	if err != nil {
+		t.Fatalf("matching inventory evidence must validate: %v", err)
+	}
+	if strings.Join(policy.ExpectedMCPTools, ",") != "context7/toolA,context7/toolB" || strings.Join(policy.PluginTools, ",") != "skill:review" {
+		t.Fatalf("policy must carry the proven inventories, got %+v", policy)
+	}
+	// The profile omits an enabled tool (toolB) that the native
+	// inventory exposes: refused — the exact-set coverage rule would
+	// otherwise be satisfiable by probing toolA alone.
+	p, root = enabled()
+	p.Harnesses["codex"].Codex.ExpectedMCPTools = []string{"context7/toolA"}
+	p = stageToolInventory(t, p, root, full)
+	if _, err := ValidateCodexHarness(p, root); err == nil || !strings.Contains(err.Error(), "expected_mcp_tools") ||
+		!strings.Contains(err.Error(), "does not equal the native tool inventory") {
+		t.Fatalf("omitting an enabled native tool must be refused, got %v", err)
+	}
+	// The profile omits an enabled plugin tool.
+	p, root = enabled()
+	p.Harnesses["codex"].Codex.ExpectedPluginTools = []string{}
+	p = stageToolInventory(t, p, root, full)
+	if _, err := ValidateCodexHarness(p, root); err == nil || !strings.Contains(err.Error(), "expected_plugin_tools") {
+		t.Fatalf("omitting an enabled plugin tool must be refused, got %v", err)
+	}
+	// The native inventory exposes a server the profile does not list.
+	p, root = enabled()
+	extra := full
+	extra.MCPServers = map[string][]string{"context7": {"toolA", "toolB"}, "fs": {}}
+	p = stageToolInventory(t, p, root, extra)
+	if _, err := ValidateCodexHarness(p, root); err == nil || !strings.Contains(err.Error(), "expected_mcp_servers") {
+		t.Fatalf("an unlisted native server must be refused, got %v", err)
+	}
+	// Version drift, digest drift, shape drift, half-set binding.
+	p, root = enabled()
+	stale := full
+	stale.CodexCLIVersion = "0.153.0"
+	p = stageToolInventory(t, p, root, stale)
+	if _, err := ValidateCodexHarness(p, root); err == nil || !strings.Contains(err.Error(), "is for codex") {
+		t.Fatalf("a capture for another version must be refused, got %v", err)
+	}
+	p, root = enabled()
+	p = stageToolInventory(t, p, root, full)
+	p.Harnesses["codex"].Codex.ToolInventoryDigest = "sha256:" + strings.Repeat("0", 64)
+	if _, err := ValidateCodexHarness(p, root); err == nil || !strings.Contains(err.Error(), "tool inventory digest mismatch") {
+		t.Fatalf("a digest mismatch must be refused, got %v", err)
+	}
+	p, root = enabled()
+	p = stageToolInventory(t, p, root, full)
+	p.Harnesses["codex"].Codex.ToolInventoryDigest = ""
+	if _, err := ValidateCodexHarness(p, root); err == nil || !strings.Contains(err.Error(), "must both be set") {
+		t.Fatalf("a half-set binding must be refused, got %v", err)
+	}
+	p, root = enabled()
+	p = stageToolInventory(t, p, root, full)
+	rel := p.Harnesses["codex"].Codex.ToolInventoryPath
+	shape := []byte(`{"codex_cli_version":"0.154.0","mcp_servers":{"context7":["toolA","toolB"]},"plugin_tools":["skill:review"],"extra":1}`)
+	if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(rel)), shape, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	p.Harnesses["codex"].Codex.ToolInventoryDigest = fmt.Sprintf("sha256:%x", sha256.Sum256(shape))
+	if _, err := ValidateCodexHarness(p, root); err == nil || !strings.Contains(err.Error(), "not the Council capture shape") {
+		t.Fatalf("an unknown field in the capture must be refused, got %v", err)
+	}
+
+	// Nothing enabled: evidence optional; when present it must still
+	// agree (an inventory exposing a server while the profile lists
+	// none is refused).
+	p, root = evidenceRootForCodex(t, v3CodexProfile())
+	if _, err := ValidateCodexHarness(p, root); err != nil {
+		t.Fatalf("a profile enabling nothing needs no inventory evidence: %v", err)
+	}
+	p, root = evidenceRootForCodex(t, v3CodexProfile())
+	p = stageToolInventory(t, p, root, NativeToolInventory{CodexCLIVersion: "0.154.0",
+		MCPServers: map[string][]string{"fs": {"read"}}, PluginTools: []string{}})
+	if _, err := ValidateCodexHarness(p, root); err == nil || !strings.Contains(err.Error(), "expected_mcp_servers") {
+		t.Fatalf("an inventory exposing servers the profile hides must be refused, got %v", err)
+	}
+	p, root = evidenceRootForCodex(t, v3CodexProfile())
+	p = stageToolInventory(t, p, root, NativeToolInventory{CodexCLIVersion: "0.154.0",
+		MCPServers: map[string][]string{}, PluginTools: []string{}})
+	if _, err := ValidateCodexHarness(p, root); err != nil {
+		t.Fatalf("an empty capture agreeing with an empty profile must validate: %v", err)
+	}
+
+	// Duplicate inventory entries are rejected, not canonicalized away.
+	p, root = enabled()
+	p.Harnesses["codex"].Codex.ExpectedMCPTools = []string{"context7/toolA", "context7/toolB", "context7/toolA"}
+	p = stageToolInventory(t, p, root, full)
+	if _, err := ValidateCodexHarness(p, root); err == nil || !strings.Contains(err.Error(), "is duplicated") {
+		t.Fatalf("a duplicated MCP tool entry must be refused, got %v", err)
+	}
+	p, root = enabled()
+	p.Harnesses["codex"].Codex.ExpectedPluginTools = []string{"skill:review", " skill:review"}
+	p = stageToolInventory(t, p, root, full)
+	if _, err := ValidateCodexHarness(p, root); err == nil || !strings.Contains(err.Error(), "is duplicated") {
+		t.Fatalf("a duplicated plugin tool entry must be refused, got %v", err)
+	}
+}
+
 // A profile that is not cprof-v3 — or a v3 profile without a complete
 // codex harness block — is rejected with the typed ErrUnsupportedProfile.
 func TestValidateCodexHarness_RequiresV3WithCompleteBlock(t *testing.T) {

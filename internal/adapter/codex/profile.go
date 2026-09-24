@@ -7,8 +7,10 @@ package codex
 // started.
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -140,6 +142,7 @@ func ValidateCodexHarness(profile storage.CanonicalProfile, evidenceRoot string)
 	for _, s := range c.ExpectedMCPServers {
 		mcpServers[strings.TrimSpace(s)] = struct{}{}
 	}
+	seenMCPTools := make(map[string]struct{}, len(c.ExpectedMCPTools))
 	for _, path := range c.ExpectedMCPTools {
 		path = strings.TrimSpace(path)
 		server, tool, ok := strings.Cut(path, "/")
@@ -149,14 +152,24 @@ func ValidateCodexHarness(profile storage.CanonicalProfile, evidenceRoot string)
 		if _, known := mcpServers[server]; !known {
 			return unsupported(fmt.Sprintf("expected_mcp_tools entry %q names a server outside expected_mcp_servers", path))
 		}
+		if _, dup := seenMCPTools[path]; dup {
+			return unsupported(fmt.Sprintf("expected_mcp_tools entry %q is duplicated", path))
+		}
+		seenMCPTools[path] = struct{}{}
 	}
 	if c.ExpectedPluginTools == nil {
 		return unsupported("codex block lacks expected_plugin_tools (the exact plugin tool inventory; [] when none)")
 	}
+	seenPlugins := make(map[string]struct{}, len(c.ExpectedPluginTools))
 	for _, name := range c.ExpectedPluginTools {
-		if strings.TrimSpace(name) == "" {
+		name = strings.TrimSpace(name)
+		if name == "" {
 			return unsupported("expected_plugin_tools carries an empty tool name")
 		}
+		if _, dup := seenPlugins[name]; dup {
+			return unsupported(fmt.Sprintf("expected_plugin_tools entry %q is duplicated", name))
+		}
+		seenPlugins[name] = struct{}{}
 	}
 	if c.ExpectedInstructionSources == nil {
 		return unsupported("codex block lacks expected_instruction_sources")
@@ -178,6 +191,9 @@ func ValidateCodexHarness(profile storage.CanonicalProfile, evidenceRoot string)
 
 	if err := rehashEventUniverse(evidenceRoot, c.EventUniversePath, c.EventUniverseDigest); err != nil {
 		return CodexLaunchPolicy{}, err
+	}
+	if err := verifyToolInventoryEvidence(evidenceRoot, c); err != nil {
+		return CodexLaunchPolicy{}, &ErrUnsupportedProfile{AlgoVersion: profile.AlgoVersion, Reason: err.Error()}
 	}
 
 	return CodexLaunchPolicy{
@@ -252,19 +268,109 @@ func canonicalApprovalPolicyEncoding(p storage.CodexApprovalPolicy) (string, err
 // trusted evidence root (symlink-safe containment), re-hashes the raw
 // bytes, and requires an exact digest match.
 func rehashEventUniverse(evidenceRoot, relPath, wantDigest string) error {
+	_, err := readEvidenceFile(evidenceRoot, relPath, wantDigest, "event universe", "event_universe_path")
+	return err
+}
+
+// NativeToolInventory is the provider-free native tool-inventory capture
+// (Council-defined JSON, committed under the evidence root): the MCP
+// servers with the tools each exposes, and the skill/plugin-contributed
+// tools, for one installed codex version. It is the evidence that
+// PROVES the frozen expected_mcp_tools / expected_plugin_tools lists
+// complete — a profile can no longer omit an enabled tool and still
+// pass exact-set coverage.
+type NativeToolInventory struct {
+	CodexCLIVersion string              `json:"codex_cli_version"`
+	MCPServers      map[string][]string `json:"mcp_servers"`
+	PluginTools     []string            `json:"plugin_tools"`
+}
+
+// verifyToolInventoryEvidence enforces the inventory-completeness rule:
+// whenever the profile enables any MCP server or plugin tool, the
+// digest-bound native inventory capture is required, must re-hash
+// exactly, must be for the pinned app-server version, and its server
+// set, "<server>/<tool>" set, and plugin-tool set must EQUAL the frozen
+// lists. A profile enabling nothing may omit the capture; when present
+// it is verified the same way.
+func verifyToolInventoryEvidence(evidenceRoot string, c *storage.CodexHarnessSpec) error {
+	path := strings.TrimSpace(c.ToolInventoryPath)
+	digest := strings.TrimSpace(c.ToolInventoryDigest)
+	enabled := len(c.ExpectedMCPServers) > 0 || len(c.ExpectedPluginTools) > 0 || len(c.ExpectedMCPTools) > 0
+	if path == "" && digest == "" {
+		if enabled {
+			return errors.New("the profile enables MCP servers or plugin tools but carries no tool_inventory_path/tool_inventory_digest: production eligibility requires the digest-bound native tool inventory that proves expected_mcp_tools and expected_plugin_tools complete")
+		}
+		return nil
+	}
+	if path == "" || digest == "" {
+		return errors.New("tool_inventory_path and tool_inventory_digest must both be set")
+	}
+	if err := storage.ValidateSHA256Digest(digest); err != nil {
+		return fmt.Errorf("tool_inventory_digest: %w", err)
+	}
+	raw, err := readEvidenceFile(evidenceRoot, path, digest, "tool inventory", "tool_inventory_path")
+	if err != nil {
+		return err
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var inv NativeToolInventory
+	if err := dec.Decode(&inv); err != nil {
+		return fmt.Errorf("tool inventory evidence is not the Council capture shape: %w", err)
+	}
+	if strings.TrimSpace(inv.CodexCLIVersion) != strings.TrimSpace(c.AppServerVersion) {
+		return fmt.Errorf("tool inventory evidence is for codex %q but the profile pins %q", inv.CodexCLIVersion, c.AppServerVersion)
+	}
+	servers := make([]string, 0, len(inv.MCPServers))
+	tools := make([]string, 0)
+	for server, list := range inv.MCPServers {
+		server = strings.TrimSpace(server)
+		if server == "" {
+			return errors.New("tool inventory evidence carries an empty MCP server name")
+		}
+		servers = append(servers, server)
+		for _, tool := range list {
+			tool = strings.TrimSpace(tool)
+			if tool == "" {
+				return fmt.Errorf("tool inventory evidence: server %q carries an empty tool name", server)
+			}
+			tools = append(tools, server+"/"+tool)
+		}
+	}
+	for _, check := range []struct {
+		label            string
+		frozen, observed []string
+	}{
+		{"expected_mcp_servers", c.ExpectedMCPServers, servers},
+		{"expected_mcp_tools", c.ExpectedMCPTools, tools},
+		{"expected_plugin_tools", c.ExpectedPluginTools, inv.PluginTools},
+	} {
+		frozen, observed := sortedUniqueTrimmed(check.frozen), sortedUniqueTrimmed(check.observed)
+		if strings.Join(frozen, "\x00") != strings.Join(observed, "\x00") {
+			return fmt.Errorf("%s %v does not equal the native tool inventory evidence %v (frozen inventories must be proven complete)",
+				check.label, frozen, observed)
+		}
+	}
+	return nil
+}
+
+// readEvidenceFile resolves a repo-relative evidence path inside the
+// trusted evidence root (symlink-safe containment), re-hashes the raw
+// bytes, requires an exact digest match, and returns the bytes.
+func readEvidenceFile(evidenceRoot, relPath, wantDigest, label, field string) ([]byte, error) {
 	rel := strings.TrimSpace(relPath)
 	if rel == "" {
-		return fmt.Errorf("event_universe_path is empty")
+		return nil, fmt.Errorf("%s is empty", field)
 	}
 	rel = filepath.ToSlash(filepath.Clean(rel))
 	if filepath.IsAbs(rel) || rel == "." || rel == ".." ||
 		strings.HasPrefix(rel, "../") || strings.HasPrefix(rel, "/") {
-		return fmt.Errorf("event_universe_path %q escapes the evidence root", relPath)
+		return nil, fmt.Errorf("%s %q escapes the evidence root", field, relPath)
 	}
 
 	resolvedRoot, err := filepath.EvalSymlinks(evidenceRoot)
 	if err != nil {
-		return fmt.Errorf("resolve evidence root: %w", err)
+		return nil, fmt.Errorf("resolve evidence root: %w", err)
 	}
 	parts := strings.Split(rel, "/")
 	cur := resolvedRoot
@@ -272,35 +378,35 @@ func rehashEventUniverse(evidenceRoot, relPath, wantDigest string) error {
 		cur = filepath.Join(cur, part)
 		fi, err := os.Lstat(cur)
 		if err != nil {
-			return fmt.Errorf("evidence path component: %w", err)
+			return nil, fmt.Errorf("evidence path component: %w", err)
 		}
 		if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
-			return fmt.Errorf("evidence path component %q is not a real directory", part)
+			return nil, fmt.Errorf("evidence path component %q is not a real directory", part)
 		}
 	}
 	final := filepath.Join(cur, parts[len(parts)-1])
 	fi, err := os.Lstat(final)
 	if err != nil {
-		return fmt.Errorf("read event universe evidence: %w", err)
+		return nil, fmt.Errorf("read %s evidence: %w", label, err)
 	}
 	if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
-		return fmt.Errorf("event universe evidence must be a regular file")
+		return nil, fmt.Errorf("%s evidence must be a regular file", label)
 	}
 	real, err := filepath.EvalSymlinks(final)
 	if err != nil {
-		return fmt.Errorf("resolve event universe evidence: %w", err)
+		return nil, fmt.Errorf("resolve %s evidence: %w", label, err)
 	}
 	if !strings.HasPrefix(real, resolvedRoot+string(os.PathSeparator)) {
-		return fmt.Errorf("event universe evidence %q resolves outside the evidence root", relPath)
+		return nil, fmt.Errorf("%s evidence %q resolves outside the evidence root", label, relPath)
 	}
 
 	raw, err := os.ReadFile(final)
 	if err != nil {
-		return fmt.Errorf("read event universe evidence: %w", err)
+		return nil, fmt.Errorf("read %s evidence: %w", label, err)
 	}
 	got := fmt.Sprintf("sha256:%x", sha256.Sum256(raw))
 	if got != wantDigest {
-		return fmt.Errorf("event universe digest mismatch: got %s want %s", got, wantDigest)
+		return nil, fmt.Errorf("%s digest mismatch: got %s want %s", label, got, wantDigest)
 	}
-	return nil
+	return raw, nil
 }

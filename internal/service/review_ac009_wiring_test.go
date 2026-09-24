@@ -110,6 +110,21 @@ func codexServiceProfile(t *testing.T, scratch, evidenceRoot, wsRoot string) (st
 		t.Fatalf("write universe: %v", err)
 	}
 	digest := "sha256:" + sha256SumService(string(raw))
+	// The profile enables one MCP server: the native tool inventory that
+	// proves expected_mcp_tools complete is staged and digest-pinned.
+	invRaw, err := json.Marshal(map[string]any{
+		"codex_cli_version": "0.154.0",
+		"mcp_servers":       map[string][]string{"context7": {"resolve-library-id", "get-library-docs"}},
+		"plugin_tools":      []string{},
+	})
+	if err != nil {
+		t.Fatalf("marshal inventory: %v", err)
+	}
+	invRel := "docs/superpowers/evidence/ac009-native-tool-inventory-0.154.0.json"
+	if err := os.WriteFile(filepath.Join(evidenceRoot, filepath.FromSlash(invRel)), invRaw, 0o600); err != nil {
+		t.Fatalf("write inventory: %v", err)
+	}
+	invDigest := "sha256:" + sha256SumService(string(invRaw))
 
 	profile := storage.CanonicalProfile{
 		AlgoVersion:         "cprof-v3",
@@ -143,6 +158,8 @@ func codexServiceProfile(t *testing.T, scratch, evidenceRoot, wsRoot string) (st
 					},
 					EventUniversePath:   rel,
 					EventUniverseDigest: digest,
+					ToolInventoryPath:   invRel,
+					ToolInventoryDigest: invDigest,
 				},
 			},
 		},

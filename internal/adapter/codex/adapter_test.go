@@ -89,6 +89,22 @@ func newAdapterHarnessProfile(t *testing.T, lines []string, mutate func(*storage
 		mutate(&profile)
 	}
 	cx := profile.Harnesses["codex"].Codex
+	if (len(cx.ExpectedMCPServers) > 0 || len(cx.ExpectedPluginTools) > 0) && cx.ToolInventoryPath == "" {
+		// A mutation that enables MCP servers or plugin tools needs the
+		// digest-bound native inventory capture the freeze re-hashes;
+		// the harness stages one agreeing with the frozen lists.
+		inv := NativeToolInventory{CodexCLIVersion: cx.AppServerVersion,
+			MCPServers: map[string][]string{}, PluginTools: append([]string{}, cx.ExpectedPluginTools...)}
+		for _, srv := range cx.ExpectedMCPServers {
+			inv.MCPServers[srv] = []string{}
+		}
+		for _, path := range cx.ExpectedMCPTools {
+			srv, tool, _ := strings.Cut(path, "/")
+			inv.MCPServers[srv] = append(inv.MCPServers[srv], tool)
+		}
+		profile = stageToolInventory(t, profile, evidenceRoot, inv)
+		cx = profile.Harnesses["codex"].Codex
+	}
 	cx.ExpectedCodexHome = filepath.Join(scratch, ".codex")
 	cx.Platform = storage.CodexPlatformSpec{OS: runtime.GOOS, Family: "unix"}
 	cx.SandboxPolicy.WritableRoots = []string{wsRoot}

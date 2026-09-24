@@ -171,6 +171,14 @@ type CodexHarnessSpec struct {
 	RulesEvidence              CodexRulesEvidenceSpec `json:"rules_evidence"`
 	EventUniversePath          string                 `json:"event_universe_path"`
 	EventUniverseDigest        string                 `json:"event_universe_digest"`
+	// ToolInventoryPath / ToolInventoryDigest bind the provider-free
+	// NATIVE tool-inventory capture (repo-relative under the evidence
+	// root, sha256 of its bytes) that PROVES the two inventories above
+	// complete: validation re-hashes the capture and requires its server,
+	// MCP tool, and plugin tool sets to EQUAL the frozen lists. Required
+	// whenever the profile enables any MCP server or plugin tool.
+	ToolInventoryPath   string `json:"tool_inventory_path"`
+	ToolInventoryDigest string `json:"tool_inventory_digest"`
 }
 
 // CanonicalProfile defines the frozen execution profile parameters for a Council run.
@@ -526,6 +534,8 @@ func canonicalCodexBlock(c *CodexHarnessSpec) (map[string]any, error) {
 		},
 		"event_universe_path":   codexScalar(c.EventUniversePath),
 		"event_universe_digest": strings.ToLower(strings.TrimSpace(c.EventUniverseDigest)),
+		"tool_inventory_path":   codexScalar(c.ToolInventoryPath),
+		"tool_inventory_digest": strings.ToLower(strings.TrimSpace(c.ToolInventoryDigest)),
 	}, nil
 }
 
