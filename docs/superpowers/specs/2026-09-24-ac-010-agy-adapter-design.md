@@ -858,3 +858,36 @@ none is claimed by the design.
    (typed `ErrSealedImageMismatch`) where the host forbids executable
    memfds (`vm.memfd_noexec=2` returns `EACCES`, which is not retried).
    The seal set and the exact-equality check are unchanged.
+2. Child `HOME` (§3.1, §3.7). The frozen `expected_home` is
+   `/home/<operator>/.gemini`; the executor's default of setting `HOME`
+   to the allocation's config directory would leave every Agy child
+   unauthenticated and would put its conversation files where §3.4
+   never looks. The launch request therefore carries `HomeDir`, which
+   the executor accepts only for an agy-shaped, sealed launch (or the
+   test-only fixture marker on a non-Linux host), absolute and clean, and
+   emits as the child's `HOME` in place of the allocation config
+   directory. The Agy launch source sets it to the PARENT of
+   `expected_home` and refuses an `expected_home` that is not absolute,
+   clean and named `.gemini`. Every other adapter's launch is unchanged.
+3. Orphan conversation id durability (§3.3, §3.11). The v7 schema is
+   unreleased, so `agy_turn_attempts.orphan_conversation_id` and the
+   creation-uncertainty episode's `orphan_native_id` were added to the
+   v7 DDL in place (no v8). A dispatch drift records the observed id
+   before the child is terminated; a creation drift after a valid-UUID
+   `init` opens a durable creation-uncertainty episode carrying the id,
+   which blocks re-creation until a controller resolves it.
+4. Attempt insert and launch reservation are one storage transaction
+   (`InsertAgyTurnAttemptAndReserveLaunch`), as §3.5 requires; any
+   failure before `Start` after that point records `missing`.
+5. `DispatchAccepted` as returned by `Dispatch` means the single user
+   line was fully transmitted and stdin closed (AC-008 precedent). The
+   §3.5 acceptance (`user_input DONE`) is the durable native
+   acknowledgement recorded on the attempt; a failure to record it
+   surfaces as `DispatchUnknown`, never as a silent success.
+6. Forced termination of a sealed launch also kills the child's process
+   group (the sealed launch sets `Setpgid`); a descendant that changes
+   its own session or group escapes this, which the operator evidence
+   script (Task 8) observes.
+7. §3.8 diagnostics (conversation file size and step counts at first
+   acceptance and at reconcile) are not implemented by the adapter task
+   and are tracked as an acceptance-pass gap.
