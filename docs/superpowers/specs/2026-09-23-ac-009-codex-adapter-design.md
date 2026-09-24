@@ -689,9 +689,12 @@ adapter side effect.
   native inventory — the `mcpServerStatus/list` response shape is not
   schema-pinned (no deterministic parser can bind the raw response) and
   no native plugin/skill inventory surface is pinned — so profile freeze
-  REFUSES any profile enabling an MCP server or plugin tool; only empty
-  inventories are launchable, kept affirmatively empty by the dispatch-
-  time server-level drift check. The binding slot for the eventual
+  REFUSES any profile enabling an MCP server or plugin tool, at BOTH
+  layers: the storage cprof-v3 freeze validator (`ComputeProfileDigest`,
+  hence durable run creation) and the adapter's launch-policy
+  validation; a run can never durably freeze a profile the production
+  adapter cannot launch. Only empty inventories are launchable, kept
+  affirmatively empty by the dispatch-time server-level drift check. The binding slot for the eventual
   evidence is `tool_inventory_path`/`tool_inventory_digest` (Council
   shape `{codex_cli_version, mcp_servers: {server: [tool…]}, plugin_tools}`,
   strictly decoded: one value, known keys once, no duplicates) with the
