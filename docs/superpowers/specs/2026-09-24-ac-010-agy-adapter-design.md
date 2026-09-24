@@ -1,7 +1,7 @@
 # AC-010 Design — Agy (Antigravity CLI) persistent contributor adapter
 
-Status: DRAFT v2 for review (v1 review: 7 findings, all addressed — see
-"v2 changes" at the end)
+Status: DRAFT v3 for review (v1: 7 findings, v2: 5 findings — all
+addressed; change logs at the end)
 Date: 2026-09-24
 Issue: #10
 Depends on: AC-003 (controller grants), AC-005 (workspaces/execution policy),
@@ -136,9 +136,9 @@ One CLI process per dispatched turn, launched through the AC-005
   |---|---|---|
   | `permissive_dev` | `unrestricted` | Launches. Provider egress direct. **Degraded per AC-005** (not OS-enforced; never presented as egress control). Tool network stays under `--sandbox`/permission rules, whose headless enforcement is `not verified` (§7) and is therefore NOT claimed. |
   | `permissive_dev` | `allowlist` | Launches. Provider egress through the AC-005 allowlist proxy, destination-gated from `network_allowlist` (the Antigravity backend endpoints the operator lists). |
-  | `permissive_dev` | `none` | Launches; the first turn fails natively on provider reach (verified `result` ERROR shape). Fixture/air-gapped evidence only. |
+  | `permissive_dev` | `none` | **Fixture/diagnostic only, never production**: the `models` auth gate cannot reach the backend, so it is INCONCLUSIVE (§3.2: transport failure ≠ "not signed in") and no turn child starts. Council's fixture executable answers `models` deterministically, which is how CI exercises this row. |
   | `strict` | `allowlist` | **Launch rejected, fail-closed** (proxy reachability from a fresh namespace unverified for this child class). |
-  | `strict` | `none` | Launches; no external egress; turns fail natively (honest). |
+  | `strict` | `none` | **Fixture/diagnostic only, never production**: same as above — the auth gate is inconclusive without egress, so no prompt is ever transmitted. |
   | `strict` | `unrestricted` | **Launch rejected, fail-closed** (unverified capability; never silently downgraded). |
 
   Workspace mode (`none`/`readonly`/`isolated_branch`) is the AC-005
@@ -186,6 +186,40 @@ scoped:
   and lookup, and because freeze rejects non-empty MCP/plugin inventories
   (§3.7), the expected coverage set is exactly the built-in classes
   (read, glob, grep, shell) — fully derivable from the frozen profile.
+- **Version-pinned tool-to-capability coverage map (closes the built-in
+  path gap).** Every name in `expected_tools` MUST appear in the pinned
+  coverage map for the frozen `cli_version` (committed with the
+  evidence, digest-bound like the `init` capture); the map assigns each
+  tool exactly one class, and the attestation must cover every tool of a
+  probed class that the profile enables:
+
+  | Class | 1.2.9 tools | Attestation obligation |
+  |---|---|---|
+  | `sibling_read_path` | `view_file`, `read_resource`, `list_dir`, `find_by_name`, `grep_search`, `run_command`, `send_command_input`, `notebook_execution`, `open_browser_url`, `read_browser_page`, `execute_browser_javascript` (browser tools can dereference `file://`), `call_mcp_tool` (per frozen MCP tool) | one `sibling_read` record per tool name (cprot-v2 tool_class: read/glob/grep/bash_absolute/mcp; browser and notebook execution are recorded under `bash_absolute` semantics — "arbitrary code with filesystem reach") |
+  | `own_mutation_path` | `write_to_file`, `replace_file_content`, `multi_replace_file_content`, `sed_file`, `notebook_edit`, `run_command`, `send_command_input`, `notebook_execution`, `execute_browser_javascript` | `self_mutation` records for write, append, truncate, rename, delete per tool name (a tool that cannot express an operation records that operation as denied-by-construction only when the probe suite proves the tool refuses it) |
+  | `network_only` | `search_web`, `read_url_content` (non-`file://` only — a `file://` probe is part of `sibling_read_path` above), `generate_image` | none for isolation; governed by `sandbox`/permission rules |
+  | `control` | `ask_permission`, `ask_custom_permission`, `ask_question`, `finish`, `wait`, `wait_5_seconds`, `schedule`, `send_message`, `manage_inbox`, `manage_task`, `manage_subagents`, `define_subagent`, `invoke_subagent`, `browser_subagent`, `list_permissions`, `list_resources`, `delete_knowledge`, `command_status`, `capture_browser_screenshot`, `capture_browser_console_logs`, `list_browser_pages`, and the remaining `browser_*` interaction tools (`click`, `input`, `scroll`, `drag`, `mouse_*`, `press_key`, `refresh_page`, `resize_window`, `select_option`, `get_dom`, `get_network_request`, `list_network_requests`, `scroll_dom`) | none — no independent filesystem reach beyond the paths above; subagents inherit the same tool set, so their reach is covered transitively by the tool-level probes (recorded as an assumption in the suite) |
+  | `uncovered` | any tool NOT in the map for this version | **profile rejected at freeze** — the path to production is a native denial that removes the tool from `init.tools` (operator `settings.json` rule) proven by the `init` capture, or a later evidence run that extends the map |
+
+  A tool listed in two classes carries both obligations. The map is
+  evidence, not code: it lives at `docs/superpowers/evidence/
+  ac010-agy-tool-coverage-<version>.json`, is digest-bound in the profile
+  (`tool_coverage_path`/`tool_coverage_digest`, §3.7), and coverage
+  validation derives the expected record set from `expected_tools` ∩ map.
+- **Skills, plugins, and guardrail hooks — configured state verified,
+  execution not claimed.** The profile freezes `expected_skills` (the
+  skill directory names under `<home>/antigravity-cli/skills` and the
+  enabled plugins' skill dirs), `expected_plugins` (from `agy plugin
+  list`, provider-free), and `hooks_config_digest` (sha256 of the
+  operator's `<home>/config/hooks.json` bytes). Construction and every
+  launch re-derive all three and fail closed on drift
+  (`ErrToolkitDrift`); `--disable-slash-commands` is pinned so skills
+  cannot be invoked as slash commands. What this proves: the configured
+  toolkit is the frozen one. What it does NOT prove (recorded as a gap,
+  never claimed): that a hook executed on a given tool call, or that the
+  model loaded a given skill. Issue #10's "verify expected
+  skills/tools/plugins and enabled guardrails" is met at the
+  configured-state level and stated as such in §6.
 - **Approval records:** Agy has no per-variant approval wire protocol; the
   permission decision is native (`request-review` auto-deny) and surfaces
   in `result.denied_actions`. The attestation's `approval_deny` records
@@ -198,10 +232,15 @@ scoped:
   adapter runs the frozen `models` inventory launch (`<binary> models`,
   network-bound, no model call) through the executor before the FIRST
   dispatch of a logical session and again at `ResumeSession` after a
-  park; the live-verified unauthenticated text (`Please sign in to view
-  available models…`), a non-zero exit, or an empty/unparseable catalog
-  ⇒ typed `ErrAgyAuthRequired`, no turn process started; the catalog must
-  also contain the frozen model or the launch is `ErrProfileDrift`;
+  park. Three outcomes, all decided before any prompt exists: the
+  live-verified unauthenticated text (`Please sign in to view available
+  models…`) ⇒ typed `ErrAgyAuthRequired`; a transport/network failure,
+  timeout, non-zero exit, or empty/unparseable catalog ⇒ typed
+  `ErrAgyAuthInconclusive` (fail closed — under `network_mode=none` this
+  is the only possible outcome, which is why those matrix rows are
+  fixture/diagnostic only, §3.1); a catalog that lacks the frozen model ⇒
+  `ErrProfileDrift`. Only a parsed catalog containing the frozen model
+  passes; no turn process starts otherwise;
   (3) turn child starts: `init` verified (§3.1) and only then the prompt
   is written. **After the first stdin byte nothing is pre-acceptance**:
   any `result` (ERROR included, sign-in/quota/validation text included)
@@ -260,18 +299,31 @@ that never binds).
   with the error text.
 - **Required-tool verification (issue #10 criterion):** every attempt
   carries a `required_tools` set read from the durable dispatch intent
-  through the attempt-identity seam (`RequiredToolsFor(ref)`; the
-  controller records it when the prompt is queued; absent ⇒ the frozen
-  profile's `default_required_tools`, which may be empty). At terminal
-  the adapter computes `executed_tools` = names of `tool` steps observed
-  `DONE` for this process that are NOT in `denied_actions`, and
-  `denied_tools` = `denied_actions[].display_name`/`action`. The result is
+  through the attempt-identity seam (`RequiredToolsFor(ref)`). The set
+  is validated at QUEUE time — each name must be in the frozen
+  `expected_tools` (native tool names, e.g. `run_command`), duplicates
+  rejected — journaled with the queued prompt, and immutable thereafter;
+  absent ⇒ the frozen `default_required_tools` (also ⊆ `expected_tools`).
+  **Identity namespace and correlation rule.** Native tool names are the
+  single namespace. `result.denied_actions` speaks a different vocabulary
+  (`action:"command"`, `display_name:"RunCommand"`), so the version-
+  pinned denial map (part of the tool-coverage evidence file, §3.2)
+  translates each `(action, display_name)` pair to the set of native
+  tool names it denies (1.2.9: `command`/`RunCommand` → `run_command`,
+  `send_command_input`; further pairs are added only from live
+  evidence). Because a denied `tool` step still reports `state:DONE`
+  in-stream (live-verified), execution is established as: `executed(T)`
+  ⇔ a `tool` step with `tool_name == T` reached `DONE` for this process
+  AND no denial in `denied_actions` maps to `T`. A `denied_actions` entry
+  whose pair is NOT in the pinned map fails closed: every observed tool
+  step of this process is treated as NOT executed and the attempt is
+  flagged incomplete with `unmapped_denials` recorded. The result is
   flagged `verification_incomplete` when `required_tools − executed_tools
   ≠ ∅` (a required tool silently SKIPPED) or `denied_tools ≠ ∅`, with
-  `missing_required_tools` and `denied_tools` recorded on the attempt and
-  one `tool_denied` event emitted per denied action. `SUCCESS` with exit 0
-  never clears the flag; acceptance of the contributor's output is the
-  controller's decision, never automatic.
+  `missing_required_tools`, `denied_tools`, and `unmapped_denials`
+  recorded on the attempt and one `tool_denied` event emitted per mapped
+  denial. `SUCCESS` with exit 0 never clears the flag; acceptance of the
+  contributor's output is the controller's decision, never automatic.
 - Bound: Council's turn bound is enforced by SIGINT (§3.6), with
   `--print-timeout` set strictly LARGER as a backstop; if the stderr
   `[agy] print timeout` marker appears the attempt is **Uncertain**
@@ -320,8 +372,13 @@ number literals verbatim); the digest is
       "expected_plugin_tools": [],
       "default_required_tools": [],
       "hooks_evidence": {"verified": ["…"], "unverifiable": ["hook execution at the Agy layer", "settings.json permissions.allow contents"]},
+      "expected_skills": ["…"],
+      "expected_plugins": ["superpowers"],
+      "hooks_config_digest": "sha256:<hex>",
       "init_evidence_path": "docs/superpowers/evidence/ac010-agy-init-1.2.9.json",
-      "init_evidence_digest": "sha256:<hex>"
+      "init_evidence_digest": "sha256:<hex>",
+      "tool_coverage_path": "docs/superpowers/evidence/ac010-agy-tool-coverage-1.2.9.json",
+      "tool_coverage_digest": "sha256:<hex>"
     }
   }
 }
@@ -353,12 +410,28 @@ with a typed validation error):
   or `expected_plugin_tools` until such a path exists. Only empty
   inventories are launchable; the attestation coverage set is then the
   built-in classes exactly, fully derivable from the profile.
-- `init_evidence_path`/`init_evidence_digest`: required; a committed
-  provider-free capture of the `init` event from the creation launch
-  (§3.3) for this version; re-hashed at freeze and construction; its
-  `init.tools` must equal `expected_tools` and its `permission_mode` the
-  frozen mode. This is the native, digest-bound proof of the built-in
+- `init_evidence_path`/`init_evidence_digest` and
+  `tool_coverage_path`/`tool_coverage_digest`: required. **Evidence-root
+  containment contract (AC-008/AC-009 rules, applied verbatim):** the
+  path is repo-relative (no absolute path, no `..`, cleaned, forward
+  slashes), resolved ONLY inside the operator-owned, service-configured
+  evidence root; every path component must be a real directory (no
+  symlinks) and the final entry a regular file whose symlink-resolved
+  location stays under the resolved root; the raw bytes are re-hashed
+  and must equal the digest exactly. Decoding is STRICT: exactly one
+  JSON value followed by EOF (trailing content rejected), no unknown
+  keys, no duplicate keys. The `init` capture must be a single
+  `{"event":"init",…}` object whose `init.tools` equals `expected_tools`
+  and whose `permission_mode` equals the frozen mode; the coverage map
+  must be for the frozen `cli_version` and must classify every
+  `expected_tools` entry (§3.2). Any profile that binds host data outside
+  the root, or a capture that fails any rule, is rejected at freeze and
+  at construction. This is the native, digest-bound proof of the built-in
   inventory that AC-009 lacked for Codex.
+- `expected_skills`, `expected_plugins`: required (`[]` when none),
+  duplicates rejected. `hooks_config_digest`: `sha256:` + 64 hex over the
+  operator's `hooks.json` bytes (re-derived at construction and launch,
+  §3.2).
 - `hooks_evidence.verified`/`unverifiable`: at least one list present.
 - Unknown fields: `DisallowUnknownFields` on the typed block; an `agy`
   block under any `algo_version` other than `cprof-v4` is a validation
@@ -384,11 +457,15 @@ as v4 and every other contributor on it remains valid. No record-only
 mode; no backfill.
 
 **Binary pin (hazard 1).** Production construction and EVERY launch
-re-verify `binary_path` (must be the resolved absolute path, no symlink
-escape), size+mtime+inode (cached) and, on any change, the full sha256
-against `binary_digest`; drift ⇒ typed `ErrBinaryDrift`, no process
-started, and every attestation for the old digest is invalid by
-construction. The operator obligation to disable the auto-updater is
+(creation, auth gate, and each turn child) re-verify `binary_path` (must
+be the resolved absolute path, no symlink escape, regular file) and
+compute the FULL sha256 of its bytes against `binary_digest` — no
+metadata cache: an in-place modification that preserves size, mtime, and
+inode is inside the threat model. The cost (~1 s for a 217 MB binary) is
+accepted per launch. Drift ⇒ typed `ErrBinaryDrift`, no process started,
+and every attestation for the old digest is invalid by construction.
+The hash is taken immediately before the executor launch; the
+executor-observed executable identity is recorded on the launch row. The operator obligation to disable the auto-updater is
 recorded as unverified; the pin is the defense either way.
 
 ### 3.8 Trust model of the durable conversation file
@@ -443,7 +520,7 @@ agy_turn_attempts         -- attempt_id, session_id, turn_key, prompt_digest,
                           --   accepted, terminal, result_payload, result_usage,
                           --   required_tools_json, executed_tools_json,
                           --   missing_required_tools_json, denied_tools_json,
-                          --   verification_incomplete BOOL,
+                          --   unmapped_denials_json, verification_incomplete BOOL,
                           --   observed_status (completed|failed|cancelled|missing|uncertain),
                           --   uncertainty_disposition NULL, transition_version, timestamps
 agy_attempt_launches      -- attempt_id, reservation_seq, state (reserved|started|
@@ -520,8 +597,8 @@ eligibility is limited accordingly:
 |---|---|
 | Probe the installed CLI and supported output fields with sanitized fixtures | §2, evidence file; fixture executable (§4) |
 | Start independently and resume a specified conversation | §3.3 (provider-free creation), §3.1/§3.5 (`--conversation` + `init` equality) |
-| Verify expected skills/tools/plugins and enabled guardrails | §3.7 `expected_tools` = `init.tools` at freeze (digest-bound `init_evidence`) and every launch; MCP/plugin inventories gated to empty until natively provable; `permission_mode` attestation; hooks recorded as unverifiable |
-| Required skipped/denied tools keep verification incomplete regardless of exit code | §3.5 per-attempt `required_tools` vs observed executed `tool` steps ⇒ `missing_required_tools`; `denied_actions` ⇒ `denied_tools`; either ⇒ `verification_incomplete`; exit code never classifies (§2.1/§3.9) |
+| Verify expected skills/tools/plugins and enabled guardrails | §3.7 `expected_tools` = `init.tools` at freeze (digest-bound `init_evidence`) and every launch; every tool classified by the pinned coverage map (uncovered ⇒ rejected); `expected_skills`/`expected_plugins`/`hooks_config_digest` re-derived at every launch (configured state verified; execution explicitly not claimed); `permission_mode` attestation; MCP/plugin tool inventories gated to empty until natively provable |
+| Required skipped/denied tools keep verification incomplete regardless of exit code | §3.5 queue-validated immutable `required_tools` (native names) vs observed executed `tool` steps under the pinned denial map ⇒ `missing_required_tools`; `denied_actions` ⇒ `denied_tools`; unmapped denials fail closed; any ⇒ `verification_incomplete`; exit code never classifies (§2.1/§3.9) |
 | Bounded cancellation, unknown outcomes, client-close recovery, no fallback harness | §3.6 SIGINT → verified `interrupted`; §3.9/§3.10 Uncertain rules; §3.1 detached context; no other adapter is ever substituted |
 
 ### 6.1 Concrete acceptance scenarios
@@ -549,7 +626,10 @@ eligibility is limited accordingly:
 
 ## 7. Unverified items carried forward (explicit)
 
-`--mode`/`--sandbox` effect headlessly; `denied_tools` rule denial shape;
+`--mode`/`--sandbox` effect headlessly; `denied_tools` rule denial shape
+and whether a natively denied tool disappears from `init.tools`; hook
+EXECUTION and skill LOADING at the Agy layer (configured state is
+verified, §3.2); the transitive-subagent coverage assumption;
 workspace-trust gating; healthy-turn print-timeout; content-block user
 messages; `AGY_ERROR` exit-3 path; MCP tool naming in `call_mcp_tool` steps;
 plugin/skill tool surfacing; auto-updater off switch; `GEMINI_API_KEY`
@@ -575,3 +655,22 @@ none is claimed by the design.
 6. Scenario 3 now requires a controller disposition before the next turn.
 7. Platform eligibility rule (§3.12): linux/unix only in v1, macOS and
    Windows refused at construction with fixture-only coverage.
+
+## 9. v3 changes (review of v2)
+
+1. Auth gate vs `network_mode=none`: transport failure is
+   `ErrAgyAuthInconclusive` (fail closed), distinct from
+   `ErrAgyAuthRequired`; the two `none` rows are fixture/diagnostic only
+   and can never reach production dispatch (§3.1, §3.2).
+2. Built-in path coverage: a version-pinned, digest-bound
+   tool-to-capability coverage map classifies every `expected_tools`
+   entry; uncovered tools reject the profile; skills, plugins, and the
+   guardrail hooks file are frozen and re-derived at every launch as
+   configured-state verification, with execution explicitly not claimed
+   (§3.2, §3.7, §6, §7).
+3. `init_evidence`/`tool_coverage` evidence-root containment and strict
+   decoding contract (§3.7).
+4. Native-tool-name namespace, version-pinned denial map, correlation
+   rule, unmapped-denial fail-closed, queue-time validation and
+   immutability of `required_tools` (§3.5, §3.11, §6).
+5. Binary pin: full sha256 at every launch, no metadata cache (§3.7).
