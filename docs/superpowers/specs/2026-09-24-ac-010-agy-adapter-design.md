@@ -913,3 +913,28 @@ none is claimed by the design.
     layout; the auth gate parses one id per row and treats any other
     layout as inconclusive (fails closed). Stage A of the evidence script
     records the real layout before any profile freeze.
+13. Durable pre-launch creation marker (§3.3, §3.11). Because Agy
+    cannot re-offer a created conversation across processes, the
+    service opens a provisional creation-uncertainty episode (reason
+    `creation_in_flight`, create-op provenance) BEFORE the creation
+    child starts. A successful bind closes it with disposition `bound`
+    inside the bind transaction; a pre-child rejection closes it
+    `not_created`; every other outcome (uncertain, drift, refused bind,
+    client disconnect, crash) leaves it open, annotated with the
+    observed or orphan native id when known, and blocks re-creation
+    until a controller resolves it. Exactly one open episode exists per
+    session; the adapter's own drift record annotates the open marker
+    instead of opening a second episode.
+14. Client disconnect is not cancellation (AGENTS.md). Once the native
+    conversation exists, every durable write that follows (bind, orphan
+    annotation, marker close) runs detached from the request context.
+15. Required tools seam (§3.5). `RequiredToolsFor` returns an error
+    channel; a storage read error or a missing dispatch intent refuses
+    the dispatch before any reservation. Only an intent with an empty
+    set falls back to the frozen `default_required_tools`. Queue-time
+    validation rejects duplicates (spec text) rather than deduplicating,
+    and the queued set is immutable across prompt replacement (typed
+    refusal on a changed set).
+16. Attestation recording authority (§3.2) is the operator credential,
+    matching the codex precedent; the tuple written to the row comes
+    from the run's frozen profile and coverage, never from the request.
