@@ -179,6 +179,18 @@ func TestValidateAgyHarness_Accepts(t *testing.T) {
 	}
 }
 
+func TestValidateAgyHarness_MissingModelRejected(t *testing.T) {
+	p, root := acceptedProfileAndRoot(t)
+	h := p.Harnesses["agy"]
+	h.Model = "  "
+	p.Harnesses["agy"] = h
+	_, err := ValidateAgyHarness(p, root)
+	var unsupported *ErrUnsupportedProfile
+	if !errors.As(err, &unsupported) || !strings.Contains(unsupported.Reason, "model") {
+		t.Fatalf("a missing frozen model must fail closed, got %v", err)
+	}
+}
+
 func TestValidateAgyHarness_WrongAlgoVersionRejected(t *testing.T) {
 	p, root := acceptedProfileAndRoot(t)
 	p.AlgoVersion = "cprof-v3"

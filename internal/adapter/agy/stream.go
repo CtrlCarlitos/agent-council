@@ -503,6 +503,14 @@ func newStderrTail() *boundedBuffer {
 // read stderr itself); its current tail is attached to any returned
 // error for diagnostics.
 func ReadEvents(r io.Reader, sink func(Event) error, stderrTail *boundedBuffer) error {
+	return readEventLines(r, func(ev Event, _ []byte) error { return sink(ev) }, stderrTail)
+}
+
+// readEventLines is ReadEvents with the verbatim (trimmed) line handed
+// to the sink alongside its decoded event: the adapter keeps the exact
+// result line as terminal evidence (Task 5, TurnResult.RawEvidence).
+// The line slice is only valid for the duration of the sink call.
+func readEventLines(r io.Reader, sink func(Event, []byte) error, stderrTail *boundedBuffer) error {
 	scanner := bufio.NewScanner(r)
 	// The scan buffer must exceed maxEventLineBytes so an oversized line
 	// surfaces DecodeEvent's typed ErrLineTooLong instead of bufio's own
@@ -518,7 +526,7 @@ func ReadEvents(r io.Reader, sink func(Event) error, stderrTail *boundedBuffer) 
 		if err != nil {
 			return withStderrTail(err, stderrTail)
 		}
-		if err := sink(ev); err != nil {
+		if err := sink(ev, line); err != nil {
 			return withStderrTail(err, stderrTail)
 		}
 	}

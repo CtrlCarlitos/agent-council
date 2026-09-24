@@ -35,7 +35,10 @@ func (e *ErrUnsupportedProfile) Error() string {
 // AgyLaunchPolicy is the verified frozen Agy policy for a run, ready for
 // the launch seam.
 type AgyLaunchPolicy struct {
-	CLIVersion            string
+	CLIVersion string
+	// Model is the frozen harnesses.agy model (the --model pin; init.model
+	// must echo it).
+	Model                 string
 	BinaryPath            string
 	BinaryDigest          string
 	ExpectedHome          string
@@ -85,6 +88,10 @@ func ValidateAgyHarness(profile storage.CanonicalProfile, evidenceRoot string) (
 
 	if profile.ToolkitManifest == nil {
 		return unsupported("profile requires toolkit_manifest")
+	}
+	model := strings.TrimSpace(spec.Model)
+	if model == "" {
+		return unsupported("agy harness requires a frozen model")
 	}
 
 	// Shape/enum rules (spec §3.7), mirrored from the storage freeze
@@ -226,6 +233,7 @@ func ValidateAgyHarness(profile storage.CanonicalProfile, evidenceRoot string) (
 
 	return AgyLaunchPolicy{
 		CLIVersion:            a.CLIVersion,
+		Model:                 model,
 		BinaryPath:            binaryPath,
 		BinaryDigest:          strings.ToLower(strings.TrimSpace(a.BinaryDigest)),
 		ExpectedHome:          expectedHome,
