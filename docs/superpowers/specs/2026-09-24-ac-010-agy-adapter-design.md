@@ -949,15 +949,17 @@ none is claimed by the design.
     (a new process on the same conversation after `init` equality) and
     says so; the operator surface is follow-up work (AC-008/AC-009 share
     the same gap).
-18. First-attestation bootstrap (§3.2, §4 Stage C) — a GAP.
-    `RecordAgyProbeAttestation` is a Go method with no HTTP route, and a
-    service configured with `AgyBinaryPath` refuses construction until a
-    covering row exists, so no production entry point can record the
-    FIRST row. The acceptance test records it through the service
-    operation on a configured fixture-scoped instance; the evidence
-    script's Stage C produces the draft record set and names the
-    operation, and never writes storage rows. An operator entry point is
-    follow-up work (the AC-009 script records the same absence).
+18. Attestation bootstrap (§3.2, §4). Production construction requires
+    a covering attestation row, and the first row must be recordable
+    before the adapter exists. `RecordAgyProbeAttestation` therefore
+    depends only on the store, the operator credential and the
+    configured agy profile and evidence root, never on a wired adapter;
+    and a server configured with `AgyBinaryPath` but without a covering
+    row starts WITHOUT the agy adapter in an explicit "awaiting
+    attestation" state (surfaced on the server status surface and
+    logged; every agy operation refuses with the typed ineligibility
+    error). After the row is recorded, a restart constructs the adapter.
+    No child runs before eligibility in either state.
 19. Evidence helpers (§4 Stage A). The sealed-vs-path comparison and the
     freeze-time canonical digests use two `-tags evidence` Go test
     helpers instead of a new binary: `TestSealedProbe`
@@ -971,22 +973,3 @@ none is claimed by the design.
     executor's child environment exactly (PATH TMPDIR TERM LANG LC_ALL
     USER, HOME, COUNCIL_*), so the comparison isolates the exec
     mechanism.
-17. Known gap — controller disposition for Uncertain turn attempts
-    (§3.9, §3.10). `agy_turn_attempts.uncertainty_disposition` exists,
-    but no service operation records a controller disposition for an
-    Uncertain attempt, so such an attempt keeps blocking its
-    conversation. The codex adapter (AC-009) has the same column and
-    the same gap. Tracked as a follow-up issue covering both adapters;
-    the acceptance scenario that needs a disposition writes the row
-    directly and is labelled as a stand-in.
-18. Attestation bootstrap (§3.2, §4). Production construction requires
-    a covering attestation row, and the first row must be recordable
-    before the adapter exists. `RecordAgyProbeAttestation` therefore
-    depends only on the store, the operator credential and the
-    configured agy profile and evidence root, never on a wired adapter;
-    and a server configured with `AgyBinaryPath` but without a covering
-    row starts WITHOUT the agy adapter in an explicit "awaiting
-    attestation" state (surfaced on the server status surface and
-    logged; every agy operation refuses with the typed ineligibility
-    error). After the row is recorded, a restart constructs the adapter.
-    No child runs before eligibility in either state.
