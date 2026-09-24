@@ -23,15 +23,13 @@ import (
 // may be launched: no shrinking, no growing, no writing, and the seal set
 // itself may never be extended again. Equality (not "at least") is
 // checked everywhere this is used, so a host that additionally forces
-// MFD_NOEXEC_SEAL (adding F_SEAL_EXEC/F_SEAL_FUTURE_WRITE to the memfd
-// unasked) fails closed instead of silently accepting a differently
-// sealed image.
+// MFD_NOEXEC_SEAL (adding F_SEAL_EXEC to the memfd unasked) fails closed
+// instead of silently accepting a differently sealed image.
 const requiredSeals = unix.F_SEAL_SHRINK | unix.F_SEAL_GROW | unix.F_SEAL_WRITE | unix.F_SEAL_SEAL
 
 // createSealedMemfd creates the memfd that will hold the pinned
 // executable's bytes. It asks for MFD_EXEC first: without it, a kernel
-// built with CONFIG_MEMFD_CREATE's default-noexec behavior (or one
-// where the sysctl vm.memfd_noexec forces it) marks the memfd
+// where the sysctl vm.memfd_noexec enforces it marks the memfd
 // non-executable regardless of MFD_ALLOW_SEALING, which would make the
 // later exec of /proc/self/fd/<dup> fail with ENOEXEC/EACCES even
 // though every seal check passed. MFD_EXEC was added in Linux 6.3

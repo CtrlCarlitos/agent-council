@@ -615,11 +615,11 @@ func TestStart_SealedImage_SlowChildVerifiedBeforeOutput(t *testing.T) {
 	// finished, and Start returned, before the child ran past its
 	// sleep — a non-blocking-read timing window would flake under
 	// -race on a loaded runner; this cannot.
-	startReturned := time.Now()
 	proc, err := New().Start(context.Background(), req)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	startReturned := time.Now()
 
 	out, err := io.ReadAll(proc.Stdout())
 	if err != nil {
@@ -969,6 +969,11 @@ func TestManagedProcess_Interrupt_SealedImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = proc.Terminate(ctx)
+	})
 
 	if err := proc.Interrupt(); err != nil {
 		t.Fatalf("Interrupt: %v", err)
@@ -1009,6 +1014,11 @@ func TestManagedProcess_ExecutableIdentity_PathLaunch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = proc.Terminate(ctx)
+	})
 
 	ident := proc.ExecutableIdentity()
 	if ident.Path != fixturePath {
@@ -1101,6 +1111,11 @@ func TestStart_SealedImage_StrictNetworkNone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = proc.Terminate(ctx)
+	})
 
 	ident := proc.ExecutableIdentity()
 	if ident.Digest != img.Digest {
