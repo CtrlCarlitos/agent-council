@@ -307,7 +307,7 @@ stage_a() {
                                             value: (if type=="string" then [] else ([.tools[]? | (if type=="string" then . else (.name // "") end)]) end) })
                                    | from_entries),
               plugin_tools: [] }' > "$inv_draft" 2>/dev/null \
-            && note "A.3b DRAFT tool inventory -> stage-a-tool-inventory.DRAFT.json (UNVERIFIED: review against the raw id:103 frame, add plugin_tools, then commit as docs/superpowers/evidence/ac009-native-tool-inventory-<version>.json and pin its sha256 in the profile)" \
+            && note "A.3b DRAFT tool inventory -> stage-a-tool-inventory.DRAFT.json (UNVERIFIED and NOT an accepted evidence path: the response shape is not schema-pinned and plugin tools cannot be enumerated natively, so production REFUSES any profile with non-empty expected_mcp_servers/expected_mcp_tools/expected_plugin_tools until a schema-pinned derivation exists; the draft is research material for that work)" \
             || note "A.3b DRAFT tool inventory: extraction failed on this response shape (record honestly; author the capture from the raw frame)"
     else
         note "A.3b DRAFT tool inventory: not produced (mcpServerStatus/list unanswered)"
@@ -803,8 +803,9 @@ stage_c() {
         echo "  The service REFUSES anything that does not cover the run's frozen profile:"
         echo "  every built-in class (Read/Glob/Grep/Bash) exactly once, EXACTLY the frozen"
         echo "  expected_mcp_tools and expected_plugin_tools inventories (set equality — a"
-        echo "  server is never covered by probing one of its tools; the profile itself only"
-        echo "  freezes when those lists equal the digest-bound native capture), all five mutation"
+        echo "  server is never covered by probing one of its tools; NOTE: a profile with a"
+        echo "  non-empty MCP/plugin inventory is not launchable at all until a schema-pinned"
+        echo "  native evidence path exists — only empty inventories unlock production), all five mutation"
         echo "  operations on every mutation-capable"
         echo "  path, and a native_refusal_enum approval_deny record for every pinned approval"
         echo "  method with a schema-native refusal enum; unexpected or duplicate coverage is"

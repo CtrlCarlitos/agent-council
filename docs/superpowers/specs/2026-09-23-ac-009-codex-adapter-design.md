@@ -684,20 +684,23 @@ adapter side effect.
   `expected_mcp_servers`) and `expected_plugin_tools` (exact
   skill/plugin-contributed tool names) are the EXACT, digest-bound tool
   inventories the attestation coverage rule (§3.7) enumerates; both are
-  required (`[]` when none). They are PROVEN complete, not asserted:
-  whenever the profile enables any MCP server or plugin tool it must
-  bind `tool_inventory_path`/`tool_inventory_digest` — a committed,
-  provider-free native tool-inventory capture (Council shape:
-  `{codex_cli_version, mcp_servers: {server: [tool…]}, plugin_tools}`,
-  produced from the Stage A `mcpServerStatus/list` capture plus the
-  native skills inventory, operator-reviewed, digest-pinned). Freeze
-  re-hashes it and requires its server, `<server>/<tool>`, and plugin
-  sets to EQUAL the frozen lists, so a profile cannot omit an enabled
-  tool and still pass exact-set coverage. The capture is version-bound
-  evidence: tool-level LIVE verification at dispatch remains an
-  integration obligation (the pinned `mcpServerStatus/list` shape is
-  verified at server granularity only) and is listed as unverified in
-  the evidence matrix until the real integration run proves it.
+  required (`[]` when none). **Gate (honest gap)**: no committed
+  evidence path yet proves a NON-EMPTY inventory equals the installed
+  native inventory — the `mcpServerStatus/list` response shape is not
+  schema-pinned (no deterministic parser can bind the raw response) and
+  no native plugin/skill inventory surface is pinned — so profile freeze
+  REFUSES any profile enabling an MCP server or plugin tool; only empty
+  inventories are launchable, kept affirmatively empty by the dispatch-
+  time server-level drift check. The binding slot for the eventual
+  evidence is `tool_inventory_path`/`tool_inventory_digest` (Council
+  shape `{codex_cli_version, mcp_servers: {server: [tool…]}, plugin_tools}`,
+  strictly decoded: one value, known keys once, no duplicates) with the
+  equality rule already implemented (server, `<server>/<tool>`, and
+  plugin sets must EQUAL the frozen lists); it becomes an accepted path
+  only once it binds the RAW native response plus a schema-pinned
+  derivation, or an operator attestation carrying the raw-response
+  digest with a verified native plugin source. An operator-edited
+  capture alone is not native evidence and unlocks nothing.
   - **Normalization**: the existing family — BOM trim, NFC, dedupe,
     byte-wise lexicographic sort for array fields (case-sensitive; the
     lowercasing quirk of `tooling` is NOT applied here); scalars trimmed +
