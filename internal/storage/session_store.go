@@ -24,10 +24,11 @@ type SessionRecord struct {
 }
 
 type PendingPrompt struct {
-	SessionID string    `json:"session_id"`
-	TurnKey   string    `json:"turn_key"`
-	Prompt    string    `json:"prompt"`
-	CreatedAt time.Time `json:"created_at"`
+	SessionID     string    `json:"session_id"`
+	TurnKey       string    `json:"turn_key"`
+	Prompt        string    `json:"prompt"`
+	RequiredTools []string  `json:"required_tools,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 type journalPayload struct {
@@ -465,7 +466,8 @@ func (s *Store) QueuePrompt(ctx context.Context, opID string, callerLease string
 	}
 
 	sanitized := SanitizeText(prompt.Prompt)
-	fp := computeFingerprint("queue_prompt", sessionID, prompt.TurnKey, sanitized)
+	requiredToolsJSON := marshalStrings(prompt.RequiredTools)
+	fp := computeFingerprint("queue_prompt", sessionID, prompt.TurnKey, sanitized, requiredToolsJSON)
 
 	tx, err := s.BeginWrite(ctx)
 	if err != nil {
@@ -529,10 +531,10 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 	}
 
 	// Check if already in pending_prompts
-	var existingPendingPrompt string
-	err = tx.Tx().QueryRowContext(ctx, "SELECT prompt FROM pending_prompts WHERE session_id = ? AND turn_key = ?;", sessionID, prompt.TurnKey).Scan(&existingPendingPrompt)
+	var existingPendingPrompt, existingRequiredTools string
+	err = tx.Tx().QueryRowContext(ctx, "SELECT prompt, required_tools_json FROM pending_prompts WHERE session_id = ? AND turn_key = ?;", sessionID, prompt.TurnKey).Scan(&existingPendingPrompt, &existingRequiredTools)
 	if err == nil {
-		if existingPendingPrompt == sanitized {
+		if existingPendingPrompt == sanitized && existingRequiredTools == requiredToolsJSON {
 			receipt := OperationReceipt{
 				OpID:             opID,
 				CommandType:      "queue_prompt",
@@ -559,8 +561,8 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 
 	// Insert into pending_prompts
 	_, err = tx.Tx().ExecContext(ctx, `
-INSERT INTO pending_prompts (session_id, turn_key, prompt, queued_at)
-VALUES (?, ?, ?, ?);`, sessionID, prompt.TurnKey, sanitized, now)
+INSERT INTO pending_prompts (session_id, turn_key, prompt, queued_at, required_tools_json)
+VALUES (?, ?, ?, ?, ?);`, sessionID, prompt.TurnKey, sanitized, now, requiredToolsJSON)
 	if err != nil {
 		return OperationReceipt{}, fmt.Errorf("insert pending prompt: %w", err)
 	}

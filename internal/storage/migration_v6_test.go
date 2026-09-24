@@ -18,8 +18,8 @@ func TestAC009_MigrationV6_FreshStoreHasEpisodeTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schema version: %v", err)
 	}
-	if ver != 6 {
-		t.Fatalf("expected schema version exactly 6, got %d", ver)
+	if ver != 7 {
+		t.Fatalf("expected schema version exactly 7, got %d", ver)
 	}
 	var name string
 	if err := store.DB().QueryRow(
@@ -85,8 +85,8 @@ VALUES ('codex-sess', '01934f7a-1b2c-7def-9abc-def01234567a', 0, 'm', 'w', 'cpro
 	if err != nil {
 		t.Fatalf("CurrentSchemaVersion: %v", err)
 	}
-	if ver != 6 {
-		t.Fatalf("expected schema version exactly 6, got %d", ver)
+	if ver != 7 {
+		t.Fatalf("expected schema version exactly 7, got %d", ver)
 	}
 	var v6Name, v6Checksum string
 	if err := store.readDB.QueryRow("SELECT name, checksum FROM schema_migrations WHERE version = 6;").Scan(&v6Name, &v6Checksum); err != nil {
