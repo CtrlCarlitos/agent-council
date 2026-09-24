@@ -11,6 +11,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -180,5 +181,86 @@ func (p *agyProcess) settle(bound time.Duration) int {
 	case <-time.After(time.Until(deadline)):
 		p.kill()
 		return <-exited
+	}
+}
+
+// ── Gate captures (`models`, `plugin list`) ─────────────────────────────
+
+// captureLimit bounds each captured stream of a gate launch; output
+// beyond it is drained and the capture reported as overflowed.
+const captureLimit = 1 << 20
+
+// captureResult is one gate launch's bounded stdout/stderr and exit code.
+type captureResult struct {
+	stdout, stderr []byte
+	overflow       bool
+	exitCode       int
+}
+
+// errCaptureTimeout reports a gate launch that did not finish within
+// its bound; the child was terminated.
+var errCaptureTimeout = errors.New("agy gate launch did not finish within the bound")
+
+// limitedBuffer keeps the first captureLimit bytes and drains the rest.
+type limitedBuffer struct {
+	buf      []byte
+	overflow bool
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	if room := captureLimit - len(b.buf); room > 0 {
+		if len(p) > room {
+			b.buf = append(b.buf, p[:room]...)
+			b.overflow = true
+		} else {
+			b.buf = append(b.buf, p...)
+		}
+	} else if len(p) > 0 {
+		b.overflow = true
+	}
+	return len(p), nil
+}
+
+// runCapture starts one provider-free gate launch through the executor
+// (sealed and verified like every launch), closes its stdin at once
+// (no input ever exists for these subcommands), reads both streams to
+// EOF with a bounded buffer, and reaps the child — all within bound. On
+// timeout the child is terminated and errCaptureTimeout returned. The
+// caller's context never bounds the child (adapter-owned bounds only).
+func runCapture(executor execpolicy.PolicyExecutor, req execpolicy.LaunchRequest, bound time.Duration) (captureResult, error) {
+	proc, err := executor.Start(context.Background(), req)
+	if err != nil {
+		return captureResult{}, fmt.Errorf("gate launch start: %w", err)
+	}
+	_ = proc.Stdin().Close()
+
+	var out, errOut limitedBuffer
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(&out, proc.Stdout()); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(&errOut, proc.Stderr()); done <- struct{}{} }()
+
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	terminate := func() (captureResult, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), terminateTimeout)
+		defer cancel()
+		_ = proc.Terminate(ctx)
+		return captureResult{}, errCaptureTimeout
+	}
+	for pending := 2; pending > 0; {
+		select {
+		case <-done:
+			pending--
+		case <-timer.C:
+			return terminate()
+		}
+	}
+	exited := make(chan int, 1)
+	go func() { code, _ := proc.Wait(); exited <- code }()
+	select {
+	case code := <-exited:
+		return captureResult{stdout: out.buf, stderr: errOut.buf, overflow: out.overflow || errOut.overflow, exitCode: code}, nil
+	case <-timer.C:
+		return terminate()
 	}
 }

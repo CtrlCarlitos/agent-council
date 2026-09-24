@@ -38,17 +38,24 @@ type AgyLaunchPolicy struct {
 	CLIVersion string
 	// Model is the frozen harnesses.agy model (the --model pin; init.model
 	// must echo it).
-	Model                 string
-	BinaryPath            string
-	BinaryDigest          string
-	ExpectedHome          string
-	PlatformOS            string
-	PlatformFamily        string
-	PermissionMode        string
-	ExecutionMode         string
-	Sandbox               bool
-	PrintTimeoutBackstop  time.Duration
-	ExpectedTools         []string
+	Model                string
+	BinaryPath           string
+	BinaryDigest         string
+	ExpectedHome         string
+	PlatformOS           string
+	PlatformFamily       string
+	PermissionMode       string
+	ExecutionMode        string
+	Sandbox              bool
+	PrintTimeoutBackstop time.Duration
+	ExpectedTools        []string
+	// ExpectedMCPServers/ExpectedMCPTools/ExpectedPluginTools are the
+	// frozen native inventories, always empty for a launchable profile
+	// (the §3.7 inventory-evidence gate); the production-eligibility
+	// gate re-checks them (eligibility.go).
+	ExpectedMCPServers    []string
+	ExpectedMCPTools      []string
+	ExpectedPluginTools   []string
 	ExpectedSkills        []string
 	DefaultRequiredTools  []string
 	RequiredHooks         []string
@@ -244,6 +251,9 @@ func ValidateAgyHarness(profile storage.CanonicalProfile, evidenceRoot string) (
 		Sandbox:               a.Sandbox,
 		PrintTimeoutBackstop:  time.Duration(a.PrintTimeoutBackstopSeconds) * time.Second,
 		ExpectedTools:         append([]string(nil), a.ExpectedTools...),
+		ExpectedMCPServers:    append([]string(nil), a.ExpectedMCPServers...),
+		ExpectedMCPTools:      append([]string(nil), a.ExpectedMCPTools...),
+		ExpectedPluginTools:   append([]string(nil), a.ExpectedPluginTools...),
 		ExpectedSkills:        append([]string(nil), a.ExpectedSkills...),
 		DefaultRequiredTools:  append([]string(nil), a.DefaultRequiredTools...),
 		RequiredHooks:         append([]string(nil), a.RequiredHooks...),
@@ -323,9 +333,27 @@ var allowedPluginComponents = map[string]struct{}{
 // insignificant whitespace), and requires the canonical bytes to equal
 // raw EXACTLY (spec §3.2 canonical-bytes rule).
 func validatePluginsCanonicalBytes(raw []byte) error {
+	canonBytes, err := canonicalPluginsBytes(raw)
+	if err != nil {
+		return err
+	}
+	if string(canonBytes) != string(raw) {
+		return fmt.Errorf("committed plugins evidence bytes are not the canonical encoding")
+	}
+	return nil
+}
+
+// canonicalPluginsBytes strictly decodes a `plugin list` capture,
+// validates its pinned shape, and returns its canonical re-encoding
+// (spec §3.2). The committed evidence must equal it byte for byte; the
+// live output is compared by the digest of it (toolkit.go).
+func canonicalPluginsBytes(raw []byte) ([]byte, error) {
 	var doc pluginsEvidence
 	if err := evidence.DecodeStrictObject(raw, &doc); err != nil {
-		return fmt.Errorf("decode plugins evidence: %w", err)
+		return nil, fmt.Errorf("decode plugins evidence: %w", err)
+	}
+	if doc.Imports == nil {
+		return nil, fmt.Errorf("plugins evidence lacks the imports array")
 	}
 	imports := append([]pluginImport(nil), doc.Imports...)
 	sort.Slice(imports, func(i, j int) bool { return imports[i].Name < imports[j].Name })
@@ -333,25 +361,25 @@ func validatePluginsCanonicalBytes(raw []byte) error {
 	seenNames := make(map[string]struct{}, len(imports))
 	for _, imp := range imports {
 		if strings.TrimSpace(imp.Name) == "" {
-			return fmt.Errorf("plugins evidence import has an empty name")
+			return nil, fmt.Errorf("plugins evidence import has an empty name")
 		}
 		if _, dup := seenNames[imp.Name]; dup {
-			return fmt.Errorf("plugins evidence import %q is duplicated", imp.Name)
+			return nil, fmt.Errorf("plugins evidence import %q is duplicated", imp.Name)
 		}
 		seenNames[imp.Name] = struct{}{}
 		if strings.TrimSpace(imp.Source) == "" {
-			return fmt.Errorf("plugins evidence import %q has an empty source", imp.Name)
+			return nil, fmt.Errorf("plugins evidence import %q has an empty source", imp.Name)
 		}
 		if _, err := time.Parse(time.RFC3339, imp.ImportedAt); err != nil {
-			return fmt.Errorf("plugins evidence import %q importedAt must be RFC3339: %w", imp.Name, err)
+			return nil, fmt.Errorf("plugins evidence import %q importedAt must be RFC3339: %w", imp.Name, err)
 		}
 		if len(imp.Components) == 0 {
-			return fmt.Errorf("plugins evidence import %q has no components", imp.Name)
+			return nil, fmt.Errorf("plugins evidence import %q has no components", imp.Name)
 		}
 		comps := sortedUniqueTrimmed(imp.Components)
 		for _, c := range comps {
 			if _, ok := allowedPluginComponents[c]; !ok {
-				return fmt.Errorf("plugins evidence import %q has unknown component %q", imp.Name, c)
+				return nil, fmt.Errorf("plugins evidence import %q has unknown component %q", imp.Name, c)
 			}
 		}
 		compsAny := make([]any, len(comps))
@@ -368,12 +396,9 @@ func validatePluginsCanonicalBytes(raw []byte) error {
 	canonicalDoc := map[string]any{"imports": canonicalImports}
 	canonBytes, err := evidence.Canonical(canonicalDoc)
 	if err != nil {
-		return fmt.Errorf("canonicalize plugins evidence: %w", err)
+		return nil, fmt.Errorf("canonicalize plugins evidence: %w", err)
 	}
-	if string(canonBytes) != string(raw) {
-		return fmt.Errorf("committed plugins evidence bytes are not the canonical encoding")
-	}
-	return nil
+	return canonBytes, nil
 }
 
 // coverageEvidenceDoc is the typed shape of the tool_coverage_path

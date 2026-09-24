@@ -59,8 +59,12 @@ func agyFixture(t *testing.T) *agytest.Fixture {
 // ── test executor ───────────────────────────────────────────────────────
 
 type testExecutor struct {
-	inner  execpolicy.PolicyExecutor
-	starts atomic.Int32
+	inner execpolicy.PolicyExecutor
+	// starts counts create/turn (stream-json) launches only; gateStarts
+	// counts the provider-free gate launches (`models`, `plugin list`,
+	// Task 6), which the beforeStart/wrapProc/lastReq seams never see.
+	starts     atomic.Int32
+	gateStarts atomic.Int32
 
 	mu          sync.Mutex
 	beforeStart func(req execpolicy.LaunchRequest) error
@@ -68,7 +72,20 @@ type testExecutor struct {
 	lastReq     execpolicy.LaunchRequest
 }
 
+// isGateLaunch reports a provider-free gate launch (`models` or
+// `plugin list`).
+func isGateLaunch(req execpolicy.LaunchRequest) bool {
+	return len(req.Args) > 0 && (req.Args[0] == "models" || req.Args[0] == "plugin")
+}
+
 func (e *testExecutor) Start(ctx context.Context, req execpolicy.LaunchRequest) (execpolicy.ManagedProcess, error) {
+	if isGateLaunch(req) {
+		if req.SealedImage == nil && runtime.GOOS != "linux" {
+			req.FixtureLaunch = true
+		}
+		e.gateStarts.Add(1)
+		return e.inner.Start(ctx, req)
+	}
 	e.mu.Lock()
 	before, wrap := e.beforeStart, e.wrapProc
 	e.lastReq = req
@@ -157,6 +174,7 @@ type agyHarness struct {
 	store         *storage.Store
 	wm            *workspace.WorkspaceManager
 	fx            *agytest.Fixture
+	evidenceRoot  string
 	exec          *testExecutor
 	source        *StorageLaunchSource
 	policy        AgyLaunchPolicy
@@ -189,6 +207,15 @@ func newAgyHarnessProfile(t *testing.T, mutate func(*storage.CanonicalProfile)) 
 	a.BinaryDigest = fx.Digest
 	a.ExpectedHome = home
 	a.Platform = storage.AgyPlatformSpec{OS: runtime.GOOS, Family: "unix"}
+	// The configured toolkit state the Task 6 checks verify before every
+	// launch, staged in the temp home: the hooks capture (its canonical
+	// digest frozen) and the one expected skill directory.
+	a.HooksConfigDigest = stageHooks(t, home, defaultHooksJSON)
+	for _, skill := range a.ExpectedSkills {
+		if err := os.MkdirAll(filepath.Join(home, "antigravity-cli", "skills", skill), 0o700); err != nil {
+			t.Fatalf("mkdir skill: %v", err)
+		}
+	}
 	if mutate != nil {
 		mutate(&profile)
 	}
@@ -234,7 +261,7 @@ func newAgyHarnessProfile(t *testing.T, mutate func(*storage.CanonicalProfile)) 
 	}
 
 	h := &agyHarness{
-		t: t, stateDir: stateDir, store: store, wm: wm, fx: fx,
+		t: t, stateDir: stateDir, store: store, wm: wm, fx: fx, evidenceRoot: evidenceRoot,
 		exec:   &testExecutor{inner: execpolicy.New()},
 		policy: policy, profile: profile, profileDigest: digest,
 		model:    profile.Harnesses["agy"].Model,
@@ -256,6 +283,41 @@ func (h *agyHarness) newAdapter() *AgyAdapter {
 		h.t.Fatalf("NewFixtureScopedAdapter: %v", err)
 	}
 	return a
+}
+
+// defaultHooksJSON is the staged operator hooks capture: one guardrail
+// entry with a non-empty command and no disabled marker.
+const defaultHooksJSON = `{"guardrail": {"command": "guardrail.sh", "enabled": true, "event": "PreToolUse"}}`
+
+// stageHooks writes raw as <home>/config/hooks.json and returns its
+// canonical digest (what the profile freezes as hooks_config_digest).
+func stageHooks(t *testing.T, home, raw string) string {
+	t.Helper()
+	dir := filepath.Join(home, "config")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir hooks dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "hooks.json"), []byte(raw), 0o600); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
+	}
+	digest, err := CanonicalHooksConfigDigest([]byte(raw))
+	if err != nil {
+		t.Fatalf("hooks digest: %v", err)
+	}
+	return digest
+}
+
+// gateLines returns the gate-launch argv log lines of kind ("models" or
+// "plugin\x1flist").
+func (h *agyHarness) gateLines(kind string) []string {
+	h.t.Helper()
+	var out []string
+	for _, l := range h.fixtureFile(".agy-fixture-gate-args") {
+		if l == kind {
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 func defaultAttempt(ref adapter.TurnRef) (string, bool) {

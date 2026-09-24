@@ -83,6 +83,11 @@ package agy
 //   {"models_catalog": [...]}            `agy models` catalog override
 //   {"models_not_signed_in": true}       `agy models` not-signed-in text
 //   {"plugin_list_drift": "<raw text>"}  `agy plugin list` drifted output
+//   {"models_error": "<text>"}           `agy models` prints <text> to
+//                                        stderr and exits 1 (transport/
+//                                        network failure)
+//   {"models_hang_ms": N}                `agy models` sleeps N ms before
+//                                        any output (auth-gate timeout)
 //   {"version": "<string>"}              --version output
 //   {"materialize": true}                right after init, create
 //                                        <HOME>/.gemini/antigravity-cli/
@@ -99,6 +104,11 @@ package agy
 //   .agy-fixture-input   the single stdin line read, verbatim
 //   .agy-fixture-env     "HOME=<value>" of the child's environment, one
 //                        line per invocation
+//   .agy-fixture-gate-args / .agy-fixture-gate-env
+//                        the same two logs for the provider-free gate
+//                        subcommands (`models`, `plugin list`), kept
+//                        apart so the stream-json logs stay one line
+//                        per create/turn launch
 
 import (
 	"fmt"
@@ -179,6 +189,8 @@ type directive struct {
 	ModelsCatalog       []string          ` + "`" + `json:"models_catalog"` + "`" + `
 	ModelsNotSignedIn   bool              ` + "`" + `json:"models_not_signed_in"` + "`" + `
 	PluginListDrift     string            ` + "`" + `json:"plugin_list_drift"` + "`" + `
+	ModelsError         string            ` + "`" + `json:"models_error"` + "`" + `
+	ModelsHangMs        int64             ` + "`" + `json:"models_hang_ms"` + "`" + `
 	Version             string            ` + "`" + `json:"version"` + "`" + `
 	Materialize         bool              ` + "`" + `json:"materialize"` + "`" + `
 	SpawnSleeper        bool              ` + "`" + `json:"spawn_sleeper"` + "`" + `
@@ -199,6 +211,8 @@ type scenarioState struct {
 	modelsCatalog      []string
 	modelsNotSignedIn  bool
 	pluginListDrift    string
+	modelsError        string
+	modelsHangMs       int64
 	version            string
 	materialize        bool
 	spawnSleeper       bool
@@ -264,6 +278,10 @@ func loadScenario() *scenarioState {
 			st.modelsNotSignedIn = true
 		case d.PluginListDrift != "":
 			st.pluginListDrift = d.PluginListDrift
+		case d.ModelsError != "":
+			st.modelsError = d.ModelsError
+		case d.ModelsHangMs > 0:
+			st.modelsHangMs = d.ModelsHangMs
 		case d.Version != "":
 			st.version = d.Version
 		case d.Materialize:
@@ -350,6 +368,13 @@ func findConversationArg(args []string) (string, bool) {
 }
 
 func handleModels(st *scenarioState) {
+	if st.modelsHangMs > 0 {
+		time.Sleep(time.Duration(st.modelsHangMs) * time.Millisecond)
+	}
+	if st.modelsError != "" {
+		fmt.Fprintln(os.Stderr, st.modelsError)
+		os.Exit(1)
+	}
 	if st.modelsNotSignedIn {
 		fmt.Println("You are not logged into Antigravity. Run ` + "`" + `agy` + "`" + ` to sign in.")
 		return
@@ -532,8 +557,15 @@ func main() {
 		time.Sleep(10 * time.Minute)
 		return
 	}
-	appendLine(".agy-fixture-args", strings.Join(args, "\x1f"))
-	appendLine(".agy-fixture-env", "HOME="+os.Getenv("HOME"))
+	// The provider-free gate subcommands (models, plugin list) log to
+	// their own files so a stream-json launch's argv/env evidence stays
+	// one line per create/turn launch.
+	argsLog, envLog := ".agy-fixture-args", ".agy-fixture-env"
+	if (len(args) > 0 && args[0] == "models") || (len(args) > 1 && args[0] == "plugin" && args[1] == "list") {
+		argsLog, envLog = ".agy-fixture-gate-args", ".agy-fixture-gate-env"
+	}
+	appendLine(argsLog, strings.Join(args, "\x1f"))
+	appendLine(envLog, "HOME="+os.Getenv("HOME"))
 
 	st := loadScenario()
 

@@ -6,6 +6,7 @@ package agy
 // prompt byte exists on the wire.
 //
 //   - CreateSession: eligibility → persisted-binding idempotency →
+//     toolkit configured state (Task 6) →
 //     frozen creation launch (no --conversation) → init verified (UUIDv4
 //     id, permission mode, model, cwd, tools) → stdin closed WITHOUT a
 //     message → bounded exit. The adapter never persists: the service
@@ -13,7 +14,8 @@ package agy
 //     reservation; an uncertain creation tombstones the session.
 //   - ResumeSession: local inspection only (binding + conversation file).
 //   - Dispatch: single flight per native conversation → durable block
-//     check → eligibility → attempt+pdig AND launch reservation in ONE
+//     check → eligibility → toolkit configured state → models auth
+//     gate (Task 6) → attempt+pdig AND launch reservation in ONE
 //     transaction → sealed Start under the inherited operator HOME (exe
 //     identity recorded) → init verified BEFORE the
 //     write (drift ⇒ child terminated, prompt never written, Rejected) →
@@ -198,6 +200,23 @@ type AgyAdapter struct {
 	// transitions (nil in production): a non-nil return replaces the
 	// store call with that error.
 	fault func(op string) error
+
+	// preLaunchCheck is the per-launch toolkit configured-state check
+	// (Task 6, toolkit.go): run after the launch is assembled and
+	// validated and before the creation or turn child starts (a turn's
+	// before its durable reservation). Every constructor sets it to
+	// toolkitCheck — the fixture scope included (validation, not
+	// eligibility); a non-nil error refuses the launch, no child started.
+	preLaunchCheck func(ctx context.Context, sessionID adapter.SessionID) error
+
+	// The `models` auth gate's per-session pass cache (authgate.go):
+	// authPassed[session] is when the gate last passed; a pass older
+	// than authTTL (0 = never cached) re-runs the gate; ResumeSession
+	// and any failure drop the entry. now is the clock (injectable).
+	authMu     sync.Mutex
+	authPassed map[adapter.SessionID]time.Time
+	authTTL    time.Duration
+	now        func() time.Time
 }
 
 // Durable transition names passed to the fault seam.
@@ -313,7 +332,7 @@ func buildAgyAdapter(
 	if _, err := agyHomeDir(policy.ExpectedHome); err != nil {
 		return nil, err
 	}
-	return &AgyAdapter{
+	a := &AgyAdapter{
 		store: store, executor: executor, launch: launch, allocations: allocations, policy: policy,
 		profileDigest: profileDigest, image: image, identity: identity,
 		required: required, attestation: attestation, fixtureScope: fixtureScope,
@@ -324,15 +343,21 @@ func buildAgyAdapter(
 		uncertain: make(map[adapter.SessionID]error),
 
 		materializeErrs: make(map[adapter.SessionID]error),
-	}, nil
+
+		authPassed: make(map[adapter.SessionID]time.Time),
+		authTTL:    defaultAuthGateTTL,
+		now:        time.Now,
+	}
+	a.preLaunchCheck = a.toolkitCheck
+	return a, nil
 }
 
 // ── Probe ───────────────────────────────────────────────────────────────
 
 // Probe reports the adapter's FROZEN identity (CLI version, model) and
-// design capabilities without launching anything: in this phase the
-// provider-free `models` auth gate is not wired (Task 6), so the model
-// inventory is the frozen pin, not a live catalog.
+// design capabilities without launching anything: the model inventory
+// is the frozen pin, not a live catalog (the `models` auth gate runs
+// before a session's first dispatch, authgate.go, never from Probe).
 func (a *AgyAdapter) Probe(ctx context.Context) (adapter.ProbeReport, error) {
 	cancellation := adapter.CapabilitySupported
 	if runtime.GOOS == "windows" {
@@ -490,6 +515,9 @@ func (a *AgyAdapter) createBinding(ctx context.Context, req adapter.CreateSessio
 	if err := a.validateLaunch(ctx, launch, req.SessionID, LaunchCreate, "", launch.Model, ""); err != nil {
 		return adapter.SessionBinding{}, err
 	}
+	if err := a.runPreLaunchCheck(ctx, req.SessionID); err != nil {
+		return adapter.SessionBinding{}, err
+	}
 
 	proc, err := a.executor.Start(context.Background(), launch)
 	if err != nil {
@@ -640,14 +668,23 @@ func (a *AgyAdapter) checkEligibility(sessionID adapter.SessionID) error {
 	if a.fixtureScope {
 		return nil
 	}
-	if a.attestation == nil {
-		return &ErrProductionEligibilityMissing{SessionID: sessionID, Reason: "no attestation lookup is wired"}
+	// The full Task 6 gate (eligibility.go) — platform, sealed image,
+	// inventories, covering attestation — re-checked before every
+	// creation and turn launch (durable lookups only, no process).
+	err := checkProductionEligibility(a.policy, a.image, a.attestation)
+	var missing *ErrProductionEligibilityMissing
+	if errors.As(err, &missing) {
+		missing.SessionID = sessionID
 	}
-	if _, ok := a.attestation(); !ok {
-		return &ErrProductionEligibilityMissing{SessionID: sessionID,
-			Reason: "no valid isolation attestation for the frozen (agy version, platform, manifest, profile) tuple"}
+	return err
+}
+
+// runPreLaunchCheck runs the per-launch toolkit seam (nil = none).
+func (a *AgyAdapter) runPreLaunchCheck(ctx context.Context, sessionID adapter.SessionID) error {
+	if a.preLaunchCheck == nil {
+		return nil
 	}
-	return nil
+	return a.preLaunchCheck(ctx, sessionID)
 }
 
 // validateLaunch is the adapter's closing check on a launch request: the
@@ -813,6 +850,9 @@ func sameDir(a, b string) bool {
 // file still exists at the recorded path, 0600, current uid, recorded
 // identity. Native verification is the next turn's init check.
 func (a *AgyAdapter) ResumeSession(ctx context.Context, binding adapter.SessionBinding) error {
+	// A resumed (parked) session re-proves sign-in: the next dispatch
+	// runs the models auth gate again (spec §3.2 gate step 2).
+	a.invalidateAuth(binding.SessionID)
 	// An empty config would skip the model/workspace comparison: refuse.
 	if strings.TrimSpace(binding.Config.Model) == "" || strings.TrimSpace(binding.Config.WorkspaceRoot) == "" {
 		return fmt.Errorf("resume of %s requires the bound model and workspace root", binding.SessionID)
@@ -991,6 +1031,15 @@ func (a *AgyAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt s
 	}
 	if !sameDir(req.Paths.Root, binding.Workspace) {
 		err := &ErrSessionConfigMismatch{SessionID: ref.SessionID, Field: "workspace", Want: req.Paths.Root, Have: binding.Workspace}
+		return rejectRelease(err.Error(), err)
+	}
+	// Task 6 gates, before anything durable and before any prompt
+	// exists: toolkit configured state (every launch), then the models
+	// auth gate (first dispatch of the session / after resume / TTL).
+	if err := a.runPreLaunchCheck(ctx, ref.SessionID); err != nil {
+		return rejectRelease(err.Error(), err)
+	}
+	if err := a.authGate(ctx, ref.SessionID); err != nil {
 		return rejectRelease(err.Error(), err)
 	}
 	req.TurnKey = ref.TurnKey
