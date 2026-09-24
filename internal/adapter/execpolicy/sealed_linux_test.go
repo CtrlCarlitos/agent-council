@@ -39,6 +39,8 @@ import (
 //     own.
 //   - "fds": lists /proc/self/fd link targets, one per line (used by
 //     the CLOEXEC test: no target should start with "/memfd:").
+//   - "--print=" (an agy-shaped argv): prints "HOME=<$HOME>" so the
+//     agy-only HomeDir env injection can be asserted.
 const fixtureSource = `package main
 
 import (
@@ -53,6 +55,8 @@ func main() {
 		mode = os.Args[1]
 	}
 	switch mode {
+	case "--print=":
+		fmt.Println("HOME=" + os.Getenv("HOME"))
 	case "slow":
 		time.Sleep(300 * time.Millisecond)
 		fmt.Println("slow-done", time.Now().UnixNano())
@@ -1144,5 +1148,74 @@ func TestSha256Hex(t *testing.T) {
 	want := "sha256:" + hex.EncodeToString(sum[:])
 	if got := sha256Hex([]byte("hello")); got != want {
 		t.Fatalf("sha256Hex = %q, want %q", got, want)
+	}
+}
+
+// agyShapedArgs is the minimal argv IsAgyLaunch recognizes.
+func agyShapedArgs() []string {
+	return []string{"--print=", "--input-format", "stream-json", "--output-format", "stream-json"}
+}
+
+// TestStart_AgyHomeDir_SealedLaunchGetsHomeDir: an agy-shaped sealed
+// launch with HomeDir runs with HOME=<HomeDir>, never Paths.Config
+// (AC-010 §3.1: HOME is NOT overridden for authenticated runs).
+func TestStart_AgyHomeDir_SealedLaunchGetsHomeDir(t *testing.T) {
+	requireFixture(t)
+	img, err := NewSealedImage(fixturePath, fixtureDigest)
+	if err != nil {
+		t.Fatalf("NewSealedImage: %v", err)
+	}
+	defer img.Close()
+	home := t.TempDir()
+	paths := sealedTestPaths(t)
+	req := LaunchRequest{
+		SessionID: "sess-agy-home", Command: img.ArgV0, Args: agyShapedArgs(),
+		Paths: paths, Profile: sealedTestProfile([]string{img.ArgV0}),
+		SealedImage: img, HomeDir: home,
+	}
+	proc, err := New().Start(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	out, err := io.ReadAll(proc.Stdout())
+	if err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	_, _ = proc.Wait()
+	if got := strings.TrimSpace(string(out)); got != "HOME="+home {
+		t.Fatalf("agy sealed launch HOME = %q, want %q (never Paths.Config %q)", got, "HOME="+home, paths.Config)
+	}
+
+	// Without HomeDir the same launch keeps HOME=Paths.Config.
+	req.HomeDir = ""
+	proc, err = New().Start(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Start without HomeDir: %v", err)
+	}
+	out, _ = io.ReadAll(proc.Stdout())
+	_, _ = proc.Wait()
+	if got := strings.TrimSpace(string(out)); got != "HOME="+paths.Config {
+		t.Fatalf("launch without HomeDir HOME = %q, want Paths.Config", got)
+	}
+}
+
+// TestStart_AgyHomeDir_MalformedRefused: a relative or unclean HomeDir
+// is refused before any process starts.
+func TestStart_AgyHomeDir_MalformedRefused(t *testing.T) {
+	requireFixture(t)
+	img, err := NewSealedImage(fixturePath, fixtureDigest)
+	if err != nil {
+		t.Fatalf("NewSealedImage: %v", err)
+	}
+	defer img.Close()
+	for _, home := range []string{"relative/home", "/tmp/../tmp/home", "/tmp/home/"} {
+		req := LaunchRequest{
+			SessionID: "sess-agy-home-bad", Command: img.ArgV0, Args: agyShapedArgs(),
+			Paths: sealedTestPaths(t), Profile: sealedTestProfile([]string{img.ArgV0}),
+			SealedImage: img, HomeDir: home,
+		}
+		if _, err := New().Start(context.Background(), req); !errors.Is(err, ErrInvalidLaunchRequest) {
+			t.Fatalf("HomeDir %q: want ErrInvalidLaunchRequest, got %v", home, err)
+		}
 	}
 }

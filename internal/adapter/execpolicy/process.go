@@ -34,6 +34,11 @@ type managedProcess struct {
 	stderr      io.Reader
 	cleanup     func()
 	exeIdentity ExeIdentity
+	// killGroup is set for sealed launches, whose child leads its own
+	// process group (Setpgid): the forced path of Terminate then also
+	// SIGKILLs that group so descendants the child spawned cannot
+	// outlive it. Path launches leave it false (unchanged behavior).
+	killGroup bool
 
 	mu       sync.Mutex
 	waitDone chan struct{}
@@ -129,6 +134,11 @@ func (p *managedProcess) Terminate(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		_ = terminateForcefully(proc)
+		if p.killGroup {
+			// The leader is not reaped yet (or its group still has
+			// members), so its pid still names this process group.
+			_ = killProcessGroup(proc.Pid)
+		}
 		<-p.waitDoneChan()
 		return ctx.Err()
 	}

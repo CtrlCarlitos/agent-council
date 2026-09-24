@@ -187,6 +187,16 @@ type LaunchRequest struct {
 	// a substitute for SealedImage, only the documented escape hatch
 	// where SealedImage cannot exist.
 	FixtureLaunch bool
+	// HomeDir, when set, is emitted as HOME INSTEAD of Paths.Config. It
+	// exists for one launch shape only: an agy launch (IsAgyLaunch) must
+	// run against the operator's authenticated native home (AC-010 spec
+	// §3.1/§3.2: HOME is NOT overridden for authenticated runs; a
+	// relocated HOME is unauthenticated). The executor accepts it only
+	// when the request is agy-shaped, the launch is sealed (or the
+	// explicit fixture marker applies off Linux), and HomeDir is an
+	// absolute, clean path; anything else is ErrInvalidLaunchRequest.
+	// Every other launch keeps HOME=Paths.Config.
+	HomeDir string
 }
 
 // CapabilityChecker verifies whether the host environment supports required isolation capabilities.
@@ -352,6 +362,15 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 		}
 	}
 
+	// 6b. The agy-only HOME override (never for any other launch shape).
+	home := req.Paths.Config
+	if req.HomeDir != "" {
+		if err := validateHomeDir(req); err != nil {
+			return nil, err
+		}
+		home = req.HomeDir
+	}
+
 	// 7. Construct sanitized environment allowlist
 	var env []string
 	baseKeys := []string{"PATH", "TMPDIR", "TERM", "LANG", "LC_ALL", "USER"}
@@ -365,7 +384,7 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 			}
 		}
 	}
-	env = append(env, "HOME="+req.Paths.Config)
+	env = append(env, "HOME="+home)
 	env = append(env, "COUNCIL_WORKSPACE_ROOT="+req.Paths.Root)
 	if runID != "" {
 		env = append(env, "COUNCIL_RUN_ID="+runID)
@@ -546,6 +565,23 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 		cleanup:     cleanup,
 		exeIdentity: ExeIdentity{Path: req.Command},
 	}, nil
+}
+
+// validateHomeDir admits LaunchRequest.HomeDir only on an agy-shaped,
+// sealed (or off-Linux fixture-marked) launch with an absolute, clean
+// path.
+func validateHomeDir(req LaunchRequest) error {
+	if !IsAgyLaunch(req) {
+		return fmt.Errorf("%w: HomeDir is accepted only on an agy launch", ErrInvalidLaunchRequest)
+	}
+	sealed := req.SealedImage != nil || (req.FixtureLaunch && runtime.GOOS != "linux")
+	if !sealed {
+		return fmt.Errorf("%w: HomeDir requires a sealed agy launch", ErrInvalidLaunchRequest)
+	}
+	if !filepath.IsAbs(req.HomeDir) || filepath.Clean(req.HomeDir) != req.HomeDir {
+		return fmt.Errorf("%w: HomeDir %q must be an absolute, clean path", ErrInvalidLaunchRequest, req.HomeDir)
+	}
+	return nil
 }
 
 func validateGitCommand(req LaunchRequest, runID string) error {

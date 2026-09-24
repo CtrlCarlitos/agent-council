@@ -198,6 +198,7 @@ func startSealed(ctx context.Context, req LaunchRequest, env []string, cleanup f
 		stdout:    stdoutPipe,
 		stderr:    stderrPipe,
 		cleanup:   cleanup,
+		killGroup: true,
 		exeIdentity: ExeIdentity{
 			DevIno: res.ident.DevIno,
 			Digest: res.ident.Digest,

@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/execpolicy"
+	"github.com/CtrlCarlitos/agent-council/internal/adapter/workspace"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
@@ -542,5 +543,30 @@ func f() execpolicy.LaunchRequest {
 				t.Fatalf("caught=%v (violations=%v), want caught=%v", caught, violations, tc.wantCaught)
 			}
 		})
+	}
+}
+
+// TestPolicyExecutor_HomeDir_RefusedOffAgyShape: LaunchRequest.HomeDir
+// is an agy-only extension. A non-agy launch carrying it is refused
+// before any process starts, and so is an unsealed agy launch.
+func TestPolicyExecutor_HomeDir_RefusedOffAgyShape(t *testing.T) {
+	root := t.TempDir()
+	config := t.TempDir()
+	paths := workspace.WorkspacePaths{Root: root, Config: config, Worktree: root, Mode: "isolated_branch"}
+	nonAgy := execpolicy.LaunchRequest{
+		SessionID: "sess-home-nonagy", Command: "echo", Args: []string{"hello"},
+		Paths: paths, Profile: agyProfile(), HomeDir: t.TempDir(),
+	}
+	nonAgy.Profile.Tooling = []string{"echo"}
+	if _, err := execpolicy.New().Start(context.Background(), nonAgy); !errors.Is(err, execpolicy.ErrInvalidLaunchRequest) {
+		t.Fatalf("non-agy launch with HomeDir: want ErrInvalidLaunchRequest, got %v", err)
+	}
+
+	unsealed := execpolicy.LaunchRequest{
+		SessionID: "sess-home-unsealed", Command: "agy", Args: frozenAgyArgs(),
+		Paths: paths, Profile: agyProfile(), HomeDir: t.TempDir(),
+	}
+	if _, err := execpolicy.New().Start(context.Background(), unsealed); !errors.Is(err, execpolicy.ErrInvalidLaunchRequest) {
+		t.Fatalf("unsealed agy launch with HomeDir: want ErrInvalidLaunchRequest, got %v", err)
 	}
 }
