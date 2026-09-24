@@ -58,6 +58,12 @@ func (p *fixtureProcess) Stderr() io.Reader     { return strings.NewReader("") }
 
 func (p *fixtureProcess) Wait() (int, error) { <-p.done; return 0, nil }
 
+func (p *fixtureProcess) ExecutableIdentity() execpolicy.ExeIdentity {
+	return execpolicy.ExeIdentity{}
+}
+
+func (p *fixtureProcess) Interrupt() error { return nil }
+
 func (p *fixtureProcess) Terminate(ctx context.Context) error {
 	_ = ctx
 	p.in.Close()

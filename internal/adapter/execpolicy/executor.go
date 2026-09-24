@@ -68,6 +68,12 @@ type LaunchRequest struct {
 	// ProfileDigest is the frozen run-profile digest in force for this
 	// launch (AC-008 §3.6 manifest-digest binding for attestations).
 	ProfileDigest string
+	// SealedImage, when set, pins the exact executable Start launches:
+	// a kernel-sealed memfd copy of the binary, verified at the ptrace
+	// exec-stop against /proc/<pid>/exe before the child runs a single
+	// instruction (Linux only; ErrSealedLaunchUnsupported elsewhere).
+	// Command must equal SealedImage.ArgV0 exactly.
+	SealedImage *SealedImage
 }
 
 // CapabilityChecker verifies whether the host environment supports required isolation capabilities.
@@ -335,6 +341,25 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 		scrubbedEnv = append(scrubbedEnv, "CLAUDE_CONFIG_DIR="+req.ClaudeConfigDir)
 	}
 
+	cleanup := func() {
+		if proxyToClose != nil {
+			_ = proxyToClose.Close()
+		}
+	}
+
+	if req.SealedImage != nil {
+		if req.Command != req.SealedImage.ArgV0 {
+			cleanup()
+			return nil, fmt.Errorf("%w: command %q does not match sealed image argv0 %q", ErrInvalidLaunchRequest, req.Command, req.SealedImage.ArgV0)
+		}
+		proc, err := startSealed(ctx, req, scrubbedEnv, cleanup)
+		if err != nil {
+			cleanup()
+			return nil, err
+		}
+		return proc, nil
+	}
+
 	cmd := exec.CommandContext(ctx, req.Command, req.Args...)
 	cmd.Dir = req.Paths.Root
 	cmd.Env = scrubbedEnv
@@ -376,15 +401,12 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 	}
 
 	return &managedProcess{
-		cmd:       cmd,
-		stdinPipe: stdinPipe,
-		stdout:    stdoutPipe,
-		stderr:    stderrPipe,
-		cleanup: func() {
-			if proxyToClose != nil {
-				_ = proxyToClose.Close()
-			}
-		},
+		cmd:         cmd,
+		stdinPipe:   stdinPipe,
+		stdout:      stdoutPipe,
+		stderr:      stderrPipe,
+		cleanup:     cleanup,
+		exeIdentity: ExeIdentity{Path: req.Command},
 	}, nil
 }
 

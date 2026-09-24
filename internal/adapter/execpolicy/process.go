@@ -15,14 +15,25 @@ type ManagedProcess interface {
 	Stderr() io.Reader
 	Wait() (int, error)
 	Terminate(ctx context.Context) error
+	// ExecutableIdentity returns the identity captured for the launched
+	// executable: a command path for an ordinary launch, or a
+	// device:inode pair and content digest for a sealed-image launch
+	// verified at the ptrace exec-stop.
+	ExecutableIdentity() ExeIdentity
+	// Interrupt sends a cooperative interrupt (SIGINT on POSIX) to the
+	// child, distinct from Terminate's graceful-then-forced shutdown
+	// sequence. Returns ErrInterruptUnsupported where the platform has
+	// no equivalent signal.
+	Interrupt() error
 }
 
 type managedProcess struct {
-	cmd       *exec.Cmd
-	stdinPipe io.WriteCloser
-	stdout    io.Reader
-	stderr    io.Reader
-	cleanup   func()
+	cmd         *exec.Cmd
+	stdinPipe   io.WriteCloser
+	stdout      io.Reader
+	stderr      io.Reader
+	cleanup     func()
+	exeIdentity ExeIdentity
 
 	mu       sync.Mutex
 	waitDone chan struct{}
@@ -83,6 +94,21 @@ func (p *managedProcess) Wait() (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.exitCode, p.waitErr
+}
+
+func (p *managedProcess) ExecutableIdentity() ExeIdentity {
+	return p.exeIdentity
+}
+
+func (p *managedProcess) Interrupt() error {
+	p.mu.Lock()
+	proc := p.cmd.Process
+	p.mu.Unlock()
+
+	if proc == nil {
+		return nil
+	}
+	return interruptProcess(proc)
 }
 
 func (p *managedProcess) Terminate(ctx context.Context) error {

@@ -15,3 +15,9 @@ func terminateGracefully(proc *os.Process) error {
 func terminateForcefully(proc *os.Process) error {
 	return proc.Kill()
 }
+
+// interruptProcess has no Windows equivalent: there is no
+// process-scoped graceful interrupt signal analogous to SIGINT.
+func interruptProcess(proc *os.Process) error {
+	return ErrInterruptUnsupported
+}

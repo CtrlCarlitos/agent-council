@@ -17,3 +17,10 @@ func terminateGracefully(proc *os.Process) error {
 func terminateForcefully(proc *os.Process) error {
 	return proc.Kill()
 }
+
+// interruptProcess sends SIGINT, the cooperative interrupt signal used by
+// ManagedProcess.Interrupt (distinct from Terminate's SIGTERM/SIGKILL
+// shutdown sequence).
+func interruptProcess(proc *os.Process) error {
+	return proc.Signal(syscall.SIGINT)
+}
