@@ -661,3 +661,39 @@ func TestAgyState_RequiredToolsDefaultsEmptyWhenUnset(t *testing.T) {
 		t.Fatalf("an unset required-tools list must decode empty, got %v", details.DispatchIntent.RequiredTools)
 	}
 }
+
+// GetAgyProtectionAttestation returns the whole durable row (tuple and
+// frame) by attestation id so the adapter can re-compare the stored
+// tuple against the policy in force before validating coverage (AC-010
+// Task 6); a missing row is nil, never an error.
+func TestAgyState_GetProtectionAttestation(t *testing.T) {
+	store := openAgyStore(t)
+	ctx := context.Background()
+
+	id := "cprot-v2:sha256:" + strings.Repeat("ef", 32)
+	if _, err := store.DB().ExecContext(ctx, `
+INSERT INTO agy_protection_attestations
+	(attestation_id, agy_version, platform, manifest_digest, profile_digest,
+	 probe_results, probed_at, actor)
+VALUES (?, '1.2.9', 'linux/unix', 'sha256:md', 'cprof-v4:sha256:pd', 'frame', '2026-09-24T00:00:00Z', 'op')`,
+		id); err != nil {
+		t.Fatalf("insert attestation: %v", err)
+	}
+	rec, err := store.GetAgyProtectionAttestation(ctx, id)
+	if err != nil || rec == nil {
+		t.Fatalf("get attestation: %+v err=%v", rec, err)
+	}
+	want := AgyProtectionAttestationRecord{AttestationID: id, AgyVersion: "1.2.9", Platform: "linux/unix",
+		ManifestDigest: "sha256:md", ProfileDigest: "cprof-v4:sha256:pd", ProbeResults: "frame",
+		ProbedAt: "2026-09-24T00:00:00Z", Actor: "op"}
+	if *rec != want {
+		t.Fatalf("row = %+v, want %+v", *rec, want)
+	}
+	missing, err := store.GetAgyProtectionAttestation(ctx, "cprot-v2:sha256:"+strings.Repeat("00", 32))
+	if err != nil || missing != nil {
+		t.Fatalf("a missing row is nil without error, got %+v err=%v", missing, err)
+	}
+	if blank, err := store.GetAgyProtectionAttestation(ctx, "  "); err != nil || blank != nil {
+		t.Fatalf("a blank id is nil without error, got %+v err=%v", blank, err)
+	}
+}

@@ -172,6 +172,32 @@ func (s *Store) AgyProtectionProbeResults(ctx context.Context, attestationID str
 	return raw, nil
 }
 
+// GetAgyProtectionAttestation returns the durable attestation row (its
+// binding tuple and cprot-v2 frame) by id, or nil when no row carries
+// that id. The Agy adapter re-compares the stored tuple against the
+// frozen policy in force before it validates coverage (AC-010 §3.2): a
+// row found by id is never trusted on the lookup's say-so alone. RunID
+// is not a column (journal provenance only) and stays empty.
+func (s *Store) GetAgyProtectionAttestation(ctx context.Context, attestationID string) (*AgyProtectionAttestationRecord, error) {
+	if strings.TrimSpace(attestationID) == "" {
+		return nil, nil
+	}
+	var rec AgyProtectionAttestationRecord
+	err := s.DB().QueryRowContext(ctx, `
+SELECT attestation_id, agy_version, platform, manifest_digest, profile_digest,
+       probe_results, probed_at, actor
+FROM agy_protection_attestations WHERE attestation_id = ?`, attestationID).Scan(
+		&rec.AttestationID, &rec.AgyVersion, &rec.Platform, &rec.ManifestDigest, &rec.ProfileDigest,
+		&rec.ProbeResults, &rec.ProbedAt, &rec.Actor)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query agy protection attestation: %w", err)
+	}
+	return &rec, nil
+}
+
 // ── Durable creation uncertainty — episodes ─────────────────────────────
 
 // AgyCreationUncertainty is the durable record request for a session
