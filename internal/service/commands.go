@@ -62,6 +62,11 @@ type QueuePromptRequest struct {
 	ExpectedVersion int64  `json:"expected_version"`
 	TurnKey         string `json:"turn_key"`
 	Prompt          string `json:"prompt"`
+	// RequiredTools is the optional AC-010 required-tool set for an agy
+	// session's turn: validated here against the run's frozen
+	// expected_tools, journaled with the prompt, immutable thereafter.
+	// Absent/empty means the frozen default_required_tools apply.
+	RequiredTools []string `json:"required_tools,omitempty"`
 }
 
 type QueuePromptResponse struct {
@@ -728,10 +733,21 @@ func (s *Server) handleQueuePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := s.validateQueuedRequiredTools(r.Context(), sessionID, req.RequiredTools); err != nil {
+		var invalid *invalidRequiredToolsError
+		if errors.As(err, &invalid) {
+			writeError(w, http.StatusBadRequest, "invalid_required_tools", err.Error(), req.OpID)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), req.OpID)
+		return
+	}
+
 	receipt, err := s.store.QueuePrompt(r.Context(), req.OpID, req.ControllerLease, sessionID, req.ExpectedVersion, storage.PendingPrompt{
-		SessionID: sessionID,
-		TurnKey:   req.TurnKey,
-		Prompt:    req.Prompt,
+		SessionID:     sessionID,
+		TurnKey:       req.TurnKey,
+		Prompt:        req.Prompt,
+		RequiredTools: req.RequiredTools,
 	})
 	if err != nil {
 		if errors.Is(err, storage.ErrStaleUpdate) {
@@ -756,6 +772,66 @@ func (s *Server) handleQueuePrompt(w http.ResponseWriter, r *http.Request) {
 		OpID:       req.OpID,
 		Receipt:    receipt,
 	})
+}
+
+// invalidRequiredToolsError is a queue-time required_tools refusal (a
+// caller error, HTTP 400 invalid_required_tools).
+type invalidRequiredToolsError struct{ msg string }
+
+func (e *invalidRequiredToolsError) Error() string { return e.msg }
+
+// validateQueuedRequiredTools enforces the AC-010 §3.5 queue-time rule:
+// required_tools is accepted only for an agy session; every name must be
+// in the run's frozen harnesses.agy expected_tools (native tool names),
+// and names must be non-empty and unique (the adapter refuses a
+// duplicated set at dispatch, so it is refused here, before it can be
+// journaled). Absent/empty needs no check.
+func (s *Server) validateQueuedRequiredTools(ctx context.Context, sessionID string, tools []string) error {
+	if len(tools) == 0 {
+		return nil
+	}
+	meta, err := s.store.GetSessionMetadata(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("session lookup: %w", err)
+	}
+	if meta.Contributor != string(council.Agy) {
+		return &invalidRequiredToolsError{msg: fmt.Sprintf(
+			"required_tools is only supported for agy sessions; session %s contributor is %q", sessionID, meta.Contributor)}
+	}
+	rec, err := s.store.GetRunProfile(ctx, meta.RunID)
+	if err != nil {
+		return fmt.Errorf("run profile lookup: %w", err)
+	}
+	spec, ok := rec.Profile.Harnesses["agy"]
+	if !ok || spec.Agy == nil {
+		return &invalidRequiredToolsError{msg: fmt.Sprintf(
+			"run %s has no frozen agy harness block; required_tools cannot be validated", meta.RunID)}
+	}
+	expected := make(map[string]struct{}, len(spec.Agy.ExpectedTools))
+	for _, t := range spec.Agy.ExpectedTools {
+		expected[t] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(tools))
+	var unknown, dups []string
+	for _, t := range tools {
+		if _, dup := seen[t]; dup {
+			dups = append(dups, t)
+			continue
+		}
+		seen[t] = struct{}{}
+		if _, ok := expected[t]; !ok || strings.TrimSpace(t) == "" {
+			unknown = append(unknown, fmt.Sprintf("%q", t))
+		}
+	}
+	switch {
+	case len(unknown) > 0:
+		return &invalidRequiredToolsError{msg: fmt.Sprintf(
+			"required_tools names not in the run's frozen expected_tools: %s", strings.Join(unknown, ", "))}
+	case len(dups) > 0:
+		return &invalidRequiredToolsError{msg: fmt.Sprintf(
+			"required_tools lists duplicate names: %s", strings.Join(dups, ", "))}
+	}
+	return nil
 }
 
 func (s *Server) handleReplacePrompt(w http.ResponseWriter, r *http.Request) {

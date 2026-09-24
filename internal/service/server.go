@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
+	"github.com/CtrlCarlitos/agent-council/internal/adapter/agy"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/claude"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/codex"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/execpolicy"
@@ -286,6 +288,34 @@ type ServerConfig struct {
 	// CodexBinaryPath is set; disjoint from StateDir and
 	// WorkspaceBaseDir, operator-only permissions (0700).
 	CodexScratchRoot string
+
+	// AgyBinaryPath, when set, enables the Agy persistent contributor
+	// adapter (AC-010). Empty means no Agy adapter. It must equal the
+	// frozen harnesses.agy.binary_path: the sealed image of that pinned
+	// binary is what every launch execs.
+	AgyBinaryPath string
+
+	// AgyProfile is the operator-approved frozen cprof-v4 run profile
+	// with the complete harnesses.agy block. Required when AgyBinaryPath
+	// is set: the frozen launch policy is validated from it (evidence
+	// re-hashed under AgyEvidenceRoot) at construction.
+	AgyProfile storage.CanonicalProfile
+
+	// AgyEvidenceRoot is the trusted evidence root the frozen init/tool-
+	// coverage/plugins evidence is re-hashed against. Required when
+	// AgyBinaryPath is set.
+	AgyEvidenceRoot string
+
+	// AgyHomeDir is the operator HOME every agy child inherits; it must
+	// be the parent of the frozen expected_home. Required when
+	// AgyBinaryPath is set and NEVER defaulted from $HOME.
+	AgyHomeDir string
+
+	// AgyScratchRoot is the operator-provisioned neutral directory for
+	// the construction-scoped `plugin list` capture. Required when
+	// AgyBinaryPath is set; disjoint from StateDir and WorkspaceBaseDir,
+	// operator-only permissions (0700).
+	AgyScratchRoot string
 }
 
 type ReadinessResponse struct {
@@ -335,7 +365,9 @@ type Server struct {
 	// duplicate creations must not observe it (they share the adapter's
 	// creation reservation afterwards).
 	codexBirthMu sync.Mutex
-	teardownErr  error
+	// agyBirthMu is codexBirthMu's agy counterpart (AC-010 birth).
+	agyBirthMu  sync.Mutex
+	teardownErr error
 }
 
 func NewServer(store *storage.Store, lock *ServiceLock, cfg ServerConfig) (*Server, error) {
@@ -358,8 +390,8 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 	// production OpenCode adapter with fail-closed seams backed by the same
 	// workspace manager and policy executor the service uses.
 	if adp == nil && strings.TrimSpace(cfg.OpenCodeBinaryPath) != "" {
-		if strings.TrimSpace(cfg.ClaudeBinaryPath) != "" || strings.TrimSpace(cfg.CodexBinaryPath) != "" {
-			return nil, errors.New("only one persistent contributor adapter can be wired per service instance (OpenCode and Claude/Codex are both configured)")
+		if strings.TrimSpace(cfg.ClaudeBinaryPath) != "" || strings.TrimSpace(cfg.CodexBinaryPath) != "" || strings.TrimSpace(cfg.AgyBinaryPath) != "" {
+			return nil, errors.New("only one persistent contributor adapter can be wired per service instance (OpenCode and Claude/Codex/Agy are both configured)")
 		}
 		scratchRoot, scratchErr := resolveOpenCodeProbeScratchRoot(cfg)
 		if scratchErr != nil {
@@ -384,6 +416,9 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 	if adp == nil && strings.TrimSpace(cfg.ClaudeBinaryPath) != "" {
 		if strings.TrimSpace(cfg.CodexBinaryPath) != "" {
 			return nil, errors.New("only one persistent contributor adapter can be wired per service instance (Claude and Codex are both configured)")
+		}
+		if strings.TrimSpace(cfg.AgyBinaryPath) != "" {
+			return nil, errors.New("only one persistent contributor adapter can be wired per service instance (Claude and Agy are both configured)")
 		}
 		configBase, err := resolveClaudeConfigBaseDir(cfg)
 		if err != nil {
@@ -417,6 +452,9 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 	// are validated at construction, and the §3.3 eligibility lookup is
 	// always wired to the durable cprot-v2 rows.
 	if adp == nil && strings.TrimSpace(cfg.CodexBinaryPath) != "" {
+		if strings.TrimSpace(cfg.AgyBinaryPath) != "" {
+			return nil, errors.New("only one persistent contributor adapter can be wired per service instance (Codex and Agy are both configured)")
+		}
 		scratchRoot, err := resolveCodexScratchRoot(cfg)
 		if err != nil {
 			return nil, fmt.Errorf("Codex scratch root: %w", err)
@@ -432,7 +470,159 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 		}
 	}
 
+	// If no adapter is provided but Agy is configured, construct the
+	// production Agy adapter (AC-010) with fail-closed configuration
+	// validation: profile, evidence root, operator home, and scratch
+	// root are all required; the frozen platform must be linux/unix on a
+	// Linux host (§3.12) — refused typed BEFORE any child; the
+	// production constructor then runs the §3.2 gates (eligibility from
+	// the durable cprot-v2 rows before the construction `plugin list`).
+	if adp == nil && strings.TrimSpace(cfg.AgyBinaryPath) != "" {
+		agyAdapter, err := newProductionAgyAdapter(store, pe, wm, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("Agy adapter construction: %w", err)
+		}
+		adp = agyAdapter
+	}
+
 	return newServerWithAdapter(store, lock, cfg, adp, wm, pe)
+}
+
+// newProductionAgyAdapter validates the Agy configuration fail closed
+// and builds the production adapter wired to the service's
+// required-tools seam (the queue-time set journaled on the dispatch
+// intent).
+func newProductionAgyAdapter(store *storage.Store, pe execpolicy.PolicyExecutor, wm *workspace.WorkspaceManager, cfg ServerConfig) (*agy.AgyAdapter, error) {
+	if strings.TrimSpace(cfg.AgyProfile.AlgoVersion) == "" {
+		return nil, errors.New("AgyProfile is required when AgyBinaryPath is configured")
+	}
+	evidenceRoot, err := resolveAgyEvidenceRoot(cfg)
+	if err != nil {
+		return nil, err
+	}
+	homeDir, err := resolveAgyHomeDir(cfg)
+	if err != nil {
+		return nil, err
+	}
+	scratchRoot, err := resolveAgyScratchRoot(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("Agy scratch root: %w", err)
+	}
+	if wm == nil {
+		return nil, errors.New("WorkspaceBaseDir is required when AgyBinaryPath is configured (AC-005 allocations)")
+	}
+	policy, err := agy.ValidateAgyHarness(cfg.AgyProfile, evidenceRoot)
+	if err != nil {
+		return nil, fmt.Errorf("frozen agy policy: %w", err)
+	}
+	if filepath.Clean(strings.TrimSpace(cfg.AgyBinaryPath)) != policy.BinaryPath {
+		return nil, fmt.Errorf("AgyBinaryPath %q is not the frozen binary_path %q", cfg.AgyBinaryPath, policy.BinaryPath)
+	}
+	if err := checkAgyPlatform(policy); err != nil {
+		return nil, err
+	}
+	return agy.NewProductionAgyAdapter(store, pe, wm, cfg.AgyProfile, evidenceRoot, homeDir, scratchRoot,
+		agy.WithRequiredToolsSource(&agyRequiredToolsSource{store: store}))
+}
+
+// checkAgyPlatform is the §3.12 production-eligibility platform rule,
+// applied at construction before any child: the frozen platform must be
+// linux/unix and the host must be Linux.
+func checkAgyPlatform(policy agy.AgyLaunchPolicy) error {
+	if policy.PlatformOS == "linux" && policy.PlatformFamily == "unix" && runtime.GOOS == "linux" {
+		return nil
+	}
+	return &agy.ErrUnsupportedProfile{AlgoVersion: "cprof-v4",
+		Reason: fmt.Sprintf("production agy is eligible only for the linux/unix platform on a linux host (frozen %s/%s, host %s)",
+			policy.PlatformOS, policy.PlatformFamily, runtime.GOOS)}
+}
+
+// resolveAgyEvidenceRoot validates the configured trusted evidence
+// root: required and a real directory.
+func resolveAgyEvidenceRoot(cfg ServerConfig) (string, error) {
+	dir := strings.TrimSpace(cfg.AgyEvidenceRoot)
+	if dir == "" {
+		return "", errors.New("AgyEvidenceRoot is required when AgyBinaryPath is configured")
+	}
+	dir = filepath.Clean(dir)
+	st, err := os.Stat(dir)
+	if err != nil {
+		return "", fmt.Errorf("agy evidence root %s is missing: %w", dir, err)
+	}
+	if !st.IsDir() {
+		return "", fmt.Errorf("agy evidence root %s is not a directory", dir)
+	}
+	return dir, nil
+}
+
+// resolveAgyHomeDir validates the configured operator HOME: required
+// (never defaulted from $HOME), absolute, an existing directory. The
+// production constructor then requires it to be the parent of the
+// frozen expected_home.
+func resolveAgyHomeDir(cfg ServerConfig) (string, error) {
+	dir := strings.TrimSpace(cfg.AgyHomeDir)
+	if dir == "" {
+		return "", errors.New("AgyHomeDir is required when AgyBinaryPath is configured (it is never defaulted from $HOME)")
+	}
+	if !filepath.IsAbs(dir) {
+		return "", fmt.Errorf("AgyHomeDir %q must be absolute", dir)
+	}
+	dir = filepath.Clean(dir)
+	st, err := os.Stat(dir)
+	if err != nil {
+		return "", fmt.Errorf("agy home %s is missing: %w", dir, err)
+	}
+	if !st.IsDir() {
+		return "", fmt.Errorf("agy home %s is not a directory", dir)
+	}
+	return dir, nil
+}
+
+// resolveAgyScratchRoot validates and prepares the configured Agy
+// construction scratch root, mirroring resolveCodexScratchRoot: required,
+// absolute, disjoint from StateDir and WorkspaceBaseDir (resolved, pre-
+// and post-creation), operator-only permissions.
+func resolveAgyScratchRoot(cfg ServerConfig) (string, error) {
+	root := strings.TrimSpace(cfg.AgyScratchRoot)
+	if root == "" {
+		return "", errors.New("AgyScratchRoot is required when AgyBinaryPath is configured")
+	}
+	if !filepath.IsAbs(root) {
+		return "", fmt.Errorf("AgyScratchRoot %q must be absolute", root)
+	}
+	root = filepath.Clean(root)
+	bases := map[string]string{}
+	for name, base := range map[string]string{
+		"StateDir":         cfg.StateDir,
+		"WorkspaceBaseDir": cfg.WorkspaceBaseDir,
+	} {
+		base = strings.TrimSpace(base)
+		if base == "" {
+			continue
+		}
+		bases[name] = filepath.Clean(base)
+	}
+	resolved, err := resolveExistingPath(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve agy scratch root: %w", err)
+	}
+	if err := checkScratchContainment(bases, resolved); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", fmt.Errorf("create agy scratch root: %w", err)
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		return "", fmt.Errorf("secure agy scratch root: %w", err)
+	}
+	resolvedFinal, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve agy scratch root after creation: %w", err)
+	}
+	if err := checkScratchContainment(bases, resolvedFinal); err != nil {
+		return "", err
+	}
+	return root, nil
 }
 
 func newServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerConfig, adp adapter.Adapter, wm *workspace.WorkspaceManager, pe execpolicy.PolicyExecutor) (*Server, error) {
