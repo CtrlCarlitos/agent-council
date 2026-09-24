@@ -319,7 +319,13 @@ adapter side effect.
   native UUIDv7 `id` becomes `NativeSessionID`; the adapter validates
   UUIDv7 shape and returns the binding with `materialized=false` (no
   rollout observed yet). The adapter does not persist; service/storage
-  persists the binding.
+  persists the binding. Errata (implementation review): persistence is
+  the AC-008-shaped transactional transition (`BindCodexSession`) — the
+  controller lease is re-validated INSIDE the write transaction (a lease
+  handed off while the native creation was in flight cannot publish the
+  binding), the op_id is journaled with receipt replay, and one binding
+  per session is enforced. The pre-flight authority check is an early
+  refusal, not the authority.
 - `thread/start` accepts the frozen thread parameters that the schema
   supports at creation (cwd = workspace root; model/sandbox/approval are
   pinned per turn at dispatch, §3.5, because resume re-derives them —
@@ -332,6 +338,17 @@ adapter side effect.
   blocked. Because `thread/start` consumed no provider quota, the eventual
   operator disposition is normally "abandon the orphan thread" (cheap,
   honest); `thread/list` sweeps are diagnostic only and never auto-bind.
+  Errata (implementation review): the durable block is modeled as
+  numbered **creation-uncertainty episodes** per logical session
+  (`codex_creation_uncertainties`, migration v6): an uncertain outcome
+  opens the next episode (concurrent callers sharing one outcome open
+  ONE episode; the schema allows at most one open episode per session);
+  the block holds while an episode is open; a resolution targets ONE
+  exact episode and requires CURRENT controller authority (lease +
+  expected generation re-validated in the storage transaction) with a
+  disposition (`abandon_orphan` | `verified_absent`) and reason. A
+  session that ends uncertain again after a resolution opens a distinct
+  episode — never a replay of, or a conflict with, the resolved one.
 - Concurrent duplicate `CreateSession`: creation reservation (one native
   thread identity, shared result including typed failures, mismatched
   callers fail closed) — AC-008 pattern.
@@ -547,6 +564,30 @@ adapter side effect.
   - Storage: the `codex_protection_attestations` table stores ONLY
     cprot-v2 records; Claude's `claude_protection_attestations` keeps
     cprot-v1 untouched. Freeze-at-launch semantics are unchanged.
+  - **Coverage binding (errata, implementation review)**: "the suite
+    enumerates every enabled class" is ENFORCED, not assumed. The
+    expected coverage set is derived from the run's STORED frozen
+    profile (the launch policy: platform, version, manifest digest,
+    `expected_mcp_servers`, toolkit `expected_plugins`/`expected_skills`)
+    and the pinned §3.6 approval table — never from the evidence. A
+    valid attestation carries: exactly one `sibling_read` per built-in
+    class (Read, Glob, Grep, shell-absolute); `sibling_read` plus all
+    five `self_mutation` operations for every mutation-capable path
+    (shell, each expected MCP server tool named `<server>` or
+    `<server>/<tool>`, each expected plugin tool); no mutation records
+    for read-only classes; a `native_refusal_enum` `approval_deny` for
+    every pinned method with a schema-native refusal enum; optional
+    `live_verified_equivalent` records for the two deny-equivalent
+    variants (absent ⇒ fail-closed on receipt, §3.6). Unexpected
+    coverage (a server, plugin, class, or method the profile does not
+    enable) or duplicate coverage (a class probed through two names)
+    invalidates the suite. Enforced at RECORDING (the journal operation
+    resolves the run profile and refuses anything less) AND at LOOKUP
+    (the eligibility seam and the launch-time protection freeze decode
+    the durable frame and refuse an uncovered row): a tuple match that
+    does not cover the profile unlocks nothing. The attestation is
+    therefore bound to the referenced run's profile by derivation; any
+    run with a byte-identical frozen profile shares it by design.
 - **Protected-evidence upgrade**: only while a matching attestation —
   both record classes fully denied — is valid for the launch's frozen
   (version, platform, manifest digest) is a launch's rollout upgraded to
@@ -754,7 +795,7 @@ advisory mode. Replacement work is always a new attempt; unresolved
 attempts block the native session across restarts (durable state, not
 process memory).
 
-### 3.11 Durable state schema (storage migration v5; AC-008 §3.11 adapted)
+### 3.11 Durable state schema (storage migrations v5 + v6; AC-008 §3.11 adapted)
 
 ```
 codex_session_bindings
@@ -801,7 +842,18 @@ codex_protection_attestations
   -- classes: sibling_read[] + self_mutation[] + approval_deny[];
   -- sibling_read + approval_deny bind production-dispatch eligibility
   -- (§3.3), BOTH probe classes bind protected evidence (§3.7); a later
-  -- attestation never reclassifies earlier attempts
+  -- attestation never reclassifies earlier attempts; the record set
+  -- must COVER the run's frozen profile (§3.7 coverage binding) — the
+  -- journal operation and every lookup enforce it
+
+codex_creation_uncertainties   -- migration v6 (errata, §3.4 episodes)
+  session_id, episode INTEGER (>= 1), PRIMARY KEY (session_id, episode)
+  run_id, reason, recorded_by, record_op_id, cause_op_id, recorded_at
+  disposition TEXT NULL (abandon_orphan|verified_absent)  -- NULL = open
+  resolution_reason, resolution_generation, resolution_op_id, resolved_at
+  UNIQUE partial index on session_id WHERE disposition IS NULL
+  -- at most ONE open episode per session; resolution is a controller-
+  -- authorized journal operation targeting one exact episode
 ```
 
 Crash-safe ordering mirrors AC-008 §3.11 exactly: attempt+baseline durable
