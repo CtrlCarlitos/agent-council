@@ -22,7 +22,12 @@ issue #10. It follows the approved design,
    `NewProductionAgyAdapter`.
 7. The service wiring:
    - derived session birth with a durable pre-launch creation marker;
-   - the run-bound cprot-v2 `RecordAgyProbeAttestation` operation;
+   - the run-bound cprot-v2 `RecordAgyProbeAttestation` operation,
+     which needs no wired adapter;
+   - the §14.18 `awaiting_attestation` server state: a service configured
+     for agy without a covering attestation starts without the adapter,
+     reports the state on `GET /v1/status`, and refuses every agy
+     operation typed; a restart after recording constructs the adapter;
    - `ResolveAgySessionCreationUncertainty`;
    - queue-time `required_tools` validation.
 8. The acceptance story, the operator evidence script, and the evidence
@@ -53,7 +58,9 @@ table to committed tests, and has an explicit "unverified live" column.
   - the executor refuses forbidden flags (`--dangerously-skip-permissions`,
     `--continue`, `-i`, `--remote-control`, `install`, `update`);
   - the prompt goes only on stdin, and only after `init` equality;
-  - production launches need a covering cprot-v2 attestation.
+  - production launches need a covering cprot-v2 attestation; until one
+    is recorded the service runs in `awaiting_attestation` with no agy
+    adapter and no agy child (§14.18).
 - **Native self-update** (research §0 hazard 1). A changed binary fails
   closed at the sealed-image digest check (`TestAcceptance_Agy_S10_…`). An
   update mid-run makes every attestation stale by construction.
@@ -65,11 +72,13 @@ table to committed tests, and has an explicit "unverified live" column.
   - §14.17: no controller operation records a disposition for an
     Uncertain turn attempt. The durable block holds; clearing it needs
     follow-up work. AC-008 and AC-009 have the same gap.
-  - §14.18 is closed in this branch's final wave (see spec §14.18):
-    `RecordAgyProbeAttestation` depends only on the store, the operator
-    credential, and the configured agy profile and evidence root — never
-    on a wired adapter — so the first row can be recorded that way before
-    the adapter exists.
+  - §14.18 (attestation bootstrap) is closed in this branch: the first
+    row is recorded through `RecordAgyProbeAttestation` on a server in
+    the `awaiting_attestation` state, and a restart constructs the
+    adapter (no hot reload). The production-path acceptance test goes
+    through exactly that sequence. Like the codex and claude operations,
+    the recording is a Go method on the running `Server`, with no HTTP
+    route or CLI command yet.
 - **Descendants.** A descendant that leaves the child's process group
   escapes the forced kill (§14.6).
 
@@ -119,7 +128,10 @@ fixture only:
   binary path configured showed that no command other than `dirname`
   executed.
 - Acceptance: `internal/service/acceptance_agy_test.go` has 14 tests: the
-  lifecycle, the production path, and §6.1 S01–S12.
+  lifecycle, the production path (through the real §14.18 bootstrap:
+  awaiting server → recorded row → restart → production adapter), and
+  §6.1 S01–S12. `internal/service/review_ac010_bootstrap_test.go` covers
+  the awaiting state itself.
 - Mutation checks run during development: removing the print-timeout
   marker, the ignored-input marker, the denial ⇒ incomplete rule, or the
   unresolved-attempt block each fails the corresponding acceptance test.

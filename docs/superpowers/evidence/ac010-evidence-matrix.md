@@ -26,13 +26,13 @@ column is **open**.
 | 2 | Crash after the stdin write, result lost: Uncertain; block persists across restart; disposition required | `service/acceptance_agy_test.go:TestAcceptance_Agy_S02_CrashAfterStdinWriteResultLost` (prompt written, no result: Uncertain; the service records no terminal; after a restart with a fresh adapter, Reconcile is Uncertain, `HasAgyUnresolvedAttempts` holds, the next release is refused, and no new process starts); `adapter/agy/reconcile_test.go:TestAgyCrashGap_FirstByteBeforeUserInput`, `TestAgyCrashGap_AcceptedBeforeTerminal`, `TestAgyReconcile_Matrix`; `storage/agy_state_test.go:TestAgyState_CrashAfterFirstByteBeforeUserInput` | A real service-process crash (simulated by cancelling workers and closing the service). **Gap §14.17:** no controller-disposition operation is shipped. |
 | 3 | Process death mid-turn: Uncertain, BLOCKS; only after a disposition does the next turn start as a new process on the same conversation after `init` equality | `service/acceptance_agy_test.go:TestAcceptance_Agy_S03_ProcessDeathBlocksUntilDisposition` (accepted, then exit without result: Uncertain; the next dispatch is rejected "unresolved attempt" with no process; after the disposition, the next turn is launch #3 with `--conversation <id>` and the prompt is written after `init`); `adapter/agy/dispatch_test.go:TestAgyDispatch_ExitWithoutResultUncertain` | **Gap §14.17:** the test writes the disposition to the row directly, because no operator surface exists. |
 | 4 | Controller disconnect: the turn continues; the observer re-attaches | `service/acceptance_agy_test.go:TestAcceptance_Agy_S04_ControllerDisconnectObserverReattaches` (SSE observer and controller both disconnect while the gated child runs; the child is alive per the `/proc` cwd scan and launch state `started`; the turn completes; a re-attached SSE observer gets the durable terminal); `…:TestAcceptance_Agy_Lifecycle` step 5; `adapter/agy/dispatch_test.go:TestAgyDispatch_ObserverDetachDoesNotCancelTurn`; `service/review_ac010_fixround1_test.go:TestServiceAgySession_CancelledRequestStillRecordsTheCreatedConversation` (§14.14) | — |
-| 5 | Exact identity: absent/malformed id ⇒ `ErrConversationDrift`, prompt never written, orphan recorded; non-UUID never transmitted | `service/acceptance_agy_test.go:TestAcceptance_Agy_S05_ExactIdentity` (the 1.2.9 silent fallback to a new UUID, and a malformed id: the turn fails "agy conversation drift"; 0 stdin lines; orphan id durable; attempt `missing`; only the bound UUID is ever passed as `--conversation`; a non-UUID binding is refused by the schema CHECK); `adapter/agy/dispatch_test.go:TestAgyDispatch_FallbackIDDriftNeverWritesPrompt`; `adapter/agy/fixround_test.go:TestAgyDispatch_OrphanConversationDurableAcrossRestart`; creation side: `…:TestAcceptance_Agy_Lifecycle` step 10, `service/review_ac010_wiring_test.go:TestServiceAgySession_UncertainCreationEpisodeAndResolution`, `adapter/agy/adapter_test.go:TestAgyAdapter_CreateSessionNonUUIDConversationUncertain` | Stage B b2 (live resume, init id equality) |
+| 5 | Exact identity: absent/malformed id ⇒ `ErrConversationDrift`, prompt never written, orphan recorded; non-UUID never transmitted | `service/acceptance_agy_test.go:TestAcceptance_Agy_S05_ExactIdentity` (the 1.2.9 silent fallback to a new UUID, and a malformed id: the turn fails "agy conversation drift"; 0 stdin lines; orphan id durable; attempt `missing`; only the bound UUID is ever passed as `--conversation`; a non-UUID binding is refused by the schema CHECK); `adapter/agy/dispatch_test.go:TestAgyDispatch_FallbackIDDriftNeverWritesPrompt`; `adapter/agy/durability_test.go:TestAgyDispatch_OrphanConversationDurableAcrossRestart`; creation side: `…:TestAcceptance_Agy_Lifecycle` step 10, `service/review_ac010_wiring_test.go:TestServiceAgySession_UncertainCreationEpisodeAndResolution`, `adapter/agy/adapter_test.go:TestAgyAdapter_CreateSessionNonUUIDConversationUncertain` | Stage B b2 (live resume, init id equality) |
 | 6 | Permission-requiring tool auto-denied natively; `tool_denied`; `verification_incomplete`; exit 0 does not verify | `service/acceptance_agy_test.go:TestAcceptance_Agy_S06_PermissionToolAutoDeniedIncomplete` (a live SSE `tool_denied` progress event; terminal `completed`; every required tool ran, yet verification is incomplete; launch `exit_code` = 0; raw evidence has `verification_incomplete:true`); `…:TestAcceptance_Agy_Lifecycle` step 6; `adapter/agy/dispatch_test.go:TestAgyDispatch_DeniedToolEmitsToolDeniedAndIncomplete`, `TestAgyDispatch_DenialClassesRecorded`, `TestAgyDispatch_RequiredToolSkippedIncomplete` | Stage B b3 (live `denied_actions` under `request-review`, re-observed on the frozen build) |
-| 7 | Config drift: `init.permission_mode`/`model`/`cwd` mismatch fails before transmission | `service/acceptance_agy_test.go:TestAcceptance_Agy_S07_ConfigDriftFailsBeforeTransmission` (`permission_mode` through the bridge); `adapter/agy/dispatch_test.go:TestAgyDispatch_ProfileAndToolDriftRejectedPreWrite`; `adapter/agy/fixround_test.go:TestAgyDispatch_EmptyInitFieldsAreDriftPreWrite` (model/cwd/empty fields); `service/review_ac010_fixround1_test.go:TestServiceAgySession_CreationDriftAnnotatesTheServiceMarker` | — |
+| 7 | Config drift: `init.permission_mode`/`model`/`cwd` mismatch fails before transmission | `service/acceptance_agy_test.go:TestAcceptance_Agy_S07_ConfigDriftFailsBeforeTransmission` (`permission_mode` through the bridge); `adapter/agy/dispatch_test.go:TestAgyDispatch_ProfileAndToolDriftRejectedPreWrite`; `adapter/agy/durability_test.go:TestAgyDispatch_EmptyInitFieldsAreDriftPreWrite` (model/cwd/empty fields); `service/review_ac010_fixround1_test.go:TestServiceAgySession_CreationDriftAnnotatesTheServiceMarker` | — |
 | 8 | Tool inventory drift: `init.tools` ≠ frozen ⇒ pre-transmission failure | `service/acceptance_agy_test.go:TestAcceptance_Agy_S08_ToolInventoryDriftFailsBeforeTransmission`; `adapter/agy/dispatch_test.go:TestAgyDispatch_ProfileAndToolDriftRejectedPreWrite`; `adapter/agy/profile_test.go:TestValidateAgyHarness_InitEvidenceToolsMismatchRejected` | Stage A A.7 (does live `init.tools` equal the frozen set?) |
 | 9 | Print-timeout marker: Uncertain even with `result` present | `service/acceptance_agy_test.go:TestAcceptance_Agy_S09_PrintTimeoutMarkerUncertain` (marker + ERROR result: attempt Uncertain; the classification reason is "stderr print-timeout marker"; no service terminal; the conversation is blocked); `adapter/agy/dispatch_test.go:TestAgyDispatch_PrintTimeoutMarkerUncertain` | Stage B b5 (the marker on a healthy turn; only the 429-retry case has been observed) |
-| 10 | Binary drift: digest mismatch ⇒ no process started | `service/acceptance_agy_test.go:TestAcceptance_Agy_S10_BinaryDriftStartsNoProcess` (the pinned path holds different bytes, so production construction is refused with `ErrSealedImageMismatch` even when a covering attestation exists; no construction child); `adapter/execpolicy/sealed_linux_test.go:TestNewSealedImage_DigestMismatchRefused`, `TestBuildSealedCmd_DigestMismatchRefusedAtLaunch`; `adapter/agy/eligibility_test.go:TestEligibility_SealedImageRequiredAndPinned`; `adapter/agy/fixround_test.go:TestAgyValidateLaunch_TiedToAllocationImageAndHome` | Stage A A.3/A.4 (agy's behavior when exec'd from a sealed memfd: install-dir discovery, sidecars, updater) |
-| 11 | Unattested authenticated dispatch: `ErrProductionEligibilityMissing` before any child | `service/acceptance_agy_test.go:TestAcceptance_Agy_S11_UnattestedDispatchRefusedBeforeAnyChild` (without a row the production service is refused with `ErrNotEligible` wrapping `ErrProductionEligibilityMissing`, and no child starts; if the row is purged after construction, the next released turn fails "agy production eligibility missing" with no attempt row and no turn process); `adapter/agy/wiring_test.go:TestNewProductionAgyAdapter_EligibilityReCheckedPerDispatch`; `adapter/agy/adapter_test.go:TestAgyAdapter_ProductionEligibilityMissingPreChild`; `adapter/agy/production_guard_test.go:TestProductionGuard_NilAttestationFailsClosedPreChild` | Stage C (the first real attestation). **Gap §14.18:** there is no production entry point for recording it. |
+| 10 | Binary drift: digest mismatch ⇒ no process started | `service/acceptance_agy_test.go:TestAcceptance_Agy_S10_BinaryDriftStartsNoProcess` (the pinned path holds different bytes, so production construction is refused with `ErrSealedImageMismatch` even when a covering attestation exists; no construction child); `adapter/execpolicy/sealed_linux_test.go:TestNewSealedImage_DigestMismatchRefused`, `TestBuildSealedCmd_DigestMismatchRefusedAtLaunch`; `adapter/agy/eligibility_test.go:TestEligibility_SealedImageRequiredAndPinned`; `adapter/agy/durability_test.go:TestAgyValidateLaunch_TiedToAllocationImageAndHome` | Stage A A.3/A.4 (agy's behavior when exec'd from a sealed memfd: install-dir discovery, sidecars, updater) |
+| 11 | Unattested authenticated dispatch: `ErrProductionEligibilityMissing` before any child | `service/acceptance_agy_test.go:TestAcceptance_Agy_S11_UnattestedDispatchRefusedBeforeAnyChild` (without a row the production-configured service starts WITHOUT the agy adapter in the §14.18 `awaiting_attestation` state and its agy operations refuse with `ErrNotEligible` wrapping `ErrProductionEligibilityMissing`; no child starts; if the row is purged after construction, the next released turn fails "agy production eligibility missing" with no attempt row and no turn process); `service/review_ac010_bootstrap_test.go:TestServiceBootstrap_AgyAwaitingAttestationRecordRestart` (birth, `required_tools` queueing and release refuse typed with no child); `adapter/agy/wiring_test.go:TestNewProductionAgyAdapter_EligibilityReCheckedPerDispatch`; `adapter/agy/adapter_test.go:TestAgyAdapter_ProductionEligibilityMissingPreChild`; `adapter/agy/production_guard_test.go:TestProductionGuard_NilAttestationFailsClosedPreChild` | Stage C (the first real attestation, recorded on the awaiting server). |
 | 12 | Ignored input event: stderr marker ⇒ Uncertain, never assumed sent | `service/acceptance_agy_test.go:TestAcceptance_Agy_S12_IgnoredInputEventUncertain` (the envelope is rewritten on the wire; the child drops it; the attempt is Uncertain with reason "stderr ignored-input marker"; no terminal; the conversation is blocked); `adapter/agy/dispatch_test.go:TestAgyDispatch_IgnoredInputMarkerUncertain`; `adapter/agy/agyfixture_protocol_test.go:TestAgyFixture_EnvelopeValidation_UnsupportedEventIgnored` | — |
 
 ## §6 acceptance mapping (issue #10 criteria)
@@ -43,7 +43,7 @@ column is **open**.
 | Start independently and resume a specified conversation | `service/acceptance_agy_test.go:TestAcceptance_Agy_Lifecycle` (provider-free creation with empty stdin, no `--conversation`, no `models` gate; turns 1, 2, and the post-restart turn 3 each run as a new process with `--conversation <bound id>`); `service/review_ac010_wiring_test.go:TestServiceAgySession_BirthDerivesModelWorkspaceAndDigest`; `adapter/agy/adapter_test.go:TestAgyAdapter_CreateSessionBindsInitConversationID`; `adapter/agy/authgate_test.go:TestAuthGate_CreationIsNotGated` | Stage B b1/b2 |
 | Verify expected skills/tools/plugins and enabled guardrails | `adapter/agy/toolkit_test.go` (all); `adapter/agy/wiring_test.go:TestNewProductionAgyAdapter_ToolkitDriftAtConstruction`; `adapter/agy/coverage_test.go` (all); `adapter/agy/profile_test.go:TestValidateAgyHarness_UnmodifiedInstallHasUncoveredTools`, `TestValidateAgyHarness_NonEmptyMCPInventoryRejected`; `storage/canonical_profile_v4_test.go:TestCanonicalProfileV4_NonEmptyInventoriesRejectedAtFreeze` | Stage A A.6/A.8/A.9 (live plugin, hooks, and skills captures; `mcp list`). Hook execution and plugin skill loading are not claimed (§7). |
 | Required skipped/denied tools keep verification incomplete regardless of exit code | `service/acceptance_agy_test.go:TestAcceptance_Agy_Lifecycle` (queue-time `required_tools` → missing + denial → incomplete), `TestAcceptance_Agy_S06_…`; `service/review_ac010_wiring_test.go:TestServiceQueue_AgyRequiredToolsValidatedAtQueueTime`; `adapter/agy/verification_test.go`; `adapter/agy/dispatch_test.go:TestAgyDispatch_RequiredToolSkippedIncomplete`, `TestAgyDispatch_DenialClassesRecorded`; `storage/agy_state_test.go:TestAgyState_ReplacePendingPromptKeepsImmutableRequiredTools` | Stage B b3 and b7 (the `denied_tools` rule's denial shape) |
-| Bounded cancellation, unknown outcomes, client-close recovery, no fallback harness | `adapter/agy/cancel_test.go` (all); `adapter/agy/fixround_test.go:TestAgyCancel_ForcedKillReapsSealedDescendants`, `TestAgyDispatch_ExternalInterruptIsFailedNotCancelled`; §6.1 rows 2/3/9/12 above; `…:TestAcceptance_Agy_Lifecycle` steps 5 and 10–12 (disconnect is not cancellation; restart with an open creation episode → resolution); `adapter/council_boundary_test.go:TestCouncilBoundary_ProductionRegistryRejectsFake` | Stage B b4 (live SIGINT on the frozen build). A descendant that leaves its process group is not reaped (§14.6). |
+| Bounded cancellation, unknown outcomes, client-close recovery, no fallback harness | `adapter/agy/cancel_test.go` (all); `adapter/agy/durability_test.go:TestAgyCancel_ForcedKillReapsSealedDescendants`, `TestAgyDispatch_ExternalInterruptIsFailedNotCancelled`; §6.1 rows 2/3/9/12 above; `…:TestAcceptance_Agy_Lifecycle` steps 5 and 10–12 (disconnect is not cancellation; restart with an open creation episode → resolution); `adapter/council_boundary_test.go:TestCouncilBoundary_ProductionRegistryRejectsFake` | Stage B b4 (live SIGINT on the frozen build). A descendant that leaves its process group is not reaped (§14.6). |
 
 ## Task 8 self-review table (Invariant → Interface → Assertion → tests)
 
@@ -55,28 +55,45 @@ column is **open**.
 | Prompt only after `init` equality; first byte is the boundary; exit code never classifies | `AgyAdapter.Dispatch` | fallback id ⇒ empty fixture input; crash gaps; denied ⇒ incomplete with exit 0 | `…:TestAcceptance_Agy_S05_ExactIdentity`, `…_S06_…`, `…_S07_…`, `…_S08_…`; `adapter/agy/dispatch_test.go:TestAgyDispatch_FallbackIDDriftNeverWritesPrompt`, `TestAgyDispatch_AcceptedOnUserInputAndCompleted`, `TestLaunchArgv_ExactGrammar`; `adapter/agy/reconcile_test.go:TestAgyCrashGap_StartedBeforeFirstByte` | Stage B b1 (the live `user_input` DONE step as the §14.5 acceptance) |
 | Required tools ⊆ expected, immutable, verified with the denial map | `Server.handleQueuePrompt`, `agy.ComputeVerification` | queue-time 400; skipped ⇒ incomplete; ambiguous/unattributed/unmapped classes | `service/review_ac010_wiring_test.go:TestServiceQueue_AgyRequiredToolsValidatedAtQueueTime`; `service/review_ac010_fixround1_test.go:TestServiceAgyDispatch_MissingIntentRefusedBeforeReservation`; `adapter/agy/dispatch_test.go:TestAgyDispatch_RequiredToolsSourceErrorRejectsBeforeReservation`, `TestAgyDispatch_DenialClassesRecorded`; `adapter/agy/verification_test.go`; `storage/agy_state_test.go:TestAgyState_ReplacePendingPromptKeepsImmutableRequiredTools`; `…:TestAcceptance_Agy_Lifecycle` (queue → attempt `required_tools` → missing) | Stage B b3/b7 |
 | Auth gate provider-free; `none` rows fixture-only | `adapter/agy/authgate.go`, capability checker | not signed in ⇒ `ErrAgyAuthRequired`; network failure ⇒ inconclusive; production `none` refused | `adapter/agy/authgate_test.go` (all); `adapter/agy/adapter_test.go:TestAgyAdapter_LaunchMatrix`; `…:TestAcceptance_Agy_Lifecycle` (the `models` gate runs before the first turn child and not at creation) | Stage A A.5: the real `models` layout (§14.12). The gate fails closed on any layout other than one id per row. |
-| Coverage derived from `expected_tools` ∩ map; uncovered ⇒ rejected | `adapter/agy/coverage.go`, `ValidateAgyHarness` | subagent/browser tools ⇒ freeze refused; an attestation missing a mapped tool ⇒ refused at record and lookup | `adapter/agy/coverage_test.go` (all); `adapter/agy/eligibility_test.go:TestAttestationLookup_UncoveredRowIneligible`; `service/review_ac010_wiring_test.go:TestServiceAttestation_AgyAuthorityIdempotencyCoverage` ("missing mapped tool", "extra record"); `…:TestAcceptance_Agy_ProductionConstructionUnlockedByServiceRecordedAttestation` | Stage C probe outcomes. **Gap §14.18:** the first row has no production entry point. |
+| Coverage derived from `expected_tools` ∩ map; uncovered ⇒ rejected | `adapter/agy/coverage.go`, `ValidateAgyHarness` | subagent/browser tools ⇒ freeze refused; an attestation missing a mapped tool ⇒ refused at record and lookup | `adapter/agy/coverage_test.go` (all); `adapter/agy/eligibility_test.go:TestAttestationLookup_UncoveredRowIneligible`; `service/review_ac010_wiring_test.go:TestServiceAttestation_AgyAuthorityIdempotencyCoverage` ("missing mapped tool", "extra record"); `…:TestAcceptance_Agy_ProductionConstructionUnlockedByServiceRecordedAttestation` | Stage C probe outcomes. |
 | Toolkit configured state re-derived at every launch | `adapter/agy/toolkit.go` | plugin/skills/hooks drift; disabled marker; canonical-bytes mismatch | `adapter/agy/toolkit_test.go` (all); `adapter/agy/wiring_test.go:TestNewProductionAgyAdapter_ToolkitDriftAtConstruction` | Stage A A.6/A.8 (the live captures). Hook execution is not claimed (§7). |
 | Bounded cancellation; Uncertain until disposition; no fallback harness | `Cancel`, `Reconcile`, episodes | SIGINT ⇒ interrupted ⇒ confirmed; grace ⇒ Uncertain; blocked across restart until resolution | `adapter/agy/cancel_test.go` (all); `…:TestAcceptance_Agy_S02_…`, `…_S03_…`, `…_Lifecycle` (creation episode → restart → blocked → resolved → birth); `service/review_ac010_fixround1_test.go:TestServiceAgySession_CrashBetweenCreateAndBindIsBlockedByTheMarker` (§14.13); `storage/agy_uncertainty_test.go` (all); `storage/agy_inflight_test.go` (all) | Stage B b4. **Gap §14.17:** no turn-attempt disposition surface. |
 
-## Production path (Task 7 reviewer follow-up)
+## Production path through the attestation bootstrap (spec §14.18)
 
 `service/acceptance_agy_test.go:TestAcceptance_Agy_ProductionConstructionUnlockedByServiceRecordedAttestation`
-(Linux only):
+(Linux only) drives the shipped bootstrap from configuration alone
+(`NewServerWithAdapter(…, nil)`):
 
-1. A covering cprot-v2 row is recorded through the service operation
-   `Server.RecordAgyProbeAttestation`, using the operator token and actor
-   and the run-derived tuple.
-2. That row unlocks `NewServerWithAdapter(…, nil)`, which runs
-   `agy.NewProductionAgyAdapter`. The construction `plugin list` runs.
-3. A birth and a queued turn then run through the production adapter:
+1. With no covering row, the production-configured service starts
+   WITHOUT the agy adapter in the typed `awaiting_attestation` state
+   (`Server.AgyStatus()`, the `agy` block of `GET /v1/status`, one
+   warning log line). No construction child runs.
+2. The covering cprot-v2 row is recorded through
+   `Server.RecordAgyProbeAttestation` ON THAT AWAITING SERVER, using the
+   operator token and actor and the run-derived tuple. Recording needs
+   only the store, the operator credential and the configured evidence
+   root, never a wired adapter.
+3. A restart over the same store and state directory runs
+   `agy.NewProductionAgyAdapter`; the construction `plugin list` runs and
+   the status is `wired`. There is no hot reload.
+4. A birth and a queued turn then run through the production adapter:
    - the attempt identity comes from the journaled dispatch intent;
    - the queued `required_tools` verify;
    - every sealed launch runs with `HOME` = the parent of `expected_home`
      (§14.2).
 
-Before this test, the production path was proven only with a row written
-directly to storage (`recordAttestationDirect`).
+`service/review_ac010_bootstrap_test.go` covers the state itself: the
+awaiting state on `AgyStatus()` and `GET /v1/status`; `CreateAgySession`,
+queue-time `required_tools` and release refused with the wrapped
+`ErrNotEligible` (HTTP 503 `agy_not_eligible`) and no child; recording on
+the awaiting server; the restart constructing the production adapter;
+and a non-attestation construction error (a wrong `AgyHomeDir`) still
+failing the server.
+
+Limit: `RecordAgyProbeAttestation` is a Go method on the running
+`Server`; like the codex and claude attestation operations it has no HTTP
+route or CLI command in this branch.
 
 ## Unresolved gaps (recorded in spec §14; not closed by this PR)
 
@@ -86,11 +103,13 @@ directly to storage (`recordAttestationDirect`).
   only be cleared by editing storage by hand. AC-008 and AC-009 have the
   same gap.
 
-**§14.18** is closed in this branch's final wave (see spec §14.18):
-`RecordAgyProbeAttestation` depends only on the store, the operator
-credential, and the configured agy profile and evidence root — never on
-a wired adapter — so the first row can be recorded that way before the
-adapter exists.
+**§14.18** (attestation bootstrap) is closed in this branch: a server
+configured with `AgyBinaryPath` but without a covering row starts in the
+typed `awaiting_attestation` state (status surface + log; every agy
+operation refuses with `ErrNotEligible`; no child), the first row is
+recorded there through `RecordAgyProbeAttestation` (no wired adapter
+needed), and a restart constructs the adapter. See "Production path"
+above.
 
 ## What only the operator's stages can establish (all open)
 
@@ -115,7 +134,8 @@ adapter exists.
 **Stage C:**
 - structured denial of every `sibling_read_path` tool and every
   `own_mutation_path` tool in the frozen inventory;
-- the first cprot-v2 attestation (blocked on the §14.18 gap).
+- the first cprot-v2 attestation, recorded through
+  `RecordAgyProbeAttestation` on the awaiting server, then a restart.
 - Write/append self-mutation is judged on the structured `denied_actions`
   marker alone, because the CLI rewrites its own conversation file on
   every turn.
