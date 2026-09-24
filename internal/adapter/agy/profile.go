@@ -10,8 +10,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -95,14 +93,14 @@ func ValidateAgyHarness(profile storage.CanonicalProfile, evidenceRoot string) (
 	if !agySemverPattern.MatchString(strings.TrimSpace(a.CLIVersion)) {
 		return unsupported(fmt.Sprintf("cli_version %q must be MAJOR.MINOR.PATCH", a.CLIVersion))
 	}
-	binaryPath := cleanedPath(a.BinaryPath)
+	binaryPath := storage.NormalizePathScalar(a.BinaryPath)
 	if binaryPath == "" || !strings.HasPrefix(binaryPath, "/") {
 		return unsupported(fmt.Sprintf("binary_path %q must be absolute", a.BinaryPath))
 	}
 	if err := storage.ValidateSHA256Digest(a.BinaryDigest); err != nil {
 		return unsupported("binary_digest: " + err.Error())
 	}
-	expectedHome := cleanedPath(a.ExpectedHome)
+	expectedHome := storage.NormalizePathScalar(a.ExpectedHome)
 	if expectedHome == "" || !strings.HasPrefix(expectedHome, "/") {
 		return unsupported(fmt.Sprintf("expected_home %q must be absolute", a.ExpectedHome))
 	}
@@ -247,21 +245,6 @@ func ValidateAgyHarness(profile storage.CanonicalProfile, evidenceRoot string) (
 	}, nil
 }
 
-// cleanedPath mirrors storage's scalar path normalization (BOM trim,
-// ToSlash/Clean, no trailing slash) for the fields the adapter re-
-// validates independently of storage.ComputeProfileDigest.
-func cleanedPath(p string) string {
-	s := strings.Trim(p, "\ufeff")
-	if s == "" {
-		return ""
-	}
-	s = filepath.ToSlash(filepath.Clean(s))
-	if s != "/" {
-		s = strings.TrimSuffix(s, "/")
-	}
-	return s
-}
-
 func requireUnique(field string, items []string) error {
 	seen := make(map[string]struct{}, len(items))
 	for _, item := range items {
@@ -385,240 +368,174 @@ func validatePluginsCanonicalBytes(raw []byte) error {
 	return nil
 }
 
+// coverageEvidenceDoc is the typed shape of the tool_coverage_path
+// evidence file (spec §3.7): only the three known keys (cli_version,
+// tools, denial_map). evidence.DecodeStrictObject enforces the shape
+// rules generic to every evidence file (single value, no unknown or
+// duplicate keys at any nesting level, no trailing content); the rules
+// below are the ones specific to THIS shape that a generic decoder
+// cannot express.
+type coverageEvidenceDoc struct {
+	CLIVersion string                  `json:"cli_version"`
+	Tools      map[string][]Capability `json:"tools"`
+	DenialMap  []DenialEntry           `json:"denial_map"`
+}
+
 // decodeCoverageEvidence decodes the tool_coverage_path evidence shape
-// (spec §3.7) STRICTLY at the token level, so the evidence file has
-// exactly one canonical meaning: one top-level object followed by EOF;
-// only the three known keys (cli_version, tools, denial_map), each at
-// most once and all present; "tools" keys unique and encountered in
-// strictly ascending order; each tool's capability array non-empty, in
-// the closed enum's canonical order, deduplicated, and uncovered
-// exclusive of every other value; "denial_map" entries encountered in
-// (action, display_name) ascending order with no duplicate pair, each
-// entry's tools array sorted, deduplicated, non-empty, and (checked
-// after decoding) a subset of the "tools" keys. encoding/json's normal
-// map/struct decoding would silently collapse duplicate keys, lose
-// encounter order, and accept trailing values, so it is not used for
-// this shape (mirrors codex.decodeNativeToolInventory).
+// (spec §3.7) by composing evidence.DecodeStrictObject (single value, no
+// unknown/duplicate keys, no trailing content — the same guarantees
+// codex's evidence decoding relies on) with the ordering/enum rules that
+// decoder does not know about this shape: "tools" keys must be
+// encountered in strictly ascending order in the file (Go's map decode
+// discards that order, so it is recovered separately by
+// toolKeysInFileOrder — everything else about the shape is already
+// covered by DecodeStrictObject by the time that runs); each tool's
+// capability array must be non-empty, in the closed enum's canonical
+// order, deduplicated, and uncovered exclusive of every other value;
+// "denial_map" entries — whose order IS preserved by ordinary JSON-array
+// decoding — must be ascending by (action, display_name) with no
+// duplicate pair, and each entry's tools array must be sorted,
+// deduplicated, non-empty, and (checked after decoding) a subset of the
+// "tools" keys.
 func decodeCoverageEvidence(raw []byte) (CoverageMap, error) {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	expectDelim := func(want json.Delim) error {
-		tok, err := dec.Token()
-		if err != nil {
-			return err
-		}
-		if d, ok := tok.(json.Delim); !ok || d != want {
-			return fmt.Errorf("expected %q, got %v", want, tok)
-		}
-		return nil
+	var doc coverageEvidenceDoc
+	if err := evidence.DecodeStrictObject(raw, &doc); err != nil {
+		return CoverageMap{}, fmt.Errorf("decode tool coverage evidence: %w", err)
 	}
-	stringToken := func(what string) (string, error) {
-		tok, err := dec.Token()
-		if err != nil {
-			return "", err
-		}
-		s, ok := tok.(string)
-		if !ok {
-			return "", fmt.Errorf("%s must be a string, got %v", what, tok)
-		}
-		return s, nil
+	if strings.TrimSpace(doc.CLIVersion) == "" {
+		return CoverageMap{}, fmt.Errorf("cli_version must not be empty")
+	}
+	if doc.Tools == nil {
+		return CoverageMap{}, fmt.Errorf("missing key %q", "tools")
+	}
+	if doc.DenialMap == nil {
+		return CoverageMap{}, fmt.Errorf("missing key %q", "denial_map")
 	}
 
-	m := CoverageMap{Tools: make(map[string][]Capability)}
-
-	if err := expectDelim('{'); err != nil {
-		return m, err
+	for tool, caps := range doc.Tools {
+		if tool == "" {
+			return CoverageMap{}, fmt.Errorf("tools carries an empty tool name")
+		}
+		if len(caps) == 0 {
+			return CoverageMap{}, fmt.Errorf("tools[%q] carries no capabilities", tool)
+		}
+		lastRank := -1
+		for _, c := range caps {
+			rank := capabilityRank(c)
+			if rank < 0 {
+				return CoverageMap{}, fmt.Errorf("tools[%q] carries unknown capability %q", tool, c)
+			}
+			if rank <= lastRank {
+				return CoverageMap{}, fmt.Errorf("tools[%q] capabilities must be sorted in enum order without duplicates", tool)
+			}
+			lastRank = rank
+			if c == CapabilityUncovered && len(caps) != 1 {
+				return CoverageMap{}, fmt.Errorf("tools[%q]: uncovered must be exclusive of every other capability", tool)
+			}
+		}
 	}
-	seenTop := make(map[string]struct{}, 3)
+
+	toolKeys, err := toolKeysInFileOrder(raw)
+	if err != nil {
+		return CoverageMap{}, fmt.Errorf("recover tools key order: %w", err)
+	}
+	for i := 1; i < len(toolKeys); i++ {
+		if toolKeys[i] <= toolKeys[i-1] {
+			return CoverageMap{}, fmt.Errorf("tools keys must be sorted and unique: %q does not follow %q", toolKeys[i], toolKeys[i-1])
+		}
+	}
+
 	var lastAction, lastDisplay string
-	for dec.More() {
-		key, err := stringToken("object key")
-		if err != nil {
-			return m, err
+	for i, entry := range doc.DenialMap {
+		if entry.Action == "" {
+			return CoverageMap{}, fmt.Errorf("denial_map entry action is empty")
 		}
-		if _, dup := seenTop[key]; dup {
-			return m, fmt.Errorf("key %q is duplicated", key)
+		if entry.DisplayName == "" {
+			return CoverageMap{}, fmt.Errorf("denial_map entry display_name is empty")
 		}
-		seenTop[key] = struct{}{}
-		switch key {
-		case "cli_version":
-			v, err := stringToken("cli_version")
-			if err != nil {
-				return m, err
-			}
-			if strings.TrimSpace(v) == "" {
-				return m, fmt.Errorf("cli_version must not be empty")
-			}
-			m.CLIVersion = v
-		case "tools":
-			if err := expectDelim('{'); err != nil {
-				return m, fmt.Errorf("tools: %w", err)
-			}
-			var lastTool string
-			first := true
-			for dec.More() {
-				tool, err := stringToken("tools tool name")
-				if err != nil {
-					return m, err
-				}
-				if tool == "" {
-					return m, fmt.Errorf("tools carries an empty tool name")
-				}
-				if !first && tool <= lastTool {
-					return m, fmt.Errorf("tools keys must be sorted and unique: %q does not follow %q", tool, lastTool)
-				}
-				lastTool = tool
-				first = false
-				if err := expectDelim('['); err != nil {
-					return m, fmt.Errorf("tools[%q]: %w", tool, err)
-				}
-				var caps []Capability
-				lastRank := -1
-				for dec.More() {
-					capStr, err := stringToken("capability")
-					if err != nil {
-						return m, err
-					}
-					rank := capabilityRank(Capability(capStr))
-					if rank < 0 {
-						return m, fmt.Errorf("tools[%q] carries unknown capability %q", tool, capStr)
-					}
-					if rank <= lastRank {
-						return m, fmt.Errorf("tools[%q] capabilities must be sorted in enum order without duplicates", tool)
-					}
-					lastRank = rank
-					caps = append(caps, Capability(capStr))
-				}
-				if err := expectDelim(']'); err != nil {
-					return m, fmt.Errorf("tools[%q]: %w", tool, err)
-				}
-				if len(caps) == 0 {
-					return m, fmt.Errorf("tools[%q] carries no capabilities", tool)
-				}
-				for _, c := range caps {
-					if c == CapabilityUncovered && len(caps) != 1 {
-						return m, fmt.Errorf("tools[%q]: uncovered must be exclusive of every other capability", tool)
-					}
-				}
-				m.Tools[tool] = caps
-			}
-			if err := expectDelim('}'); err != nil {
-				return m, fmt.Errorf("tools: %w", err)
-			}
-		case "denial_map":
-			if err := expectDelim('['); err != nil {
-				return m, fmt.Errorf("denial_map: %w", err)
-			}
-			for dec.More() {
-				if err := expectDelim('{'); err != nil {
-					return m, fmt.Errorf("denial_map entry: %w", err)
-				}
-				var entry DenialEntry
-				seenEntryKeys := make(map[string]struct{}, 3)
-				for dec.More() {
-					ekey, err := stringToken("denial_map entry key")
-					if err != nil {
-						return m, err
-					}
-					if _, dup := seenEntryKeys[ekey]; dup {
-						return m, fmt.Errorf("denial_map entry key %q is duplicated", ekey)
-					}
-					seenEntryKeys[ekey] = struct{}{}
-					switch ekey {
-					case "action":
-						v, err := stringToken("denial_map action")
-						if err != nil {
-							return m, err
-						}
-						entry.Action = v
-					case "display_name":
-						v, err := stringToken("denial_map display_name")
-						if err != nil {
-							return m, err
-						}
-						entry.DisplayName = v
-					case "tools":
-						if err := expectDelim('['); err != nil {
-							return m, fmt.Errorf("denial_map tools: %w", err)
-						}
-						var lastT string
-						first := true
-						for dec.More() {
-							t, err := stringToken("denial_map tools entry")
-							if err != nil {
-								return m, err
-							}
-							if t == "" {
-								return m, fmt.Errorf("denial_map tools entry is empty")
-							}
-							if !first && t <= lastT {
-								return m, fmt.Errorf("denial_map tools must be sorted and deduplicated: %q does not follow %q", t, lastT)
-							}
-							lastT = t
-							first = false
-							entry.Tools = append(entry.Tools, t)
-						}
-						if err := expectDelim(']'); err != nil {
-							return m, fmt.Errorf("denial_map tools: %w", err)
-						}
-					default:
-						return m, fmt.Errorf("denial_map entry has unknown key %q", ekey)
-					}
-				}
-				if err := expectDelim('}'); err != nil {
-					return m, fmt.Errorf("denial_map entry: %w", err)
-				}
-				for _, req := range []string{"action", "display_name", "tools"} {
-					if _, ok := seenEntryKeys[req]; !ok {
-						return m, fmt.Errorf("denial_map entry missing key %q", req)
-					}
-				}
-				if entry.Action == "" {
-					return m, fmt.Errorf("denial_map entry action is empty")
-				}
-				if entry.DisplayName == "" {
-					return m, fmt.Errorf("denial_map entry display_name is empty")
-				}
-				if len(entry.Tools) == 0 {
-					return m, fmt.Errorf("denial_map entry %q/%q has no tools", entry.Action, entry.DisplayName)
-				}
-				if len(m.DenialMap) > 0 {
-					if entry.Action == lastAction && entry.DisplayName == lastDisplay {
-						return m, fmt.Errorf("denial_map has duplicate (action,display_name) pair (%q,%q)", entry.Action, entry.DisplayName)
-					}
-					if entry.Action < lastAction || (entry.Action == lastAction && entry.DisplayName < lastDisplay) {
-						return m, fmt.Errorf("denial_map must be sorted by (action,display_name)")
-					}
-				}
-				lastAction, lastDisplay = entry.Action, entry.DisplayName
-				m.DenialMap = append(m.DenialMap, entry)
-			}
-			if err := expectDelim(']'); err != nil {
-				return m, fmt.Errorf("denial_map: %w", err)
-			}
-		default:
-			return m, fmt.Errorf("unknown key %q", key)
+		if len(entry.Tools) == 0 {
+			return CoverageMap{}, fmt.Errorf("denial_map entry %q/%q has no tools", entry.Action, entry.DisplayName)
 		}
-	}
-	if err := expectDelim('}'); err != nil {
-		return m, err
-	}
-	for _, req := range []string{"cli_version", "tools", "denial_map"} {
-		if _, ok := seenTop[req]; !ok {
-			return m, fmt.Errorf("missing key %q", req)
+		var lastT string
+		for j, t := range entry.Tools {
+			if t == "" {
+				return CoverageMap{}, fmt.Errorf("denial_map tools entry is empty")
+			}
+			if j > 0 && t <= lastT {
+				return CoverageMap{}, fmt.Errorf("denial_map tools must be sorted and deduplicated: %q does not follow %q", t, lastT)
+			}
+			lastT = t
 		}
-	}
-	if _, err := dec.Token(); err != io.EOF {
-		return m, fmt.Errorf("trailing content after coverage evidence object")
+		if i > 0 {
+			if entry.Action == lastAction && entry.DisplayName == lastDisplay {
+				return CoverageMap{}, fmt.Errorf("denial_map has duplicate (action,display_name) pair (%q,%q)", entry.Action, entry.DisplayName)
+			}
+			if entry.Action < lastAction || (entry.Action == lastAction && entry.DisplayName < lastDisplay) {
+				return CoverageMap{}, fmt.Errorf("denial_map must be sorted by (action,display_name)")
+			}
+		}
+		lastAction, lastDisplay = entry.Action, entry.DisplayName
 	}
 
 	// Cross-validate after decoding (denial_map may precede tools in the
 	// canonical byte order: cli_version < denial_map < tools).
-	for _, entry := range m.DenialMap {
+	for _, entry := range doc.DenialMap {
 		for _, t := range entry.Tools {
-			if _, ok := m.Tools[t]; !ok {
-				return m, fmt.Errorf("denial_map entry (%q,%q) names tool %q which is not in tools", entry.Action, entry.DisplayName, t)
+			if _, ok := doc.Tools[t]; !ok {
+				return CoverageMap{}, fmt.Errorf("denial_map entry (%q,%q) names tool %q which is not in tools", entry.Action, entry.DisplayName, t)
 			}
 		}
 	}
-	return m, nil
+
+	return CoverageMap{CLIVersion: doc.CLIVersion, Tools: doc.Tools, DenialMap: doc.DenialMap}, nil
+}
+
+// toolKeysInFileOrder recovers the "tools" object's key encounter order
+// exactly as written in the file — the one property of this shape that
+// encoding/json's ordinary map decode discards and that
+// evidence.DecodeStrictObject has no reason to preserve (it enforces
+// strictness, not field order). It assumes raw already passed
+// evidence.DecodeStrictObject (single well-formed value, no duplicate
+// keys anywhere), so it does no strictness checking of its own — it is
+// a pure order-extraction pass over the same bytes, not a second
+// validator.
+func toolKeysInFileOrder(raw []byte) ([]string, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if _, err := dec.Token(); err != nil { // top-level '{'
+		return nil, err
+	}
+	var keys []string
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, _ := keyTok.(string)
+		if key != "tools" {
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if _, err := dec.Token(); err != nil { // "tools" object's '{'
+			return nil, err
+		}
+		for dec.More() {
+			kTok, err := dec.Token()
+			if err != nil {
+				return nil, err
+			}
+			k, _ := kTok.(string)
+			keys = append(keys, k)
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return nil, err
+			}
+		}
+		if _, err := dec.Token(); err != nil { // "tools" object's '}'
+			return nil, err
+		}
+	}
+	return keys, nil
 }

@@ -66,9 +66,9 @@ func capabilityRank(c Capability) int {
 // a native denial (settings.json rule) proven for the pinned CLI
 // version, naming the tools it covers.
 type DenialEntry struct {
-	Action      string
-	DisplayName string
-	Tools       []string
+	Action      string   `json:"action"`
+	DisplayName string   `json:"display_name"`
+	Tools       []string `json:"tools"`
 }
 
 // CoverageMap is the version-pinned tool-to-capability coverage map

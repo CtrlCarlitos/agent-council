@@ -346,11 +346,15 @@ func normalizeStringSlice(slice []string, lower bool, cleanPath bool) []string {
 	return out
 }
 
-// normalizePathScalar applies the family's scalar path normalization
+// NormalizePathScalar applies the family's scalar path normalization
 // (BOM trim, ToSlash/Clean, no trailing slash, NFC) to a single path
 // field (e.g. binary_path, expected_home) — the scalar counterpart of
-// normalizeStringSlice(slice, false, true).
-func normalizePathScalar(p string) string {
+// normalizeStringSlice(slice, false, true). Exported so every adapter
+// that re-validates a frozen path field independently (e.g.
+// internal/adapter/agy) shares this exact normalization instead of
+// forking it, keeping the frozen digest and the adapter's re-validated
+// value provably identical for every input, including non-NFC Unicode.
+func NormalizePathScalar(p string) string {
 	s := strings.Trim(p, "\ufeff")
 	s = filepath.ToSlash(filepath.Clean(s))
 	if s != "/" {
@@ -705,9 +709,9 @@ func validateCodexHarnessBlock(c *CodexHarnessSpec) error {
 func canonicalAgyBlock(a *AgyHarnessSpec) map[string]any {
 	return map[string]any{
 		"cli_version":                    codexScalar(a.CLIVersion),
-		"binary_path":                    normalizePathScalar(a.BinaryPath),
+		"binary_path":                    NormalizePathScalar(a.BinaryPath),
 		"binary_digest":                  strings.ToLower(strings.TrimSpace(a.BinaryDigest)),
-		"expected_home":                  normalizePathScalar(a.ExpectedHome),
+		"expected_home":                  NormalizePathScalar(a.ExpectedHome),
 		"platform":                       map[string]any{"family": codexScalar(a.Platform.Family), "os": codexScalar(a.Platform.OS)},
 		"permission_mode":                codexScalar(a.PermissionMode),
 		"execution_mode":                 codexScalar(a.ExecutionMode),
@@ -723,13 +727,13 @@ func canonicalAgyBlock(a *AgyHarnessSpec) map[string]any {
 			"unverifiable": normalizeStringSlice(a.HooksEvidence.Unverifiable, false, false),
 		},
 		"expected_skills":         normalizeStringSlice(a.ExpectedSkills, false, false),
-		"plugins_evidence_path":   normalizePathScalar(a.PluginsEvidencePath),
+		"plugins_evidence_path":   NormalizePathScalar(a.PluginsEvidencePath),
 		"plugins_evidence_digest": strings.ToLower(strings.TrimSpace(a.PluginsEvidenceDigest)),
 		"hooks_config_digest":     strings.ToLower(strings.TrimSpace(a.HooksConfigDigest)),
 		"required_hooks":          normalizeStringSlice(a.RequiredHooks, false, false),
-		"init_evidence_path":      normalizePathScalar(a.InitEvidencePath),
+		"init_evidence_path":      NormalizePathScalar(a.InitEvidencePath),
 		"init_evidence_digest":    strings.ToLower(strings.TrimSpace(a.InitEvidenceDigest)),
-		"tool_coverage_path":      normalizePathScalar(a.ToolCoveragePath),
+		"tool_coverage_path":      NormalizePathScalar(a.ToolCoveragePath),
 		"tool_coverage_digest":    strings.ToLower(strings.TrimSpace(a.ToolCoverageDigest)),
 	}
 }
@@ -798,14 +802,14 @@ func validateAgyHarnessBlock(a *AgyHarnessSpec) error {
 	if !semverPattern.MatchString(codexScalar(a.CLIVersion)) {
 		return fmt.Errorf("agy block cli_version %q must be MAJOR.MINOR.PATCH", a.CLIVersion)
 	}
-	binaryPath := normalizePathScalar(a.BinaryPath)
+	binaryPath := NormalizePathScalar(a.BinaryPath)
 	if binaryPath == "" || !strings.HasPrefix(binaryPath, "/") {
 		return fmt.Errorf("agy block binary_path %q must be absolute", a.BinaryPath)
 	}
 	if err := requireDistinctSHA256("binary_digest", a.BinaryDigest); err != nil {
 		return err
 	}
-	expectedHome := normalizePathScalar(a.ExpectedHome)
+	expectedHome := NormalizePathScalar(a.ExpectedHome)
 	if expectedHome == "" || !strings.HasPrefix(expectedHome, "/") {
 		return fmt.Errorf("agy block expected_home %q must be absolute", a.ExpectedHome)
 	}

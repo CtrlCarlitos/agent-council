@@ -363,3 +363,56 @@ func TestValidateAgyHarness_EvidenceDigestMismatchRejected(t *testing.T) {
 		t.Fatal("an init_evidence_digest mismatch must be rejected")
 	}
 }
+
+// ValidateAgyHarness re-validates binary_path/expected_home with the
+// EXACT SAME normalizer storage.ComputeProfileDigest uses to freeze
+// them (storage.NormalizePathScalar), instead of a forked copy that
+// could silently drift (e.g. omit NFC normalization). A path component
+// written as decomposed Unicode ("e" + U+0301, NFD) must come out of
+// both the frozen canonical profile and AgyLaunchPolicy as the SAME
+// precomposed ("é", NFC) string.
+func TestValidateAgyHarness_PathScalarsShareStorageNFCNormalization(t *testing.T) {
+	p, root := acceptedProfileAndRoot(t)
+	decomposedBinaryPath := "/home/op/café/.local/bin/agy" // "café" written as e + combining acute accent
+	decomposedExpectedHome := "/home/op/.gemini_café"      // same decomposed sequence
+	p.Harnesses["agy"].Agy.BinaryPath = decomposedBinaryPath
+	p.Harnesses["agy"].Agy.ExpectedHome = decomposedExpectedHome
+
+	_, canon, err := storage.ComputeProfileDigest(p)
+	if err != nil {
+		t.Fatalf("compute profile digest: %v", err)
+	}
+	var canonDoc struct {
+		Harnesses map[string]struct {
+			Agy struct {
+				BinaryPath   string `json:"binary_path"`
+				ExpectedHome string `json:"expected_home"`
+			} `json:"agy"`
+		} `json:"harnesses"`
+	}
+	if err := json.Unmarshal(canon, &canonDoc); err != nil {
+		t.Fatalf("unmarshal canonical profile: %v", err)
+	}
+	wantBinaryPath := canonDoc.Harnesses["agy"].Agy.BinaryPath
+	wantExpectedHome := canonDoc.Harnesses["agy"].Agy.ExpectedHome
+
+	// Sanity: the canonical value is precomposed, not the raw decomposed
+	// input, so the comparison below is actually exercising normalization.
+	if !strings.Contains(wantBinaryPath, "é") || strings.Contains(wantBinaryPath, "é") {
+		t.Fatalf("canonical profile binary_path must be NFC-normalized, got %q", wantBinaryPath)
+	}
+	if !strings.Contains(wantExpectedHome, "é") || strings.Contains(wantExpectedHome, "é") {
+		t.Fatalf("canonical profile expected_home must be NFC-normalized, got %q", wantExpectedHome)
+	}
+
+	policy, err := ValidateAgyHarness(p, root)
+	if err != nil {
+		t.Fatalf("ValidateAgyHarness: %v", err)
+	}
+	if policy.BinaryPath != wantBinaryPath {
+		t.Fatalf("AgyLaunchPolicy.BinaryPath %q does not equal the canonical profile's frozen binary_path %q", policy.BinaryPath, wantBinaryPath)
+	}
+	if policy.ExpectedHome != wantExpectedHome {
+		t.Fatalf("AgyLaunchPolicy.ExpectedHome %q does not equal the canonical profile's frozen expected_home %q", policy.ExpectedHome, wantExpectedHome)
+	}
+}
