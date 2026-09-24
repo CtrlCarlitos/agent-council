@@ -123,9 +123,9 @@ func TestAgyTest_ImportGuard_NoFixtureConstructorReferencesOutsideAgyPackage(t *
 	forbidden := map[string]bool{
 		"FixtureOption": true,
 		"FixtureMode":   true,
-		// Task 5 is expected to add a fixture-scoped constructor
-		// analogous to codex's NewFixtureScopedAdapter; whatever name it
-		// picks belongs in this set too.
+		// Task 5's fixture-scoped constructor (production eligibility
+		// skipped): never reachable from production wiring.
+		"NewFixtureScopedAdapter": true,
 	}
 	walkErr := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
