@@ -110,7 +110,32 @@ VALUES (?, ?, 0, ?, ?, ?, ?)`,
 // check; the operation is idempotent by op_id with receipt replay; a
 // session that already has a binding is rejected (one native identity
 // per session); the native_id shape is enforced by the schema.
+//
+// A session with an OPEN creation-uncertainty episode (an in-flight
+// marker included) cannot be bound here: the service's birth path binds
+// through BindAgySessionClosingEpisode, which closes its own marker in
+// the same transaction.
 func (s *Store) BindAgySession(ctx context.Context, opID, callerLease string, b AgySessionBinding) (OperationReceipt, error) {
+	return s.bindAgySession(ctx, opID, callerLease, b, 0)
+}
+
+// BindAgySessionClosingEpisode is BindAgySession for the service's birth
+// path: in ONE transaction it re-validates the lease, replays by op_id,
+// refuses an existing binding, inserts the binding, journals the op, and
+// closes the session's open in-flight creation marker `episode` with
+// disposition AgyUncertaintyBound (resolution op = opID, generation =
+// the validated one). A missing, closed, or non-in-flight episode is
+// refused before any write. The op fingerprint is BindAgySession's, so a
+// replay of the same create op through either entry point returns the
+// committed receipt.
+func (s *Store) BindAgySessionClosingEpisode(ctx context.Context, opID, callerLease string, b AgySessionBinding, episode int64) (OperationReceipt, error) {
+	if episode < 1 {
+		return OperationReceipt{}, errors.New("binding that closes a creation marker requires the episode")
+	}
+	return s.bindAgySession(ctx, opID, callerLease, b, episode)
+}
+
+func (s *Store) bindAgySession(ctx context.Context, opID, callerLease string, b AgySessionBinding, episode int64) (OperationReceipt, error) {
 	if strings.TrimSpace(opID) == "" || strings.TrimSpace(callerLease) == "" {
 		return OperationReceipt{}, errors.New("binding requires the operation id and the controller lease")
 	}
@@ -132,7 +157,8 @@ func (s *Store) BindAgySession(ctx context.Context, opID, callerLease string, b 
 	}
 	defer tx.Rollback()
 
-	if _, err := classifyCredential(ctx, tx.Tx(), runID, callerLease, true); err != nil {
+	gen, err := classifyCredential(ctx, tx.Tx(), runID, callerLease, true)
+	if err != nil {
 		return OperationReceipt{}, fmt.Errorf("controller authority: %w", err)
 	}
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "bind_agy_session", fp); err != nil {
@@ -149,6 +175,24 @@ func (s *Store) BindAgySession(ctx context.Context, opID, callerLease string, b 
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return OperationReceipt{}, fmt.Errorf("query existing binding: %w", err)
+	}
+	var openEpisode int64
+	var openReason string
+	err = tx.Tx().QueryRowContext(ctx, `
+SELECT episode, reason FROM agy_creation_uncertainties
+WHERE session_id = ? AND disposition IS NULL`, b.SessionID).Scan(&openEpisode, &openReason)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		if episode > 0 {
+			return OperationReceipt{}, fmt.Errorf("session %s has no open creation marker %d to close", b.SessionID, episode)
+		}
+	case err != nil:
+		return OperationReceipt{}, fmt.Errorf("query open creation uncertainty: %w", err)
+	case episode == 0:
+		return OperationReceipt{}, &ErrAgyCreationUncertaintyOpen{SessionID: b.SessionID, Episode: openEpisode, Reason: openReason}
+	case openEpisode != episode || openReason != AgyCreationInFlightReason:
+		return OperationReceipt{}, fmt.Errorf("session %s open creation-uncertainty episode %d (%s) is not the unannotated in-flight marker %d; refusing to bind",
+			b.SessionID, openEpisode, openReason, episode)
 	}
 
 	now := time.Now().UTC()
@@ -169,6 +213,20 @@ func (s *Store) BindAgySession(ctx context.Context, opID, callerLease string, b 
 	}
 	if err := insertAgySessionBindingTx(ctx, tx.Tx(), b); err != nil {
 		return OperationReceipt{}, err
+	}
+	if episode > 0 {
+		res, err := tx.Tx().ExecContext(ctx, `
+UPDATE agy_creation_uncertainties
+SET disposition = ?, resolution_reason = ?, resolution_generation = ?, resolution_op_id = ?, resolved_at = ?
+WHERE session_id = ? AND episode = ? AND disposition IS NULL`,
+			AgyUncertaintyBound, "bound to native conversation "+b.NativeID, gen, opID, now.Format(time.RFC3339Nano),
+			b.SessionID, episode)
+		if err != nil {
+			return OperationReceipt{}, fmt.Errorf("close creation marker: %w", err)
+		}
+		if n, err := res.RowsAffected(); err != nil || n != 1 {
+			return OperationReceipt{}, fmt.Errorf("close creation marker: expected one open row, updated %d (%v)", n, err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return OperationReceipt{}, err

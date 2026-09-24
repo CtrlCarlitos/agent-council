@@ -249,6 +249,49 @@ const (
 	AgyUncertaintyVerifiedAbsent = "verified_absent"
 )
 
+// The service-owned pre-launch creation marker (spec §3.3/§3.11): an
+// episode opened with AgyCreationInFlightReason BEFORE the creation
+// child starts blocks recreation exactly like any other open episode,
+// so a crash anywhere between the child's start and the binding commit
+// leaves a durable block instead of a silent second creation. It is
+// closed only by the successful bind (AgyUncertaintyBound, in the bind's
+// transaction), by a proven clean pre-launch rejection
+// (AgyUncertaintyNotCreated), or by a controller resolution.
+const (
+	AgyCreationInFlightReason = "creation_in_flight"
+	// AgyUncertaintyBound: the in-flight creation's conversation was
+	// bound to the session (closed inside BindAgySessionClosingEpisode).
+	AgyUncertaintyBound = "bound"
+	// AgyUncertaintyNotCreated: the adapter rejected the creation before
+	// any child process existed, so no native identity can exist.
+	AgyUncertaintyNotCreated = "not_created"
+)
+
+// ErrAgyCreationUncertaintyOpen reports that the session already has an
+// open creation-uncertainty episode (an in-flight marker included):
+// creation is blocked until it is closed or resolved.
+type ErrAgyCreationUncertaintyOpen struct {
+	SessionID string
+	Episode   int64
+	Reason    string
+}
+
+func (e *ErrAgyCreationUncertaintyOpen) Error() string {
+	return fmt.Sprintf("session %s has an open creation-uncertainty episode %d (%s)", e.SessionID, e.Episode, e.Reason)
+}
+
+// isAgyInFlightReason reports whether an episode reason is the (possibly
+// outcome-annotated) service in-flight marker.
+func isAgyInFlightReason(reason string) bool {
+	return reason == AgyCreationInFlightReason || strings.HasPrefix(reason, AgyCreationInFlightReason+": ")
+}
+
+// IsAgyCreationInFlight reports whether the episode is a service
+// pre-launch creation marker (annotated or not).
+func (ep *AgyCreationUncertaintyEpisode) IsAgyCreationInFlight() bool {
+	return ep != nil && isAgyInFlightReason(ep.Reason)
+}
+
 const (
 	agyUncertainCmd  = "record_agy_creation_uncertain"
 	agyUncertainKind = "agy_creation_uncertain"
@@ -288,14 +331,24 @@ func (s *Store) RecordAgyCreationUncertain(ctx context.Context, rec AgyCreationU
 	defer tx.Rollback()
 
 	// Open episode: the fact is already durable — replay its receipt.
+	// The one open episode is ANNOTATED, never duplicated: a first
+	// observed orphan id fills a NULL orphan_native_id, and the service's
+	// in-flight marker gains the outcome (so the adapter's drift record
+	// lands on the service's episode before the child is terminated).
 	var openEpisode int64
 	var openOpID string
 	err = tx.Tx().QueryRowContext(ctx, `
 SELECT episode, record_op_id FROM agy_creation_uncertainties
 WHERE session_id = ? AND disposition IS NULL`, rec.SessionID).Scan(&openEpisode, &openOpID)
 	if err == nil {
+		if err := annotateOpenAgyEpisodeTx(ctx, tx.Tx(), rec.SessionID, openEpisode, rec.OrphanNativeID, rec.Reason); err != nil {
+			return 0, OperationReceipt{}, err
+		}
 		receipt, err := journalReceipt(ctx, tx.Tx(), openOpID)
 		if err != nil {
+			return 0, OperationReceipt{}, err
+		}
+		if err := tx.Commit(); err != nil {
 			return 0, OperationReceipt{}, err
 		}
 		return openEpisode, receipt, nil
@@ -304,8 +357,21 @@ WHERE session_id = ? AND disposition IS NULL`, rec.SessionID).Scan(&openEpisode,
 		return 0, OperationReceipt{}, fmt.Errorf("query open creation uncertainty: %w", err)
 	}
 
+	episode, receipt, err := insertAgyUncertaintyEpisodeTx(ctx, tx.Tx(), rec)
+	if err != nil {
+		return 0, OperationReceipt{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, OperationReceipt{}, err
+	}
+	return episode, receipt, nil
+}
+
+// insertAgyUncertaintyEpisodeTx opens the NEXT episode (the caller has
+// established that none is open) with its journal entry.
+func insertAgyUncertaintyEpisodeTx(ctx context.Context, tx *sql.Tx, rec AgyCreationUncertainty) (int64, OperationReceipt, error) {
 	var maxEpisode sql.NullInt64
-	if err := tx.Tx().QueryRowContext(ctx,
+	if err := tx.QueryRowContext(ctx,
 		`SELECT MAX(episode) FROM agy_creation_uncertainties WHERE session_id = ?`, rec.SessionID).Scan(&maxEpisode); err != nil {
 		return 0, OperationReceipt{}, fmt.Errorf("query creation uncertainty episodes: %w", err)
 	}
@@ -315,7 +381,7 @@ WHERE session_id = ? AND disposition IS NULL`, rec.SessionID).Scan(&openEpisode,
 	}
 	opID := agyUncertaintyOpID(rec.SessionID, episode)
 	fp := computeFingerprint(agyUncertainCmd, rec.SessionID, rec.RunID, fmt.Sprintf("%d", episode), rec.Reason)
-	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, rec.RecordedBy, agyUncertainCmd, fp); err != nil {
+	if receipt, err := checkOrRecordIdempotency(tx, opID, rec.RecordedBy, agyUncertainCmd, fp); err != nil {
 		return 0, OperationReceipt{}, err
 	} else if receipt != nil {
 		// A journal entry without its episode row cannot exist (same
@@ -332,11 +398,11 @@ WHERE session_id = ? AND disposition IS NULL`, rec.SessionID).Scan(&openEpisode,
 		CreatedAt:        now,
 		Payload:          rec.Reason,
 	}
-	if err := recordJournalEntry(tx.Tx(), opID, agyUncertainCmd, fp, rec.RunID, rec.SessionID, "",
+	if err := recordJournalEntry(tx, opID, agyUncertainCmd, fp, rec.RunID, rec.SessionID, "",
 		agyUncertainKind, receipt, rec.RecordedBy); err != nil {
 		return 0, OperationReceipt{}, err
 	}
-	if _, err := tx.Tx().ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 INSERT INTO agy_creation_uncertainties
 	(session_id, episode, run_id, reason, recorded_by, record_op_id, cause_op_id, orphan_native_id, recorded_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -344,10 +410,150 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		nullableString(rec.OrphanNativeID), now.Format(time.RFC3339Nano)); err != nil {
 		return 0, OperationReceipt{}, fmt.Errorf("insert creation uncertainty episode: %w", err)
 	}
+	return episode, receipt, nil
+}
+
+// annotateOpenAgyEpisodeTx records what was observed on the session's
+// open episode: a first orphan id fills a NULL orphan_native_id (a
+// DIFFERENT id than the one already recorded is refused — one creation
+// child per episode), and an unannotated in-flight marker gains the
+// outcome as "creation_in_flight: <outcome>". Any other reason is kept.
+func annotateOpenAgyEpisodeTx(ctx context.Context, tx *sql.Tx, sessionID string, episode int64, orphan, outcome string) error {
+	var reason string
+	var existing sql.NullString
+	if err := tx.QueryRowContext(ctx, `
+SELECT reason, orphan_native_id FROM agy_creation_uncertainties
+WHERE session_id = ? AND episode = ? AND disposition IS NULL`, sessionID, episode).Scan(&reason, &existing); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("session %s has no OPEN creation-uncertainty episode %d", sessionID, episode)
+		}
+		return fmt.Errorf("query open creation uncertainty episode: %w", err)
+	}
+	newOrphan := existing
+	if orphan != "" {
+		if existing.Valid && existing.String != orphan {
+			return fmt.Errorf("session %s creation-uncertainty episode %d already records orphan %s; refusing to replace it with %s",
+				sessionID, episode, existing.String, orphan)
+		}
+		newOrphan = sql.NullString{String: orphan, Valid: true}
+	}
+	newReason := reason
+	if reason == AgyCreationInFlightReason && strings.TrimSpace(outcome) != "" && outcome != AgyCreationInFlightReason {
+		newReason = AgyCreationInFlightReason + ": " + outcome
+	}
+	if newReason == reason && newOrphan == existing {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE agy_creation_uncertainties SET reason = ?, orphan_native_id = ?
+WHERE session_id = ? AND episode = ? AND disposition IS NULL`, newReason, newOrphan, sessionID, episode); err != nil {
+		return fmt.Errorf("annotate creation uncertainty episode: %w", err)
+	}
+	return nil
+}
+
+// BeginAgyCreationInFlight opens the service's pre-launch creation
+// marker (reason AgyCreationInFlightReason) for the session BEFORE any
+// creation child starts. It is atomic with the checks: an already-open
+// episode is refused typed (*ErrAgyCreationUncertaintyOpen) and a bound
+// session is refused, both before any write. The journal entry carries
+// the recording identity; cause_op_id is the creation operation.
+func (s *Store) BeginAgyCreationInFlight(ctx context.Context, runID, sessionID, createOpID, recordedBy string) (int64, OperationReceipt, error) {
+	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(runID) == "" {
+		return 0, OperationReceipt{}, errors.New("creation in-flight marker requires the session and run provenance")
+	}
+	if strings.TrimSpace(createOpID) == "" || strings.TrimSpace(recordedBy) == "" {
+		return 0, OperationReceipt{}, errors.New("creation in-flight marker requires the creation operation id and the recording identity")
+	}
+	tx, err := s.BeginWrite(ctx)
+	if err != nil {
+		return 0, OperationReceipt{}, err
+	}
+	defer tx.Rollback()
+
+	var openEpisode int64
+	var openReason string
+	err = tx.Tx().QueryRowContext(ctx, `
+SELECT episode, reason FROM agy_creation_uncertainties
+WHERE session_id = ? AND disposition IS NULL`, sessionID).Scan(&openEpisode, &openReason)
+	if err == nil {
+		return 0, OperationReceipt{}, &ErrAgyCreationUncertaintyOpen{SessionID: sessionID, Episode: openEpisode, Reason: openReason}
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, OperationReceipt{}, fmt.Errorf("query open creation uncertainty: %w", err)
+	}
+	var bound string
+	err = tx.Tx().QueryRowContext(ctx,
+		`SELECT native_id FROM agy_session_bindings WHERE session_id = ?`, sessionID).Scan(&bound)
+	if err == nil {
+		return 0, OperationReceipt{}, fmt.Errorf("session %s is already bound to native identity %s; no creation may start", sessionID, bound)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, OperationReceipt{}, fmt.Errorf("query existing binding: %w", err)
+	}
+	episode, receipt, err := insertAgyUncertaintyEpisodeTx(ctx, tx.Tx(), AgyCreationUncertainty{
+		RunID: runID, SessionID: sessionID, Reason: AgyCreationInFlightReason,
+		RecordedBy: recordedBy, CauseOpID: createOpID,
+	})
+	if err != nil {
+		return 0, OperationReceipt{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, OperationReceipt{}, err
 	}
 	return episode, receipt, nil
+}
+
+// SetAgyCreationUncertaintyOrphan records what a creation observed on
+// the session's exact OPEN episode: the orphan native id (when known;
+// a conflicting id is refused) and, for an unannotated in-flight
+// marker, the outcome. The episode stays open — only a controller
+// resolution (or the bind) closes it.
+func (s *Store) SetAgyCreationUncertaintyOrphan(ctx context.Context, sessionID string, episode int64, orphanID, outcome string) error {
+	if strings.TrimSpace(sessionID) == "" || episode < 1 {
+		return errors.New("creation-uncertainty annotation requires the session id and the episode")
+	}
+	tx, err := s.BeginWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := annotateOpenAgyEpisodeTx(ctx, tx.Tx(), sessionID, episode, orphanID, outcome); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// CloseAgyCreationInFlight closes an UNANNOTATED in-flight marker whose
+// creation provably produced no unbound conversation: disposition
+// AgyUncertaintyNotCreated (the adapter rejected before any child
+// existed) or AgyUncertaintyBound (the session is already bound to the
+// very conversation the creation reported). Any other episode — an
+// annotated marker, an adapter/uncertain episode — is refused: those
+// need a controller resolution.
+func (s *Store) CloseAgyCreationInFlight(ctx context.Context, sessionID string, episode int64, disposition, reason string) error {
+	switch disposition {
+	case AgyUncertaintyNotCreated, AgyUncertaintyBound:
+	default:
+		return fmt.Errorf("in-flight marker close disposition %q is not one of %s|%s", disposition, AgyUncertaintyNotCreated, AgyUncertaintyBound)
+	}
+	if strings.TrimSpace(reason) == "" {
+		return errors.New("in-flight marker close requires the reason")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := s.DB().ExecContext(ctx, `
+UPDATE agy_creation_uncertainties
+SET disposition = ?, resolution_reason = ?, resolved_at = ?
+WHERE session_id = ? AND episode = ? AND disposition IS NULL AND reason = ?`,
+		disposition, reason, now, sessionID, episode, AgyCreationInFlightReason)
+	if err != nil {
+		return fmt.Errorf("close creation in-flight marker: %w", err)
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return fmt.Errorf("close creation in-flight marker: session %s episode %d is not an open unannotated in-flight marker (updated %d, %v)",
+			sessionID, episode, n, err)
+	}
+	return nil
 }
 
 // ResolveAgyCreationUncertainty durably resolves ONE exact open episode
