@@ -251,6 +251,38 @@ func TestCanonicalProfileV3_ApprovalsReviewerMustBeUser(t *testing.T) {
 	}
 }
 
+// sandbox_policy.type enum at freeze (AC-009 §5): only read-only and
+// workspace-write are launchable; danger-full-access (which would flow
+// verbatim into every turn/start pin) and any unknown value are a
+// validation error in any launch or code path.
+func TestCanonicalProfileV3_SandboxTypeEnum(t *testing.T) {
+	for _, ok := range []string{"read-only", "workspace-write"} {
+		p := v3Profile()
+		p.Harnesses["codex"].Codex.SandboxPolicy.Type = ok
+		if _, _, err := ComputeProfileDigest(p); err != nil {
+			t.Fatalf("sandbox_policy type %q must freeze: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "danger-full-access", "danger-full-access ", "yolo-full-access", "read_only"} {
+		p := v3Profile()
+		p.Harnesses["codex"].Codex.SandboxPolicy.Type = bad
+		if _, _, err := ComputeProfileDigest(p); err == nil {
+			t.Fatalf("sandbox_policy type %q must be rejected at freeze", bad)
+		}
+	}
+	// The same gate holds at parse-freeze of raw JSON.
+	for _, bad := range []string{"danger-full-access", "yolo-full-access"} {
+		raw := v3CanonicalJSONWithSandboxType(bad)
+		parsed, err := ParseCanonicalProfileJSON(raw)
+		if err != nil {
+			t.Fatalf("parse is shape-only: %v", err)
+		}
+		if _, _, err := ComputeProfileDigest(parsed); err == nil {
+			t.Fatalf("sandbox_policy type %q must be rejected at parse-freeze", bad)
+		}
+	}
+}
+
 // Granular approval policy: the committed 0.154.0 TurnStartParams.json
 // capture pins the five-key all-boolean AskForApproval.granular shape,
 // so a well-formed granular policy now freezes (Task 9 wired the shape
@@ -473,4 +505,19 @@ func v3CanonicalJSONWithPolicy(policy string) []byte {
 		panic("golden vector lost its approval_policy")
 	}
 	return []byte(strings.Replace(base, old, `"approval_policy":`+policy, 1))
+}
+
+// v3CanonicalJSONWithSandboxType builds a strict-decodable v3 profile
+// JSON whose sandbox_policy.type is the given value.
+func v3CanonicalJSONWithSandboxType(sandboxType string) []byte {
+	base := string(v3GoldenRaw())
+	old := `"type":"workspace-write"`
+	if !strings.Contains(base, old) {
+		panic("golden vector lost its sandbox_policy type")
+	}
+	repl, err := json.Marshal(sandboxType)
+	if err != nil {
+		panic(err)
+	}
+	return []byte(strings.Replace(base, old, `"type":`+string(repl), 1))
 }

@@ -175,6 +175,33 @@ func TestValidateCodexHarness_GranularNilObjectRejectedTyped(t *testing.T) {
 	}
 }
 
+// The sandbox_policy.type enum is a freeze gate (AC-009 §5): only
+// read-only and workspace-write are launchable; danger-full-access —
+// which would otherwise flow verbatim into every turn/start pin and
+// self-confirm in the echo compares — and any unknown value are
+// rejected with the typed error before any child starts.
+func TestValidateCodexHarness_SandboxTypeEnumRejected(t *testing.T) {
+	for _, ok := range []string{"read-only", "workspace-write"} {
+		p, root := evidenceRootForCodex(t, v3CodexProfile())
+		p.Harnesses["codex"].Codex.SandboxPolicy.Type = ok
+		if _, err := ValidateCodexHarness(p, root); err != nil {
+			t.Fatalf("sandbox_policy type %q must validate: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"danger-full-access", "yolo-full-access", "read_only", "Read-Only"} {
+		p, root := evidenceRootForCodex(t, v3CodexProfile())
+		p.Harnesses["codex"].Codex.SandboxPolicy.Type = bad
+		_, err := ValidateCodexHarness(p, root)
+		var unsupported *ErrUnsupportedProfile
+		if err == nil || !errors.As(err, &unsupported) {
+			t.Fatalf("sandbox_policy type %q must be rejected with typed ErrUnsupportedProfile, got %T: %v", bad, err, err)
+		}
+		if !strings.Contains(err.Error(), "sandbox_policy") {
+			t.Fatalf("rejection must name sandbox_policy, got %v", err)
+		}
+	}
+}
+
 // The event universe file is re-hashed at validation and must match the
 // frozen digest; a valid profile yields the launch policy with the
 // frozen values, including the canonical approval-policy encoding.

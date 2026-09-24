@@ -546,3 +546,158 @@ func TestCodexAdapter_Cancel_DefinitiveRefusalRejected(t *testing.T) {
 		t.Fatal("a refused interrupt must not retire the turn run")
 	}
 }
+
+// A Cancel racing the pre-route window (run registered, turn/start ack
+// still pending, no turn route installed) must return CancelUnknown
+// without blocking or panicking — the interrupt cannot be addressed
+// before the route exists, and the slot stays held.
+func TestCodexAdapter_Cancel_PreRouteWindowUnknown(t *testing.T) {
+	h := newAdapterHarness(t)
+	scenario := append([]string{authOKLine()}, threadStartRules(testThreadID, h.wsRoot, h.model)...)
+	scenario = append(scenario, resumeRule(testThreadID, h.wsRoot, h.model, nil))
+	scenario = append(scenario,
+		`{"respond": {"method":"turn/start","delay_ms":2000,"result":{"id":"`+testTurnID+`","threadId":"`+testThreadID+`","status":{"type":"inProgress"}}}}`)
+	writeScenario(t, h.scratch, scenario...)
+	h.createAndPersist(t)
+	seedRollout(t, h, testThreadID)
+
+	ref := adapter.TurnRef{SessionID: testSessionID, TurnKey: "t-cancel-preroute"}
+	type dispatchResult struct {
+		out adapter.DispatchOutcome
+		err error
+	}
+	dispatched := make(chan dispatchResult, 1)
+	go func() {
+		out, err := h.dispatch(t, ref.TurnKey, "prompt")
+		dispatched <- dispatchResult{out: out, err: err}
+	}()
+
+	// Wait for the run to enter the pre-route window: registered in the
+	// live map, turn route not yet installed.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		h.adapter.mu.Lock()
+		run, live := h.adapter.turns[ref]
+		inWindow := live && run != nil && run.tap == nil
+		h.adapter.mu.Unlock()
+		if inWindow {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the run never entered the pre-route window")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// The cancel must come back promptly with CancelUnknown — a nil-tap
+	// dereference here panicked the handler goroutine before the guard.
+	type cancelResult struct {
+		outcome adapter.CancelOutcome
+		err     error
+	}
+	cancelled := make(chan cancelResult, 1)
+	go func() {
+		outcome, err := h.adapter.Cancel(context.Background(), ref)
+		cancelled <- cancelResult{outcome: outcome, err: err}
+	}()
+	select {
+	case res := <-cancelled:
+		if res.err != nil {
+			t.Fatalf("pre-route cancel: %v", res.err)
+		}
+		if res.outcome.Disposition != adapter.CancelUnknown {
+			t.Fatalf("the unaddressable pre-route interrupt must be CancelUnknown, got %+v", res.outcome)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("pre-route cancel must not block on the pending dispatch ack")
+	}
+
+	// The dispatch completes normally afterwards and the run stays live.
+	res := <-dispatched
+	if res.err != nil || res.out.Status != adapter.DispatchAccepted {
+		t.Fatalf("dispatch after the pre-route cancel: %+v err=%v", res.out, res.err)
+	}
+	h.adapter.mu.Lock()
+	_, live := h.adapter.turns[ref]
+	h.adapter.mu.Unlock()
+	if !live {
+		t.Fatal("the accepted turn must stay live after the pre-route cancel")
+	}
+}
+
+// The deferred ledger regression: a caller whose context goes away
+// mid-wait gets CancelRequested — the interrupt request stands, the
+// escalation remains armed, and the slot (run + child) is still held.
+func TestCodexAdapter_Cancel_CallerGoneMidWaitRequested(t *testing.T) {
+	h := newAdapterHarness(t)
+	scenario := append([]string{authOKLine()}, threadStartRules(testThreadID, h.wsRoot, h.model)...)
+	scenario = append(scenario, resumeRule(testThreadID, h.wsRoot, h.model, nil))
+	scenario = append(scenario, turnAcceptedRules(testThreadID, testTurnID, false)...)
+	scenario = append(scenario, `{"respond": {"method":"turn/interrupt","result":{"action":"interrupted"}}}`)
+	writeScenario(t, h.scratch, scenario...)
+	h.createAndPersist(t)
+	seedRollout(t, h, testThreadID)
+
+	ref := adapter.TurnRef{SessionID: testSessionID, TurnKey: "t-cancel-gone"}
+	if out, err := h.dispatch(t, ref.TurnKey, "prompt"); err != nil || out.Status != adapter.DispatchAccepted {
+		t.Fatalf("dispatch: %+v err=%v", out, err)
+	}
+	waitAttempt(t, h, ref.TurnKey, func(a *storage.CodexTurnAttempt) bool { return a.NativeTurnID != nil })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type cancelResult struct {
+		outcome adapter.CancelOutcome
+		err     error
+	}
+	cancelled := make(chan cancelResult, 1)
+	go func() {
+		outcome, err := h.adapter.Cancel(ctx, ref)
+		cancelled <- cancelResult{outcome: outcome, err: err}
+	}()
+
+	// Fire the caller cancellation once the interrupt provably reached
+	// the child (mid-wait, before any terminal).
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		reached := false
+		for _, m := range requestLog(t, h.scratch) {
+			if m == "turn/interrupt" {
+				reached = true
+				break
+			}
+		}
+		if reached {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("turn/interrupt never reached the child")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+
+	select {
+	case res := <-cancelled:
+		if res.err != nil {
+			t.Fatalf("cancel: %v", res.err)
+		}
+		if res.outcome.Disposition != adapter.CancelRequested {
+			t.Fatalf("a caller disconnect mid-wait must be CancelRequested, got %+v", res.outcome)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the ctx-done branch never fired")
+	}
+
+	// The request stands: the run and its slot are still held and the
+	// child was NOT terminated (client disconnect is not cancellation).
+	h.adapter.mu.Lock()
+	_, live := h.adapter.turns[ref]
+	h.adapter.mu.Unlock()
+	if !live {
+		t.Fatal("the slot must still be held after CancelRequested")
+	}
+	if terminatedCount(t, h.scratch) != 0 {
+		t.Fatal("a requester disconnect must not terminate the child")
+	}
+}

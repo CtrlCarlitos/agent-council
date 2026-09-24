@@ -112,6 +112,11 @@ func ValidateCodexHarness(profile storage.CanonicalProfile, evidenceRoot string)
 	if strings.TrimSpace(c.SandboxPolicy.Type) == "" {
 		return unsupported("codex block lacks the sandbox_policy type")
 	}
+	switch c.SandboxPolicy.Type {
+	case "read-only", "workspace-write":
+	default:
+		return unsupported(fmt.Sprintf("sandbox_policy type %q is forbidden: only read-only and workspace-write are launchable (spec §5)", c.SandboxPolicy.Type))
+	}
 	if len(c.SandboxPolicy.WritableRoots) == 0 {
 		return unsupported("codex block sandbox_policy requires writable_roots")
 	}

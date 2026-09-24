@@ -731,6 +731,56 @@ func TestCodexAdapter_CreationUncertainTombstoneBlocksRetry(t *testing.T) {
 	}
 }
 
+// §3.8/§3.4: a definitive thread/start error response (the deterministic
+// trust-precondition refusal) is a typed pre-acceptance rejection — NOT
+// creation-uncertain: no tombstone, so a corrected retry is NOT blocked.
+func TestCodexAdapter_CreateSessionDefinitiveRefusalRejected(t *testing.T) {
+	h := newAdapterHarness(t)
+	const refusal = "Not inside a trusted directory and --skip-git-repo-check was not used"
+	writeScenario(t, h.scratch,
+		authOKLine(),
+		`{"respond_error": {"method":"thread/start","code":-32000,"message":"Not inside a trusted directory and --skip-git-repo-check was not used"}}`)
+
+	req := adapter.CreateSessionRequest{
+		SessionID:   testSessionID,
+		Contributor: "codex",
+		Config:      adapter.SessionConfig{WorkspaceRoot: h.wsRoot, Model: h.model},
+	}
+	_, err := h.adapter.CreateSession(context.Background(), req)
+	var rejected *ErrCodexThreadStartRejected
+	if !errors.As(err, &rejected) {
+		t.Fatalf("definitive thread/start refusal must be typed ErrCodexThreadStartRejected, got %T: %v", err, err)
+	}
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Message != refusal {
+		t.Fatalf("rejection must wrap the verbatim RPCError, got %T: %v", err, err)
+	}
+	var unc *adapter.ErrSessionCreationUncertain
+	if errors.As(err, &unc) {
+		t.Fatal("a definitive refusal must NOT classify as creation-uncertain")
+	}
+	if terminatedCount(t, h.scratch) < 1 {
+		t.Fatal("a refused creation must terminate the child (never silently reused)")
+	}
+
+	// Contrast with the lost-response path (TestCodexAdapter_
+	// CreationUncertainTombstoneBlocksRetry): the retry is NOT blocked by
+	// a tombstone — it reaches the child again and hits the live refusal.
+	_, retryErr := h.adapter.CreateSession(context.Background(), req)
+	if !errors.As(retryErr, &rejected) {
+		t.Fatalf("retry must hit the live refusal again (no tombstone), got %T: %v", retryErr, retryErr)
+	}
+	if strings.Contains(retryErr.Error(), "creation uncertainty is unresolved") {
+		t.Fatal("a definitive refusal must not tombstone the session")
+	}
+	if args := readFixtureFile(t, h.scratch, ".codex-fixture-args"); len(args) != 2 {
+		t.Fatalf("the retry must launch a fresh child (no tombstone), launches: %v", args)
+	}
+	if h.adapter.ResolveCreationUncertainty(testSessionID) {
+		t.Fatal("no tombstone may exist after a definitive refusal")
+	}
+}
+
 // ── §3.4 ResumeSession (local inspection only) ──────────────────────────
 
 func TestCodexAdapter_ResumeSessionLocalOnly(t *testing.T) {

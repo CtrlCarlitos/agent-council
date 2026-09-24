@@ -56,6 +56,25 @@ func (e *ErrCodexAuthRequired) Error() string {
 
 func (e *ErrCodexAuthRequired) Unwrap() error { return e.Err }
 
+// ErrCodexThreadStartRejected reports a definitive native refusal of
+// thread/start (spec §3.4/§3.8): the child answered the request with a
+// JSON-RPC error (e.g. the deterministic trust-precondition failure
+// "Not inside a trusted directory …"), so the outcome is NOT creation
+// uncertainty — no thread was created and the child is terminated. No
+// §3.4 tombstone is recorded: a corrected creation attempt is permitted.
+type ErrCodexThreadStartRejected struct {
+	SessionID adapter.SessionID
+	Code      int
+	Message   string
+	Err       error
+}
+
+func (e *ErrCodexThreadStartRejected) Error() string {
+	return fmt.Sprintf("thread/start was definitively refused for session %s (%d: %s)", e.SessionID, e.Code, e.Message)
+}
+
+func (e *ErrCodexThreadStartRejected) Unwrap() error { return e.Err }
+
 // ErrProfileDrift reports a pre-transmission effective-config mismatch
 // (spec §3.5): the complete thread/resume configuration disagreed with
 // the frozen profile, the child was terminated, and the prompt was
@@ -559,6 +578,21 @@ func (a *CodexAdapter) createBinding(ctx context.Context, req adapter.CreateSess
 			// created, so this is a clean rejection — not uncertainty.
 			return adapter.SessionBinding{}, fmt.Errorf("thread/start was not transmitted: %w", err)
 		}
+		var rpcErr *RPCError
+		if errors.As(err, &rpcErr) {
+			// Definitive native refusal AFTER the request was written
+			// (§3.8 trust precondition, §3.4): the child answered with a
+			// JSON-RPC error, so nothing is uncertain — no thread was
+			// created. Typed pre-acceptance rejection with NO tombstone
+			// and NO journal-uncertainty record; only lost responses
+			// take the uncertain path below.
+			return adapter.SessionBinding{}, &ErrCodexThreadStartRejected{
+				SessionID: req.SessionID,
+				Code:      rpcErr.Code,
+				Message:   rpcErr.Message,
+				Err:       err,
+			}
+		}
 		// Lost response, abandoned reservation, or protocol drift: the
 		// native thread may exist; automatic recreation is blocked
 		// (tombstone on this child, typed uncertainty to the caller).
@@ -959,8 +993,13 @@ func (a *CodexAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown,
 			Reason: "turn route could not be installed: " + terr.Error()}, terr
 	}
+	// Publish the route under the turns lock: a Cancel racing the
+	// pre-route window reads run.tap under the same lock (nil ⇒ unknown,
+	// never a dereference of the uninstalled route).
+	a.mu.Lock()
 	run.tap = tap
 	run.routeInstalled = true
+	a.mu.Unlock()
 
 	// Bind the native turn id in-life from turn/started (replayed from
 	// the park buffer when the notification arrived before the route).
@@ -1449,6 +1488,10 @@ var cancelTerminalGrace = 5 * time.Second
 func (a *CodexAdapter) Cancel(ctx context.Context, ref adapter.TurnRef) (adapter.CancelOutcome, error) {
 	a.mu.Lock()
 	run := a.turns[ref]
+	var tap *TurnTap
+	if run != nil {
+		tap = run.tap
+	}
 	a.mu.Unlock()
 
 	if run == nil {
@@ -1462,6 +1505,14 @@ func (a *CodexAdapter) Cancel(ctx context.Context, ref adapter.TurnRef) (adapter
 		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown,
 			Reason: "turn not dispatched"}, nil
 	}
+	if tap == nil {
+		// Pre-route window (§3.9): the run is registered but the
+		// turn/start ack is still pending, so no turn route exists and
+		// the interrupt cannot be addressed. The run and its slot stay
+		// held; report unknown without blocking the caller.
+		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown,
+			Reason: "turn is still awaiting its dispatch ack; no interrupt route exists yet"}, nil
+	}
 	if _, terminal := run.terminalStatus(); terminal {
 		return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelAlreadyTerminal,
 			Reason: "turn already reached a verified terminal"}, nil
@@ -1471,7 +1522,7 @@ func (a *CodexAdapter) Cancel(ctx context.Context, ref adapter.TurnRef) (adapter
 	// disconnected controller cannot abandon the request mid-write.
 	ictx, icancel := context.WithTimeout(context.WithoutCancel(ctx), dispatchAckTimeout)
 	defer icancel()
-	err := run.child.client.TurnInterrupt(ictx, run.nativeThreadID, run.tap.TurnID())
+	err := run.child.client.TurnInterrupt(ictx, run.nativeThreadID, tap.TurnID())
 	if err != nil {
 		var rpcErr *RPCError
 		if errors.As(err, &rpcErr) {
@@ -1521,7 +1572,7 @@ func (a *CodexAdapter) Cancel(ctx context.Context, ref adapter.TurnRef) (adapter
 			}
 			return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown,
 				Reason: "terminal signal lost"}, nil
-		case <-run.tap.Done():
+		case <-tap.Done():
 			if observed, ok := awaitBuffered(); ok {
 				if observed == "interrupted" {
 					return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelConfirmed,

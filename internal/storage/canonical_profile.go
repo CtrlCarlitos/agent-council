@@ -544,9 +544,16 @@ func (p CanonicalProfile) validateCodexBlocks() error {
 }
 
 // validateCodexHarnessBlock enforces the freeze-time codex gates:
+// sandbox_policy.type enum {read-only, workspace-write} (spec §5 —
+// danger-full-access is forbidden in any launch or code path),
 // approval_policy enum {untrusted, on-request, never, granular object},
 // granular shape evidence (fail-closed), and approvals_reviewer == user.
 func validateCodexHarnessBlock(c *CodexHarnessSpec) error {
+	switch codexScalar(c.SandboxPolicy.Type) {
+	case "read-only", "workspace-write":
+	default:
+		return fmt.Errorf("unsupported sandbox_policy type %q (expected read-only or workspace-write; danger-full-access is forbidden)", c.SandboxPolicy.Type)
+	}
 	switch c.ApprovalPolicy.Kind {
 	case CodexApprovalKindString:
 		switch norm.NFC.String(strings.Trim(c.ApprovalPolicy.String, "\ufeff")) {
