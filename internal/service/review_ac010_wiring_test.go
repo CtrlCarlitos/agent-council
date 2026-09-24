@@ -287,15 +287,29 @@ type agyWireServer struct {
 
 func (e *agyWireEnv) fixtureServer(t *testing.T, store *storage.Store) *agyWireServer {
 	t.Helper()
+	return e.fixtureServerWith(t, store, nil, nil)
+}
+
+// fixtureServerWith is fixtureServer with an injectable executor and
+// required-tools source (nil = the defaults: the real PolicyExecutor and
+// the service's journaled-intent seam). The AC-010 acceptance story
+// (acceptance_agy_test.go) uses it for the wire-level fault scenarios.
+func (e *agyWireEnv) fixtureServerWith(t *testing.T, store *storage.Store, exec execpolicy.PolicyExecutor, required agy.RequiredToolsSource) *agyWireServer {
+	t.Helper()
 	wm, err := workspace.NewWorkspaceManager(e.stateDir, e.wsBase)
 	if err != nil {
 		t.Fatalf("workspace manager: %v", err)
 	}
-	exec := &agyWireExecutor{inner: execpolicy.New()}
+	if exec == nil {
+		exec = &agyWireExecutor{inner: execpolicy.New()}
+	}
+	if required == nil {
+		required = &agyRequiredToolsSource{store: store}
+	}
 	src := agy.NewAgyTurnLaunchSource(store, wm, e.policy, e.fx.SealedImage)
 	identity := agyWireIdentity{}
 	adp, err := agy.NewFixtureScopedAdapter(store, exec, src, wm, e.policy, e.digest, e.fx.SealedImage,
-		identity, &agyRequiredToolsSource{store: store}, agy.FixtureMode{})
+		identity, required, agy.FixtureMode{})
 	if err != nil {
 		t.Fatalf("fixture-scoped adapter: %v", err)
 	}
