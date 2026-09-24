@@ -64,11 +64,11 @@ func (s *Store) PublishArtifact(ctx context.Context, opID string, callerLease st
 		return ArtifactMetadata{}, ErrArtifactOversized
 	}
 
-	// 3. Pre-authorization: validate caller authority against runs.controller_lease BEFORE creating any files
-	var runLease string
-	err := s.readDB.QueryRowContext(ctx, "SELECT controller_lease FROM runs WHERE run_id = ?;", meta.RunID).Scan(&runLease)
-	if err != nil || runLease != callerLease {
-		return ArtifactMetadata{}, ErrUnauthorizedOperation
+	// 3. Pre-authorization: classify caller authority before any file work
+	// (AC-004; administrator class — the current credential on unadopted
+	// runs remains the operator's maintenance handle).
+	if _, err := classifyCredential(ctx, s.readDB, meta.RunID, callerLease, false); err != nil {
+		return ArtifactMetadata{}, err
 	}
 
 	// 4. Pre-write sanitization of content
@@ -83,13 +83,12 @@ func (s *Store) PublishArtifact(ctx context.Context, opID string, callerLease st
 
 	// Check idempotency first before file creation
 	var storedCmdType, storedFingerprint, payloadJSON string
-	err = s.readDB.QueryRowContext(ctx, "SELECT command_type, command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;", opID).Scan(&storedCmdType, &storedFingerprint, &payloadJSON)
+	err := s.readDB.QueryRowContext(ctx, "SELECT command_type, command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;", opID).Scan(&storedCmdType, &storedFingerprint, &payloadJSON)
 	if err == nil {
 		var ajp artifactJournalPayload
 		if err := json.Unmarshal([]byte(payloadJSON), &ajp); err == nil && ajp.CommittedMeta.ID != "" {
-			if ajp.CallerLease != callerLease {
-				return ArtifactMetadata{}, ErrUnauthorizedOperation
-			}
+			// Authority was classified before this lookup; the recorded
+			// caller_lease may belong to a superseded controller.
 			if storedCmdType != "publish_artifact" || storedFingerprint != fp {
 				return ArtifactMetadata{}, ErrIdempotencyConflict
 			}
@@ -98,102 +97,8 @@ func (s *Store) PublishArtifact(ctx context.Context, opID string, callerLease st
 	}
 
 	// 6. Filesystem staging and atomic no-clobber installation
-	artifactMu.Lock()
-	defer artifactMu.Unlock()
-
-	artifactsDir := filepath.Join(s.stateDir, "artifacts")
-	if err := ensureNoSymlink(artifactsDir); err != nil {
+	if err := s.writeCASBlob(sanitizedContent, digest); err != nil {
 		return ArtifactMetadata{}, err
-	}
-	destDir := filepath.Join(artifactsDir, digest[:2])
-	if err := ensureNoSymlink(destDir); err != nil {
-		return ArtifactMetadata{}, err
-	}
-	destPath := filepath.Join(destDir, digest)
-	if err := ensureNoSymlink(destPath); err != nil {
-		return ArtifactMetadata{}, err
-	}
-
-	tmpDir := filepath.Join(artifactsDir, "tmp")
-	if err := ensureNoSymlink(tmpDir); err != nil {
-		return ArtifactMetadata{}, err
-	}
-	if err := os.MkdirAll(tmpDir, 0700); err != nil {
-		return ArtifactMetadata{}, fmt.Errorf("create tmp dir: %w", err)
-	}
-	if err := os.MkdirAll(destDir, 0700); err != nil {
-		return ArtifactMetadata{}, fmt.Errorf("create dest dir: %w", err)
-	}
-
-	// Staging file
-	tmpFile, err := os.CreateTemp(tmpDir, "blob-*")
-	if err != nil {
-		return ArtifactMetadata{}, fmt.Errorf("create staging file: %w", err)
-	}
-	tmpName := tmpFile.Name()
-
-	n, writeErr := tmpFile.Write(sanitizedContent)
-	if writeErr == nil && n != len(sanitizedContent) {
-		writeErr = io.ErrShortWrite
-	}
-	syncErr := tmpFile.Sync()
-	closeErr := tmpFile.Close()
-	if writeErr != nil || syncErr != nil || closeErr != nil {
-		_ = os.Remove(tmpName)
-		if writeErr != nil {
-			return ArtifactMetadata{}, fmt.Errorf("write staging file: %w", writeErr)
-		}
-		if syncErr != nil {
-			return ArtifactMetadata{}, fmt.Errorf("sync staging file: %w", syncErr)
-		}
-		return ArtifactMetadata{}, fmt.Errorf("close staging file: %w", closeErr)
-	}
-
-	if err := os.Chmod(tmpName, 0600); err != nil {
-		_ = os.Remove(tmpName)
-		return ArtifactMetadata{}, fmt.Errorf("chmod staging file: %w", err)
-	}
-
-	// Cross-process no-clobber install via os.Link. Staged content was fully written and synced.
-	linkErr := os.Link(tmpName, destPath)
-	if linkErr == nil {
-		_ = os.Remove(tmpName)
-	} else if os.IsExist(linkErr) {
-		_ = os.Remove(tmpName)
-		// Verify existing destination: size and content digest; if corrupt, fail without repair
-		existingBytes, err := s.ReadArtifact(digest)
-		if err != nil || !bytes.Equal(existingBytes, sanitizedContent) {
-			return ArtifactMetadata{}, ErrArtifactCorrupt
-		}
-	} else {
-		_ = os.Remove(tmpName)
-		return ArtifactMetadata{}, fmt.Errorf("install artifact file: %w", linkErr)
-	}
-
-	// Sync parent directory before metadata commit on supported POSIX filesystems.
-	// Windows artifact availability after sudden power loss:
-	// AC-002 flushes staged file contents and installs a complete digest-addressed file via os.Link.
-	// The current Windows implementation does not establish a crash-durable namespace-publication barrier
-	// before committing SQLite artifact metadata (user-mode directory handles cannot be flushed via
-	// FlushFileBuffers, which returns ERROR_ACCESS_DENIED). Therefore, a successful publication receipt
-	// does not guarantee that the artifact file remains available after abrupt power loss, even if its
-	// database revision record survives.
-	// Reads return content only when the file exists and its size and digest match the committed revision;
-	// missing or altered content returns explicit errors (ErrArtifactNotFound / ErrArtifactCorrupt) without
-	// exposing unverified bytes. This detects unavailable or corrupt artifacts; it does not prevent their loss.
-	if runtime.GOOS != "windows" {
-		d, err := os.Open(destDir)
-		if err != nil {
-			return ArtifactMetadata{}, fmt.Errorf("open dest dir for sync: %w", err)
-		}
-		dSyncErr := d.Sync()
-		dCloseErr := d.Close()
-		if dSyncErr != nil || dCloseErr != nil {
-			if dSyncErr != nil {
-				return ArtifactMetadata{}, fmt.Errorf("sync dest dir: %w", dSyncErr)
-			}
-			return ArtifactMetadata{}, fmt.Errorf("close dest dir: %w", dCloseErr)
-		}
 	}
 
 	// 7. Record metadata in relational store inside write transaction
@@ -361,4 +266,98 @@ WHERE artifact_id = ? AND revision = ?;`, artifactID, revision).Scan(&meta.ID, &
 	}
 
 	return meta, data, nil
+}
+
+// writeCASBlob atomically installs sanitizedContent under artifacts/<digest[:2]>/<digest>
+// via temporary staging and os.Link, guaranteeing no-clobber semantics.
+func (s *Store) writeCASBlob(sanitizedContent []byte, digest string) error {
+	artifactMu.Lock()
+	defer artifactMu.Unlock()
+
+	artifactsDir := filepath.Join(s.stateDir, "artifacts")
+	if err := ensureNoSymlink(artifactsDir); err != nil {
+		return err
+	}
+	destDir := filepath.Join(artifactsDir, digest[:2])
+	if err := ensureNoSymlink(destDir); err != nil {
+		return err
+	}
+	destPath := filepath.Join(destDir, digest)
+	if err := ensureNoSymlink(destPath); err != nil {
+		return err
+	}
+
+	tmpDir := filepath.Join(artifactsDir, "tmp")
+	if err := ensureNoSymlink(tmpDir); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(tmpDir, 0700); err != nil {
+		return fmt.Errorf("create tmp dir: %w", err)
+	}
+	if err := os.MkdirAll(destDir, 0700); err != nil {
+		return fmt.Errorf("create dest dir: %w", err)
+	}
+
+	// Staging file
+	tmpFile, err := os.CreateTemp(tmpDir, "blob-*")
+	if err != nil {
+		return fmt.Errorf("create staging file: %w", err)
+	}
+	tmpName := tmpFile.Name()
+
+	n, writeErr := tmpFile.Write(sanitizedContent)
+	if writeErr == nil && n != len(sanitizedContent) {
+		writeErr = io.ErrShortWrite
+	}
+	syncErr := tmpFile.Sync()
+	closeErr := tmpFile.Close()
+	if writeErr != nil || syncErr != nil || closeErr != nil {
+		_ = os.Remove(tmpName)
+		if writeErr != nil {
+			return fmt.Errorf("write staging file: %w", writeErr)
+		}
+		if syncErr != nil {
+			return fmt.Errorf("sync staging file: %w", syncErr)
+		}
+		return fmt.Errorf("close staging file: %w", closeErr)
+	}
+
+	if err := os.Chmod(tmpName, 0600); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("chmod staging file: %w", err)
+	}
+
+	// Cross-process no-clobber install via os.Link. Staged content was fully written and synced.
+	linkErr := os.Link(tmpName, destPath)
+	if linkErr == nil {
+		_ = os.Remove(tmpName)
+	} else if os.IsExist(linkErr) {
+		_ = os.Remove(tmpName)
+		// Verify existing destination: size and content digest; if corrupt, fail without repair
+		existingBytes, err := s.ReadArtifact(digest)
+		if err != nil || !bytes.Equal(existingBytes, sanitizedContent) {
+			return ErrArtifactCorrupt
+		}
+	} else {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("install artifact file: %w", linkErr)
+	}
+
+	// Sync parent directory before metadata commit on supported POSIX filesystems.
+	if runtime.GOOS != "windows" {
+		d, err := os.Open(destDir)
+		if err != nil {
+			return fmt.Errorf("open dest dir for sync: %w", err)
+		}
+		dSyncErr := d.Sync()
+		dCloseErr := d.Close()
+		if dSyncErr != nil || dCloseErr != nil {
+			if dSyncErr != nil {
+				return fmt.Errorf("sync dest dir: %w", dSyncErr)
+			}
+			return fmt.Errorf("close dest dir: %w", dCloseErr)
+		}
+	}
+
+	return nil
 }

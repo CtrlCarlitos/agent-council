@@ -20,6 +20,7 @@ func TestStore_CredentialRedaction_RealStorageBoundary(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-1")
+	adoptControllerForTest(t, store, "run-1", "lease-1")
 	_, _ = store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable",
 	})
@@ -44,10 +45,11 @@ func TestStore_CredentialRedaction_RealStorageBoundary(t *testing.T) {
 	}
 
 	// 2. ReleaseTurn receipt must also have redacted tokens
-	relReceipt, err := store.ReleaseTurn(ctx, "op-rel-sec", "lease-1", "sess-1", 2, "turn-sec")
+	relRes, err := store.ReleaseTurn(ctx, "op-rel-sec", "lease-1", "sess-1", 2, "turn-sec")
 	if err != nil {
 		t.Fatalf("release turn: %v", err)
 	}
+	relReceipt := relRes.Receipt
 	if strings.Contains(relReceipt.SanitizedPrompt, secretKey) || strings.Contains(relReceipt.SanitizedPrompt, githubToken) || strings.Contains(relReceipt.SanitizedPrompt, slackToken) {
 		t.Fatalf("release receipt contains raw secret tokens: %s", relReceipt.SanitizedPrompt)
 	}

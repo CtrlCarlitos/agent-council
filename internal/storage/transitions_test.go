@@ -20,6 +20,7 @@ func TestStore_ReleaseGuards_HostLossBlocksRelease(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-1")
+	adoptControllerForTest(t, store, "run-1", "lease-1")
 	_, _ = store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "host_lost",
 	})
@@ -44,6 +45,7 @@ func TestStore_NativeBindings_MultipleSessionsSameContributor(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-1")
+	adoptControllerForTest(t, store, "run-1", "lease-1")
 
 	// Session 1: active contributor for claude
 	_, err = store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
@@ -88,16 +90,18 @@ func TestStore_ReconcileSession_GenerationAndTurnValidation(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-1")
+	adoptControllerForTest(t, store, "run-1", "lease-1")
 	_, _ = store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable", RecoveryGeneration: 1,
 	})
 	_, _ = store.QueuePrompt(ctx, "op-q-1", "lease-1", "sess-1", 1, storage.PendingPrompt{
 		SessionID: "sess-1", TurnKey: "turn-1", Prompt: "Review diff", CreatedAt: time.Now(),
 	})
-	relReceipt, err := store.ReleaseTurn(ctx, "op-rel-1", "lease-1", "sess-1", 2, "turn-1")
+	relRes, err := store.ReleaseTurn(ctx, "op-rel-1", "lease-1", "sess-1", 2, "turn-1")
 	if err != nil {
 		t.Fatalf("release turn: %v", err)
 	}
+	relReceipt := relRes.Receipt
 	if relReceipt.SanitizedPrompt != "Review diff" {
 		t.Fatalf("expected sanitized prompt in release receipt, got %s", relReceipt.SanitizedPrompt)
 	}
@@ -113,7 +117,7 @@ func TestStore_ReconcileSession_GenerationAndTurnValidation(t *testing.T) {
 		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-WRONG"},
 		Generation: 2,
 	}
-	_, err = store.ReconcileSession(ctx, "op-rec-mismatch", "lease-1", refMismatch, adapter.ReconciliationOutcome{
+	_, err = store.ReconcileSession(ctx, "op-rec-mismatch", store.ExecutionRefForTurn(ctx, string(refMismatch.SessionID), refMismatch.TurnKey), refMismatch, adapter.ReconciliationOutcome{
 		Ref: refMismatch, Reachability: council.VisibilityReachable, Status: adapter.ReconciliationReachableTerminal, Observed: council.TurnCompleted,
 	})
 	if err == nil {
@@ -125,7 +129,7 @@ func TestStore_ReconcileSession_GenerationAndTurnValidation(t *testing.T) {
 		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-1"},
 		Generation: 1,
 	}
-	_, err = store.ReconcileSession(ctx, "op-rec-stale", "lease-1", refStale, adapter.ReconciliationOutcome{
+	_, err = store.ReconcileSession(ctx, "op-rec-stale", store.ExecutionRefForTurn(ctx, string(refStale.SessionID), refStale.TurnKey), refStale, adapter.ReconciliationOutcome{
 		Ref: refStale, Reachability: council.VisibilityReachable, Status: adapter.ReconciliationReachableTerminal, Observed: council.TurnCompleted,
 	})
 	if err == nil {
@@ -137,7 +141,7 @@ func TestStore_ReconcileSession_GenerationAndTurnValidation(t *testing.T) {
 		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-1"},
 		Generation: 2,
 	}
-	recReceipt, err := store.ReconcileSession(ctx, "op-rec-valid", "lease-1", refValid, adapter.ReconciliationOutcome{
+	recReceipt, err := store.ReconcileSession(ctx, "op-rec-valid", store.ExecutionRefForTurn(ctx, string(refValid.SessionID), refValid.TurnKey), refValid, adapter.ReconciliationOutcome{
 		Ref: refValid, Reachability: council.VisibilityReachable, Status: adapter.ReconciliationReachableTerminal, Observed: council.TurnCompleted, Result: "approved",
 	})
 	if err != nil {
@@ -158,6 +162,7 @@ func TestStore_RecordDispatchObservation_LateArrivalIgnored(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-1")
+	adoptControllerForTest(t, store, "run-1", "lease-1")
 	_, _ = store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable", RecoveryGeneration: 1,
 	})
@@ -177,7 +182,7 @@ func TestStore_RecordDispatchObservation_LateArrivalIgnored(t *testing.T) {
 		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-1"},
 		Generation: 2,
 	}
-	_, err = store.ReconcileSession(ctx, "op-rec-1", "lease-1", ref, adapter.ReconciliationOutcome{
+	_, err = store.ReconcileSession(ctx, "op-rec-1", store.ExecutionRefForTurn(ctx, string(ref.SessionID), ref.TurnKey), ref, adapter.ReconciliationOutcome{
 		Ref: ref, Reachability: council.VisibilityReachable, Status: adapter.ReconciliationReachableTerminal, Observed: council.TurnCompleted,
 	})
 	if err != nil {

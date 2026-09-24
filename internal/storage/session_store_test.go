@@ -18,6 +18,7 @@ func TestStore_OptimisticConcurrency_StaleUpdateRejected(t *testing.T) {
 
 	ctx := context.Background()
 	_, err = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-1")
+	adoptControllerForTest(t, store, "run-1", "lease-1")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -84,6 +85,7 @@ func TestStore_Authority_LeaseValidation(t *testing.T) {
 
 	ctx := context.Background()
 	_, err = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-valid")
+	adoptControllerForTest(t, store, "run-1", "lease-valid")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
