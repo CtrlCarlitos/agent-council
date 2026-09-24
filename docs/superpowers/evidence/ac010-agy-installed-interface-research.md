@@ -183,8 +183,8 @@ started**; status: inactive, systemd user unit `antigravity-cli-daemon`),
 | SIGINT / SIGTERM while idle | exit 0, only `init`, no terminal event |
 
 `init` event shape (verbatim keys): `{"event":"init","conversation_id":"<uuid>",
-"init":{"cwd":"<abs>","tools":[<58 names>],"permission_mode":"request-review"}}`.
-Tool names observed (1.2.9): `ask_custom_permission, ask_permission,
+"init":{"cwd":"<abs>","tools":[<57 names>],"permission_mode":"request-review"}}`.
+Tool names observed (1.2.9, 57 unique): `ask_custom_permission, ask_permission,
 ask_question, browser_* (17), browser_subagent, call_mcp_tool,
 capture_browser_console_logs, capture_browser_screenshot, click_browser_pixel,
 command_status, define_subagent, delete_knowledge, execute_browser_javascript,
