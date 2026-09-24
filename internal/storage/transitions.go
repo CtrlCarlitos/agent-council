@@ -35,6 +35,27 @@ type decisionJournalPayload struct {
 }
 
 var safeProfileIdentifierRegex = regexp.MustCompile(`^[a-zA-Z0-9_\-\.]+$`)
+
+// ValidateSafeIdentifier enforces the repository identifier rule:
+// non-empty, only [A-Za-z0-9_.-] (no path separators on any platform,
+// no traversal), length-bounded. "." and ".." are rejected.
+func ValidateSafeIdentifier(kind, id string) error {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" {
+		return fmt.Errorf("%s is empty", kind)
+	}
+	if len(trimmed) > 128 {
+		return fmt.Errorf("%s exceeds 128 bytes", kind)
+	}
+	if !safeProfileIdentifierRegex.MatchString(trimmed) {
+		return fmt.Errorf("%s %q contains characters outside [A-Za-z0-9_.-]", kind, id)
+	}
+	if trimmed == "." || trimmed == ".." {
+		return fmt.Errorf("%s %q is a reserved path component", kind, id)
+	}
+	return nil
+}
+
 var envAssignmentRegex = regexp.MustCompile(`(?i)[a-z0-9_]*(key|token|secret|password|bearer|auth)[a-z0-9_]*\s*=`)
 var envVarNameRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
@@ -178,6 +199,11 @@ func (s *Store) SetNativeBinding(ctx context.Context, opID string, callerLease s
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, false); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "set_native_binding", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
@@ -195,9 +221,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return OperationReceipt{}, ErrStaleUpdate
 	}
@@ -245,36 +269,247 @@ UPDATE sessions SET row_version = ?, updated_at = ? WHERE session_id = ?;`, newV
 	return receipt, nil
 }
 
-func (s *Store) ReleaseTurn(ctx context.Context, opID string, callerLease string, sessionID string, expectedVersion int64, turnKey string) (ReleaseReceipt, error) {
+// FindCommittedRelease checks if opID has already been committed as a release_turn operation.
+func (s *Store) FindCommittedRelease(ctx context.Context, opID string, callerLease string, sessionID string, turnKey string) (*ReleaseReceipt, bool, error) {
+	// Current controller authority precedes receipt replay (AC-004).
+	if _, err := authorizeSessionController(ctx, s.readDB, sessionID, callerLease, true); err != nil {
+		return nil, false, err
+	}
+	fp := computeFingerprint("release_turn", sessionID, turnKey)
+	var storedCmdType, storedFingerprint, payloadJSON string
+	err := s.readDB.QueryRowContext(ctx, "SELECT command_type, command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;", opID).Scan(&storedCmdType, &storedFingerprint, &payloadJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var jp releaseJournalPayload
+	if err := json.Unmarshal([]byte(payloadJSON), &jp); err == nil && jp.Receipt.TurnKey != "" {
+		if jp.Receipt.OperationReceipt.TurnKey == "" {
+			jp.Receipt.OperationReceipt.TurnKey = jp.Receipt.TurnKey
+		}
+		// Authority was classified at the boundary before this lookup; the
+		// recorded caller_lease may belong to a superseded controller whose
+		// committed response the current controller recovers.
+		if storedCmdType != "release_turn" || storedFingerprint != fp {
+			return nil, false, ErrIdempotencyConflict
+		}
+		return &jp.Receipt, true, nil
+	}
+	return nil, false, nil
+}
+
+// GetSessionVersion returns the current row_version of the given session.
+func (s *Store) GetSessionVersion(ctx context.Context, sessionID string) (int64, error) {
+	var version int64
+	err := s.readDB.QueryRowContext(ctx, "SELECT row_version FROM sessions WHERE session_id = ?;", sessionID).Scan(&version)
+	if err != nil {
+		return 0, err
+	}
+	return version, nil
+}
+
+// GetTurnPrompt returns the prompt text of the given turn.
+func (s *Store) GetTurnPrompt(ctx context.Context, sessionID, turnKey string) (string, error) {
+	var prompt string
+	err := s.readDB.QueryRowContext(ctx, "SELECT prompt FROM turns WHERE session_id = ? AND turn_key = ?;", sessionID, turnKey).Scan(&prompt)
+	if err != nil {
+		return "", err
+	}
+	return prompt, nil
+}
+
+// FindOperationReceipt checks if opID exists in journal_entries and validates callerLease if non-empty.
+func (s *Store) FindOperationReceipt(ctx context.Context, opID string, callerLease string) (*OperationReceipt, bool, error) {
+	var storedCmdType, storedFingerprint, payloadJSON string
+	var runID string
+	err := s.readDB.QueryRowContext(ctx, "SELECT command_type, command_fingerprint, payload_json, run_id FROM journal_entries WHERE op_id = ?;", opID).Scan(&storedCmdType, &storedFingerprint, &payloadJSON, &runID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	// Current controller authority precedes receipt replay (AC-004); the
+	// journal row's run scopes the classification.
+	if _, err := classifyCredential(ctx, s.readDB, runID, callerLease, true); err != nil {
+		return nil, false, err
+	}
+	var jp journalPayload
+	if err := json.Unmarshal([]byte(payloadJSON), &jp); err == nil && jp.Receipt.OpID != "" {
+		// Authority was classified before this lookup; the recorded
+		// caller_lease may belong to a superseded controller whose
+		// committed response the current controller recovers.
+		_ = callerLease
+		return &jp.Receipt, true, nil
+	}
+	return nil, false, nil
+}
+
+// SessionRecoveryState holds reachability and recovery status for a session.
+type SessionRecoveryState struct {
+	Visibility        string
+	ActiveRecoveryGen uint64
+	RecoveryContext   string
+	RowVersion        int64
+	State             string
+	ActiveKey         string
+}
+
+// GetSessionRecoveryState reads current visibility and recovery generation.
+func (s *Store) GetSessionRecoveryState(ctx context.Context, sessionID string) (SessionRecoveryState, error) {
+	var st SessionRecoveryState
+	var activeKey sql.NullString
+	err := s.readDB.QueryRowContext(ctx, "SELECT visibility, active_recovery_gen, row_version, state, active_key, coalesce(recovery_context, '') FROM sessions WHERE session_id = ?;", sessionID).Scan(&st.Visibility, &st.ActiveRecoveryGen, &st.RowVersion, &st.State, &activeKey, &st.RecoveryContext)
+	if err != nil {
+		return SessionRecoveryState{}, err
+	}
+	if activeKey.Valid {
+		st.ActiveKey = activeKey.String
+	}
+	return st, nil
+}
+
+// GetSessionNativeBinding returns the saved native binding for a session
+// together with the session's contributor identity, for explicit recovery
+// attach. found is false when no binding has been saved.
+func (s *Store) GetSessionNativeBinding(ctx context.Context, sessionID string) (NativeBinding, string, bool, error) {
+	var b NativeBinding
+	var contributor string
+	err := s.readDB.QueryRowContext(ctx, `
+SELECT b.session_id, b.native_session_id, b.harness, b.model, b.workspace_mode, b.config_json, s.contributor
+FROM native_bindings b
+JOIN sessions s ON s.session_id = b.session_id
+WHERE b.session_id = ?;`, sessionID).Scan(&b.LogicalSessionID, &b.NativeSessionID, &b.Harness, &b.Model, &b.WorkspaceMode, &b.ToolingConfig, &contributor)
+	if err == sql.ErrNoRows {
+		return NativeBinding{}, "", false, nil
+	}
+	if err != nil {
+		return NativeBinding{}, "", false, err
+	}
+	return b, contributor, true, nil
+}
+
+// TurnDetails provides full authoritative status and state for a turn.
+type TurnDetails struct {
+	SessionID      string                 `json:"session_id"`
+	TurnKey        string                 `json:"turn_key"`
+	Prompt         string                 `json:"prompt"`
+	Status         council.TurnStatus     `json:"status"`
+	Result         string                 `json:"result"`
+	AttemptID      string                 `json:"attempt_id"`
+	CreatedAt      time.Time              `json:"created_at"`
+	CompletedAt    *time.Time             `json:"completed_at,omitempty"`
+	DispatchIntent *DispatchIntentDetails `json:"dispatch_intent,omitempty"`
+}
+
+// DispatchIntentDetails captures intent tracking for an attempt.
+type DispatchIntentDetails struct {
+	SessionID  string    `json:"session_id"`
+	TurnKey    string    `json:"turn_key"`
+	AttemptID  string    `json:"attempt_id"`
+	Phase      string    `json:"phase"`
+	RecordedAt time.Time `json:"recorded_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// GetTurnDetails returns authoritative turn state including dispatch intent.
+func (s *Store) GetTurnDetails(ctx context.Context, sessionID, turnKey string) (*TurnDetails, error) {
+	var td TurnDetails
+	var completedAt sql.NullString
+	var createdAtStr string
+	err := s.readDB.QueryRowContext(ctx, `
+SELECT session_id, turn_key, prompt, status, result, attempt_id, created_at, completed_at
+FROM turns
+WHERE session_id = ? AND turn_key = ?;`, sessionID, turnKey).Scan(&td.SessionID, &td.TurnKey, &td.Prompt, &td.Status, &td.Result, &td.AttemptID, &createdAtStr, &completedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query turn: %w", err)
+	}
+
+	if t, err := time.Parse(time.RFC3339Nano, createdAtStr); err == nil {
+		td.CreatedAt = t
+	} else if t, err := time.Parse(time.RFC3339, createdAtStr); err == nil {
+		td.CreatedAt = t
+	}
+
+	if completedAt.Valid && completedAt.String != "" {
+		if t, err := time.Parse(time.RFC3339Nano, completedAt.String); err == nil {
+			td.CompletedAt = &t
+		} else if t, err := time.Parse(time.RFC3339, completedAt.String); err == nil {
+			td.CompletedAt = &t
+		}
+	}
+
+	var di DispatchIntentDetails
+	var diRecStr, diUpdStr string
+	err = s.readDB.QueryRowContext(ctx, `
+SELECT session_id, turn_key, attempt_id, phase, recorded_at, updated_at
+FROM dispatch_intents
+WHERE session_id = ? AND turn_key = ?;`, sessionID, turnKey).Scan(&di.SessionID, &di.TurnKey, &di.AttemptID, &di.Phase, &diRecStr, &diUpdStr)
+	if err == nil {
+		if t, err := time.Parse(time.RFC3339Nano, diRecStr); err == nil {
+			di.RecordedAt = t
+		}
+		if t, err := time.Parse(time.RFC3339Nano, diUpdStr); err == nil {
+			di.UpdatedAt = t
+		}
+		td.DispatchIntent = &di
+	}
+
+	return &td, nil
+}
+
+func (s *Store) ReleaseTurn(ctx context.Context, opID string, callerLease string, sessionID string, expectedVersion int64, turnKey string) (ReleaseResult, error) {
 	if expectedVersion <= 0 {
-		return ReleaseReceipt{}, ErrInvalidExpectedVersion
+		return ReleaseResult{}, ErrInvalidExpectedVersion
 	}
 	if strings.TrimSpace(turnKey) == "" {
-		return ReleaseReceipt{}, errors.New("empty turn key")
+		return ReleaseResult{}, errors.New("empty turn key")
 	}
 
 	fp := computeFingerprint("release_turn", sessionID, turnKey)
 
 	tx, err := s.BeginWrite(ctx)
 	if err != nil {
-		return ReleaseReceipt{}, err
+		return ReleaseResult{}, err
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	issuingGeneration, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, true)
+	if err != nil {
+		return ReleaseResult{}, err
+	}
 	// Idempotency check for release_turn
 	var storedCmdType, storedFingerprint, payloadJSON string
 	err = tx.Tx().QueryRowContext(ctx, "SELECT command_type, command_fingerprint, payload_json FROM journal_entries WHERE op_id = ?;", opID).Scan(&storedCmdType, &storedFingerprint, &payloadJSON)
 	if err == nil {
 		var jp releaseJournalPayload
 		if err := json.Unmarshal([]byte(payloadJSON), &jp); err == nil && jp.Receipt.TurnKey != "" {
-			if jp.CallerLease != callerLease {
-				return ReleaseReceipt{}, ErrUnauthorizedOperation
+			if jp.Receipt.OperationReceipt.TurnKey == "" {
+				jp.Receipt.OperationReceipt.TurnKey = jp.Receipt.TurnKey
 			}
+			// Authority was classified before this transaction; the recorded
+			// caller_lease may belong to a superseded controller whose
+			// committed release the current controller recovers.
 			if storedCmdType != "release_turn" || storedFingerprint != fp {
-				return ReleaseReceipt{}, ErrIdempotencyConflict
+				return ReleaseResult{}, ErrIdempotencyConflict
 			}
-			return jp.Receipt, nil
+			return ReleaseResult{
+				Receipt:     jp.Receipt,
+				Disposition: ReleaseDispositionReplayed,
+			}, nil
 		}
+	}
+
+	// New decisions enforce the run connection precondition at this write
+	// boundary; the replay above follows the disconnected-read policy.
+	if err := requireRunConnected(ctx, tx.Tx(), runIDOfSession(ctx, tx.Tx(), sessionID)); err != nil {
+		return ReleaseResult{}, err
 	}
 
 	var runID, runLease, state, lifecycle, controllerStatus, visibility string
@@ -286,26 +521,24 @@ FROM sessions s
 JOIN runs r ON s.run_id = r.run_id
 WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &state, &lifecycle, &controllerStatus, &visibility, &activeKey)
 	if err != nil {
-		return ReleaseReceipt{}, fmt.Errorf("query session for release: %w", err)
+		return ReleaseResult{}, fmt.Errorf("query session for release: %w", err)
 	}
 
-	if runLease != callerLease {
-		return ReleaseReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
-		return ReleaseReceipt{}, ErrStaleUpdate
+		return ReleaseResult{}, ErrStaleUpdate
 	}
 	if lifecycle == "archived" {
-		return ReleaseReceipt{}, ErrSessionArchived
+		return ReleaseResult{}, ErrSessionArchived
 	}
 	if controllerStatus == "disconnected" {
-		return ReleaseReceipt{}, ErrControllerDisconnected
+		return ReleaseResult{}, ErrControllerDisconnected
 	}
 	if visibility == "host_lost" {
-		return ReleaseReceipt{}, ErrHostLost
+		return ReleaseResult{}, ErrHostLost
 	}
 	if state != "parked" || (activeKey.Valid && activeKey.String != "") {
-		return ReleaseReceipt{}, fmt.Errorf("session %s is not parked or already has active turn %v", sessionID, activeKey)
+		return ReleaseResult{}, fmt.Errorf("session %s is not parked or already has active turn %v", sessionID, activeKey)
 	}
 
 	// Fetch EXACT pending prompt for turnKey
@@ -313,16 +546,16 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &state
 	err = tx.Tx().QueryRowContext(ctx, `
 SELECT prompt FROM pending_prompts WHERE session_id = ? AND turn_key = ?;`, sessionID, turnKey).Scan(&rawPrompt)
 	if err == sql.ErrNoRows {
-		return ReleaseReceipt{}, ErrPromptNotQueued
+		return ReleaseResult{}, ErrPromptNotQueued
 	}
 	if err != nil {
-		return ReleaseReceipt{}, fmt.Errorf("query pending prompt for session %s, turn %s: %w", sessionID, turnKey, err)
+		return ReleaseResult{}, fmt.Errorf("query pending prompt for session %s, turn %s: %w", sessionID, turnKey, err)
 	}
 
 	// Delete ONLY this pending prompt
 	_, err = tx.Tx().ExecContext(ctx, `DELETE FROM pending_prompts WHERE session_id = ? AND turn_key = ?;`, sessionID, turnKey)
 	if err != nil {
-		return ReleaseReceipt{}, fmt.Errorf("delete pending prompt: %w", err)
+		return ReleaseResult{}, fmt.Errorf("delete pending prompt: %w", err)
 	}
 
 	sanitizedPrompt := SanitizeText(rawPrompt)
@@ -335,15 +568,16 @@ SELECT prompt FROM pending_prompts WHERE session_id = ? AND turn_key = ?;`, sess
 INSERT INTO turns (session_id, turn_key, prompt, status, result, attempt_id, created_at)
 VALUES (?, ?, ?, 'running', '', ?, ?);`, sessionID, turnKey, sanitizedPrompt, attemptID, now)
 	if err != nil {
-		return ReleaseReceipt{}, fmt.Errorf("insert turn: %w", err)
+		return ReleaseResult{}, fmt.Errorf("insert turn: %w", err)
 	}
 
-	// Insert into dispatch_intents
+	// Insert into dispatch_intents, stamped with the issuing controller
+	// generation that authorized this execution (AC-004 §6).
 	_, err = tx.Tx().ExecContext(ctx, `
-INSERT INTO dispatch_intents (session_id, turn_key, attempt_id, phase, recorded_at, updated_at)
-VALUES (?, ?, ?, 'intent_recorded', ?, ?);`, sessionID, turnKey, attemptID, now, now)
+INSERT INTO dispatch_intents (session_id, turn_key, attempt_id, phase, issuing_controller_generation, recorded_at, updated_at)
+VALUES (?, ?, ?, 'intent_recorded', ?, ?, ?);`, sessionID, turnKey, attemptID, issuingGeneration, now, now)
 	if err != nil {
-		return ReleaseReceipt{}, fmt.Errorf("insert dispatch intent: %w", err)
+		return ReleaseResult{}, fmt.Errorf("insert dispatch intent: %w", err)
 	}
 
 	// Update session
@@ -351,7 +585,7 @@ VALUES (?, ?, ?, 'intent_recorded', ?, ?);`, sessionID, turnKey, attemptID, now,
 UPDATE sessions SET active_key = ?, state = 'running', row_version = ?, updated_at = ?
 WHERE session_id = ?;`, turnKey, newVer, now, sessionID)
 	if err != nil {
-		return ReleaseReceipt{}, fmt.Errorf("update session for release: %w", err)
+		return ReleaseResult{}, fmt.Errorf("update session for release: %w", err)
 	}
 
 	receipt := ReleaseReceipt{
@@ -379,7 +613,7 @@ WHERE session_id = ?;`, turnKey, newVer, now, sessionID)
 INSERT INTO journal_entries (op_id, command_type, command_fingerprint, run_id, session_id, turn_key, event_kind, payload_version, payload_json, created_at)
 VALUES (?, 'release_turn', ?, ?, ?, ?, 'turn_released', 1, ?, ?);`, opID, fp, runID, sessionID, turnKey, string(payloadBytes), now)
 	if err != nil {
-		return ReleaseReceipt{}, fmt.Errorf("record release journal entry: %w", err)
+		return ReleaseResult{}, fmt.Errorf("record release journal entry: %w", err)
 	}
 
 	if s.testHookBeforeCommit != nil {
@@ -387,12 +621,15 @@ VALUES (?, 'release_turn', ?, ?, ?, ?, 'turn_released', 1, ?, ?);`, opID, fp, ru
 	}
 
 	if err := tx.Commit(); err != nil {
-		return ReleaseReceipt{}, err
+		return ReleaseResult{}, err
 	}
-	return receipt, nil
+	return ReleaseResult{
+		Receipt:     receipt,
+		Disposition: ReleaseDispositionNew,
+	}, nil
 }
 
-func (s *Store) ReconcileSession(ctx context.Context, opID string, callerLease string, ref adapter.RecoveryRef, outcome adapter.ReconciliationOutcome) (OperationReceipt, error) {
+func (s *Store) ReconcileSession(ctx context.Context, opID string, execRef ExecutionRef, ref adapter.RecoveryRef, outcome adapter.ReconciliationOutcome) (OperationReceipt, error) {
 	if err := outcome.Validate(); err != nil {
 		return OperationReceipt{}, fmt.Errorf("invalid reconciliation outcome: %w", err)
 	}
@@ -404,7 +641,7 @@ func (s *Store) ReconcileSession(ctx context.Context, opID string, callerLease s
 	}
 
 	sessID := string(ref.SessionID)
-	fp := computeFingerprint("reconcile_session", sessID, ref.TurnKey, fmt.Sprintf("%d", ref.Generation), string(outcome.Status), string(outcome.Observed), outcome.Result)
+	fp := computeFingerprint("reconcile_session", sessID, ref.TurnKey, execRef.AttemptID, fmt.Sprintf("%d", ref.Generation), string(outcome.Status), string(outcome.Observed), outcome.Result)
 
 	tx, err := s.BeginWrite(ctx)
 	if err != nil {
@@ -412,7 +649,19 @@ func (s *Store) ReconcileSession(ctx context.Context, opID string, callerLease s
 	}
 	defer tx.Rollback()
 
-	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "reconcile_session", fp); err != nil {
+	// The execution and recovery references must identify the SAME
+	// execution before replay or mutation: one execution must never
+	// validate another's recovery (Gate 1 re-review finding 1). The bound
+	// target's original attempt is then validated inside this transition.
+	if execRef.SessionID != sessID || execRef.TurnKey != ref.TurnKey {
+		return OperationReceipt{}, fmt.Errorf("%w: execution reference (%s/%s) does not match recovery reference (%s/%s)",
+			ErrWrongExecutionAttempt, execRef.SessionID, execRef.TurnKey, sessID, ref.TurnKey)
+	}
+	if _, err := resolveExecutionRef(ctx, tx.Tx(), execRef); err != nil {
+		return OperationReceipt{}, err
+	}
+
+	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, "", "reconcile_session", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
 		return *receipt, nil
@@ -431,9 +680,14 @@ WHERE s.session_id = ?;`, sessID).Scan(&runID, &runLease, &currentVer, &state, &
 		return OperationReceipt{}, fmt.Errorf("query session for reconcile: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	// Two-boundary form (AC-004 §6): the controller authorized this
+	// recovery operation at initiation (service boundary classifies
+	// authority before the probe); this commit records the verified
+	// observation under the captured execution and recovery references —
+	// an authorized probe stays persistable even if controller authority
+	// rotates while it is in flight. The active recovery generation below
+	// remains the episode-scoped validity check.
+	_ = runLease
 	if visibility != "host_lost" {
 		return OperationReceipt{}, errors.New("session host is not lost")
 	}
@@ -565,7 +819,7 @@ WHERE session_id = ?;`, newVer, now, sessID)
 		Payload:          payload,
 	}
 
-	if err := recordJournalEntry(tx.Tx(), opID, "reconcile_session", fp, runID, sessID, ref.TurnKey, "session_reconciled", receipt, callerLease); err != nil {
+	if err := recordJournalEntry(tx.Tx(), opID, "reconcile_session", fp, runID, sessID, ref.TurnKey, "session_reconciled", receipt, ""); err != nil {
 		return OperationReceipt{}, err
 	}
 
@@ -706,10 +960,20 @@ func (s *Store) RequestCancel(ctx context.Context, opID string, callerLease stri
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, true); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "request_cancel", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
 		return *receipt, nil
+	}
+	// New decisions enforce the run connection precondition at this write
+	// boundary; idempotent replay above follows the disconnected-read policy.
+	if err := requireRunConnected(ctx, tx.Tx(), runIDOfSession(ctx, tx.Tx(), sessionID)); err != nil {
+		return OperationReceipt{}, err
 	}
 
 	var runID, runLease, lifecycle, controllerStatus, state string
@@ -724,9 +988,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return OperationReceipt{}, ErrStaleUpdate
 	}
@@ -830,6 +1092,11 @@ func (s *Store) RecordTerminalOutcome(ctx context.Context, opID string, callerLe
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, true); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "record_terminal_outcome", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
@@ -849,9 +1116,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return OperationReceipt{}, ErrStaleUpdate
 	}
@@ -980,6 +1245,11 @@ func (s *Store) RecordHostLoss(ctx context.Context, opID string, callerLease str
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, true); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "record_host_loss", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
@@ -999,9 +1269,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return OperationReceipt{}, ErrStaleUpdate
 	}
@@ -1080,6 +1348,11 @@ func (s *Store) SetControllerConnection(ctx context.Context, opID string, caller
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, true); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "set_controller_connection", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
@@ -1097,9 +1370,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return OperationReceipt{}, ErrStaleUpdate
 	}
@@ -1167,6 +1438,11 @@ func (s *Store) ArchiveSession(ctx context.Context, opID string, callerLease str
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := authorizeSessionController(ctx, tx.Tx(), sessionID, callerLease, false); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "archive_session", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
@@ -1185,9 +1461,7 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &state
 		return OperationReceipt{}, fmt.Errorf("query session: %w", err)
 	}
 
-	if runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
-	}
+	_ = runLease // authority classified before replay
 	if currentVer != expectedVersion {
 		return OperationReceipt{}, ErrStaleUpdate
 	}
@@ -1254,17 +1528,29 @@ func (s *Store) RecordDecision(ctx context.Context, opID string, callerLease str
 	}
 	defer tx.Rollback()
 
+	// Current controller authority precedes idempotent replay (AC-004).
+	if _, err := classifyCredential(ctx, tx.Tx(), runID, callerLease, true); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "record_decision", fp); err != nil {
 		return OperationReceipt{}, err
 	} else if receipt != nil {
 		return *receipt, nil
 	}
 
+	// New decisions enforce the run connection precondition at this write
+	// boundary; idempotent replay above follows the disconnected-read policy.
+	if err := requireRunConnected(ctx, tx.Tx(), runID); err != nil {
+		return OperationReceipt{}, err
+	}
+
 	var runLease string
 	err = tx.Tx().QueryRowContext(ctx, "SELECT controller_lease FROM runs WHERE run_id = ?;", runID).Scan(&runLease)
-	if err != nil || runLease != callerLease {
-		return OperationReceipt{}, ErrUnauthorizedOperation
+	if err != nil {
+		return OperationReceipt{}, err
 	}
+	_ = runLease // authority classified before replay
 
 	// Verify that referenced (artifact_id, revision) exists in artifact_revisions for this run and query digest
 	var digest string
@@ -1327,4 +1613,81 @@ VALUES (?, ?, ?, ?, ?, ?, ?);`, opID, runID, artifactID, revision, digest, sanit
 		return OperationReceipt{}, err
 	}
 	return receipt, nil
+}
+
+// ValidateSessionRun checks whether the given session belongs to the specified run.
+func (s *Store) ValidateSessionRun(ctx context.Context, sessionID, runID string) error {
+	var actualRunID string
+	err := s.readDB.QueryRowContext(ctx, "SELECT run_id FROM sessions WHERE session_id = ?;", sessionID).Scan(&actualRunID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrSessionNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("validate session run: %w", err)
+	}
+	if actualRunID != runID {
+		return ErrRunSessionMismatch
+	}
+	return nil
+}
+
+// ValidateControllerLease checks whether the caller lease matches the session's run controller lease.
+func (s *Store) ValidateControllerLease(ctx context.Context, sessionID, callerLease string) error {
+	_, err := authorizeSessionController(ctx, s.readDB, sessionID, callerLease, true)
+	return err
+}
+
+// GetDiagnosticCounts computes active runs, reserved turns, unresolved turns, and recovery blockers.
+// A turn in either nonterminal execution state ('running' or 'cancelling')
+// is a reservation; an unconfirmed cancellation is not completed work.
+func (s *Store) GetDiagnosticCounts(ctx context.Context, liveWorkerKeys map[string]bool) (DiagnosticCounts, error) {
+	var counts DiagnosticCounts
+	counts.ActiveRuns = make([]string, 0)
+
+	// 1. Active runs
+	rows, err := s.readDB.QueryContext(ctx, `SELECT run_id FROM runs WHERE lifecycle = 'active';`)
+	if err != nil {
+		return counts, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var runID string
+		if err := rows.Scan(&runID); err != nil {
+			return counts, fmt.Errorf("scan active run: %w", err)
+		}
+		counts.ActiveRuns = append(counts.ActiveRuns, runID)
+	}
+	if err := rows.Err(); err != nil {
+		return counts, fmt.Errorf("iterate active runs: %w", err)
+	}
+
+	// 2. Reserved and Unresolved turns
+	turnRows, err := s.readDB.QueryContext(ctx, `SELECT session_id, turn_key, status FROM turns WHERE status IN ('running', 'cancelling');`)
+	if err != nil {
+		return counts, err
+	}
+	defer turnRows.Close()
+	for turnRows.Next() {
+		var sID, tKey, status string
+		if err := turnRows.Scan(&sID, &tKey, &status); err != nil {
+			return counts, fmt.Errorf("scan reserved turn: %w", err)
+		}
+		counts.ReservedTurns++
+		mapKey := fmt.Sprintf("%s:%s", sID, tKey)
+		if liveWorkerKeys == nil || !liveWorkerKeys[mapKey] {
+			counts.UnresolvedTurns++
+		}
+	}
+	if err := turnRows.Err(); err != nil {
+		return counts, fmt.Errorf("iterate reserved turns: %w", err)
+	}
+
+	// 3. Recovery Blockers = Unresolved turns + sessions with visibility = 'host_lost'
+	var hostLostSessions int
+	if err := s.readDB.QueryRowContext(ctx, `SELECT count(*) FROM sessions WHERE visibility = 'host_lost';`).Scan(&hostLostSessions); err != nil {
+		return counts, fmt.Errorf("count host-lost sessions: %w", err)
+	}
+	counts.RecoveryBlockers = counts.UnresolvedTurns + hostLostSessions
+
+	return counts, nil
 }

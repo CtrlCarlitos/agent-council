@@ -19,3 +19,13 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# Local tooling state (never repository content)
+.serena/
+graft/
+
+# AC-008 manual integration evidence (native output, prompts, paths — never repository content)
+ac008-evidence/
+
+# AC-009 manual integration evidence (native output, prompts, paths — never repository content)
+ac009-evidence/

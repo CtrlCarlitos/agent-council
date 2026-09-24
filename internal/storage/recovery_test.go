@@ -19,6 +19,7 @@ func TestStore_HydrateState_ExactStateReconstruction(t *testing.T) {
 
 	ctx := context.Background()
 	_, err = storeA.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_1", "src_sha_1", "profile_sha_1", "lease-1")
+	adoptControllerForTest(t, storeA, "run-1", "lease-1")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}

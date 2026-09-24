@@ -31,6 +31,7 @@ func TestReview28_ReconciliationNonterminalPreservesReservation(t *testing.T) {
 
 	ctx := context.Background()
 	_, err = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha", "src_sha", "prof_sha", "lease-1")
+	adoptControllerForTest(t, store, "run-1", "lease-1")
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -50,17 +51,18 @@ func TestReview28_ReconciliationNonterminalPreservesReservation(t *testing.T) {
 		t.Fatalf("queue prompt: %v", err)
 	}
 
-	relReceipt, err := store.ReleaseTurn(ctx, "op-rel-1", "lease-1", "sess-1", 2, "turn-1")
+	relRes, err := store.ReleaseTurn(ctx, "op-rel-1", "lease-1", "sess-1", 2, "turn-1")
 	if err != nil {
 		t.Fatalf("release turn: %v", err)
 	}
+	relReceipt := relRes.Receipt
 
 	// 1. ReconcileSession while visibility is still reachable must be rejected with ErrReconciliationInvalid
 	ref1 := adapter.RecoveryRef{
 		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-1"},
 		Generation: 1,
 	}
-	_, err = store.ReconcileSession(ctx, "op-rec-bad-vis", "lease-1", ref1, adapter.ReconciliationOutcome{
+	_, err = store.ReconcileSession(ctx, "op-rec-bad-vis", store.ExecutionRefForTurn(ctx, string(ref1.SessionID), ref1.TurnKey), ref1, adapter.ReconciliationOutcome{
 		Ref:          ref1,
 		Reachability: council.VisibilityReachable,
 		Status:       adapter.ReconciliationReachableActive,
@@ -84,7 +86,7 @@ func TestReview28_ReconciliationNonterminalPreservesReservation(t *testing.T) {
 		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-1"},
 		Generation: 1,
 	}
-	_, err = store.ReconcileSession(ctx, "op-rec-stale", "lease-1", staleRef, adapter.ReconciliationOutcome{
+	_, err = store.ReconcileSession(ctx, "op-rec-stale", store.ExecutionRefForTurn(ctx, string(staleRef.SessionID), staleRef.TurnKey), staleRef, adapter.ReconciliationOutcome{
 		Ref:          staleRef,
 		Reachability: council.VisibilityReachable,
 		Status:       adapter.ReconciliationReachableActive,
@@ -99,7 +101,7 @@ func TestReview28_ReconciliationNonterminalPreservesReservation(t *testing.T) {
 		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-1"},
 		Generation: 2,
 	}
-	_, err = store.ReconcileSession(ctx, "op-rec-ref-mismatch", "lease-1", validRef, adapter.ReconciliationOutcome{
+	_, err = store.ReconcileSession(ctx, "op-rec-ref-mismatch", store.ExecutionRefForTurn(ctx, string(validRef.SessionID), validRef.TurnKey), validRef, adapter.ReconciliationOutcome{
 		Ref:          staleRef,
 		Reachability: council.VisibilityReachable,
 		Status:       adapter.ReconciliationReachableActive,
@@ -110,7 +112,7 @@ func TestReview28_ReconciliationNonterminalPreservesReservation(t *testing.T) {
 	}
 
 	// 3. ReconciliationReachableActive: turn remains active!
-	recReceipt, err := store.ReconcileSession(ctx, "op-rec-active", "lease-1", validRef, adapter.ReconciliationOutcome{
+	recReceipt, err := store.ReconcileSession(ctx, "op-rec-active", store.ExecutionRefForTurn(ctx, string(validRef.SessionID), validRef.TurnKey), validRef, adapter.ReconciliationOutcome{
 		Ref:          validRef,
 		Reachability: council.VisibilityReachable,
 		Status:       adapter.ReconciliationReachableActive,
@@ -160,7 +162,7 @@ func TestReview28_ReconciliationNonterminalPreservesReservation(t *testing.T) {
 		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-1"},
 		Generation: 3,
 	}
-	_, err = store.ReconcileSession(ctx, "op-rec-uncert", "lease-1", uncertRef, adapter.ReconciliationOutcome{
+	_, err = store.ReconcileSession(ctx, "op-rec-uncert", store.ExecutionRefForTurn(ctx, string(uncertRef.SessionID), uncertRef.TurnKey), uncertRef, adapter.ReconciliationOutcome{
 		Ref:          uncertRef,
 		Reachability: council.VisibilityHostLost,
 		Status:       adapter.ReconciliationUncertain,
@@ -209,7 +211,7 @@ func TestReview28_ReconciliationNonterminalPreservesReservation(t *testing.T) {
 		TurnRef:    adapter.TurnRef{SessionID: "sess-1", TurnKey: "turn-1"},
 		Generation: 3,
 	}
-	_, err = store.ReconcileSession(ctx, "op-rec-conflict", "lease-1", postRef, adapter.ReconciliationOutcome{
+	_, err = store.ReconcileSession(ctx, "op-rec-conflict", store.ExecutionRefForTurn(ctx, string(postRef.SessionID), postRef.TurnKey), postRef, adapter.ReconciliationOutcome{
 		Ref:          postRef,
 		Reachability: council.VisibilityReachable,
 		Status:       adapter.ReconciliationReachableActive,
@@ -220,7 +222,7 @@ func TestReview28_ReconciliationNonterminalPreservesReservation(t *testing.T) {
 	}
 
 	// Post-terminal recovery: ReconciliationReachableTerminal succeeds and closes recovery episode
-	_, err = store.ReconcileSession(ctx, "op-rec-post-term", "lease-1", postRef, adapter.ReconciliationOutcome{
+	_, err = store.ReconcileSession(ctx, "op-rec-post-term", store.ExecutionRefForTurn(ctx, string(postRef.SessionID), postRef.TurnKey), postRef, adapter.ReconciliationOutcome{
 		Ref:          postRef,
 		Reachability: council.VisibilityReachable,
 		Status:       adapter.ReconciliationReachableTerminal,
@@ -255,6 +257,7 @@ func TestReview28_QueueOperationsStrictlyKeyed(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha", "src_sha", "prof_sha", "lease-1")
+	adoptControllerForTest(t, store, "run-1", "lease-1")
 	sessReceipt, err := store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable",
 	})
@@ -355,10 +358,11 @@ func TestReview28_QueueOperationsStrictlyKeyed(t *testing.T) {
 	}
 
 	// Release t1 -> deletes t1 from pending prompts, promotes to active turn; t3 remains pending!
-	rRel, err := store.ReleaseTurn(ctx, "op-rel-t1", "lease-1", "sess-1", ver, "t1")
+	relRes, err := store.ReleaseTurn(ctx, "op-rel-t1", "lease-1", "sess-1", ver, "t1")
 	if err != nil {
 		t.Fatalf("release t1: %v", err)
 	}
+	rRel := relRes.Receipt
 	ver = rRel.CommittedVersion
 
 	hydrated, err = store.HydrateState(ctx)
@@ -453,6 +457,7 @@ func TestReview28_HydrationSnapshotAndCompleteness(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "brief_sha_123", "src_sha_456", "prof_sha_789", "lease-1")
+	adoptControllerForTest(t, store, "run-1", "lease-1")
 
 	_, err = store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable",
@@ -543,6 +548,7 @@ func TestReview28_LifecycleCommandsAndGuards(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "b", "s", "p", "lease-1")
+	adoptControllerForTest(t, store, "run-1", "lease-1")
 	sessReceipt, err := store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable",
 	})
@@ -578,7 +584,8 @@ func TestReview28_LifecycleCommandsAndGuards(t *testing.T) {
 	})
 	ver = qReceipt.CommittedVersion
 
-	relReceipt, _ := store.ReleaseTurn(ctx, "op-rel", "lease-1", "sess-1", ver, "turn-lc")
+	relRes, _ := store.ReleaseTurn(ctx, "op-rel", "lease-1", "sess-1", ver, "turn-lc")
+	relReceipt := relRes.Receipt
 	ver = relReceipt.CommittedVersion
 
 	// 3. RequestCancel: transitions session to cancelling and turn to cancelling
@@ -683,6 +690,7 @@ func TestReview28_SensitiveDataAndFilesystemProtections(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "b", "s", "p", "lease-1")
+	adoptControllerForTest(t, store, "run-1", "lease-1")
 	_, _ = store.CreateSession(ctx, "op-sess-1", "lease-1", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable",
 	})
@@ -742,6 +750,7 @@ func TestReview28_ArtifactStoreRevisionBoundary(t *testing.T) {
 
 	ctx := context.Background()
 	_, _ = store.CreateRun(ctx, "op-run-1", "run-1", "b", "s", "p", "lease-valid")
+	adoptControllerForTest(t, store, "run-1", "lease-valid")
 	_, _ = store.CreateSession(ctx, "op-sess-1", "lease-valid", storage.SessionRecord{
 		ID: "sess-1", RunID: "run-1", Contributor: "claude", Role: "reviewer", IsActiveContributor: true, State: "parked", Visibility: "reachable",
 	})

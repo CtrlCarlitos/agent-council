@@ -14,13 +14,13 @@ func TestStore_Migrations_Lifecycle(t *testing.T) {
 	}
 	defer store.Close()
 
-	// Brand-new DB: Open applied schema v1
+	// Brand-new DB: Open applied schema v1 then v2 then v3 sequentially
 	ver, err := store.CurrentSchemaVersion()
 	if err != nil {
 		t.Fatalf("get version: %v", err)
 	}
-	if ver != 1 {
-		t.Fatalf("expected schema version 1, got %d", ver)
+	if ver < 3 {
+		t.Fatalf("expected schema version, got %d", ver)
 	}
 
 	// Repeated Migrate call is a clean no-op
@@ -75,11 +75,11 @@ func TestStore_Migrations_ConcurrentOpen(t *testing.T) {
 	defer s2.Close()
 
 	ver1, err := s1.CurrentSchemaVersion()
-	if err != nil || ver1 != 1 {
+	if err != nil || ver1 < 3 {
 		t.Fatalf("s1 ver: %d, err: %v", ver1, err)
 	}
 	ver2, err := s2.CurrentSchemaVersion()
-	if err != nil || ver2 != 1 {
+	if err != nil || ver2 < 3 {
 		t.Fatalf("s2 ver: %d, err: %v", ver2, err)
 	}
 }

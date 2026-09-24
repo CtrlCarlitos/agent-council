@@ -15,6 +15,11 @@ var (
 
 	// ErrFakeAdapterProhibited is returned when the test fake is requested from the production registry.
 	ErrFakeAdapterProhibited = errors.New("fake adapter is prohibited in production registry")
+
+	// ErrFixtureAdapterProhibited is returned when the codex test-only
+	// fixture adapter (codextest construction mode) is requested from the
+	// production registry.
+	ErrFixtureAdapterProhibited = errors.New("fixture adapter is prohibited in production registry")
 )
 
 // Registry manages production adapter implementations for council contributors.
@@ -57,10 +62,16 @@ func (r *Registry) Resolve(contrib council.Contributor) (Adapter, error) {
 }
 
 // ResolveByName resolves an adapter by contributor name or fails closed.
+// Test-only construction modes ("fake", and the codex "fixture" scope)
+// are refused before any contributor lookup: fake adapters are test
+// utilities, never production fallbacks.
 func (r *Registry) ResolveByName(name string) (Adapter, error) {
 	lower := strings.ToLower(strings.TrimSpace(name))
 	if lower == "fake" || strings.Contains(lower, "fake") {
 		return nil, ErrFakeAdapterProhibited
+	}
+	if strings.Contains(lower, "fixture") {
+		return nil, ErrFixtureAdapterProhibited
 	}
 	contrib := council.Contributor(lower)
 	if !council.ValidContributor(contrib) {
