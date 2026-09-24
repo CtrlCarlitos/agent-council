@@ -28,7 +28,77 @@ var (
 
 	// ErrInvalidLaunchRequest is returned when the launch request parameters fail validation.
 	ErrInvalidLaunchRequest = errors.New("invalid launch request")
+
+	// ErrAgyLaunchNotSealed is returned (wrapped in ErrInvalidLaunchRequest)
+	// when an agy-shaped launch request (IsAgyLaunch) carries neither a
+	// SealedImage nor the explicit FixtureLaunch marker. Production agy
+	// launches must always go through the sealed-image path (AC-010);
+	// only the agytest fixture harness may bypass it, and only via the
+	// explicit marker.
+	ErrAgyLaunchNotSealed = errors.New("agy launch requires a sealed image or the explicit fixture-launch marker")
+
+	// ErrAgyLaunchForbiddenArg is returned (wrapped in
+	// ErrInvalidLaunchRequest) when an agy-shaped launch request's argv
+	// carries a flag or subcommand the frozen launch source must never
+	// pass: an auth/permission bypass, identity-losing resumption,
+	// interactive/remote control, or project/installation management
+	// surface (AC-010 Global Constraints).
+	ErrAgyLaunchForbiddenArg = errors.New("agy launch argv carries a forbidden argument")
 )
+
+// agyForbiddenArgs is the closed set of agy CLI flags/subcommands a
+// Council-driven launch must never carry (AC-010 Global Constraints,
+// verbatim): auth/permission bypass, identity-losing resumption,
+// interactive/remote control, and project/installation/update/mic
+// management surfaces.
+var agyForbiddenArgs = map[string]bool{
+	"--dangerously-skip-permissions": true,
+	"-c":                             true,
+	"--continue":                     true,
+	"-i":                             true,
+	"--prompt-interactive":           true,
+	"--remote-control":               true,
+	"--add-dir":                      true,
+	"--project":                      true,
+	"--new-project":                  true,
+	"install":                        true,
+	"update":                         true,
+	"mic-serve":                      true,
+}
+
+// IsAgyLaunch reports whether req is shaped like an agy stream-json
+// launch (AC-010 Global Constraints, frozen argv): the leading
+// "--print=" flag together with both "--input-format stream-json" and
+// "--output-format stream-json". This is sufficient for recognition;
+// the full exact-argv validation belongs to the agy launch source
+// (Task 5), not to this recognizer.
+func IsAgyLaunch(req LaunchRequest) bool {
+	args := req.Args
+	if len(args) == 0 || args[0] != "--print=" {
+		return false
+	}
+	hasInputStreamJSON := false
+	hasOutputStreamJSON := false
+	for i, a := range args {
+		if a == "--input-format" && i+1 < len(args) && args[i+1] == "stream-json" {
+			hasInputStreamJSON = true
+		}
+		if a == "--output-format" && i+1 < len(args) && args[i+1] == "stream-json" {
+			hasOutputStreamJSON = true
+		}
+	}
+	return hasInputStreamJSON && hasOutputStreamJSON
+}
+
+// agyForbiddenArg returns the first forbidden argv entry present, if any.
+func agyForbiddenArg(args []string) (string, bool) {
+	for _, a := range args {
+		if agyForbiddenArgs[a] {
+			return a, true
+		}
+	}
+	return "", false
+}
 
 // LaunchRequest encapsulates all parameters required to launch a supervised process.
 type LaunchRequest struct {
@@ -74,6 +144,23 @@ type LaunchRequest struct {
 	// instruction (Linux only; ErrSealedLaunchUnsupported elsewhere).
 	// Command must equal SealedImage.ArgV0 exactly.
 	SealedImage *SealedImage
+	// FixtureLaunch is the explicit, construction-time marker (AC-010,
+	// mirroring the codex/opencode fixture-scope discipline: never
+	// inferred from absent state) that authorizes an agy-shaped launch
+	// (IsAgyLaunch) to proceed WITHOUT a SealedImage. Its only reason to
+	// exist: NewSealedImage is Linux-only (ErrSealedLaunchUnsupported
+	// elsewhere), so the agytest fixture harness cannot build a sealed
+	// image off Linux and needs an explicit, auditable bypass instead of
+	// a platform-sniffed one. Only the internal/adapter/agy/agytest
+	// package may set it — production packages never do (enforced by
+	// TestFixtureLaunch_NeverSetOutsideAgytest in executor_agy_test.go,
+	// mirroring the codex/codextest import/reference guards). On Linux,
+	// agytest always builds a real SealedImage from the compiled fixture
+	// binary and sets this too, so Task 3's sealed-launch path is
+	// exercised by every fixture test there as well — this field is not
+	// a substitute for SealedImage, only the documented escape hatch
+	// where SealedImage cannot exist.
+	FixtureLaunch bool
 }
 
 // CapabilityChecker verifies whether the host environment supports required isolation capabilities.
@@ -344,6 +431,23 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 	cleanup := func() {
 		if proxyToClose != nil {
 			_ = proxyToClose.Close()
+		}
+	}
+
+	// agy-shaped launches (AC-010): forbidden argv is refused
+	// regardless of sealing, and production (no SealedImage, no
+	// explicit FixtureLaunch marker) is refused outright — an agy
+	// launch must always run the sealed, ptrace-verified binary except
+	// for the agytest fixture harness, which is the only caller
+	// authorized to set FixtureLaunch.
+	if IsAgyLaunch(req) {
+		if arg, found := agyForbiddenArg(req.Args); found {
+			cleanup()
+			return nil, fmt.Errorf("%w: %w: %q", ErrInvalidLaunchRequest, ErrAgyLaunchForbiddenArg, arg)
+		}
+		if req.SealedImage == nil && !req.FixtureLaunch {
+			cleanup()
+			return nil, fmt.Errorf("%w: %w", ErrInvalidLaunchRequest, ErrAgyLaunchNotSealed)
 		}
 	}
 
