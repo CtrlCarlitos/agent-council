@@ -971,3 +971,22 @@ none is claimed by the design.
     executor's child environment exactly (PATH TMPDIR TERM LANG LC_ALL
     USER, HOME, COUNCIL_*), so the comparison isolates the exec
     mechanism.
+17. Known gap — controller disposition for Uncertain turn attempts
+    (§3.9, §3.10). `agy_turn_attempts.uncertainty_disposition` exists,
+    but no service operation records a controller disposition for an
+    Uncertain attempt, so such an attempt keeps blocking its
+    conversation. The codex adapter (AC-009) has the same column and
+    the same gap. Tracked as a follow-up issue covering both adapters;
+    the acceptance scenario that needs a disposition writes the row
+    directly and is labelled as a stand-in.
+18. Attestation bootstrap (§3.2, §4). Production construction requires
+    a covering attestation row, and the first row must be recordable
+    before the adapter exists. `RecordAgyProbeAttestation` therefore
+    depends only on the store, the operator credential and the
+    configured agy profile and evidence root, never on a wired adapter;
+    and a server configured with `AgyBinaryPath` but without a covering
+    row starts WITHOUT the agy adapter in an explicit "awaiting
+    attestation" state (surfaced on the server status surface and
+    logged; every agy operation refuses with the typed ineligibility
+    error). After the row is recorded, a restart constructs the adapter.
+    No child runs before eligibility in either state.
