@@ -518,6 +518,7 @@ CREATE TABLE IF NOT EXISTS agy_turn_attempts (
 	observed_status    TEXT NOT NULL DEFAULT 'uncertain'
 	                   CHECK (observed_status IN ('completed','failed','cancelled','missing','uncertain')),
 	uncertainty_disposition TEXT,
+	orphan_conversation_id TEXT,
 	created_at         TIMESTAMP NOT NULL,
 	updated_at         TIMESTAMP NOT NULL,
 	UNIQUE(session_id, turn_key, attempt_id)
@@ -557,6 +558,7 @@ CREATE TABLE IF NOT EXISTS agy_creation_uncertainties (
 	recorded_by        TEXT NOT NULL,
 	record_op_id       TEXT NOT NULL,
 	cause_op_id        TEXT NOT NULL,
+	orphan_native_id   TEXT,
 	recorded_at        TEXT NOT NULL,
 	disposition        TEXT,
 	resolution_reason  TEXT,

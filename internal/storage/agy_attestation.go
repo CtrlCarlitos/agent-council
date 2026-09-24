@@ -184,6 +184,11 @@ type AgyCreationUncertainty struct {
 	Reason     string
 	RecordedBy string // the identity attributed in the journal entry (the adapter)
 	CauseOpID  string // the creation operation that ended uncertain (provenance)
+	// OrphanNativeID is the native conversation id the creation child
+	// reported before the creation was abandoned (e.g. profile/tool drift
+	// after a valid init): durable diagnostic evidence of the possibly
+	// orphaned conversation, never bound. Empty when none was observed.
+	OrphanNativeID string
 }
 
 // AgyCreationUncertaintyEpisode is one durable uncertainty episode of a
@@ -197,6 +202,7 @@ type AgyCreationUncertaintyEpisode struct {
 	RecordedBy           string
 	RecordOpID           string
 	CauseOpID            string
+	OrphanNativeID       *string
 	RecordedAt           time.Time
 	Disposition          *string
 	ResolutionReason     *string
@@ -306,10 +312,10 @@ WHERE session_id = ? AND disposition IS NULL`, rec.SessionID).Scan(&openEpisode,
 	}
 	if _, err := tx.Tx().ExecContext(ctx, `
 INSERT INTO agy_creation_uncertainties
-	(session_id, episode, run_id, reason, recorded_by, record_op_id, cause_op_id, recorded_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+	(session_id, episode, run_id, reason, recorded_by, record_op_id, cause_op_id, orphan_native_id, recorded_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		rec.SessionID, episode, rec.RunID, rec.Reason, rec.RecordedBy, opID, rec.CauseOpID,
-		now.Format(time.RFC3339Nano)); err != nil {
+		nullableString(rec.OrphanNativeID), now.Format(time.RFC3339Nano)); err != nil {
 		return 0, OperationReceipt{}, fmt.Errorf("insert creation uncertainty episode: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -428,7 +434,7 @@ func (s *Store) HasAgyCreationUncertainty(ctx context.Context, sessionID string)
 // when none is open — the controller resolves exactly this one.
 func (s *Store) OpenAgyCreationUncertainty(ctx context.Context, sessionID string) (*AgyCreationUncertaintyEpisode, error) {
 	row := s.DB().QueryRowContext(ctx, `
-SELECT session_id, episode, run_id, reason, recorded_by, record_op_id, cause_op_id, recorded_at,
+SELECT session_id, episode, run_id, reason, recorded_by, record_op_id, cause_op_id, orphan_native_id, recorded_at,
        disposition, resolution_reason, resolution_generation, resolution_op_id, resolved_at
 FROM agy_creation_uncertainties WHERE session_id = ? AND disposition IS NULL`, sessionID)
 	return scanAgyUncertaintyEpisode(row)
@@ -438,7 +444,7 @@ FROM agy_creation_uncertainties WHERE session_id = ? AND disposition IS NULL`, s
 // episode order (evidence: the resolved history is never deleted).
 func (s *Store) AgyCreationUncertaintyEpisodes(ctx context.Context, sessionID string) ([]AgyCreationUncertaintyEpisode, error) {
 	rows, err := s.DB().QueryContext(ctx, `
-SELECT session_id, episode, run_id, reason, recorded_by, record_op_id, cause_op_id, recorded_at,
+SELECT session_id, episode, run_id, reason, recorded_by, record_op_id, cause_op_id, orphan_native_id, recorded_at,
        disposition, resolution_reason, resolution_generation, resolution_op_id, resolved_at
 FROM agy_creation_uncertainties WHERE session_id = ? ORDER BY episode`, sessionID)
 	if err != nil {
@@ -459,10 +465,10 @@ FROM agy_creation_uncertainties WHERE session_id = ? ORDER BY episode`, sessionI
 func scanAgyUncertaintyEpisode(row rowScanner) (*AgyCreationUncertaintyEpisode, error) {
 	var ep AgyCreationUncertaintyEpisode
 	var recordedAt string
-	var disposition, resolutionReason, resolutionOpID, resolvedAt sql.NullString
+	var disposition, resolutionReason, resolutionOpID, resolvedAt, orphan sql.NullString
 	var resolutionGen sql.NullInt64
 	if err := row.Scan(&ep.SessionID, &ep.Episode, &ep.RunID, &ep.Reason, &ep.RecordedBy, &ep.RecordOpID,
-		&ep.CauseOpID, &recordedAt, &disposition, &resolutionReason, &resolutionGen, &resolutionOpID, &resolvedAt); err != nil {
+		&ep.CauseOpID, &orphan, &recordedAt, &disposition, &resolutionReason, &resolutionGen, &resolutionOpID, &resolvedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -470,6 +476,7 @@ func scanAgyUncertaintyEpisode(row rowScanner) (*AgyCreationUncertaintyEpisode, 
 	}
 	ep.RecordedAt, _ = time.Parse(time.RFC3339Nano, recordedAt)
 	ep.Disposition = nullStr(disposition)
+	ep.OrphanNativeID = nullStr(orphan)
 	ep.ResolutionReason = nullStr(resolutionReason)
 	ep.ResolutionOpID = nullStr(resolutionOpID)
 	if resolutionGen.Valid {
@@ -482,4 +489,12 @@ func scanAgyUncertaintyEpisode(row rowScanner) (*AgyCreationUncertaintyEpisode, 
 		}
 	}
 	return &ep, nil
+}
+
+// nullableString maps an empty string to SQL NULL.
+func nullableString(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }

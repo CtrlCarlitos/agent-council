@@ -235,9 +235,14 @@ type AgyTurnAttempt struct {
 	VerificationIncomplete bool
 	ObservedStatus         string // completed|failed|cancelled|missing|uncertain
 	UncertaintyDisposition *string
-	TransitionVersion      int64
-	CreatedAt              time.Time
-	UpdatedAt              time.Time
+	// OrphanConversationID is the native conversation id a turn launch
+	// reported instead of the bound one (a silent fallback to a NEW
+	// conversation, hazard 2): recorded once, before the child is
+	// terminated, as durable diagnostic evidence — never bound.
+	OrphanConversationID *string
+	TransitionVersion    int64
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 }
 
 // AgyExeIdentity is the executable identity captured at launch start —
@@ -270,7 +275,19 @@ type AgyVerification struct {
 // verify against, independent of whatever the queued-prompt row still
 // says by then.
 func (s *Store) InsertAgyTurnAttempt(ctx context.Context, a AgyTurnAttempt) error {
-	_, err := s.DB().ExecContext(ctx, `
+	tx, err := s.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := insertAgyTurnAttemptTx(ctx, tx, a); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func insertAgyTurnAttemptTx(ctx context.Context, tx *sql.Tx, a AgyTurnAttempt) error {
+	_, err := tx.ExecContext(ctx, `
 INSERT INTO agy_turn_attempts
 	(attempt_id, session_id, turn_key, prompt_digest, required_tools_json,
 	 launch_count, observed_status, transition_version, created_at, updated_at)
@@ -281,6 +298,30 @@ VALUES (?, ?, ?, ?, ?, 0, 'uncertain', 1, ?, ?)`,
 		return fmt.Errorf("insert agy turn attempt: %w", err)
 	}
 	return nil
+}
+
+// InsertAgyTurnAttemptAndReserveLaunch durably records the attempt
+// (with its prompt digest and required tools) AND consumes its single
+// launch slot in ONE transaction (spec §3.5: the launch is reserved in
+// the same transaction, before the executor starts). A crash leaves
+// either nothing or both — never an attempt without its reservation.
+func (s *Store) InsertAgyTurnAttemptAndReserveLaunch(ctx context.Context, a AgyTurnAttempt, executorIdentity string) (reservationSeq int64, err error) {
+	tx, err := s.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if err := insertAgyTurnAttemptTx(ctx, tx, a); err != nil {
+		return 0, err
+	}
+	seq, err := reserveAgyLaunchTx(ctx, tx, a.AttemptID, executorIdentity)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return seq, nil
 }
 
 // ReserveAgyLaunch atomically consumes the single launch slot
@@ -295,7 +336,17 @@ func (s *Store) ReserveAgyLaunch(ctx context.Context, attemptID, executorIdentit
 		return 0, err
 	}
 	defer tx.Rollback()
+	seq, err := reserveAgyLaunchTx(ctx, tx, attemptID, executorIdentity)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return seq, nil
+}
 
+func reserveAgyLaunchTx(ctx context.Context, tx *sql.Tx, attemptID, executorIdentity string) (int64, error) {
 	var count int
 	if err := tx.QueryRowContext(ctx, `
 SELECT launch_count FROM agy_turn_attempts WHERE attempt_id = ?`, attemptID).Scan(&count); err != nil {
@@ -326,9 +377,6 @@ VALUES (?, ?, 'reserved', ?)`, attemptID, seq, executorIdentity); err != nil {
 UPDATE agy_turn_attempts SET launch_count = launch_count + 1,
 	transition_version = transition_version + 1, updated_at = ?
 WHERE attempt_id = ?`, time.Now().UTC().Format(time.RFC3339), attemptID); err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return seq, nil
@@ -456,6 +504,41 @@ WHERE attempt_id = ? AND native_step_index IS NULL`,
 	return tx.Commit()
 }
 
+// RecordAgyOrphanConversation durably records the orphan native
+// conversation id a turn launch reported instead of the bound one. It
+// is once-only: replaying the same id is idempotent; a different id is
+// refused and changes nothing. An unknown attempt is an error.
+func (s *Store) RecordAgyOrphanConversation(ctx context.Context, attemptID, id string) error {
+	if strings.TrimSpace(attemptID) == "" {
+		return errors.New("orphan conversation record requires the attempt id")
+	}
+	tx, err := s.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var existing sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT orphan_conversation_id FROM agy_turn_attempts WHERE attempt_id = ?`, attemptID).Scan(&existing); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("attempt %s does not exist", attemptID)
+		}
+		return fmt.Errorf("query orphan conversation: %w", err)
+	}
+	if existing.Valid {
+		if existing.String == id {
+			return tx.Commit() // idempotent replay
+		}
+		return fmt.Errorf("attempt %s already records orphan conversation %q; refusing %q", attemptID, existing.String, id)
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE agy_turn_attempts SET orphan_conversation_id = ?, transition_version = transition_version + 1,
+	updated_at = ? WHERE attempt_id = ?`, id, time.Now().UTC().Format(time.RFC3339), attemptID); err != nil {
+		return fmt.Errorf("record orphan conversation: %w", err)
+	}
+	return tx.Commit()
+}
+
 // SetAgyAttemptObservedStatus records the evidence-derived outcome
 // without marking the attempt terminal (e.g. a non-terminal status
 // refinement mid-flight).
@@ -531,7 +614,7 @@ SELECT attempt_id, session_id, turn_key, native_step_index, prompt_digest, launc
        accepted, terminal, result_payload, result_usage,
        required_tools_json, executed_tools_json, missing_required_tools_json, denied_tools_json,
        ambiguous_denials_json, unattributed_denials_json, unmapped_denials_json, verification_incomplete,
-       observed_status, uncertainty_disposition, transition_version, created_at, updated_at
+       observed_status, uncertainty_disposition, orphan_conversation_id, transition_version, created_at, updated_at
 FROM agy_turn_attempts WHERE attempt_id = ?`, attemptID)
 	return scanAgyAttempt(row)
 }
@@ -543,7 +626,7 @@ SELECT attempt_id, session_id, turn_key, native_step_index, prompt_digest, launc
        accepted, terminal, result_payload, result_usage,
        required_tools_json, executed_tools_json, missing_required_tools_json, denied_tools_json,
        ambiguous_denials_json, unattributed_denials_json, unmapped_denials_json, verification_incomplete,
-       observed_status, uncertainty_disposition, transition_version, created_at, updated_at
+       observed_status, uncertainty_disposition, orphan_conversation_id, transition_version, created_at, updated_at
 FROM agy_turn_attempts
 WHERE session_id = ? AND turn_key = ?
 ORDER BY created_at DESC LIMIT 1`, sessionID, turnKey)
@@ -566,14 +649,14 @@ func scanAgyAttemptInto(scan func(dest ...any) error, a *AgyTurnAttempt) error {
 	var terminal, verificationIncomplete int
 	var nativeStepIndex sql.NullInt64
 	var acceptedNull sql.NullInt64
-	var disposition sql.NullString
+	var disposition, orphan sql.NullString
 	var requiredJSON, executedJSON, missingJSON, deniedJSON, ambiguousJSON, unattributedJSON, unmappedJSON string
 	if err := scan(
 		&a.AttemptID, &a.SessionID, &a.TurnKey, &nativeStepIndex, &a.PromptDigest, &a.LaunchCount,
 		&acceptedNull, &terminal, &a.ResultPayload, &a.ResultUsage,
 		&requiredJSON, &executedJSON, &missingJSON, &deniedJSON,
 		&ambiguousJSON, &unattributedJSON, &unmappedJSON, &verificationIncomplete,
-		&a.ObservedStatus, &disposition, &a.TransitionVersion, &createdAt, &updatedAt,
+		&a.ObservedStatus, &disposition, &orphan, &a.TransitionVersion, &createdAt, &updatedAt,
 	); err != nil {
 		return err
 	}
@@ -595,6 +678,7 @@ func scanAgyAttemptInto(scan func(dest ...any) error, a *AgyTurnAttempt) error {
 	a.UnattributedDenials = unmarshalStrings(unattributedJSON)
 	a.UnmappedDenials = unmarshalStrings(unmappedJSON)
 	a.UncertaintyDisposition = nullStr(disposition)
+	a.OrphanConversationID = nullStr(orphan)
 	a.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	a.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
 	return nil
