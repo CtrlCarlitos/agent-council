@@ -134,6 +134,8 @@ func codexServiceProfile(t *testing.T, scratch, evidenceRoot, wsRoot string) (st
 					ApprovalPolicy:             storage.CodexApprovalPolicy{Kind: "string", String: "on-request"},
 					ApprovalsReviewer:          "user",
 					ExpectedMCPServers:         []string{"context7"},
+					ExpectedMCPTools:           []string{"context7/resolve-library-id", "context7/get-library-docs"},
+					ExpectedPluginTools:        []string{},
 					ExpectedInstructionSources: []string{"~/.codex/AGENTS.md"},
 					RulesEvidence: storage.CodexRulesEvidenceSpec{
 						Verified:     []string{"sandbox workspace-write"},
@@ -241,17 +243,6 @@ func openCodexWiringStore(t *testing.T, stateDir string) *storage.Store {
 	return store
 }
 
-func codexCreateRequest() adapter.CreateSessionRequest {
-	return adapter.CreateSessionRequest{
-		SessionID:   adapter.SessionID(codexWiringSessionID),
-		Contributor: "codex",
-		Config: adapter.SessionConfig{
-			WorkspaceRoot: filepath.Join("/tmp", "ac009-ws"),
-			Model:         "gpt-5.6-sol",
-		},
-	}
-}
-
 // Every Codex configuration piece is required: removing any one — or
 // drifting the frozen evidence — fails construction before the service
 // starts.
@@ -345,7 +336,7 @@ func TestServiceWiring_CodexConstructionSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("plain server: %v", err)
 	}
-	if _, _, err := plain.CreateCodexSession(context.Background(), "op-x", codexWiringLease, codexCreateRequest()); err == nil ||
+	if _, _, err := plain.CreateCodexSession(context.Background(), "op-x", codexWiringLease, codexWiringSessionID); err == nil ||
 		!strings.Contains(err.Error(), "no contributor adapter is wired") {
 		t.Fatalf("birth path without codex wiring must refuse, got %v", err)
 	}
@@ -366,7 +357,7 @@ func TestServiceCodexSession_EligibilityFailsClosedPreChild(t *testing.T) {
 		t.Fatalf("construction: %v", err)
 	}
 
-	binding, _, err := srv.CreateCodexSession(context.Background(), "op-create-pre", codexWiringLease, codexCreateRequest())
+	binding, _, err := srv.CreateCodexSession(context.Background(), "op-create-pre", codexWiringLease, codexWiringSessionID)
 	if binding.NativeSessionID != "" {
 		t.Fatalf("no binding may publish pre-attestation, got %+v", binding)
 	}
@@ -416,7 +407,7 @@ VALUES (?, ?, ?, ?, ?, '[]', ?, 'operator-test')`,
 	if err != nil {
 		t.Fatalf("construction: %v", err)
 	}
-	_, _, err = srv.CreateCodexSession(context.Background(), "op-create-drift", codexWiringLease, codexCreateRequest())
+	_, _, err = srv.CreateCodexSession(context.Background(), "op-create-drift", codexWiringLease, codexWiringSessionID)
 	var missing *codex.ErrProductionEligibilityMissing
 	if !errors.As(err, &missing) {
 		t.Fatalf("manifest drift must NOT satisfy the lookup; want ErrProductionEligibilityMissing, got %T: %v", err, err)
@@ -601,7 +592,7 @@ func TestServiceAttestation_CodexOperatorAuthorityAndIdempotency(t *testing.T) {
 			Class: codex.RecordSiblingRead, ToolClass: codex.ToolMCP, ToolName: "rogue/read",
 			Operation: codex.OpRead, Denied: true, EnforcingCapability: codex.CapDenyList, DenialText: "x"})
 		r.Attestation = extra
-	})); err == nil || !strings.Contains(err.Error(), "not an expected MCP server") {
+	})); err == nil || !strings.Contains(err.Error(), "not in the frozen MCP tool inventory") {
 		t.Fatalf("unexpected coverage must be refused, got %v", err)
 	}
 	// denied=false evidence is invalid cprot-v2 and refused.
@@ -780,8 +771,7 @@ func TestServiceCodexSession_CreationUncertainBlocksAcrossRestart(t *testing.T) 
 		t.Fatalf("record attestation: %v", err)
 	}
 
-	req := codexCreateRequest()
-	req.Config.WorkspaceRoot = d.wsBase
+	req := codexWiringSessionID
 	if _, _, err := srv1.CreateCodexSession(context.Background(), "op-create-1", codexWiringLease, req); err == nil {
 		t.Fatal("the poisoned creation must fail")
 	} else {
@@ -926,8 +916,7 @@ func TestServiceCodexSession_HandoffDuringCreationCannotPublishBinding(t *testin
 	}); err != nil {
 		t.Fatalf("record attestation: %v", err)
 	}
-	req := codexCreateRequest()
-	req.Config.WorkspaceRoot = d.wsBase
+	req := codexWiringSessionID
 
 	// Old controller starts the creation; the stub holds thread/start
 	// for 2s.
@@ -992,10 +981,100 @@ func TestServiceCodexSession_HandoffDuringCreationCannotPublishBinding(t *testin
 	if err != nil || stored == nil || stored.NativeID != threadID || stored.ProfileDigest != codexProfileDigest(t, profile) {
 		t.Fatalf("binding must be persisted with the frozen profile digest, got %+v err=%v", stored, err)
 	}
+	// Derived, not caller-supplied: the frozen codex model and the
+	// AC-005 allocation under the frozen writable root (the base).
+	wantRoot := filepath.Join(d.wsBase, codexWiringRunID, codexWiringSessionID, "scratch")
+	if real, err := filepath.EvalSymlinks(wantRoot); err == nil {
+		wantRoot = real
+	}
+	if stored.Model != "gpt-5.6-sol" || stored.Workspace != wantRoot {
+		t.Fatalf("binding must carry the derived model/workspace (%q), got %+v", wantRoot, stored)
+	}
+	if binding.Config.WorkspaceRoot != wantRoot || binding.Config.Model != "gpt-5.6-sol" {
+		t.Fatalf("the native thread must be created with the derived config, got %+v", binding.Config)
+	}
 	// Replay of the same op returns the committed receipt without a
 	// second binding.
 	_, replay, err := srv.CreateCodexSession(context.Background(), "op-create-new", grant.LeaseSecret, req)
 	if err != nil || replay.OpID != receipt.OpID || replay.Payload != receipt.Payload {
 		t.Fatalf("replay must return the committed receipt, got %+v err=%v", replay, err)
+	}
+}
+
+// ── Birth parameters are derived, never caller-supplied (P1) ────────────
+
+// A run whose frozen profile is not the profile the service's codex
+// adapter froze to is refused at birth, before any child starts: the
+// adapter compares every binding against ITS frozen digest, so such a
+// session could never dispatch.
+func TestServiceCodexSession_BirthRefusesRunProfileNotWiredProfile(t *testing.T) {
+	dir := t.TempDir()
+	binDir := compileCodexStubForService(t)
+	cfg, d, profile, _ := codexWiringConfig(t, dir, binDir)
+	store := openCodexWiringStore(t, cfg.StateDir)
+	// The run freezes a DIFFERENT model than the wired profile.
+	runProfile := profile
+	runProfile.Harnesses = map[string]storage.HarnessProfileSpec{}
+	for k, v := range profile.Harnesses {
+		runProfile.Harnesses[k] = v
+	}
+	spec := runProfile.Harnesses["codex"]
+	spec.Model = "gpt-5.6-other"
+	runProfile.Harnesses["codex"] = spec
+	seedCodexRunAndSession(t, store, runProfile)
+	srv, err := NewServerWithAdapter(store, mustLock(t, cfg.StateDir), cfg, nil)
+	if err != nil {
+		t.Fatalf("construction: %v", err)
+	}
+	_, _, err = srv.CreateCodexSession(context.Background(), "op-create-mismatch", codexWiringLease, codexWiringSessionID)
+	if err == nil || !strings.Contains(err.Error(), "is not the profile this service's codex adapter froze to") {
+		t.Fatalf("a run frozen on another profile must be refused at birth, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(d.scratch, ".codex-stub-requests")); !os.IsNotExist(err) {
+		t.Fatal("no child may start for a refused birth")
+	}
+	if b, _ := store.GetCodexSessionBinding(context.Background(), codexWiringSessionID); b != nil {
+		t.Fatal("no binding may be persisted for a refused birth")
+	}
+}
+
+// The AC-005 allocation must lie inside the frozen sandbox writable
+// roots: a profile whose writable roots do not contain the workspace
+// base cannot host a thread, and the refusal happens before any child.
+func TestServiceCodexSession_BirthRefusesWorkspaceOutsideFrozenWritableRoots(t *testing.T) {
+	dir := t.TempDir()
+	binDir := compileCodexStubForService(t)
+	cfg, d, profile, _ := codexWiringConfig(t, dir, binDir)
+	elsewhere := filepath.Join(dir, "elsewhere")
+	if err := os.MkdirAll(elsewhere, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Same profile for the run and the wiring, but its writable root is
+	// NOT the workspace base the service allocates under.
+	profile.Harnesses["codex"].Codex.SandboxPolicy.WritableRoots = []string{elsewhere}
+	cfg.CodexProfile = profile
+	store := openCodexWiringStore(t, cfg.StateDir)
+	seedCodexRunAndSession(t, store, profile)
+	srv, err := NewServerWithAdapter(store, mustLock(t, cfg.StateDir), cfg, nil)
+	if err != nil {
+		t.Fatalf("construction: %v", err)
+	}
+	_, _, err = srv.CreateCodexSession(context.Background(), "op-create-outside", codexWiringLease, codexWiringSessionID)
+	if err == nil || !strings.Contains(err.Error(), "outside the frozen sandbox writable roots") {
+		t.Fatalf("an allocation outside the frozen writable roots must be refused, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(d.scratch, ".codex-stub-requests")); !os.IsNotExist(err) {
+		t.Fatal("no child may start for a refused birth")
+	}
+	// A session of another contributor cannot be born as a Codex session.
+	if _, err := store.CreateSession(context.Background(), "op-sess-claude", codexWiringLease, storage.SessionRecord{
+		ID: "sess-claude-wire", RunID: codexWiringRunID, Contributor: "claude", Role: "reviewer",
+		IsActiveContributor: true, State: "parked", Visibility: "reachable",
+	}); err != nil {
+		t.Fatalf("create claude session: %v", err)
+	}
+	if _, _, err := srv.CreateCodexSession(context.Background(), "op-create-claude", codexWiringLease, "sess-claude-wire"); err == nil ||
+		!strings.Contains(err.Error(), "not codex") {
+		t.Fatalf("a non-codex session must be refused, got %v", err)
 	}
 }

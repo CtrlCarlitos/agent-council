@@ -328,6 +328,13 @@ type Server struct {
 	running      bool
 	shutdown     chan struct{}
 	teardownOnce sync.Once
+
+	// codexBirthMu serializes the AC-005 workspace lookup-or-allocate
+	// step of codex session birth: the workspace manager publishes a
+	// placeholder while an allocation is in progress, so concurrent
+	// duplicate creations must not observe it (they share the adapter's
+	// creation reservation afterwards).
+	codexBirthMu sync.Mutex
 	teardownErr  error
 }
 

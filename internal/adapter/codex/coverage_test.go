@@ -46,8 +46,8 @@ func coveringAttestation(c ProtectionCoverage) ProtectionAttestation {
 		}
 	}
 	mutationPath(ToolBashAbsolute, "Bash")
-	for _, s := range c.MCPServers {
-		mutationPath(ToolMCP, s+"/read_file")
+	for _, s := range c.MCPTools {
+		mutationPath(ToolMCP, s)
 	}
 	for _, p := range c.PluginTools {
 		mutationPath(ToolPlugin, p)
@@ -66,8 +66,8 @@ func TestCoverage_FullSuiteValidates(t *testing.T) {
 		t.Fatalf("the covering suite must validate: %v", err)
 	}
 	// Inventory classes present in the frozen profile are required and
-	// satisfied by owner-prefixed paths.
-	c.MCPServers = []string{"context7", "fs"}
+	// satisfied by the exact frozen paths.
+	c.MCPTools = []string{"context7/resolve-library-id", "fs/read_file"}
 	c.PluginTools = []string{"skill:review"}
 	if err := coveringAttestation(c).ValidateCoverage(c); err != nil {
 		t.Fatalf("the covering suite with inventories must validate: %v", err)
@@ -81,14 +81,14 @@ func TestCoverage_FullSuiteValidates(t *testing.T) {
 	if err := att.ValidateCoverage(c); err != nil {
 		t.Fatalf("live-verified deny-equivalent records must be accepted: %v", err)
 	}
-	// CoverageFor derives the set from the frozen policy: MCP servers
+	// CoverageFor derives the set from the frozen policy: MCP tool paths
 	// and plugin tools are trimmed, deduplicated, and sorted.
 	got := CoverageFor(CodexLaunchPolicy{
 		AppServerVersion: "0.154.0", PlatformOS: "linux", PlatformFamily: "unix",
-		ManifestDigest: c.ManifestDigest, ExpectedMCPServers: []string{" fs", "context7", "fs"},
+		ManifestDigest: c.ManifestDigest, ExpectedMCPTools: []string{" fs/read", "context7/x", "fs/read"},
 		PluginTools: []string{"b", "a", "a"},
 	}, c.ProfileDigest)
-	if strings.Join(got.MCPServers, ",") != "context7,fs" || strings.Join(got.PluginTools, ",") != "a,b" {
+	if strings.Join(got.MCPTools, ",") != "context7/x,fs/read" || strings.Join(got.PluginTools, ",") != "a,b" {
 		t.Fatalf("derived coverage must be canonical: %+v", got)
 	}
 	if got.ProfileDigest != c.ProfileDigest || got.ManifestDigest != c.ManifestDigest {
@@ -141,20 +141,25 @@ func TestCoverage_Rejections(t *testing.T) {
 		{"mcp record when no server is enabled", nil, func(a *ProtectionAttestation) {
 			a.ProbeRecords = append(a.ProbeRecords, ProbeRecord{Class: RecordSiblingRead, ToolClass: ToolMCP,
 				ToolName: "context7/read", Operation: OpRead, Denied: true, EnforcingCapability: CapDenyList, DenialText: "x"})
-		}, "enables no MCP server"},
-		{"mcp path outside the expected servers", func(c *ProtectionCoverage) { c.MCPServers = []string{"context7"} },
+		}, "enables no MCP tool"},
+		{"mcp path outside the frozen inventory", func(c *ProtectionCoverage) { c.MCPTools = []string{"context7/x"} },
 			func(a *ProtectionAttestation) {
 				for i := range a.ProbeRecords {
 					if a.ProbeRecords[i].ToolClass == ToolMCP {
-						a.ProbeRecords[i].ToolName = "rogue/read"
+						a.ProbeRecords[i].ToolName = "context7/other"
 					}
 				}
-			}, "not an expected MCP server"},
-		{"expected mcp server uncovered", func(c *ProtectionCoverage) { c.MCPServers = []string{"context7", "fs"} },
+			}, "not in the frozen MCP tool inventory"},
+		{"sibling tool under a covered server is not covered by its sibling",
+			func(c *ProtectionCoverage) { c.MCPTools = []string{"context7/toolA", "context7/toolB"} },
 			func(a *ProtectionAttestation) {
-				dropWhere(a, func(r ProbeRecord) bool { return !strings.HasPrefix(r.ToolName, "fs/") })
-			}, "expected MCP server \"fs\" has no probe record"},
-		{"mcp path lacks mutation coverage", func(c *ProtectionCoverage) { c.MCPServers = []string{"context7"} },
+				dropWhere(a, func(r ProbeRecord) bool { return r.ToolName != "context7/toolB" })
+			}, "frozen MCP tool \"context7/toolB\" has no probe record"},
+		{"expected mcp tool uncovered", func(c *ProtectionCoverage) { c.MCPTools = []string{"context7/x", "fs/read"} },
+			func(a *ProtectionAttestation) {
+				dropWhere(a, func(r ProbeRecord) bool { return r.ToolName != "fs/read" })
+			}, "frozen MCP tool \"fs/read\" has no probe record"},
+		{"mcp path lacks mutation coverage", func(c *ProtectionCoverage) { c.MCPTools = []string{"context7/x"} },
 			func(a *ProtectionAttestation) {
 				dropWhere(a, func(r ProbeRecord) bool {
 					return !(r.ToolClass == ToolMCP && r.Class == RecordSelfMutation && r.Operation == OpRename)
@@ -163,7 +168,7 @@ func TestCoverage_Rejections(t *testing.T) {
 		{"plugin tool uncovered", func(c *ProtectionCoverage) { c.PluginTools = []string{"skill:review"} },
 			func(a *ProtectionAttestation) {
 				dropWhere(a, func(r ProbeRecord) bool { return r.ToolClass != ToolPlugin })
-			}, "expected skill/plugin tool \"skill:review\" has no probe record"},
+			}, "frozen skill/plugin tool \"skill:review\" has no probe record"},
 		{"plugin record when none enabled", nil, func(a *ProtectionAttestation) {
 			a.ProbeRecords = append(a.ProbeRecords, ProbeRecord{Class: RecordSiblingRead, ToolClass: ToolPlugin,
 				ToolName: "skill:x", Operation: OpRead, Denied: true, EnforcingCapability: CapDenyList, DenialText: "x"})
@@ -221,7 +226,7 @@ func TestCoverage_Rejections(t *testing.T) {
 // and a corrupt frame fails closed.
 func TestCoverage_DurableFrameRoundTrip(t *testing.T) {
 	c := testCoverage()
-	c.MCPServers = []string{"context7"}
+	c.MCPTools = []string{"context7/resolve-library-id"}
 	att := coveringAttestation(c)
 	raw, err := att.EncodeProbeRecords()
 	if err != nil {
@@ -245,8 +250,8 @@ func TestCoverage_DurableFrameRoundTrip(t *testing.T) {
 	}
 
 	stricter := c
-	stricter.MCPServers = []string{"context7", "fs"}
-	if err := stricter.ValidateFrame(raw); err == nil || !strings.Contains(err.Error(), "\"fs\" has no probe record") {
+	stricter.MCPTools = []string{"context7/resolve-library-id", "fs/read"}
+	if err := stricter.ValidateFrame(raw); err == nil || !strings.Contains(err.Error(), "\"fs/read\" has no probe record") {
 		t.Fatalf("a frame that does not cover the profile must be refused, got %v", err)
 	}
 	if err := c.ValidateFrame(raw[:len(raw)-3]); err == nil {

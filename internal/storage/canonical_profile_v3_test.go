@@ -26,6 +26,8 @@ func v3CodexBlock() *CodexHarnessSpec {
 		ApprovalPolicy:             CodexApprovalPolicy{Kind: "string", String: "on-request"},
 		ApprovalsReviewer:          "user",
 		ExpectedMCPServers:         []string{"context7"},
+		ExpectedMCPTools:           []string{"context7/resolve-library-id"},
+		ExpectedPluginTools:        []string{},
 		ExpectedInstructionSources: []string{"~/.codex/AGENTS.md"},
 		RulesEvidence: CodexRulesEvidenceSpec{
 			Verified:     []string{"sandbox workspace-write"},
@@ -61,7 +63,7 @@ func TestCanonicalProfileV3_GoldenDigestVector(t *testing.T) {
 	}
 
 	hex64 := strings.Repeat("a", 64)
-	golden := fmt.Sprintf(`{"algo_version":"cprof-v3","code_index_scope":[],"harnesses":{"codex":{"codex":{"app_server_version":"0.154.0","approval_policy":"on-request","approvals_reviewer":"user","event_universe_digest":"sha256:%s","event_universe_path":"docs/superpowers/evidence/ac009-native-event-universe-0.154.0.json","expected_codex_home":"/home/op/.codex","expected_instruction_sources":["~/.codex/AGENTS.md"],"expected_mcp_servers":["context7"],"model_provider":"openai","platform":{"family":"unix","os":"linux"},"rules_evidence":{"unverifiable":["~/.codex/rules/*.rules contents"],"verified":["sandbox workspace-write"]},"sandbox_policy":{"network_access":false,"type":"workspace-write","writable_roots":["/home/op/ws"]}},"extra_env_allowlist":[],"model":"gpt-5.6-sol","native_auth_mode":"inherited_codex_home"}},"isolation_strictness":"permissive_dev","network_allowlist":[],"network_mode":"unrestricted","tooling":["codex","git","go"],"toolkit_manifest":{"approved_tools":["Glob","Grep","Read"],"denied_complement":["Bash","Write"],"expected_hooks":["PreToolUse","SessionStart:startup"],"expected_plugins":["superpowers"],"expected_skills":["research"],"probed_cli_version":"2.1.278","turns_bound":8,"universe_evidence_digest":"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","universe_evidence_path":"docs/superpowers/evidence/ac008-native-tool-universe-2.1.278.json"},"workspace_mode":"none"}`, hex64)
+	golden := fmt.Sprintf(`{"algo_version":"cprof-v3","code_index_scope":[],"harnesses":{"codex":{"codex":{"app_server_version":"0.154.0","approval_policy":"on-request","approvals_reviewer":"user","event_universe_digest":"sha256:%s","event_universe_path":"docs/superpowers/evidence/ac009-native-event-universe-0.154.0.json","expected_codex_home":"/home/op/.codex","expected_instruction_sources":["~/.codex/AGENTS.md"],"expected_mcp_servers":["context7"],"expected_mcp_tools":["context7/resolve-library-id"],"expected_plugin_tools":[],"model_provider":"openai","platform":{"family":"unix","os":"linux"},"rules_evidence":{"unverifiable":["~/.codex/rules/*.rules contents"],"verified":["sandbox workspace-write"]},"sandbox_policy":{"network_access":false,"type":"workspace-write","writable_roots":["/home/op/ws"]}},"extra_env_allowlist":[],"model":"gpt-5.6-sol","native_auth_mode":"inherited_codex_home"}},"isolation_strictness":"permissive_dev","network_allowlist":[],"network_mode":"unrestricted","tooling":["codex","git","go"],"toolkit_manifest":{"approved_tools":["Glob","Grep","Read"],"denied_complement":["Bash","Write"],"expected_hooks":["PreToolUse","SessionStart:startup"],"expected_plugins":["superpowers"],"expected_skills":["research"],"probed_cli_version":"2.1.278","turns_bound":8,"universe_evidence_digest":"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","universe_evidence_path":"docs/superpowers/evidence/ac008-native-tool-universe-2.1.278.json"},"workspace_mode":"none"}`, hex64)
 
 	if string(canon) != golden {
 		t.Fatalf("canonical v3 JSON drifted from the golden vector:\n got: %s\nwant: %s", canon, golden)
@@ -167,6 +169,8 @@ func TestCanonicalProfileV3_Normalization(t *testing.T) {
 	p := v3Profile()
 	c := p.Harnesses["codex"].Codex
 	c.ExpectedMCPServers = []string{"\ufeffZeta", "zeta", "Alpha", "Alpha"}
+	c.ExpectedMCPTools = []string{"zeta/b", "\ufeffAlpha/a", "Alpha/a"}
+	c.ExpectedPluginTools = []string{"skill:z", "\ufeffskill:a"}
 	c.ExpectedInstructionSources = []string{"\ufeff~/.codex/AGENTS.md"}
 	c.SandboxPolicy.WritableRoots = []string{"/home/op/ws///", "\ufeff/home/op/WS"}
 	p.Harnesses["codex"] = HarnessProfileSpec{Model: "\ufeffgpt-5.6-sol", NativeAuthMode: "inherited_codex_home", Codex: c}
@@ -177,7 +181,11 @@ func TestCanonicalProfileV3_Normalization(t *testing.T) {
 	}
 	s := string(canon)
 	// Dedupe + case-sensitive byte-wise sort (no lowercasing).
-	for _, want := range []string{`"expected_mcp_servers":["Alpha","Zeta","zeta"]`} {
+	for _, want := range []string{
+		`"expected_mcp_servers":["Alpha","Zeta","zeta"]`,
+		`"expected_mcp_tools":["Alpha/a","zeta/b"]`,
+		`"expected_plugin_tools":["skill:a","skill:z"]`,
+	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("normalized array %s missing from %s", want, s)
 		}

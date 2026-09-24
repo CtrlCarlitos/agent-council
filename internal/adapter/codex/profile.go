@@ -56,10 +56,12 @@ type CodexLaunchPolicy struct {
 	EventUniversePath          string
 	EventUniverseDigest        string
 	ManifestDigest             string
-	// PluginTools are the frozen skill/plugin-contributed tool names
-	// (toolkit manifest expected_plugins ∪ expected_skills, trimmed,
-	// deduplicated, byte-wise sorted): the plugin-class half of the
-	// attestation coverage universe (coverage.go).
+	// ExpectedMCPTools is the frozen EXACT MCP tool-path inventory
+	// ("<server>/<tool>", trimmed, deduplicated, byte-wise sorted): the
+	// MCP half of the attestation coverage universe (coverage.go).
+	ExpectedMCPTools []string
+	// PluginTools is the frozen EXACT skill/plugin-contributed tool
+	// inventory: the plugin half of the coverage universe.
 	PluginTools []string
 }
 
@@ -131,6 +133,31 @@ func ValidateCodexHarness(profile storage.CanonicalProfile, evidenceRoot string)
 	if c.ExpectedMCPServers == nil {
 		return unsupported("codex block lacks expected_mcp_servers")
 	}
+	if c.ExpectedMCPTools == nil {
+		return unsupported("codex block lacks expected_mcp_tools (the exact MCP tool inventory; [] when no server exposes tools)")
+	}
+	mcpServers := make(map[string]struct{}, len(c.ExpectedMCPServers))
+	for _, s := range c.ExpectedMCPServers {
+		mcpServers[strings.TrimSpace(s)] = struct{}{}
+	}
+	for _, path := range c.ExpectedMCPTools {
+		path = strings.TrimSpace(path)
+		server, tool, ok := strings.Cut(path, "/")
+		if !ok || strings.TrimSpace(server) == "" || strings.TrimSpace(tool) == "" {
+			return unsupported(fmt.Sprintf("expected_mcp_tools entry %q is not <server>/<tool>", path))
+		}
+		if _, known := mcpServers[server]; !known {
+			return unsupported(fmt.Sprintf("expected_mcp_tools entry %q names a server outside expected_mcp_servers", path))
+		}
+	}
+	if c.ExpectedPluginTools == nil {
+		return unsupported("codex block lacks expected_plugin_tools (the exact plugin tool inventory; [] when none)")
+	}
+	for _, name := range c.ExpectedPluginTools {
+		if strings.TrimSpace(name) == "" {
+			return unsupported("expected_plugin_tools carries an empty tool name")
+		}
+	}
 	if c.ExpectedInstructionSources == nil {
 		return unsupported("codex block lacks expected_instruction_sources")
 	}
@@ -171,9 +198,8 @@ func ValidateCodexHarness(profile storage.CanonicalProfile, evidenceRoot string)
 		EventUniversePath:          c.EventUniversePath,
 		EventUniverseDigest:        c.EventUniverseDigest,
 		ManifestDigest:             manifestDigest,
-		PluginTools: sortedUniqueTrimmed(append(
-			append([]string(nil), profile.ToolkitManifest.ExpectedPlugins...),
-			profile.ToolkitManifest.ExpectedSkills...)),
+		ExpectedMCPTools:           sortedUniqueTrimmed(c.ExpectedMCPTools),
+		PluginTools:                sortedUniqueTrimmed(c.ExpectedPluginTools),
 	}, nil
 }
 

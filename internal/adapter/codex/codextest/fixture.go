@@ -511,6 +511,8 @@ func buildFixtureProfile(scratch, wsRoot string) (storage.CanonicalProfile, code
 					// {"servers":[]} (the .codex-fixture-mcp knob
 					// overrides it for inventory drift/match evidence).
 					ExpectedMCPServers:         []string{},
+					ExpectedMCPTools:           []string{},
+					ExpectedPluginTools:        []string{},
 					ExpectedInstructionSources: []string{"~/.codex/AGENTS.md"},
 					RulesEvidence: storage.CodexRulesEvidenceSpec{
 						Verified:     []string{"sandbox workspace-write"},

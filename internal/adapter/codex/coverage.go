@@ -8,8 +8,11 @@ package codex
 // surface (the §3.6 approval table), never from the evidence itself:
 //
 //   - sibling_read: exactly one record for each built-in path class
-//     (Read, Glob, Grep, shell-with-absolute-path), plus one per enabled
-//     MCP server tool and per skill/plugin-contributed tool.
+//     (Read, Glob, Grep, shell-with-absolute-path), plus exactly one per
+//     frozen MCP tool path (expected_mcp_tools, "<server>/<tool>") and
+//     per frozen plugin tool (expected_plugin_tools) — the inventories
+//     are EXACT and digest-bound in the profile; a server is never
+//     "covered" by probing one of its tools.
 //   - self_mutation: every mutation-capable path (shell, MCP, plugin)
 //     covers write, append, truncate, rename, and delete. Read-only
 //     classes (Read/Glob/Grep) carry no mutation records.
@@ -44,13 +47,11 @@ type ProtectionCoverage struct {
 	PlatformFamily string
 	ManifestDigest string
 	ProfileDigest  string
-	// MCPServers are the frozen expected MCP server names; each must be
-	// covered by at least one MCP-class path (tool name equal to the
-	// server name or "<server>/<tool>").
-	MCPServers []string
-	// PluginTools are the frozen skill/plugin-contributed tool names
-	// (toolkit manifest expected_plugins ∪ expected_skills); each must
-	// be covered by at least one plugin-class path.
+	// MCPTools is the frozen EXACT MCP tool-path inventory
+	// ("<server>/<tool>"): the recorded MCP paths must equal this set.
+	MCPTools []string
+	// PluginTools is the frozen EXACT skill/plugin-contributed tool
+	// inventory: the recorded plugin paths must equal this set.
 	PluginTools []string
 }
 
@@ -64,7 +65,7 @@ func CoverageFor(policy CodexLaunchPolicy, profileDigest string) ProtectionCover
 		PlatformFamily: policy.PlatformFamily,
 		ManifestDigest: policy.ManifestDigest,
 		ProfileDigest:  profileDigest,
-		MCPServers:     sortedUniqueTrimmed(policy.ExpectedMCPServers),
+		MCPTools:       sortedUniqueTrimmed(policy.ExpectedMCPTools),
 		PluginTools:    sortedUniqueTrimmed(policy.PluginTools),
 	}
 }
@@ -234,16 +235,16 @@ func (c ProtectionCoverage) coverRecords(probes []ProbeRecord, denies []Approval
 		}
 	}
 
-	// Inventory classes: every recorded path must belong to an expected
-	// owner; every expected owner must be covered; every path is
-	// mutation-capable (a foreign tool can write through its own
-	// process).
+	// Inventory classes: the recorded path set must EQUAL the frozen
+	// inventory — every frozen path probed, nothing else probed — and
+	// every path is mutation-capable (a foreign tool can write through
+	// its own process).
 	for _, inv := range []struct {
 		class    ToolClass
 		expected []string
 		label    string
 	}{
-		{ToolMCP, c.MCPServers, "MCP server"},
+		{ToolMCP, c.MCPTools, "MCP tool"},
 		{ToolPlugin, c.PluginTools, "skill/plugin tool"},
 	} {
 		paths := sortedNames(inv.class)
@@ -254,21 +255,23 @@ func (c ProtectionCoverage) coverRecords(probes []ProbeRecord, denies []Approval
 			}
 			continue
 		}
-		covered := make(map[string]bool, len(inv.expected))
+		expected := make(map[string]bool, len(inv.expected))
+		for _, e := range inv.expected {
+			expected[e] = false
+		}
 		for _, p := range paths {
-			owner, ok := coverageOwner(p, inv.expected)
-			if !ok {
-				return fmt.Errorf("unexpected coverage: %s path %q is not an expected %s (%v)",
+			if _, ok := expected[p]; !ok {
+				return fmt.Errorf("unexpected coverage: %s path %q is not in the frozen %s inventory %v",
 					toolClassName(inv.class), p, inv.label, inv.expected)
 			}
-			covered[owner] = true
+			expected[p] = true
 			if err := requirePath(coveragePath{class: inv.class, name: p}, true); err != nil {
 				return err
 			}
 		}
 		for _, e := range inv.expected {
-			if !covered[e] {
-				return fmt.Errorf("coverage missing: expected %s %q has no probe record", inv.label, e)
+			if !expected[e] {
+				return fmt.Errorf("coverage missing: frozen %s %q has no probe record", inv.label, e)
 			}
 		}
 	}
@@ -301,20 +304,6 @@ func (c ProtectionCoverage) coverRecords(probes []ProbeRecord, denies []Approval
 		}
 	}
 	return nil
-}
-
-// coverageOwner resolves the expected owner of an inventory path: the
-// exact owner name, or the longest owner prefix followed by "/".
-func coverageOwner(path string, expected []string) (string, bool) {
-	best, ok := "", false
-	for _, e := range expected {
-		if path == e || strings.HasPrefix(path, e+"/") {
-			if !ok || len(e) > len(best) {
-				best, ok = e, true
-			}
-		}
-	}
-	return best, ok
 }
 
 // ── cprot-v2 record frame decoding ──────────────────────────────────────

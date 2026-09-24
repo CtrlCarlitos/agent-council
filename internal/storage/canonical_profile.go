@@ -157,8 +157,16 @@ type CodexHarnessSpec struct {
 	// ApprovalsReviewer MUST be "user": any other native value (e.g.
 	// auto_review) would answer approvals outside Council's visibility
 	// (§3.6). Enforced at profile freeze, not at runtime.
-	ApprovalsReviewer          string                 `json:"approvals_reviewer"`
-	ExpectedMCPServers         []string               `json:"expected_mcp_servers"`
+	ApprovalsReviewer  string   `json:"approvals_reviewer"`
+	ExpectedMCPServers []string `json:"expected_mcp_servers"`
+	// ExpectedMCPTools is the EXACT frozen inventory of MCP tool paths,
+	// each "<server>/<tool>" with <server> in ExpectedMCPServers. It is
+	// the MCP half of the attestation coverage universe (AC-009 §3.7):
+	// every listed path must be probed, and nothing else may be.
+	ExpectedMCPTools []string `json:"expected_mcp_tools"`
+	// ExpectedPluginTools is the EXACT frozen inventory of skill/plugin-
+	// contributed tool names — the plugin half of the coverage universe.
+	ExpectedPluginTools        []string               `json:"expected_plugin_tools"`
 	ExpectedInstructionSources []string               `json:"expected_instruction_sources"`
 	RulesEvidence              CodexRulesEvidenceSpec `json:"rules_evidence"`
 	EventUniversePath          string                 `json:"event_universe_path"`
@@ -509,6 +517,8 @@ func canonicalCodexBlock(c *CodexHarnessSpec) (map[string]any, error) {
 		"approval_policy":              policy,
 		"approvals_reviewer":           codexScalar(c.ApprovalsReviewer),
 		"expected_mcp_servers":         normalizeStringSlice(c.ExpectedMCPServers, false, false),
+		"expected_mcp_tools":           normalizeStringSlice(c.ExpectedMCPTools, false, false),
+		"expected_plugin_tools":        normalizeStringSlice(c.ExpectedPluginTools, false, false),
 		"expected_instruction_sources": normalizeStringSlice(c.ExpectedInstructionSources, false, false),
 		"rules_evidence": map[string]any{
 			"verified":     normalizeStringSlice(c.RulesEvidence.Verified, false, false),

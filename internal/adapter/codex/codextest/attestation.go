@@ -16,8 +16,8 @@ import (
 
 // CoveringAttestation returns an attestation covering cov: one
 // sibling_read record per built-in class, sibling_read + the five
-// self_mutation operations for the shell path and for every expected
-// MCP server ("<server>/read_file") and plugin tool, and a
+// self_mutation operations for the shell path and for every frozen
+// MCP tool path and plugin tool, and a
 // native_refusal_enum approval_deny record for every pinned approval
 // method that has a schema-native refusal enum. probedAt must be
 // RFC3339 UTC.
@@ -43,8 +43,8 @@ func CoveringAttestation(cov codex.ProtectionCoverage, probedAt, actor string) c
 		}
 	}
 	mutationPath(codex.ToolBashAbsolute, "Bash")
-	for _, s := range cov.MCPServers {
-		mutationPath(codex.ToolMCP, s+"/read_file")
+	for _, s := range cov.MCPTools {
+		mutationPath(codex.ToolMCP, s)
 	}
 	for _, p := range cov.PluginTools {
 		mutationPath(codex.ToolPlugin, p)

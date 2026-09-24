@@ -44,6 +44,8 @@ func v3CodexProfile() storage.CanonicalProfile {
 					// {"servers":[]} (the .codex-fixture-mcp knob
 					// overrides it for inventory drift/match evidence).
 					ExpectedMCPServers:         []string{},
+					ExpectedMCPTools:           []string{},
+					ExpectedPluginTools:        []string{},
 					ExpectedInstructionSources: []string{"~/.codex/AGENTS.md"},
 					RulesEvidence: storage.CodexRulesEvidenceSpec{
 						Verified:     []string{"sandbox workspace-write"},
@@ -141,6 +143,14 @@ func TestValidateCodexHarness_RequiresCompleteBlock(t *testing.T) {
 		"approval_policy":     func(c *storage.CodexHarnessSpec) { c.ApprovalPolicy = storage.CodexApprovalPolicy{} },
 		"reviewer":            func(c *storage.CodexHarnessSpec) { c.ApprovalsReviewer = "auto_review" },
 		"mcp_servers":         func(c *storage.CodexHarnessSpec) { c.ExpectedMCPServers = nil },
+		"mcp_tools":           func(c *storage.CodexHarnessSpec) { c.ExpectedMCPTools = nil },
+		"mcp_tool_shape":      func(c *storage.CodexHarnessSpec) { c.ExpectedMCPTools = []string{"no-slash"} },
+		"mcp_tool_server": func(c *storage.CodexHarnessSpec) {
+			c.ExpectedMCPServers = []string{"context7"}
+			c.ExpectedMCPTools = []string{"rogue/read"}
+		},
+		"plugin_tools":        func(c *storage.CodexHarnessSpec) { c.ExpectedPluginTools = nil },
+		"plugin_tool_empty":   func(c *storage.CodexHarnessSpec) { c.ExpectedPluginTools = []string{" "} },
 		"instruction_sources": func(c *storage.CodexHarnessSpec) { c.ExpectedInstructionSources = nil },
 		"rules_evidence":      func(c *storage.CodexHarnessSpec) { c.RulesEvidence = storage.CodexRulesEvidenceSpec{} },
 		"universe_path":       func(c *storage.CodexHarnessSpec) { c.EventUniversePath = "" },

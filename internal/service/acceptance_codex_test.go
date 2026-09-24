@@ -104,6 +104,8 @@ func codexAcceptanceProfile(t *testing.T, scratch, wsRoot string) storage.Canoni
 					// with {"servers":[]}: the frozen inventory is
 					// affirmatively empty (must equal the observed).
 					ExpectedMCPServers:         []string{},
+					ExpectedMCPTools:           []string{},
+					ExpectedPluginTools:        []string{},
 					ExpectedInstructionSources: []string{"~/.codex/AGENTS.md"},
 					RulesEvidence: storage.CodexRulesEvidenceSpec{
 						Verified:     []string{"sandbox workspace-write"},
@@ -272,15 +274,17 @@ func codexThreadStartRules() []string {
 }
 
 // codexResumeRule builds a thread/resume response matching the frozen
-// fixture policy, with per-field drift for §3.5 rejection evidence.
-func codexResumeRule(wsRoot string, drift func(map[string]any)) string {
+// fixture policy, with per-field drift for §3.5 rejection evidence. cwd
+// is the service-derived AC-005 allocation; sandboxRoot is the frozen
+// writable root (the workspace base) the profile pins.
+func codexResumeRule(cwd, sandboxRoot string, drift func(map[string]any)) string {
 	cfg := map[string]any{
 		"id":                 codexFixtureThreadID,
 		"sessionId":          codexFixtureThreadID,
 		"status":             map[string]any{"type": "idle"},
-		"cwd":                wsRoot,
+		"cwd":                cwd,
 		"approvalPolicy":     "on-request",
-		"sandbox":            map[string]any{"type": "workspace-write", "writable_roots": []string{wsRoot}, "network_access": false},
+		"sandbox":            map[string]any{"type": "workspace-write", "writable_roots": []string{sandboxRoot}, "network_access": false},
 		"approvalsReviewer":  "user",
 		"model":              "gpt-5.6-sol",
 		"modelProvider":      "openai",
@@ -312,9 +316,9 @@ func codexTurnStartRespondRule() string {
 // serving TWO turns: the emit rules are one-shot per child, so the
 // turn/started + turn/completed pair is staged once per expected turn
 // while the respond rules (repeatable) are staged once.
-func codexLifecycleScenario(wsRoot string, turns int) []string {
+func codexLifecycleScenario(cwd, sandboxRoot string, turns int) []string {
 	lines := append([]string{codexAuthOKLine()}, codexThreadStartRules()...)
-	lines = append(lines, codexResumeRule(wsRoot, nil), codexTurnStartRespondRule())
+	lines = append(lines, codexResumeRule(cwd, sandboxRoot, nil), codexTurnStartRespondRule())
 	for i := 0; i < turns; i++ {
 		lines = append(lines,
 			`{"emit_on_request": {"method":"turn/start","line":`+codexTurnStartedLine()+`}}`,
@@ -332,6 +336,10 @@ type codexAcceptance struct {
 	store   *storage.Store // the fixture store: adapter and service share it
 	profile storage.CanonicalProfile
 	token   string
+	// wsRoot is the AC-005 allocation the service derives for the
+	// acceptance session (base/run/session/scratch under the frozen
+	// writable root): the thread cwd every scripted response must echo.
+	wsRoot  string
 	baseDir string       // parent of the service state dir (restart-test layout)
 	lock    *ServiceLock // held for the first instance; the restart releases it
 	bridge  *acceptanceBridge
@@ -364,12 +372,16 @@ func newCodexAcceptance(t *testing.T, scenario []string) *codexAcceptance {
 
 	dir := testStateDir(t)
 	stateDir := filepath.Join(dir, "state")
-	wsBase := filepath.Join(dir, "workspaces")
-	for _, d := range []string{stateDir, wsBase} {
-		if err := os.MkdirAll(d, 0o700); err != nil {
-			t.Fatalf("mkdir %s: %v", d, err)
-		}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", stateDir, err)
 	}
+	// The frozen writable root IS the workspace base: the service
+	// allocates base/run/session/scratch inside it (mode "none").
+	realBase, err := filepath.EvalSymlinks(fx.WorkspaceRoot)
+	if err != nil {
+		t.Fatalf("resolve workspace base: %v", err)
+	}
+	wsRoot := filepath.Join(realBase, codexAcceptanceRunID, codexAcceptanceSession, "scratch")
 	lock, err := AcquireServiceLock(stateDir)
 	if err != nil {
 		t.Fatalf("lock: %v", err)
@@ -382,9 +394,12 @@ func newCodexAcceptance(t *testing.T, scenario []string) *codexAcceptance {
 		StateDir:         stateDir,
 		InstanceID:       instanceID,
 		AuthToken:        token,
-		WorkspaceBaseDir: wsBase,
+		WorkspaceBaseDir: fx.WorkspaceRoot,
 		CodexBinaryPath:  "codex", // resolved on PATH to the compiled fixture
 		CodexProfile:     profile,
+		// The birth path re-validates the run's stored profile against
+		// the staged event-universe evidence.
+		CodexEvidenceRoot: filepath.Join(fx.ScratchDir, "evidence"),
 	}
 	srv, err := NewServerWithAdapter(fx.Store, lock, cfg, fx.Adapter)
 	if err != nil {
@@ -404,6 +419,14 @@ func newCodexAcceptance(t *testing.T, scenario []string) *codexAcceptance {
 	if err := fx.SeedSession(context.Background(), codexAcceptanceSession); err != nil {
 		t.Fatalf("seed session: %v", err)
 	}
+	if scenario == nil {
+		// The fixture's default scenario echoes its own workspace root
+		// as both cwd and sandbox root; the service-derived thread cwd
+		// is the allocation below the frozen root.
+		if err := fx.StageScenario(codexLifecycleScenario(wsRoot, fx.WorkspaceRoot, 1)...); err != nil {
+			t.Fatalf("restage default scenario: %v", err)
+		}
+	}
 	return &codexAcceptance{
 		t:       t,
 		fx:      fx,
@@ -411,20 +434,10 @@ func newCodexAcceptance(t *testing.T, scenario []string) *codexAcceptance {
 		store:   fx.Store,
 		profile: profile,
 		token:   token,
+		wsRoot:  wsRoot,
 		baseDir: dir,
 		lock:    lock,
 		bridge:  &acceptanceBridge{t: t, client: newTestClient(srv.SocketPath()), token: token},
-	}
-}
-
-func (acc *codexAcceptance) createRequest() adapter.CreateSessionRequest {
-	return adapter.CreateSessionRequest{
-		SessionID:   adapter.SessionID(codexAcceptanceSession),
-		Contributor: "codex",
-		Config: adapter.SessionConfig{
-			WorkspaceRoot: acc.fx.WorkspaceRoot,
-			Model:         acc.fx.Model,
-		},
 	}
 }
 
@@ -543,7 +556,7 @@ func TestAcceptance_Codex_BridgeLifecycle(t *testing.T) {
 	acc := newCodexAcceptance(t, nil)
 	// One child serves both turns: stage one one-shot notification pair
 	// per expected turn (see codexLifecycleScenario).
-	acc.restage(codexLifecycleScenario(acc.fx.WorkspaceRoot, 2)...)
+	acc.restage(codexLifecycleScenario(acc.wsRoot, acc.fx.WorkspaceRoot, 2)...)
 	ctx := context.Background()
 	bridge := acc.bridge
 
@@ -552,7 +565,7 @@ func TestAcceptance_Codex_BridgeLifecycle(t *testing.T) {
 
 	// 3. Authority pre-flight: a wrong credential is refused before any
 	// native identity is minted and no binding appears.
-	if _, _, err := acc.srv.CreateCodexSession(ctx, "op-bind-acc-cx-bad", "not-the-lease", acc.createRequest()); err == nil {
+	if _, _, err := acc.srv.CreateCodexSession(ctx, "op-bind-acc-cx-bad", "not-the-lease", codexAcceptanceSession); err == nil {
 		t.Fatal("session birth without the controller credential must be refused")
 	}
 	if b, _ := acc.store.GetCodexSessionBinding(ctx, codexAcceptanceSession); b != nil {
@@ -562,7 +575,7 @@ func TestAcceptance_Codex_BridgeLifecycle(t *testing.T) {
 	// 4. Birth through the bridge: CreateCodexSession persists the §3.4
 	// binding under the controller credential; the native id is a
 	// server-assigned canonical UUIDv7, deliberately distinct.
-	binding, _, err := acc.srv.CreateCodexSession(ctx, "op-bind-acc-cx-1", lease, acc.createRequest())
+	binding, _, err := acc.srv.CreateCodexSession(ctx, "op-bind-acc-cx-1", lease, codexAcceptanceSession)
 	if err != nil {
 		t.Fatalf("native session creation through the service path: %v", err)
 	}
@@ -579,6 +592,16 @@ func TestAcceptance_Codex_BridgeLifecycle(t *testing.T) {
 	}
 	if stored.ProfileDigest != acc.fx.ProfileDigest {
 		t.Fatalf("binding profile digest %q must be the frozen digest %q", stored.ProfileDigest, acc.fx.ProfileDigest)
+	}
+	// Nothing about the binding came from a caller: the model is the
+	// run's frozen codex model and the workspace is the AC-005
+	// allocation inside the frozen writable root.
+	if stored.Model != acc.fx.Model || stored.Workspace != acc.wsRoot {
+		t.Fatalf("binding must carry the derived model/workspace %q/%q, got %q/%q",
+			acc.fx.Model, acc.wsRoot, stored.Model, stored.Workspace)
+	}
+	if binding.Config.WorkspaceRoot != acc.wsRoot || binding.Config.Model != acc.fx.Model {
+		t.Fatalf("the native thread must be created with the derived config, got %+v", binding.Config)
 	}
 	// Gate ordering evidence: the child handshake + auth gate ran (the
 	// fixture request log records the §3.3 order) and no turn exists.
@@ -689,7 +712,7 @@ func TestAcceptance_Codex_ConcurrentDuplicateDispatch(t *testing.T) {
 	acc := newCodexAcceptance(t, nil)
 	lease := acc.adoptAndConnect()
 
-	if _, _, err := acc.srv.CreateCodexSession(context.Background(), "op-bind-acc-cx-dup", lease, acc.createRequest()); err != nil {
+	if _, _, err := acc.srv.CreateCodexSession(context.Background(), "op-bind-acc-cx-dup", lease, codexAcceptanceSession); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	stageCodexRollout(t, acc.fx.ScratchDir, codexFixtureThreadID)
@@ -736,13 +759,13 @@ func TestAcceptance_Codex_LostTurnBlocksNextThroughBridge(t *testing.T) {
 		codexAuthOKLine(),
 		codexThreadStartRules()[0],
 		codexThreadStartRules()[1],
-		codexResumeRule(acc.fx.WorkspaceRoot, nil),
+		codexResumeRule(acc.wsRoot, acc.fx.WorkspaceRoot, nil),
 		// The ack never arrives inside the adapter's dispatch window:
 		// the response is delayed past dispatchAckTimeout (15s).
 		`{"respond": {"method":"turn/start","delay_ms":16000,"result":{"id":"`+codexFixtureTurnID+`","threadId":"`+codexFixtureThreadID+`","status":{"type":"inProgress"}}}}`,
 	)
 	lease := acc.adoptAndConnect()
-	if _, _, err := acc.srv.CreateCodexSession(context.Background(), "op-bind-acc-cx-lost", lease, acc.createRequest()); err != nil {
+	if _, _, err := acc.srv.CreateCodexSession(context.Background(), "op-bind-acc-cx-lost", lease, codexAcceptanceSession); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	stageCodexRollout(t, acc.fx.ScratchDir, codexFixtureThreadID)
@@ -811,10 +834,10 @@ func TestAcceptance_Codex_ProfileDriftFailsClosedBeforeTransmission(t *testing.T
 				codexAuthOKLine(),
 				codexThreadStartRules()[0],
 				codexThreadStartRules()[1],
-				codexResumeRule(acc.fx.WorkspaceRoot, tc.drift),
+				codexResumeRule(acc.wsRoot, acc.fx.WorkspaceRoot, tc.drift),
 			)
 			lease := acc.adoptAndConnect()
-			if _, _, err := acc.srv.CreateCodexSession(context.Background(), "op-bind-acc-cx-drift", lease, acc.createRequest()); err != nil {
+			if _, _, err := acc.srv.CreateCodexSession(context.Background(), "op-bind-acc-cx-drift", lease, codexAcceptanceSession); err != nil {
 				t.Fatalf("create: %v", err)
 			}
 			stageCodexRollout(t, acc.fx.ScratchDir, codexFixtureThreadID)
@@ -856,7 +879,7 @@ func TestAcceptance_Codex_MissingNativeThreadRejected(t *testing.T) {
 		`{"respond_error": {"method":"thread/resume","code":-32600,"message":"no rollout found for thread id `+codexFixtureThreadID+`"}}`,
 	)
 	lease := acc.adoptAndConnect()
-	if _, _, err := acc.srv.CreateCodexSession(context.Background(), "op-bind-acc-cx-miss", lease, acc.createRequest()); err != nil {
+	if _, _, err := acc.srv.CreateCodexSession(context.Background(), "op-bind-acc-cx-miss", lease, codexAcceptanceSession); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
@@ -890,13 +913,13 @@ func TestAcceptance_Codex_ApprovalDenyMirroredBoundedTerminal(t *testing.T) {
 		codexAuthOKLine(),
 		codexThreadStartRules()[0],
 		codexThreadStartRules()[1],
-		codexResumeRule(acc.fx.WorkspaceRoot, nil),
+		codexResumeRule(acc.wsRoot, acc.fx.WorkspaceRoot, nil),
 		`{"emit_many_on_request": {"method":"turn/start","lines":[`+codexTurnStartedLine()+`,`+approval+`]}}`,
 		`{"respond": {"method":"turn/start","result":{"id":"`+codexFixtureTurnID+`","threadId":"`+codexFixtureThreadID+`","status":{"type":"inProgress"}}}}`,
 		`{"emit_after_response": {"method":"turn/start","line":`+codexTurnCompletedLine()+`}}`,
 	)
 	lease := acc.adoptAndConnect()
-	if _, _, err := acc.srv.CreateCodexSession(context.Background(), "op-bind-acc-cx-appr", lease, acc.createRequest()); err != nil {
+	if _, _, err := acc.srv.CreateCodexSession(context.Background(), "op-bind-acc-cx-appr", lease, codexAcceptanceSession); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	stageCodexRollout(t, acc.fx.ScratchDir, codexFixtureThreadID)
@@ -935,7 +958,7 @@ func TestAcceptance_Codex_ApprovalDenyMirroredBoundedTerminal(t *testing.T) {
 func TestAcceptance_Codex_TruncatedRolloutStaysAdvisory(t *testing.T) {
 	acc := newCodexAcceptance(t, nil)
 	lease := acc.adoptAndConnect()
-	if _, _, err := acc.srv.CreateCodexSession(context.Background(), "op-bind-acc-cx-torn", lease, acc.createRequest()); err != nil {
+	if _, _, err := acc.srv.CreateCodexSession(context.Background(), "op-bind-acc-cx-torn", lease, codexAcceptanceSession); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	stageCodexRollout(t, acc.fx.ScratchDir, codexFixtureThreadID,
@@ -980,7 +1003,7 @@ func TestAcceptance_Codex_CreationUncertainBlocksAcrossRestart(t *testing.T) {
 		go func(slot int) {
 			defer wg.Done()
 			_, _, errs[slot] = acc.srv.CreateCodexSession(ctx,
-				fmt.Sprintf("op-bind-acc-cx-share-%d", slot), lease, acc.createRequest())
+				fmt.Sprintf("op-bind-acc-cx-share-%d", slot), lease, codexAcceptanceSession)
 		}(i)
 	}
 	wg.Wait()
@@ -1037,7 +1060,7 @@ func TestAcceptance_Codex_CreationUncertainBlocksAcrossRestart(t *testing.T) {
 		StateDir:          stateDir,
 		InstanceID:        acc.srv.InstanceID() + "-restart",
 		AuthToken:         acc.token,
-		WorkspaceBaseDir:  filepath.Join(dir, "workspaces"),
+		WorkspaceBaseDir:  acc.fx.WorkspaceRoot,
 		CodexBinaryPath:   "codex",
 		CodexProfile:      acc.profile,
 		CodexEvidenceRoot: filepath.Join(acc.fx.ScratchDir, "evidence"),
@@ -1052,7 +1075,7 @@ func TestAcceptance_Codex_CreationUncertainBlocksAcrossRestart(t *testing.T) {
 		t.Fatalf("restart start: %v", err)
 	}
 
-	if _, _, err := srv2.CreateCodexSession(ctx, "op-bind-acc-cx-restart", lease, acc.createRequest()); err == nil {
+	if _, _, err := srv2.CreateCodexSession(ctx, "op-bind-acc-cx-restart", lease, codexAcceptanceSession); err == nil {
 		t.Fatal("a restart must not re-create the thread for an uncertain session")
 	} else {
 		var unc *adapter.ErrSessionCreationUncertain
