@@ -312,13 +312,13 @@ func TestAgyAdapter_ProbeReportsFrozenIdentityWithoutLaunch(t *testing.T) {
 func TestAgyAdapter_ProductionConstructorRejectsFixtureOption(t *testing.T) {
 	h := newAgyHarness(t)
 	att := func() (string, bool) { return "cprot-v2:sha256:" + strings.Repeat("ab", 32), true }
-	_, err := NewAgyAdapter(h.store, h.exec, h.source, h.policy, h.profileDigest, h.fx.SealedImage,
+	_, err := NewAgyAdapter(h.store, h.exec, h.source, h.wm, h.policy, h.profileDigest, h.fx.SealedImage,
 		fnIdentity{fn: defaultAttempt}, h.required, att, FixtureOption(FixtureMode{}))
 	var prohibited *ErrFixtureModeProhibited
 	if !errors.As(err, &prohibited) {
 		t.Fatalf("the production constructor must refuse the fixture option, got %v", err)
 	}
-	_, err = NewAgyAdapter(h.store, h.exec, h.source, h.policy, h.profileDigest, h.fx.SealedImage,
+	_, err = NewAgyAdapter(h.store, h.exec, h.source, h.wm, h.policy, h.profileDigest, h.fx.SealedImage,
 		fnIdentity{fn: defaultAttempt}, h.required, nil)
 	if err == nil {
 		t.Fatal("the production constructor requires the attestation lookup")
@@ -332,7 +332,7 @@ func TestAgyAdapter_ProductionEligibilityMissingPreChild(t *testing.T) {
 	h := newAgyHarness(t)
 	h.scenario(`{"conversation_id": "` + testNativeID + `"}`)
 	att := func() (string, bool) { return "", false }
-	prod, err := NewAgyAdapter(h.store, h.exec, h.source, h.policy, h.profileDigest, h.fx.SealedImage,
+	prod, err := NewAgyAdapter(h.store, h.exec, h.source, h.wm, h.policy, h.profileDigest, h.fx.SealedImage,
 		fnIdentity{fn: defaultAttempt}, h.required, att)
 	if err != nil {
 		t.Fatalf("NewAgyAdapter: %v", err)
@@ -392,7 +392,7 @@ func TestAgyAdapter_LaunchMatrix(t *testing.T) {
 			p.NetworkMode = "none"
 		})
 		att := func() (string, bool) { return "cprot-v2:sha256:" + strings.Repeat("ab", 32), true }
-		prod, err := NewAgyAdapter(h.store, h.exec, h.source, h.policy, h.profileDigest, h.fx.SealedImage,
+		prod, err := NewAgyAdapter(h.store, h.exec, h.source, h.wm, h.policy, h.profileDigest, h.fx.SealedImage,
 			fnIdentity{fn: defaultAttempt}, h.required, att)
 		if err != nil {
 			t.Fatalf("NewAgyAdapter: %v", err)

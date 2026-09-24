@@ -151,6 +151,11 @@ func (s *StorageLaunchSource) AgyTurnLaunch(ctx context.Context, sessionID adapt
 		}
 	}
 
+	home, err := agyHomeDir(s.policy.ExpectedHome)
+	if err != nil {
+		return execpolicy.LaunchRequest{}, err
+	}
+
 	command := s.policy.BinaryPath
 	if s.image != nil {
 		command = s.image.ArgV0
@@ -181,8 +186,35 @@ func (s *StorageLaunchSource) AgyTurnLaunch(ctx context.Context, sessionID adapt
 		Model:         model,
 		ProfileDigest: rec.ProfileDigest,
 		SealedImage:   s.image,
+		HomeDir:       home,
 	}, nil
 }
+
+// agyHomeDir derives the HOME every agy launch inherits (spec §3.1: HOME
+// is NOT overridden for authenticated runs; §3.2: sign-in is bound to
+// the operator's ~/.gemini). The frozen expected_home names that
+// ~/.gemini directory (spec §3.7 profile example) and the CLI resolves
+// <HOME>/.gemini/antigravity-cli, so HOME is its parent. Fail closed
+// unless expected_home is an absolute, clean path ending in ".gemini".
+func agyHomeDir(expectedHome string) (string, error) {
+	if !filepath.IsAbs(expectedHome) || filepath.Clean(expectedHome) != expectedHome {
+		return "", fmt.Errorf("frozen expected_home %q must be an absolute, clean path", expectedHome)
+	}
+	if filepath.Base(expectedHome) != ".gemini" {
+		return "", fmt.Errorf("frozen expected_home %q must name the operator's .gemini directory", expectedHome)
+	}
+	return filepath.Dir(expectedHome), nil
+}
+
+// AllocationLookup is the adapter's independent view of the AC-005
+// workspace allocation (satisfied by *workspace.WorkspaceManager): the
+// closing launch check compares the request's paths against it rather
+// than trusting the request's own paths.
+type AllocationLookup interface {
+	GetPaths(runID, sessionID string) (workspace.WorkspacePaths, bool)
+}
+
+var _ AllocationLookup = (*workspace.WorkspaceManager)(nil)
 
 // newLaunchLogPath allocates a fresh per-launch log path under the
 // allocation's scratch directory (created 0700).

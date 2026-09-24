@@ -442,30 +442,44 @@ func TestAgyDispatch_ObserverDetachDoesNotCancelTurn(t *testing.T) {
 	if out, err := h.dispatch("t1", "long"); err != nil || out.Status != adapter.DispatchAccepted {
 		t.Fatalf("dispatch: %+v err=%v", out, err)
 	}
+	// A witness tap that stays attached: every event the turn publishes
+	// after the detach is ordered on it.
+	witness, err := h.adapter.Observe(context.Background(), h.ref("t1"))
+	if err != nil {
+		t.Fatalf("Observe witness: %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s, err := h.adapter.Observe(ctx, h.ref("t1"))
 	if err != nil {
 		t.Fatalf("Observe: %v", err)
 	}
 	// Wait for the ACTIVE step so the turn is provably running.
-	select {
-	case ev := <-s.Events():
-		if ev.Type != adapter.EventProgress {
-			t.Fatalf("first observed event: %+v", ev)
+	for _, tap := range []adapter.Stream{s, witness} {
+		select {
+		case ev := <-tap.Events():
+			if ev.Type != adapter.EventProgress || ev.Status != council.TurnRunning {
+				t.Fatalf("first observed event: %+v", ev)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("no progress observed")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("no progress observed")
 	}
 	cancel()
-	collectEvents(t, s, 5*time.Second) // the tap closes
-	time.Sleep(100 * time.Millisecond)
-	out, err := h.adapter.Reconcile(context.Background(), adapter.RecoveryRef{TurnRef: h.ref("t1"), Generation: 1})
-	if err != nil || out.Status != adapter.ReconciliationReachableActive {
-		t.Fatalf("observer detach is not cancellation: %+v err=%v", out, err)
-	}
+	collectEvents(t, s, 5*time.Second) // the detached tap closes
+
+	// Synchronized check (no sleep): Cancel publishes exactly one
+	// "SIGINT sent" cancelling event, and only the FIRST interrupt does.
+	// Had the detach cancelled or killed the turn, the witness would
+	// see a cancelling/terminal event before ours, or Cancel would not
+	// be Confirmed.
 	co, _ := h.adapter.Cancel(context.Background(), h.ref("t1"))
 	if co.Disposition != adapter.CancelConfirmed {
 		t.Fatalf("cancel after detach: %+v", co)
+	}
+	evs := collectEvents(t, witness, 5*time.Second)
+	if len(evs) != 2 || evs[0].Status != council.TurnCancelling || evs[0].Payload != "SIGINT sent" ||
+		evs[1].Type != adapter.EventTerminal || evs[1].Status != council.TurnCancelled {
+		t.Fatalf("after the detach the turn saw only the operator's cancel, then its terminal: %+v", evs)
 	}
 }
 

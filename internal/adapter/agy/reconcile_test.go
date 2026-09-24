@@ -11,7 +11,8 @@ package agy
 // stay Uncertain and block the conversation across the restart.
 //
 //   §3.11 transition                         test
-//   attempt+pdig durable (pre-reservation)   TestAgyCrashGap_AttemptBeforeReservation
+//   attempt+pdig+reservation (ONE tx)        TestAgyCrashGap_AttemptAndReservationAtomic (fixround_test.go)
+//   unreserved attempt row (legacy/seeded)   TestAgyCrashGap_AttemptBeforeReservation
 //   launch reserved (launch_count 0→1)       TestAgyCrashGap_ReservedBeforeStart
 //   started + exe identity                   TestAgyCrashGap_StartedBeforeFirstByte
 //   first stdin byte                         TestAgyCrashGap_FirstByteBeforeUserInput
@@ -19,6 +20,7 @@ package agy
 //   terminal + verification                  TestAgyCrashGap_TerminalSurvivesRestart
 //   start_failed ⇒ missing                   TestAgyCrashGap_StartFailedMissing
 //   dead + missing (pre-write rejection)     TestAgyCrashGap_PreWriteRejectionMissing
+//   dead, missing not recorded               TestAgyCrashGap_DeadBeforeMissing (fixround_test.go)
 
 import (
 	"context"
@@ -116,6 +118,10 @@ func assertUncertainBlocked(t *testing.T, h *agyHarness, turnKey string) {
 	}
 }
 
+// Dispatch now writes the attempt and its reservation in one transaction
+// (TestAgyCrashGap_AttemptAndReservationAtomic), so it can no longer
+// leave this state; an unreserved row seeded through the storage API
+// still reconciles as DefinitivelyMissing.
 func TestAgyCrashGap_AttemptBeforeReservation(t *testing.T) {
 	h := newAgyHarness(t)
 	h.persist(testNativeID)

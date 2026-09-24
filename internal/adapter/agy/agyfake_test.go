@@ -84,11 +84,21 @@ package agy
 //   {"models_not_signed_in": true}       `agy models` not-signed-in text
 //   {"plugin_list_drift": "<raw text>"}  `agy plugin list` drifted output
 //   {"version": "<string>"}              --version output
+//   {"materialize": true}                right after init, create
+//                                        <HOME>/.gemini/antigravity-cli/
+//                                        conversations/<id>.db (0600)
+//   {"spawn_sleeper": true}              before init, ignore SIGTERM and
+//                                        start a descendant copy of this
+//                                        binary in sleep mode (same
+//                                        process group); its pid goes to
+//                                        .agy-fixture-sleeper-pid
 //
 // Evidence knobs (resolved in the child's CWD):
 //   .agy-fixture-args    argv log (fields joined by U+001F), one line
 //                        per invocation
 //   .agy-fixture-input   the single stdin line read, verbatim
+//   .agy-fixture-env     "HOME=<value>" of the child's environment, one
+//                        line per invocation
 
 import (
 	"fmt"
@@ -108,7 +118,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -167,6 +180,8 @@ type directive struct {
 	ModelsNotSignedIn   bool              ` + "`" + `json:"models_not_signed_in"` + "`" + `
 	PluginListDrift     string            ` + "`" + `json:"plugin_list_drift"` + "`" + `
 	Version             string            ` + "`" + `json:"version"` + "`" + `
+	Materialize         bool              ` + "`" + `json:"materialize"` + "`" + `
+	SpawnSleeper        bool              ` + "`" + `json:"spawn_sleeper"` + "`" + `
 }
 
 type scenarioState struct {
@@ -185,6 +200,8 @@ type scenarioState struct {
 	modelsNotSignedIn  bool
 	pluginListDrift    string
 	version            string
+	materialize        bool
+	spawnSleeper       bool
 }
 
 func appendLine(name, line string) {
@@ -249,6 +266,10 @@ func loadScenario() *scenarioState {
 			st.pluginListDrift = d.PluginListDrift
 		case d.Version != "":
 			st.version = d.Version
+		case d.Materialize:
+			st.materialize = true
+		case d.SpawnSleeper:
+			st.spawnSleeper = true
 		default:
 			recognized = false
 		}
@@ -376,12 +397,31 @@ func runStreamJSON(args []string, st *scenarioState, sigCh chan os.Signal) {
 		time.Sleep(time.Duration(st.slowInitMs) * time.Millisecond)
 	}
 
+	if st.spawnSleeper {
+		// The parent ignores SIGTERM so only a forced kill ends it; the
+		// descendant stays in the parent's process group.
+		signal.Ignore(syscall.SIGTERM)
+		sleeper := exec.Command(os.Args[0], "__agy_fixture_sleep")
+		if err := sleeper.Start(); err == nil {
+			appendLine(".agy-fixture-sleeper-pid", strconv.Itoa(sleeper.Process.Pid))
+		}
+	}
+
 	cwd, _ := os.Getwd()
 	initObj := map[string]any{"cwd": cwd, "tools": st.tools, "permission_mode": st.permissionMode}
 	if model != "" {
 		initObj["model"] = model
 	}
 	emitJSON(map[string]any{"event": "init", "conversation_id": convID, "init": initObj})
+
+	if st.materialize {
+		// The native conversation file persists at process start under
+		// the inherited HOME (<HOME>/.gemini/antigravity-cli/...).
+		dir := filepath.Join(os.Getenv("HOME"), ".gemini", "antigravity-cli", "conversations")
+		if err := os.MkdirAll(dir, 0o700); err == nil {
+			_ = os.WriteFile(filepath.Join(dir, convID+".db"), []byte("fixture conversation"), 0o600)
+		}
+	}
 
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 64<<10), 2<<20)
@@ -487,7 +527,13 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT)
 
 	args := os.Args[1:]
+	if len(args) == 1 && args[0] == "__agy_fixture_sleep" {
+		// spawn_sleeper's descendant: sleep until killed.
+		time.Sleep(10 * time.Minute)
+		return
+	}
 	appendLine(".agy-fixture-args", strings.Join(args, "\x1f"))
+	appendLine(".agy-fixture-env", "HOME="+os.Getenv("HOME"))
 
 	st := loadScenario()
 

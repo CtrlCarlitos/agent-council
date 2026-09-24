@@ -13,8 +13,9 @@ package agy
 //     reservation; an uncertain creation tombstones the session.
 //   - ResumeSession: local inspection only (binding + conversation file).
 //   - Dispatch: single flight per native conversation → durable block
-//     check → eligibility → attempt+pdig durable → launch reserved →
-//     sealed Start (exe identity recorded) → init verified BEFORE the
+//     check → eligibility → attempt+pdig AND launch reservation in ONE
+//     transaction → sealed Start under the inherited operator HOME (exe
+//     identity recorded) → init verified BEFORE the
 //     write (drift ⇒ child terminated, prompt never written, Rejected) →
 //     first stdin byte recorded at the write boundary → stdin closed →
 //     the turn goroutine owns acceptance (user_input DONE), tool
@@ -26,6 +27,8 @@ package agy
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -161,6 +164,7 @@ type AgyAdapter struct {
 	store         *storage.Store
 	executor      execpolicy.PolicyExecutor
 	launch        AgyTurnLaunchSource
+	allocations   AllocationLookup
 	policy        AgyLaunchPolicy
 	profileDigest string
 	image         *execpolicy.SealedImage
@@ -184,6 +188,35 @@ type AgyAdapter struct {
 	createMu  sync.Mutex
 	creations map[adapter.SessionID]*agyCreationCall
 	uncertain map[adapter.SessionID]error
+
+	// materializeErrs holds a failed post-acceptance materialization
+	// record per session; ResumeSession retries it and fails while the
+	// record cannot be written.
+	materializeErrs map[adapter.SessionID]error
+
+	// fault is the test-only fault-injection seam on durable
+	// transitions (nil in production): a non-nil return replaces the
+	// store call with that error.
+	fault func(op string) error
+}
+
+// Durable transition names passed to the fault seam.
+const (
+	opNativeStepIndex = "native_step_index"
+	opLaunchDead      = "launch_dead"
+	opAttemptMissing  = "attempt_missing"
+	opMaterialize     = "materialize"
+	opOrphan          = "orphan_conversation"
+)
+
+// durable runs one durable transition through the fault seam.
+func (a *AgyAdapter) durable(op string, fn func() error) error {
+	if a.fault != nil {
+		if err := a.fault(op); err != nil {
+			return err
+		}
+	}
+	return fn()
 }
 
 var _ adapter.Adapter = (*AgyAdapter)(nil)
@@ -198,6 +231,7 @@ func NewAgyAdapter(
 	store *storage.Store,
 	executor execpolicy.PolicyExecutor,
 	launch AgyTurnLaunchSource,
+	allocations AllocationLookup,
 	policy AgyLaunchPolicy,
 	profileDigest string,
 	image *execpolicy.SealedImage,
@@ -220,7 +254,7 @@ func NewAgyAdapter(
 			Reason: fmt.Sprintf("production agy is eligible only for the linux/unix platform on a linux host (frozen %s/%s, host %s)",
 				policy.PlatformOS, policy.PlatformFamily, runtime.GOOS)}
 	}
-	return buildAgyAdapter(store, executor, launch, policy, profileDigest, image, identity, required, attestation, false)
+	return buildAgyAdapter(store, executor, launch, allocations, policy, profileDigest, image, identity, required, attestation, false)
 }
 
 // NewFixtureScopedAdapter builds an AgyAdapter under the explicit
@@ -233,6 +267,7 @@ func NewFixtureScopedAdapter(
 	store *storage.Store,
 	executor execpolicy.PolicyExecutor,
 	launch AgyTurnLaunchSource,
+	allocations AllocationLookup,
 	policy AgyLaunchPolicy,
 	profileDigest string,
 	image *execpolicy.SealedImage,
@@ -240,13 +275,14 @@ func NewFixtureScopedAdapter(
 	required RequiredToolsSource,
 	_ FixtureMode,
 ) (*AgyAdapter, error) {
-	return buildAgyAdapter(store, executor, launch, policy, profileDigest, image, identity, required, nil, true)
+	return buildAgyAdapter(store, executor, launch, allocations, policy, profileDigest, image, identity, required, nil, true)
 }
 
 func buildAgyAdapter(
 	store *storage.Store,
 	executor execpolicy.PolicyExecutor,
 	launch AgyTurnLaunchSource,
+	allocations AllocationLookup,
 	policy AgyLaunchPolicy,
 	profileDigest string,
 	image *execpolicy.SealedImage,
@@ -262,6 +298,8 @@ func buildAgyAdapter(
 		return nil, errors.New("agy adapter requires the policy executor")
 	case launch == nil:
 		return nil, errors.New("agy adapter requires the launch source")
+	case allocations == nil:
+		return nil, errors.New("agy adapter requires the AC-005 allocation lookup")
 	case identity == nil:
 		return nil, errors.New("agy adapter requires the attempt identity source")
 	case strings.TrimSpace(profileDigest) == "":
@@ -272,8 +310,11 @@ func buildAgyAdapter(
 	if image != nil && image.Digest != policy.BinaryDigest {
 		return nil, fmt.Errorf("sealed image digest %s differs from the frozen binary digest %s", image.Digest, policy.BinaryDigest)
 	}
+	if _, err := agyHomeDir(policy.ExpectedHome); err != nil {
+		return nil, err
+	}
 	return &AgyAdapter{
-		store: store, executor: executor, launch: launch, policy: policy,
+		store: store, executor: executor, launch: launch, allocations: allocations, policy: policy,
 		profileDigest: profileDigest, image: image, identity: identity,
 		required: required, attestation: attestation, fixtureScope: fixtureScope,
 		turns:     make(map[adapter.TurnRef]*agyTurnRun),
@@ -281,6 +322,8 @@ func buildAgyAdapter(
 		slots:     make(map[string]string),
 		creations: make(map[adapter.SessionID]*agyCreationCall),
 		uncertain: make(map[adapter.SessionID]error),
+
+		materializeErrs: make(map[adapter.SessionID]error),
 	}, nil
 }
 
@@ -342,7 +385,12 @@ func (a *AgyAdapter) CreateSession(ctx context.Context, req adapter.CreateSessio
 	}
 	if call, ok := a.creations[req.SessionID]; ok {
 		a.createMu.Unlock()
-		<-call.done
+		select {
+		case <-call.done:
+		case <-ctx.Done():
+			// This waiter gives up; the shared creation continues.
+			return adapter.SessionBinding{}, ctx.Err()
+		}
 		if call.err != nil {
 			return adapter.SessionBinding{}, call.err
 		}
@@ -357,17 +405,19 @@ func (a *AgyAdapter) CreateSession(ctx context.Context, req adapter.CreateSessio
 	a.createMu.Unlock()
 
 	call.binding, call.err = a.createBinding(ctx, req)
-	close(call.done)
+	// The shared call ends here, success or failure: a later call re-runs
+	// the durable uncertainty check and the persisted-binding compare.
+	a.createMu.Lock()
 	if call.err != nil {
-		a.createMu.Lock()
 		if _, unc := isCreationUncertain(call.err); unc {
 			a.uncertain[req.SessionID] = call.err
 		}
-		if a.creations[req.SessionID] == call {
-			delete(a.creations, req.SessionID)
-		}
-		a.createMu.Unlock()
 	}
+	if a.creations[req.SessionID] == call {
+		delete(a.creations, req.SessionID)
+	}
+	a.createMu.Unlock()
+	close(call.done)
 	return call.binding, call.err
 }
 
@@ -437,7 +487,7 @@ func (a *AgyAdapter) createBinding(ctx context.Context, req adapter.CreateSessio
 	if !sameDir(req.Config.WorkspaceRoot, launch.Paths.Root) {
 		return adapter.SessionBinding{}, &ErrSessionConfigMismatch{SessionID: req.SessionID, Field: "workspace", Want: req.Config.WorkspaceRoot, Have: launch.Paths.Root}
 	}
-	if err := a.validateLaunch(launch, req.SessionID, LaunchCreate, "", launch.Model, ""); err != nil {
+	if err := a.validateLaunch(ctx, launch, req.SessionID, LaunchCreate, "", launch.Model, ""); err != nil {
 		return adapter.SessionBinding{}, err
 	}
 
@@ -461,13 +511,22 @@ func (a *AgyAdapter) createBinding(ctx context.Context, req adapter.CreateSessio
 		return uncertain("", fmt.Errorf("creation init not observed: %w", err))
 	}
 	if err := a.verifyInit(it.ev, LaunchCreate, "", launch.Model, launch.Paths.Root); err != nil {
-		p.kill()
-		p.wait()
 		var drift *ErrConversationDrift
 		if errors.As(err, &drift) {
+			p.kill()
+			p.wait()
 			return uncertain(drift.Observed, err)
 		}
-		return adapter.SessionBinding{}, err
+		// A valid UUIDv4 init already persisted a native conversation:
+		// record the orphan id durably BEFORE terminating the child.
+		orphan := it.ev.ConversationID
+		episode, recErr := a.recordCreationOrphan(req, orphan, err)
+		p.kill()
+		p.wait()
+		if recErr != nil {
+			return uncertain(orphan, fmt.Errorf("%w; the orphan conversation id could not be recorded durably: %v", err, recErr))
+		}
+		return adapter.SessionBinding{}, &ErrCreationDrift{SessionID: req.SessionID, NativeID: orphan, Episode: episode, Err: err}
 	}
 	nativeID := it.ev.ConversationID
 
@@ -484,9 +543,14 @@ func (a *AgyAdapter) createBinding(ctx context.Context, req adapter.CreateSessio
 		select {
 		case extra, ok := <-p.items:
 			if ok {
+				cause := &ErrProtocolDrift{Event: string(extra.ev.Kind), Reason: "creation child emitted an event after init with no input"}
+				_, recErr := a.recordCreationOrphan(req, nativeID, cause)
 				p.kill()
 				p.wait()
-				return uncertain(nativeID, &ErrProtocolDrift{Event: string(extra.ev.Kind), Reason: "creation child emitted an event after init with no input"})
+				if recErr != nil {
+					return uncertain(nativeID, fmt.Errorf("%w; the orphan conversation id could not be recorded durably: %v", cause, recErr))
+				}
+				return uncertain(nativeID, cause)
 			}
 			if p.readErr != nil {
 				p.kill()
@@ -504,6 +568,52 @@ func (a *AgyAdapter) createBinding(ctx context.Context, req adapter.CreateSessio
 			return uncertain(nativeID, errors.New("creation child did not exit within the bound after stdin closed"))
 		}
 	}
+}
+
+// ErrCreationDrift reports a creation whose init carried a valid UUIDv4
+// conversation id but drifted from the frozen profile (permission mode,
+// model, cwd, tools): the native conversation exists as an orphan. Its
+// id was recorded durably on the session's creation-uncertainty episode
+// (Episode) before the child was terminated, so recreation stays blocked
+// until a controller resolves that episode. Err is the typed drift
+// (*ErrProfileDrift or *ErrToolInventoryDrift).
+type ErrCreationDrift struct {
+	SessionID adapter.SessionID
+	NativeID  string
+	Episode   int64
+	Err       error
+}
+
+func (e *ErrCreationDrift) Error() string {
+	return fmt.Sprintf("agy creation for session %s drifted after init; orphan conversation %s recorded on uncertainty episode %d: %v",
+		e.SessionID, e.NativeID, e.Episode, e.Err)
+}
+
+func (e *ErrCreationDrift) Unwrap() error { return e.Err }
+
+// creationRecorder is the identity attributed on adapter-recorded
+// creation-uncertainty episodes.
+const creationRecorder = "agy-adapter"
+
+// recordCreationOrphan durably opens (or replays) the session's
+// creation-uncertainty episode carrying the orphan native id.
+func (a *AgyAdapter) recordCreationOrphan(req adapter.CreateSessionRequest, orphan string, cause error) (int64, error) {
+	bg := context.Background()
+	var episode int64
+	err := a.durable(opOrphan, func() error {
+		meta, err := a.store.GetSessionMetadata(bg, string(req.SessionID))
+		if err != nil {
+			return fmt.Errorf("session metadata lookup: %w", err)
+		}
+		episode, _, err = a.store.RecordAgyCreationUncertain(bg, storage.AgyCreationUncertainty{
+			RunID: meta.RunID, SessionID: string(req.SessionID),
+			Reason:     "creation drift after a valid init: " + cause.Error(),
+			RecordedBy: creationRecorder, CauseOpID: "agy-create-" + string(req.SessionID),
+			OrphanNativeID: orphan,
+		})
+		return err
+	})
+	return episode, err
 }
 
 func (a *AgyAdapter) bindingFor(req adapter.CreateSessionRequest, nativeID string) adapter.SessionBinding {
@@ -543,15 +653,37 @@ func (a *AgyAdapter) checkEligibility(sessionID adapter.SessionID) error {
 // validateLaunch is the adapter's closing check on a launch request: the
 // held sealed image, the pinned command, the frozen profile digest and
 // model, the exact frozen argv, and the launch matrix.
-func (a *AgyAdapter) validateLaunch(req execpolicy.LaunchRequest, sessionID adapter.SessionID, kind LaunchKind, nativeID, model, pdig string) error {
+func (a *AgyAdapter) validateLaunch(ctx context.Context, req execpolicy.LaunchRequest, sessionID adapter.SessionID, kind LaunchKind, nativeID, model, pdig string) error {
 	if err := checkLaunchMatrix(req.Profile, a.fixtureScope); err != nil {
 		return err
 	}
 	if req.SessionID != string(sessionID) {
 		return fmt.Errorf("launch request is for session %q, not %q", req.SessionID, sessionID)
 	}
-	if req.SealedImage != a.image {
-		return errors.New("launch request does not carry the adapter's held sealed image")
+	if err := a.checkSealedImage(req.SealedImage); err != nil {
+		return err
+	}
+	home, err := agyHomeDir(a.policy.ExpectedHome)
+	if err != nil {
+		return err
+	}
+	if req.HomeDir != home {
+		return fmt.Errorf("launch HOME %q is not the operator home %q derived from the frozen expected_home", req.HomeDir, home)
+	}
+	meta, err := a.store.GetSessionMetadata(ctx, string(sessionID))
+	if err != nil {
+		return fmt.Errorf("session metadata lookup: %w", err)
+	}
+	if req.RunID != meta.RunID {
+		return fmt.Errorf("launch request run %q is not the session's run %q", req.RunID, meta.RunID)
+	}
+	alloc, ok := a.allocations.GetPaths(meta.RunID, string(sessionID))
+	if !ok {
+		return fmt.Errorf("no AC-005 allocation for run %s session %s", meta.RunID, sessionID)
+	}
+	if req.Paths.Root != alloc.Root || req.Paths.Scratch != alloc.Scratch {
+		return fmt.Errorf("launch paths (root %q, scratch %q) are not the AC-005 allocation (root %q, scratch %q)",
+			req.Paths.Root, req.Paths.Scratch, alloc.Root, alloc.Scratch)
 	}
 	wantCmd := a.policy.BinaryPath
 	if a.image != nil {
@@ -573,7 +705,30 @@ func (a *AgyAdapter) validateLaunch(req execpolicy.LaunchRequest, sessionID adap
 		return errors.New("launch request has no AC-005 workspace root")
 	}
 	return validateLaunchArgv(req.Args, argvSpec{kind: kind, model: model, policy: a.policy,
-		nativeID: nativeID, logRoot: req.Paths.Scratch})
+		nativeID: nativeID, logRoot: alloc.Scratch})
+}
+
+// checkSealedImage requires the request's image to be the adapter's held
+// image: the same object AND the same pinned digest and argv0 (digest
+// inequality is the real refusal; pointer identity alone is fragile).
+func (a *AgyAdapter) checkSealedImage(img *execpolicy.SealedImage) error {
+	if a.image == nil {
+		if img != nil {
+			return errors.New("launch request carries a sealed image the adapter does not hold")
+		}
+		return nil
+	}
+	switch {
+	case img == nil:
+		return errors.New("launch request does not carry the adapter's held sealed image")
+	case img.Digest != a.image.Digest || img.Digest != a.policy.BinaryDigest:
+		return fmt.Errorf("launch sealed image digest %s is not the pinned %s", img.Digest, a.image.Digest)
+	case img.ArgV0 != a.image.ArgV0:
+		return fmt.Errorf("launch sealed image argv0 %q is not the held %q", img.ArgV0, a.image.ArgV0)
+	case img != a.image:
+		return errors.New("launch request does not carry the adapter's held sealed image")
+	}
+	return nil
 }
 
 // verifyInit applies the §3.1 pre-transmission checks, in order:
@@ -658,6 +813,10 @@ func sameDir(a, b string) bool {
 // file still exists at the recorded path, 0600, current uid, recorded
 // identity. Native verification is the next turn's init check.
 func (a *AgyAdapter) ResumeSession(ctx context.Context, binding adapter.SessionBinding) error {
+	// An empty config would skip the model/workspace comparison: refuse.
+	if strings.TrimSpace(binding.Config.Model) == "" || strings.TrimSpace(binding.Config.WorkspaceRoot) == "" {
+		return fmt.Errorf("resume of %s requires the bound model and workspace root", binding.SessionID)
+	}
 	stored, err := a.store.GetAgySessionBinding(ctx, string(binding.SessionID))
 	if err != nil {
 		return err
@@ -675,6 +834,17 @@ func (a *AgyAdapter) ResumeSession(ctx context.Context, binding adapter.SessionB
 	if err := a.compareStoredBinding(binding.SessionID, binding.Config, stored); err != nil {
 		return err
 	}
+	if pending := a.pendingMaterializeErr(binding.SessionID); pending != nil {
+		// A post-acceptance materialization record failed: retry it; a
+		// store that still cannot record it fails the resume.
+		if err := a.materializeIfPresent(ctx, binding.SessionID, stored.NativeID); err != nil {
+			return fmt.Errorf("materialization of %s could not be recorded: %w", binding.SessionID, err)
+		}
+		a.setMaterializeErr(binding.SessionID, nil)
+		if stored, err = a.store.GetAgySessionBinding(ctx, string(binding.SessionID)); err != nil {
+			return err
+		}
+	}
 	if !stored.Materialized {
 		return nil
 	}
@@ -689,20 +859,42 @@ func (a *AgyAdapter) ResumeSession(ctx context.Context, binding adapter.SessionB
 }
 
 // materializeIfPresent records the conversation file after the first
-// accepted turn when it is observable (stat only; best effort — a gap
-// leaves the binding unmaterialized, the next init re-verifies).
-func (a *AgyAdapter) materializeIfPresent(sessionID adapter.SessionID, nativeID string) {
-	ctx := context.Background()
+// accepted turn when it is observable (stat only). An absent or
+// ill-formed file is a gap, not an error (the binding stays
+// unmaterialized; the next init re-verifies); a store failure is
+// returned.
+func (a *AgyAdapter) materializeIfPresent(ctx context.Context, sessionID adapter.SessionID, nativeID string) error {
 	b, err := a.store.GetAgySessionBinding(ctx, string(sessionID))
-	if err != nil || b == nil || b.Materialized {
-		return
+	if err != nil {
+		return err
+	}
+	if b == nil || b.Materialized {
+		return nil
 	}
 	path := conversationPath(a.policy.ExpectedHome, nativeID)
 	identity, err := conversationFileIdentity(path)
 	if err != nil || verifyConversationFile(path, identity) != nil {
+		return nil
+	}
+	return a.durable(opMaterialize, func() error {
+		return a.store.MarkAgySessionMaterialized(ctx, string(sessionID), path, identity)
+	})
+}
+
+func (a *AgyAdapter) pendingMaterializeErr(sessionID adapter.SessionID) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.materializeErrs[sessionID]
+}
+
+func (a *AgyAdapter) setMaterializeErr(sessionID adapter.SessionID, err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err == nil {
+		delete(a.materializeErrs, sessionID)
 		return
 	}
-	_ = a.store.MarkAgySessionMaterialized(ctx, string(sessionID), path, identity)
+	a.materializeErrs[sessionID] = err
 }
 
 // ── Dispatch ────────────────────────────────────────────────────────────
@@ -745,6 +937,15 @@ func (a *AgyAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt s
 	if err != nil {
 		return reject(err.Error(), err)
 	}
+	// A turn that already reached a verified terminal is never
+	// redispatched (no redispatch branch, §3.5).
+	if latest, err := a.store.GetLatestAgyTurnAttempt(ctx, string(ref.SessionID), ref.TurnKey); err != nil {
+		return reject(err.Error(), err)
+	} else if latest != nil && latest.Terminal {
+		err := fmt.Errorf("turn %s/%s already reached a verified terminal (%s); redispatch refused",
+			ref.SessionID, ref.TurnKey, latest.ObservedStatus)
+		return reject(err.Error(), err)
+	}
 
 	// Single flight per native conversation (in-process), then the
 	// durable block (an unresolved attempt blocks across restarts).
@@ -785,7 +986,7 @@ func (a *AgyAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt s
 	if err != nil {
 		return rejectRelease("turn launch: "+err.Error(), err)
 	}
-	if err := a.validateLaunch(req, ref.SessionID, LaunchTurn, nativeID, binding.Model, pdig); err != nil {
+	if err := a.validateLaunch(ctx, req, ref.SessionID, LaunchTurn, nativeID, binding.Model, pdig); err != nil {
 		return rejectRelease(err.Error(), err)
 	}
 	if !sameDir(req.Paths.Root, binding.Workspace) {
@@ -795,16 +996,14 @@ func (a *AgyAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt s
 	req.TurnKey = ref.TurnKey
 	req.AttemptID = attempt
 
-	// §3.11 durable ordering: attempt + pdig, then the launch
-	// reservation (launch_count 0→1), BEFORE the executor starts.
+	// §3.5/§3.11 durable ordering: attempt + pdig AND the launch
+	// reservation (launch_count 0→1) in ONE transaction, BEFORE the
+	// executor starts. A failure leaves nothing durable.
 	bg := context.Background()
-	if err := a.store.InsertAgyTurnAttempt(ctx, storage.AgyTurnAttempt{
+	seq, err := a.store.InsertAgyTurnAttemptAndReserveLaunch(ctx, storage.AgyTurnAttempt{
 		AttemptID: attempt, SessionID: string(ref.SessionID), TurnKey: ref.TurnKey,
 		PromptDigest: pdig, RequiredTools: required, CreatedAt: time.Now().UTC(),
-	}); err != nil {
-		return rejectRelease(err.Error(), err)
-	}
-	seq, err := a.store.ReserveAgyLaunch(ctx, attempt, executorIdentity)
+	}, executorIdentity)
 	if err != nil {
 		return rejectRelease(err.Error(), err)
 	}
@@ -823,20 +1022,43 @@ func (a *AgyAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt s
 		exe = &storage.AgyExeIdentity{DevIno: id.DevIno, Digest: id.Digest}
 	}
 	p := watchProcess(proc)
+	// abort terminates the child before any prompt byte crossed stdin.
+	// The rejection is reported only when the pre-acceptance evidence
+	// (attempt missing) is durable; otherwise the outcome is Unknown.
+	abort := func(reason string, cause error) (adapter.DispatchOutcome, error) {
+		missingErr, deadErr := a.abortPreWrite(p, attempt, seq)
+		release()
+		if missingErr != nil {
+			unknown := adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchUnknown,
+				Reason: reason + "; the pre-write rejection could not be recorded (attempt stays uncertain): " + missingErr.Error()}
+			return unknown, errors.Join(cause, missingErr)
+		}
+		if deadErr != nil {
+			reason += "; launch dead state not recorded: " + deadErr.Error()
+		}
+		return reject(reason, cause)
+	}
 	if err := a.store.RecordAgyLaunchState(bg, attempt, seq, "started", nil, exe); err != nil {
-		a.abortPreWrite(p, attempt, seq)
-		return rejectRelease("launch state could not be recorded: "+err.Error(), err)
+		return abort("launch state could not be recorded: "+err.Error(), err)
 	}
 
 	// Pre-transmission verification (§3.1): init BEFORE any byte.
 	it, err := p.awaitInit(initTimeout)
 	if err != nil {
-		a.abortPreWrite(p, attempt, seq)
-		return rejectRelease("init not observed before the write: "+err.Error(), err)
+		return abort("init not observed before the write: "+err.Error(), err)
 	}
 	if err := a.verifyInit(it.ev, LaunchTurn, nativeID, binding.Model, req.Paths.Root); err != nil {
-		a.abortPreWrite(p, attempt, seq)
-		return rejectRelease("pre-transmission verification failed: "+err.Error(), err)
+		var drift *ErrConversationDrift
+		if errors.As(err, &drift) && drift.Observed != "" {
+			// The orphan id is durable on the attempt BEFORE the child
+			// is terminated.
+			if recErr := a.durable(opOrphan, func() error {
+				return a.store.RecordAgyOrphanConversation(bg, attempt, drift.Observed)
+			}); recErr != nil {
+				err = fmt.Errorf("%w (orphan id could not be recorded: %v)", err, recErr)
+			}
+		}
+		return abort("pre-transmission verification failed: "+err.Error(), err)
 	}
 
 	run := &agyTurnRun{
@@ -851,8 +1073,7 @@ func (a *AgyAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt s
 		_, werr = bw.Write(line[1:])
 	}
 	if werr != nil && !bw.transmitted.Load() {
-		a.abortPreWrite(p, attempt, seq)
-		return rejectRelease("stdin write failed before the first byte: "+werr.Error(), werr)
+		return abort("stdin write failed before the first byte: "+werr.Error(), werr)
 	}
 	// From here nothing is pre-acceptance: the run owns the outcome.
 	var closeErr error
@@ -912,13 +1133,20 @@ func (a *AgyAdapter) requiredTools(ctx context.Context, ref adapter.TurnRef) ([]
 
 // abortPreWrite terminates a child before any prompt byte crossed stdin
 // and records the positive pre-acceptance evidence: launch dead, attempt
-// missing (never uncertain-blocking).
-func (a *AgyAdapter) abortPreWrite(p *agyProcess, attempt string, seq int64) {
+// missing (never uncertain-blocking). Both record failures are returned:
+// a missing record that failed leaves the attempt uncertain (the caller
+// reports Unknown); a failed dead record is surfaced in the reason.
+func (a *AgyAdapter) abortPreWrite(p *agyProcess, attempt string, seq int64) (missingErr, deadErr error) {
 	p.kill()
 	code := p.wait()
 	bg := context.Background()
-	_ = a.store.RecordAgyLaunchState(bg, attempt, seq, "dead", &code, nil)
-	_ = a.store.SetAgyAttemptObservedStatus(bg, attempt, "missing")
+	deadErr = a.durable(opLaunchDead, func() error {
+		return a.store.RecordAgyLaunchState(bg, attempt, seq, "dead", &code, nil)
+	})
+	missingErr = a.durable(opAttemptMissing, func() error {
+		return a.store.SetAgyAttemptObservedStatus(bg, attempt, "missing")
+	})
+	return missingErr, deadErr
 }
 
 // boundaryWriter persists the first-byte transmission boundary at the
@@ -1064,6 +1292,7 @@ func (a *AgyAdapter) runTurn(run *agyTurnRun) {
 		result    *ResultEvent
 		resultRaw []byte
 		drift     error
+		acceptErr error
 	)
 	bound := time.NewTimer(turnBoundFor(a.policy))
 	defer bound.Stop()
@@ -1085,6 +1314,17 @@ loop:
 			}
 			if it.ev.ConversationID != run.nativeID {
 				drift = &ErrConversationDrift{Requested: run.nativeID, Observed: it.ev.ConversationID}
+				// The orphan id is durable BEFORE the child is terminated.
+				observedID := it.ev.ConversationID
+				if observedID == "" {
+					run.p.kill()
+					continue
+				}
+				if err := a.durable(opOrphan, func() error {
+					return a.store.RecordAgyOrphanConversation(bg, run.attemptID, observedID)
+				}); err != nil {
+					drift = fmt.Errorf("%w (orphan id could not be recorded: %v)", drift, err)
+				}
 				run.p.kill()
 				continue
 			}
@@ -1093,8 +1333,16 @@ loop:
 				s := it.ev.Step
 				if s.Type == StepTypeUserInput && s.State == "DONE" && !accepted {
 					accepted = true
-					_ = a.store.RecordAgyNativeStepIndex(bg, run.attemptID, s.Index)
-					a.materializeIfPresent(run.ref.SessionID, run.nativeID)
+					idx := s.Index
+					if err := a.durable(opNativeStepIndex, func() error {
+						return a.store.RecordAgyNativeStepIndex(bg, run.attemptID, idx)
+					}); err != nil {
+						// No durable acceptance evidence: the turn can
+						// never be reported as a verified terminal.
+						acceptErr = err
+					} else if err := a.materializeIfPresent(bg, run.ref.SessionID, run.nativeID); err != nil {
+						a.setMaterializeErr(run.ref.SessionID, err)
+					}
 				}
 				if s.Type == StepTypeTool && s.State == "DONE" && s.ToolName != "" {
 					observed = append(observed, s.ToolName)
@@ -1117,12 +1365,16 @@ loop:
 		run.p.kill() // poisoned stream: never a best-effort parse
 	}
 	code := run.p.settle(postResultExitGrace)
-	_ = a.store.RecordAgyLaunchState(bg, run.attemptID, run.seq, "dead", &code, nil)
+	deadErr := a.durable(opLaunchDead, func() error {
+		return a.store.RecordAgyLaunchState(bg, run.attemptID, run.seq, "dead", &code, nil)
+	})
 
 	var reason string
 	switch {
 	case drift != nil:
 		reason = "protocol drift: " + drift.Error()
+	case acceptErr != nil:
+		reason = "acceptance evidence (user_input DONE) could not be recorded: " + acceptErr.Error()
 	case readErr != nil:
 		reason = "stream poisoned: " + readErr.Error()
 	case run.p.printTimeout.Load():
@@ -1135,15 +1387,25 @@ loop:
 		reason = "process exited without a result"
 	}
 	if reason != "" {
+		if deadErr != nil {
+			reason += "; launch dead state not recorded: " + deadErr.Error()
+		}
 		a.finishRun(run, "", errors.New("attempt uncertain: "+reason))
 		return
 	}
 
 	observedStatus, turnStatus, payload := "completed", council.TurnCompleted, result.Response
 	if result.Status == "ERROR" {
-		if result.Error == "interrupted" {
+		_, _, cancelRequested := run.status()
+		switch {
+		case result.Error == "interrupted" && cancelRequested:
 			observedStatus, turnStatus, payload = "cancelled", council.TurnCancelled, ""
-		} else {
+		case result.Error == "interrupted":
+			// No Council-sent SIGINT: an external interrupt is a failure,
+			// never a Council cancellation.
+			observedStatus, turnStatus, payload = "failed", council.TurnFailed,
+				"interrupted (external: no Council cancel request)"
+		default:
 			observedStatus, turnStatus, payload = "failed", council.TurnFailed, result.Error
 		}
 	}
@@ -1165,7 +1427,11 @@ loop:
 	}
 	run.publish(adapter.Event{Type: adapter.EventTerminal, Status: turnStatus, Payload: payload,
 		Usage: usageFromJSON(usageJSON)})
-	a.finishRun(run, observedStatus, nil)
+	var finishErr error
+	if deadErr != nil {
+		finishErr = fmt.Errorf("verified %s terminal recorded, but the launch dead state was not: %w", observedStatus, deadErr)
+	}
+	a.finishRun(run, observedStatus, finishErr)
 }
 
 func progressEvent(s *StepUpdate) adapter.Event {
@@ -1323,11 +1589,16 @@ func (a *AgyAdapter) Cancel(ctx context.Context, ref adapter.TurnRef) (adapter.C
 				Reason: "SIGINT is unsupported on this platform"}, nil
 		}
 		// The child may already be gone; the run's classification decides.
+		t := time.NewTimer(postResultExitGrace)
+		defer t.Stop()
 		select {
 		case <-run.done:
 			status, _, _ := run.status()
 			return finishedCancelOutcome(ref, status), nil
-		case <-time.After(postResultExitGrace):
+		case <-ctx.Done():
+			return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown,
+				Reason: "interrupt failed and the caller stopped waiting: " + err.Error()}, nil
+		case <-t.C:
 			return adapter.CancelOutcome{Ref: ref, Disposition: adapter.CancelUnknown,
 				Reason: "interrupt failed: " + err.Error()}, nil
 		}
@@ -1370,8 +1641,36 @@ type verificationRecord struct {
 }
 
 type rawEvidenceRecord struct {
-	Result       json.RawMessage    `json:"result"`
-	Verification verificationRecord `json:"verification"`
+	Result json.RawMessage `json:"result,omitempty"`
+	// ResultOmitted replaces Result when the evidence would exceed
+	// adapter.MaxRawEvidenceBytes: the verbatim line stays durable on the
+	// attempt; its size and digest identify it.
+	ResultOmitted *omittedResult     `json:"result_omitted,omitempty"`
+	Verification  verificationRecord `json:"verification"`
+}
+
+type omittedResult struct {
+	Bytes  int    `json:"bytes"`
+	SHA256 string `json:"sha256"`
+	Reason string `json:"reason"`
+}
+
+// clampRawEvidence bounds RawEvidence to adapter.MaxRawEvidenceBytes by
+// omitting the verbatim result line (never by cutting JSON mid-value).
+func clampRawEvidence(rec rawEvidenceRecord) ([]byte, error) {
+	raw, err := json.Marshal(rec)
+	if err != nil || len(raw) <= adapter.MaxRawEvidenceBytes {
+		return raw, err
+	}
+	sum := sha256.Sum256(rec.Result)
+	rec.ResultOmitted = &omittedResult{Bytes: len(rec.Result), SHA256: hex.EncodeToString(sum[:]),
+		Reason: fmt.Sprintf("raw evidence exceeds %d bytes; the verbatim result line is retained on the attempt", adapter.MaxRawEvidenceBytes)}
+	rec.Result = nil
+	raw, err = json.Marshal(rec)
+	if err != nil || len(raw) <= adapter.MaxRawEvidenceBytes {
+		return raw, err
+	}
+	return json.Marshal(rawEvidenceRecord{ResultOmitted: rec.ResultOmitted})
 }
 
 func nonNil(s []string) []string {
@@ -1416,7 +1715,7 @@ func (a *AgyAdapter) resultFromAttempt(ref adapter.TurnRef, attempt *storage.Agy
 	if err != nil || ev.Kind != EventKindResult || ev.Result == nil {
 		return malformed, nil
 	}
-	raw, err := json.Marshal(rawEvidenceRecord{
+	raw, err := clampRawEvidence(rawEvidenceRecord{
 		Result: json.RawMessage(*attempt.ResultPayload),
 		Verification: verificationRecord{
 			RequiredTools: nonNil(attempt.RequiredTools), ExecutedTools: nonNil(attempt.ExecutedTools),
@@ -1493,7 +1792,10 @@ func (a *AgyAdapter) Reconcile(ctx context.Context, ref adapter.RecoveryRef) (ad
 			Status: adapter.ReconciliationReachableActive, Observed: observed}, nil
 	}
 	attempt, err := a.store.GetLatestAgyTurnAttempt(ctx, string(ref.SessionID), ref.TurnKey)
-	if err != nil || attempt == nil {
+	if err != nil {
+		return uncertain, fmt.Errorf("reconcile attempt lookup: %w", err)
+	}
+	if attempt == nil {
 		return uncertain, nil
 	}
 	missing := adapter.ReconciliationOutcome{Ref: ref, Reachability: council.VisibilityReachable,
@@ -1520,8 +1822,10 @@ func (a *AgyAdapter) Reconcile(ctx context.Context, ref adapter.RecoveryRef) (ad
 			return adapter.ReconciliationOutcome{Ref: ref, Reachability: council.VisibilityReachable,
 				Status: adapter.ReconciliationReachableActive, Observed: council.TurnRunning}, nil
 		}
-		if err := a.store.SetAgyAttemptObservedStatus(ctx, attempt.AttemptID, "missing"); err != nil {
-			return uncertain, nil
+		if err := a.durable(opAttemptMissing, func() error {
+			return a.store.SetAgyAttemptObservedStatus(ctx, attempt.AttemptID, "missing")
+		}); err != nil {
+			return uncertain, fmt.Errorf("record missing: %w", err)
 		}
 		return missing, nil
 	}

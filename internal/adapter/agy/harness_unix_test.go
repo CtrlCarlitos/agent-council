@@ -178,7 +178,12 @@ func newAgyHarnessProfile(t *testing.T, mutate func(*storage.CanonicalProfile)) 
 	fx := agyFixture(t)
 
 	profile, evidenceRoot := acceptedProfileAndRoot(t)
-	home := t.TempDir()
+	// expected_home names the operator's .gemini directory (spec §3.7);
+	// the launch HOME is its parent. Never the real home.
+	home := filepath.Join(t.TempDir(), ".gemini")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatalf("mkdir expected home: %v", err)
+	}
 	a := profile.Harnesses["agy"].Agy
 	a.BinaryPath = fx.BinaryPath
 	a.BinaryDigest = fx.Digest
@@ -245,7 +250,7 @@ func newAgyHarnessProfile(t *testing.T, mutate func(*storage.CanonicalProfile)) 
 
 func (h *agyHarness) newAdapter() *AgyAdapter {
 	h.t.Helper()
-	a, err := NewFixtureScopedAdapter(h.store, h.exec, h.source, h.policy, h.profileDigest,
+	a, err := NewFixtureScopedAdapter(h.store, h.exec, h.source, h.wm, h.policy, h.profileDigest,
 		h.fx.SealedImage, fnIdentity{fn: defaultAttempt}, h.required, FixtureMode{})
 	if err != nil {
 		h.t.Fatalf("NewFixtureScopedAdapter: %v", err)
