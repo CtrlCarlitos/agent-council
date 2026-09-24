@@ -26,3 +26,6 @@ graft/
 
 # AC-008 manual integration evidence (native output, prompts, paths — never repository content)
 ac008-evidence/
+
+# AC-009 manual integration evidence (native output, prompts, paths — never repository content)
+ac009-evidence/

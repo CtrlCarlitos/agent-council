@@ -1,0 +1,88 @@
+{
+  "document": "AC009 native event/method universe for the locally installed OpenAI Codex CLI",
+  "captured": "2026-09-23",
+  "binary": "/usr/bin/codex",
+  "version": "codex-cli 0.154.0",
+  "method_statement": "Every name below was OBSERVED against the installed 0.154.0 binary: invoked live over JSON-RPC stdio, received live as a stdout event, or enumerated verbatim by the server itself in a -32600 unknown-variant error (authoritative for this binary). No docs-inferred names are included. Rollout line types were read from rollout JSONL files produced by live runs.",
+  "app_server_client_requests_invoked_live": [
+    {"method": "initialize", "note": "params {clientInfo:{name,version[,title]}}; result {userAgent, codexHome, platformFamily:'unix', platformOs:'linux'}; missing clientInfo -> -32600 'Invalid request: missing field `clientInfo`'"},
+    {"method": "thread/start", "note": "provider-free with empty params; returns Thread object {id, sessionId (same value), environments, status:{type:'idle'}, model:'gpt-6-astra', historyMode:'paginated', path, createdAt,...} and emits thread/started notification; NO model call"},
+    {"method": "thread/list", "note": "paginated {data:[Thread], nextCursor, backwardsCursor}; entries notLoaded in metadata-only listing"},
+    {"method": "thread/resume", "note": "required threadId; excludeTurns:true returns metadata + effective config WITHOUT turns or model call; unknown id -> -32600 'no rollout found for thread id <id>'"},
+    {"method": "thread/loaded/list", "note": "returns ids of threads loaded in this server process"},
+    {"method": "model/list", "note": "returns catalog entries (id, displayName, supportedReasoningEfforts, ...) without a model call"},
+    {"method": "account/read", "note": "result {account:null, requiresOpenaiAuth:true} under isolated CODEX_HOME without auth"},
+    {"method": "turn/start", "note": "on missing thread -> -32600 'thread not found: <id>'; NOT exercised with a live turn in AC009 (probe budget)"},
+    {"method": "turn/interrupt", "note": "required {threadId, turnId}; on missing thread -> -32600 'thread not found: <id>'; NOT exercised against a live turn"}
+  ],
+  "app_server_client_requests_enumerated_by_server_error_live": [
+    "initialize", "server/diagnostics", "userVerification/status", "userVerification/enroll", "userVerification/delete", "userVerification/verify",
+    "thread/start", "thread/resume", "thread/fork", "thread/archive", "thread/delete", "thread/unsubscribe",
+    "thread/increment_elicitation", "thread/decrement_elicitation", "thread/name/set",
+    "thread/goal/set", "thread/goal/get", "thread/goal/clear",
+    "thread/queue/add", "thread/queue/list", "thread/queue/update", "thread/queue/delete", "thread/queue/reorder", "thread/queue/start",
+    "thread/metadata/update", "thread/section/move", "thread/settings/update", "thread/memoryMode/set", "memory/reset",
+    "thread/unarchive", "thread/compact/start", "thread/shellCommand", "thread/approveGuardianDeniedAction",
+    "thread/backgroundTerminals/clean", "thread/backgroundTerminals/list", "thread/backgroundTerminals/terminate",
+    "thread/rollback", "thread/revert", "thread/list",
+    "project/list", "project/read", "project/create", "project/import", "project/update", "project/move", "project/delete",
+    "threadSection/list", "threadSection/create", "threadSection/update", "threadSection/delete",
+    "thread/search", "thread/searchOccurrences", "thread/loaded/list", "thread/read", "thread/turns/list", "thread/items/list", "thread/inject_items",
+    "skills/list", "skills/extraRoots/set", "hooks/list",
+    "marketplace/add", "marketplace/remove", "marketplace/upgrade",
+    "plugin/list", "plugin/search", "plugin/installed", "plugin/reconcile", "plugin/read", "plugin/skill/read",
+    "plugin/share/save", "plugin/share/updateTargets", "plugin/share/list", "plugin/share/checkout", "plugin/share/delete",
+    "app/read", "app/list", "app/installed",
+    "fs/readFile", "fs/writeFile", "fs/createDirectory", "fs/getMetadata", "fs/readDirectory", "fs/remove", "fs/copy", "fs/watch", "fs/unwatch",
+    "skills/config/write", "plugin/install", "plugin/uninstall",
+    "turn/start", "turn/settings/update", "turn/steer", "turn/interrupt",
+    "thread/realtime/start", "thread/realtime/appendAudio", "thread/realtime/appendText", "thread/realtime/appendSpeech", "thread/realtime/stop",
+    "thread/timeline/list", "thread/realtime/listVoices",
+    "review/start", "model/list", "modelProvider/capabilities/read",
+    "experimentalFeature/list", "permissionProfile/list", "experimentalFeature/enablement/set",
+    "remoteControl/enable", "remoteControl/disable", "remoteControl/status/read",
+    "remoteControl/pairing/start", "remoteControl/pairing/status", "remoteControl/client/list", "remoteControl/client/revoke",
+    "collaborationMode/list", "mock/experimentalMethod",
+    "environment/add", "environment/info", "environment/status",
+    "mcpServer/oauth/login", "config/mcpServer/reload", "mcpServerStatus/list", "mcpServer/resource/read",
+    "mcpServer/event/stream/start", "mcpServer/event/stream/stop", "mcpServer/tool/call",
+    "windowsSandbox/setupStart", "windowsSandbox/readiness",
+    "account/login/start", "account/bedrock/discover", "account/bedrock/setup", "account/login/cancel", "account/logout",
+    "account/rateLimits/read", "account/rateLimitResetCredit/consume", "account/usage/read", "account/workspaceMessages/read", "account/sendAddCreditsNudgeEmail",
+    "feedback/upload",
+    "command/exec", "command/exec/write", "command/exec/terminate", "command/exec/resize",
+    "process/spawn", "process/writeStdin", "process/kill", "process/resizePty",
+    "config/read", "externalAgentConfig/detect", "externalAgentConfig/import", "externalAgentConfig/import/recordHistory", "externalAgentConfig/import/readHistories",
+    "config/value/write", "config/batchWrite", "configRequirements/read", "account/read",
+    "getConversationSummary", "gitDiffToRemote", "getAuthStatus",
+    "fuzzyFileSearch", "fuzzyFileSearch/sessionStart", "fuzzyFileSearch/sessionUpdate", "fuzzyFileSearch/sessionStop"
+  ],
+  "app_server_server_notifications_observed_live": [
+    {"method": "thread/started", "trigger": "unprompted, after thread/start; params {thread: Thread, emittedAtMs}"},
+    {"method": "remoteControl/status/changed", "trigger": "unprompted, at connection setup; params {status:'disabled', serverName, installationId, environmentId}"}
+  ],
+  "app_server_server_requests_schema_only_not_live_exercised": [
+    "applyPatchApproval", "execCommandApproval", "item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+    "item/permissions/requestApproval", "item/tool/call", "item/tool/requestUserInput", "mcpServer/elicitation/request",
+    "account/chatgptAuthTokens/refresh", "attestation/generate"
+  ],
+  "exec_json_stdout_event_types_observed_live": [
+    {"type": "thread.started", "fields": "thread_id", "note": "emitted on fresh exec AND on exec resume (same id as original thread)"},
+    {"type": "turn.started", "fields": "-"},
+    {"type": "item.completed", "fields": "item {id, type:'agent_message'|'error', text|message}", "note": "exec stdout showed only agent_message and error item types; commandExecution items were NOT surfaced on stdout"},
+    {"type": "error", "fields": "message", "note": "reconnect/transport fallback progress lines"},
+    {"type": "turn.completed", "fields": "usage {input_tokens, cached_input_tokens, cache_write_input_tokens, output_tokens, reasoning_output_tokens}", "note": "no cost field anywhere"},
+    {"type": "turn.failed", "fields": "error {message}"}
+  ],
+  "rollout_jsonl_line_types_observed_live": [
+    {"type": "session_meta", "fields": "session_id, id, timestamp, cwd, originator, cli_version, source, thread_source, model_provider, base_instructions, history_mode, context_window", "note": "first line; session_id == id == thread UUID == filename UUID"},
+    {"type": "event_msg", "subtypes": "task_started, item_completed, token_count, task_complete", "note": "task_complete carries last_agent_message, started_at, completed_at, duration_ms, time_to_first_token_ms, and error on failure; token_count carries total/last token usage + rate_limits + model_context_window"},
+    {"type": "response_item", "subtypes": "message (developer|user|assistant), custom_tool_call (name:'exec'), custom_tool_call_output", "note": "custom_tool_call_output embeds exit_code and sandbox-denial stderr text"},
+    {"type": "turn_context", "fields": "turn_id, root_turn_id, cwd, workspace_roots, current_date, timezone, approval_policy, approvals_reviewer, sandbox_policy, permission_profile, model, comp_hash, personality, collaboration_mode, multi_agent_version, realtime_active, summary"},
+    {"type": "world_state", "fields": "full, state"},
+    {"type": "token_usage_record", "fields": "per-response token usage"}
+  ],
+  "jsonrpc_error_codes_observed_live": [
+    {"code": -32600, "messages": ["Invalid request: missing field `clientInfo`", "Invalid request: unknown variant `<method>`, expected one of ...", "no rollout found for thread id <id>", "thread not found: <id>"]}
+  ]
+}

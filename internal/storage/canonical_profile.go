@@ -19,6 +19,169 @@ type HarnessProfileSpec struct {
 	ExtraEnvAllowlist []string `json:"extra_env_allowlist"`
 	Model             string   `json:"model"`
 	NativeAuthMode    string   `json:"native_auth_mode"`
+	// Codex is additive in cprof-v3 (absent in v1/v2 encodings, where a
+	// codex block is a validation error). See CodexHarnessSpec and the
+	// AC-009 spec §3.8 for the frozen encoding.
+	Codex *CodexHarnessSpec `json:"codex,omitempty"`
+}
+
+// CodexPlatformSpec is the frozen platform identity compared against the
+// native initialize attestation.
+type CodexPlatformSpec struct {
+	OS     string `json:"os"`
+	Family string `json:"family"`
+}
+
+// CodexSandboxPolicySpec is the frozen sandbox policy compared on resume
+// and turn_context. writable_roots are path-normalized in the canonical
+// encoding; network_access is a plain boolean.
+type CodexSandboxPolicySpec struct {
+	Type          string   `json:"type"`
+	WritableRoots []string `json:"writable_roots"`
+	NetworkAccess bool     `json:"network_access"`
+}
+
+// CodexRulesEvidenceSpec records what Council verified about the native
+// rules/hooks layer and what stays an explicit, unclaimed gap.
+type CodexRulesEvidenceSpec struct {
+	Verified     []string `json:"verified"`
+	Unverifiable []string `json:"unverifiable"`
+}
+
+// CodexGranularApproval is the `granular` object kind of the codex
+// approval policy: EXACTLY the five keys observed in the installed
+// schema. Unknown keys are rejected at parse (DisallowUnknownFields on
+// this typed struct); each value is re-encoded verbatim as canonical
+// JSON at freeze. Equality of two granular policies is byte equality of
+// their canonical encodings — no semantic interpretation of sub-values.
+type CodexGranularApproval struct {
+	McpElicitations    json.RawMessage `json:"mcp_elicitations"`
+	Rules              json.RawMessage `json:"rules"`
+	SandboxApproval    json.RawMessage `json:"sandbox_approval"`
+	RequestPermissions json.RawMessage `json:"request_permissions"`
+	SkillApproval      json.RawMessage `json:"skill_approval"`
+}
+
+// Granular approval policy kinds for CodexApprovalPolicy.Kind.
+const (
+	CodexApprovalKindString   = "string"
+	CodexApprovalKindGranular = "granular"
+)
+
+// CodexApprovalPolicy is the string-or-granular tagged union of the
+// native approval policy. The canonical enum for the string kind is
+// {untrusted, on-request, never}; no bypass value exists natively.
+type CodexApprovalPolicy struct {
+	// Kind is CodexApprovalKindString or CodexApprovalKindGranular.
+	Kind     string
+	String   string
+	Granular *CodexGranularApproval
+}
+
+func (p *CodexApprovalPolicy) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return errors.New("approval_policy is required")
+	}
+	switch trimmed[0] {
+	case '"':
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err != nil {
+			return fmt.Errorf("decode approval_policy string: %w", err)
+		}
+		p.Kind = CodexApprovalKindString
+		p.String = s
+		p.Granular = nil
+		return nil
+	case '{':
+		dec := json.NewDecoder(bytes.NewReader(trimmed))
+		dec.DisallowUnknownFields()
+		var g CodexGranularApproval
+		if err := dec.Decode(&g); err != nil {
+			return fmt.Errorf("decode granular approval_policy: %w", err)
+		}
+		if dec.More() {
+			return errors.New("trailing characters after granular approval_policy")
+		}
+		p.Kind = CodexApprovalKindGranular
+		p.String = ""
+		p.Granular = &g
+		return nil
+	default:
+		return fmt.Errorf("approval_policy must be a string or a granular object, got %s", trimmed)
+	}
+}
+
+// granularApprovalKeys are the canonical granular keys in sorted order.
+var granularApprovalKeys = []string{
+	"mcp_elicitations",
+	"request_permissions",
+	"rules",
+	"sandbox_approval",
+	"skill_approval",
+}
+
+// granularShapeEvidence records, per granular approval key, the
+// committed schema-derived evidence that pins the key's sub-value shape
+// (generate-json-schema captures committed with digest under
+// docs/superpowers/evidence/). Entries are added ONLY when the
+// corresponding capture is committed to the repository. With no
+// committed evidence for a key's shape, profile freeze REJECTS the
+// granular policy entirely (fail-closed honest gap; string policies
+// remain fully usable).
+//
+// The committed 0.154.0 capture
+// docs/superpowers/evidence/ac009-schema-0.154.0/TurnStartParams.json
+// pins the complete AskForApproval.granular shape: exactly the five keys
+// below, each typed boolean (mcp_elicitations/rules/sandbox_approval
+// required; request_permissions/skill_approval default false). All five
+// entries are therefore wired to that capture (AC-009 Task 9).
+var granularShapeEvidence = map[string]string{
+	"mcp_elicitations":    "docs/superpowers/evidence/ac009-schema-0.154.0/TurnStartParams.json",
+	"request_permissions": "docs/superpowers/evidence/ac009-schema-0.154.0/TurnStartParams.json",
+	"rules":               "docs/superpowers/evidence/ac009-schema-0.154.0/TurnStartParams.json",
+	"sandbox_approval":    "docs/superpowers/evidence/ac009-schema-0.154.0/TurnStartParams.json",
+	"skill_approval":      "docs/superpowers/evidence/ac009-schema-0.154.0/TurnStartParams.json",
+}
+
+// CodexHarnessSpec is the frozen per-run codex block added by cprof-v3
+// (AC-009 spec §3.8). Every value the design freezes and compares
+// appears here and is covered by the profile digest.
+type CodexHarnessSpec struct {
+	AppServerVersion  string                 `json:"app_server_version"`
+	ModelProvider     string                 `json:"model_provider"`
+	ExpectedCodexHome string                 `json:"expected_codex_home"`
+	Platform          CodexPlatformSpec      `json:"platform"`
+	SandboxPolicy     CodexSandboxPolicySpec `json:"sandbox_policy"`
+	ApprovalPolicy    CodexApprovalPolicy    `json:"approval_policy"`
+	// ApprovalsReviewer MUST be "user": any other native value (e.g.
+	// auto_review) would answer approvals outside Council's visibility
+	// (§3.6). Enforced at profile freeze, not at runtime.
+	ApprovalsReviewer  string   `json:"approvals_reviewer"`
+	ExpectedMCPServers []string `json:"expected_mcp_servers"`
+	// ExpectedMCPTools is the EXACT frozen inventory of MCP tool paths,
+	// each "<server>/<tool>" with <server> in ExpectedMCPServers. It is
+	// the MCP half of the attestation coverage universe (AC-009 §3.7):
+	// every listed path must be probed, and nothing else may be.
+	ExpectedMCPTools []string `json:"expected_mcp_tools"`
+	// ExpectedPluginTools is the EXACT frozen inventory of skill/plugin-
+	// contributed tool names — the plugin half of the coverage universe.
+	ExpectedPluginTools        []string               `json:"expected_plugin_tools"`
+	ExpectedInstructionSources []string               `json:"expected_instruction_sources"`
+	RulesEvidence              CodexRulesEvidenceSpec `json:"rules_evidence"`
+	EventUniversePath          string                 `json:"event_universe_path"`
+	EventUniverseDigest        string                 `json:"event_universe_digest"`
+	// ToolInventoryPath / ToolInventoryDigest are the binding slot for
+	// the eventual native tool-inventory evidence (repo-relative under
+	// the evidence root, sha256 of its bytes). The adapter re-hashes a
+	// present capture and requires its server, MCP tool, and plugin tool
+	// sets to EQUAL the frozen lists, but a Council-shaped capture is
+	// operator-edited JSON, NOT native evidence: until a schema-pinned
+	// derivation of the raw native response exists, profile freeze
+	// REJECTS every non-empty inventory (validateCodexHarnessBlock), so
+	// today the slot can only ever agree with empty lists.
+	ToolInventoryPath   string `json:"tool_inventory_path"`
+	ToolInventoryDigest string `json:"tool_inventory_digest"`
 }
 
 // CanonicalProfile defines the frozen execution profile parameters for a Council run.
@@ -132,22 +295,32 @@ func normalizeStringSlice(slice []string, lower bool, cleanPath bool) []string {
 }
 
 // ComputeProfileDigest computes the canonical profile digest and normalized JSON representation:
-// "cprof-v1:sha256:" + hex(sha256(canonical_profile_json))
+// "cprof-v1:sha256:" / "cprof-v2:sha256:" / "cprof-v3:sha256:" + hex(sha256(canonical_profile_json))
 func ComputeProfileDigest(profile CanonicalProfile) (string, []byte, error) {
 	switch profile.AlgoVersion {
 	case "cprof-v1":
 		if profile.ToolkitManifest != nil {
 			return "", nil, fmt.Errorf("toolkit_manifest requires algo_version %q, not %q", "cprof-v2", profile.AlgoVersion)
 		}
-	case "cprof-v2":
+		if err := profile.validateNoCodexBlocks(); err != nil {
+			return "", nil, err
+		}
+	case "cprof-v2", "cprof-v3":
 		if profile.ToolkitManifest == nil {
 			return "", nil, fmt.Errorf("algo_version %q requires toolkit_manifest", profile.AlgoVersion)
 		}
 		if err := profile.ValidateForClaude(); err != nil {
 			return "", nil, err
 		}
+		if profile.AlgoVersion == "cprof-v2" {
+			if err := profile.validateNoCodexBlocks(); err != nil {
+				return "", nil, err
+			}
+		} else if err := profile.validateCodexBlocks(); err != nil {
+			return "", nil, err
+		}
 	default:
-		return "", nil, fmt.Errorf("unsupported profile algo_version: %q (expected %q or %q)", profile.AlgoVersion, "cprof-v1", "cprof-v2")
+		return "", nil, fmt.Errorf("unsupported profile algo_version: %q (expected %q, %q or %q)", profile.AlgoVersion, "cprof-v1", "cprof-v2", "cprof-v3")
 	}
 
 	switch profile.WorkspaceMode {
@@ -175,11 +348,19 @@ func ComputeProfileDigest(profile CanonicalProfile) (string, []byte, error) {
 	harnessesMap := make(map[string]any, len(profile.Harnesses))
 	for hName, hSpec := range profile.Harnesses {
 		cleanedHName := norm.NFC.String(strings.Trim(hName, "\ufeff"))
-		harnessesMap[cleanedHName] = map[string]any{
+		entry := map[string]any{
 			"extra_env_allowlist": normalizeStringSlice(hSpec.ExtraEnvAllowlist, false, false),
 			"model":               norm.NFC.String(strings.Trim(hSpec.Model, "\ufeff")),
 			"native_auth_mode":    norm.NFC.String(strings.Trim(hSpec.NativeAuthMode, "\ufeff")),
 		}
+		if hSpec.Codex != nil {
+			block, err := canonicalCodexBlock(hSpec.Codex)
+			if err != nil {
+				return "", nil, err
+			}
+			entry["codex"] = block
+		}
+		harnessesMap[cleanedHName] = entry
 	}
 
 	canonicalMap := map[string]any{
@@ -193,19 +374,8 @@ func ComputeProfileDigest(profile CanonicalProfile) (string, []byte, error) {
 		"workspace_mode":       profile.WorkspaceMode,
 	}
 
-	if profile.AlgoVersion == "cprof-v2" {
-		m := profile.ToolkitManifest.ToolkitManifest
-		canonicalMap["toolkit_manifest"] = map[string]any{
-			"probed_cli_version":       norm.NFC.String(strings.Trim(m.ProbedCLIVersion, "\ufeff")),
-			"universe_evidence_path":   norm.NFC.String(strings.Trim(m.UniverseEvidencePath, "\ufeff")),
-			"universe_evidence_digest": strings.ToLower(strings.TrimSpace(m.UniverseEvidenceDigest)),
-			"approved_tools":           normalizeStringSlice(m.ApprovedTools, false, false),
-			"denied_complement":        normalizeStringSlice(m.DeniedComplement, false, false),
-			"expected_hooks":           normalizeStringSlice(m.ExpectedHooks, false, false),
-			"expected_skills":          normalizeStringSlice(m.ExpectedSkills, false, false),
-			"expected_plugins":         normalizeStringSlice(m.ExpectedPlugins, false, false),
-			"turns_bound":              m.TurnsBound,
-		}
+	if profile.AlgoVersion == "cprof-v2" || profile.AlgoVersion == "cprof-v3" {
+		canonicalMap["toolkit_manifest"] = canonicalToolkitManifestMap(profile.ToolkitManifest.ToolkitManifest)
 	}
 
 	buf := new(bytes.Buffer)
@@ -218,6 +388,223 @@ func ComputeProfileDigest(profile CanonicalProfile) (string, []byte, error) {
 	sum := sha256.Sum256(canonicalJSON)
 	digest := fmt.Sprintf("%s:sha256:%x", profile.AlgoVersion, sum)
 	return digest, canonicalJSON, nil
+}
+
+// canonicalToolkitManifestMap builds the normalized canonical sub-map
+// for a toolkit manifest — EXACTLY the value ComputeProfileDigest
+// embeds under "toolkit_manifest". Shared so the standalone manifest
+// digest and the profile digest can never diverge.
+func canonicalToolkitManifestMap(m ToolkitManifest) map[string]any {
+	return map[string]any{
+		"probed_cli_version":       norm.NFC.String(strings.Trim(m.ProbedCLIVersion, "\ufeff")),
+		"universe_evidence_path":   norm.NFC.String(strings.Trim(m.UniverseEvidencePath, "\ufeff")),
+		"universe_evidence_digest": strings.ToLower(strings.TrimSpace(m.UniverseEvidenceDigest)),
+		"approved_tools":           normalizeStringSlice(m.ApprovedTools, false, false),
+		"denied_complement":        normalizeStringSlice(m.DeniedComplement, false, false),
+		"expected_hooks":           normalizeStringSlice(m.ExpectedHooks, false, false),
+		"expected_skills":          normalizeStringSlice(m.ExpectedSkills, false, false),
+		"expected_plugins":         normalizeStringSlice(m.ExpectedPlugins, false, false),
+		"turns_bound":              m.TurnsBound,
+	}
+}
+
+// ComputeToolkitManifestDigest returns the canonical toolkit-manifest
+// digest — `sha256:<hex>` over the same normalized canonical JSON
+// encoding ComputeProfileDigest embeds under "toolkit_manifest". This is
+// THE manifest_digest value the codex launch policy freezes at
+// validation and the codex protection-attestation journal operation
+// stores: both call this one function, so the frozen launch tuple and
+// the durable attestation rows can never disagree on manifest identity.
+func ComputeToolkitManifestDigest(manifest ToolkitManifest) (string, error) {
+	buf := new(bytes.Buffer)
+	enc := json.NewEncoder(buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(canonicalToolkitManifestMap(manifest)); err != nil {
+		return "", fmt.Errorf("encode canonical toolkit manifest json: %w", err)
+	}
+	canonicalJSON := bytes.TrimRight(buf.Bytes(), "\n")
+	sum := sha256.Sum256(canonicalJSON)
+	return fmt.Sprintf("sha256:%x", sum), nil
+}
+
+// canonicalJSONValue re-encodes a raw JSON value verbatim as canonical
+// JSON: number literals are preserved (UseNumber), object keys are
+// sorted by the encoder, and no insignificant whitespace survives.
+func canonicalJSONValue(raw json.RawMessage) (any, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	if dec.More() {
+		return nil, errors.New("trailing characters after json value")
+	}
+	return v, nil
+}
+
+// canonicalGranularApproval re-encodes the granular object canonically:
+// all five keys present, each value re-encoded verbatim as canonical
+// JSON. Equality of two granular policies is byte equality of the
+// resulting encoding.
+func canonicalGranularApproval(g *CodexGranularApproval) (map[string]any, error) {
+	if g == nil {
+		return nil, fmt.Errorf("approval_policy granular kind carries no granular object")
+	}
+	raws := map[string]json.RawMessage{
+		"mcp_elicitations":    g.McpElicitations,
+		"request_permissions": g.RequestPermissions,
+		"rules":               g.Rules,
+		"sandbox_approval":    g.SandboxApproval,
+		"skill_approval":      g.SkillApproval,
+	}
+	out := make(map[string]any, len(granularApprovalKeys))
+	for _, key := range granularApprovalKeys {
+		raw := raws[key]
+		if len(raw) == 0 || string(raw) == "null" {
+			return nil, fmt.Errorf("granular approval_policy is missing required key %q", key)
+		}
+		v, err := canonicalJSONValue(raw)
+		if err != nil {
+			return nil, fmt.Errorf("granular approval_policy key %q: %w", key, err)
+		}
+		out[key] = v
+	}
+	return out, nil
+}
+
+// requireGranularShapeEvidence fails closed unless committed schema
+// evidence pins the sub-value shape of every granular key.
+func requireGranularShapeEvidence(g *CodexGranularApproval) error {
+	for _, key := range granularApprovalKeys {
+		if granularShapeEvidence[key] == "" {
+			return fmt.Errorf(
+				"granular approval_policy key %q has no committed schema-derived shape evidence; "+
+					"granular policies are rejected at profile freeze (fail-closed)", key)
+		}
+	}
+	return nil
+}
+
+// canonicalApprovalPolicy encodes the tagged union for the canonical map:
+// the string kind yields the normalized enum string; the granular kind
+// yields the canonical object.
+func canonicalApprovalPolicy(p CodexApprovalPolicy) (any, error) {
+	switch p.Kind {
+	case CodexApprovalKindString:
+		return norm.NFC.String(strings.Trim(p.String, "\ufeff")), nil
+	case CodexApprovalKindGranular:
+		return canonicalGranularApproval(p.Granular)
+	default:
+		return nil, fmt.Errorf("approval_policy must be a string or a granular object")
+	}
+}
+
+func codexScalar(s string) string {
+	return norm.NFC.String(strings.Trim(s, "\ufeff"))
+}
+
+// canonicalCodexBlock builds the canonical codex-block map (§3.8):
+// scalars trimmed + NFC; arrays BOM-trimmed, NFC, deduped, byte-wise
+// sorted without lowercasing; writable_roots path-normalized.
+func canonicalCodexBlock(c *CodexHarnessSpec) (map[string]any, error) {
+	policy, err := canonicalApprovalPolicy(c.ApprovalPolicy)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"app_server_version":  codexScalar(c.AppServerVersion),
+		"model_provider":      codexScalar(c.ModelProvider),
+		"expected_codex_home": codexScalar(c.ExpectedCodexHome),
+		"platform": map[string]any{
+			"family": codexScalar(c.Platform.Family),
+			"os":     codexScalar(c.Platform.OS),
+		},
+		"sandbox_policy": map[string]any{
+			"type":           codexScalar(c.SandboxPolicy.Type),
+			"writable_roots": normalizeStringSlice(c.SandboxPolicy.WritableRoots, false, true),
+			"network_access": c.SandboxPolicy.NetworkAccess,
+		},
+		"approval_policy":              policy,
+		"approvals_reviewer":           codexScalar(c.ApprovalsReviewer),
+		"expected_mcp_servers":         normalizeStringSlice(c.ExpectedMCPServers, false, false),
+		"expected_mcp_tools":           normalizeStringSlice(c.ExpectedMCPTools, false, false),
+		"expected_plugin_tools":        normalizeStringSlice(c.ExpectedPluginTools, false, false),
+		"expected_instruction_sources": normalizeStringSlice(c.ExpectedInstructionSources, false, false),
+		"rules_evidence": map[string]any{
+			"verified":     normalizeStringSlice(c.RulesEvidence.Verified, false, false),
+			"unverifiable": normalizeStringSlice(c.RulesEvidence.Unverifiable, false, false),
+		},
+		"event_universe_path":   codexScalar(c.EventUniversePath),
+		"event_universe_digest": strings.ToLower(strings.TrimSpace(c.EventUniverseDigest)),
+		"tool_inventory_path":   codexScalar(c.ToolInventoryPath),
+		"tool_inventory_digest": strings.ToLower(strings.TrimSpace(c.ToolInventoryDigest)),
+	}, nil
+}
+
+// validateNoCodexBlocks rejects a codex block under cprof-v1/v2.
+func (p CanonicalProfile) validateNoCodexBlocks() error {
+	for _, h := range p.Harnesses {
+		if h.Codex != nil {
+			return fmt.Errorf("a codex harness block requires algo_version %q, not %q", "cprof-v3", p.AlgoVersion)
+		}
+	}
+	return nil
+}
+
+// validateCodexBlocks freezes every codex harness block: approval
+// enum/shape gates and the §3.6 reviewer invariant.
+func (p CanonicalProfile) validateCodexBlocks() error {
+	for _, h := range p.Harnesses {
+		if h.Codex == nil {
+			continue
+		}
+		if err := validateCodexHarnessBlock(h.Codex); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateCodexHarnessBlock enforces the freeze-time codex gates:
+// sandbox_policy.type enum {read-only, workspace-write} (spec §5 —
+// danger-full-access is forbidden in any launch or code path),
+// approval_policy enum {untrusted, on-request, never, granular object},
+// granular shape evidence (fail-closed), and approvals_reviewer == user.
+func validateCodexHarnessBlock(c *CodexHarnessSpec) error {
+	switch codexScalar(c.SandboxPolicy.Type) {
+	case "read-only", "workspace-write":
+	default:
+		return fmt.Errorf("unsupported sandbox_policy type %q (expected read-only or workspace-write; danger-full-access is forbidden)", c.SandboxPolicy.Type)
+	}
+	switch c.ApprovalPolicy.Kind {
+	case CodexApprovalKindString:
+		switch norm.NFC.String(strings.Trim(c.ApprovalPolicy.String, "\ufeff")) {
+		case "untrusted", "on-request", "never":
+		default:
+			return fmt.Errorf("unsupported approval_policy %q (expected untrusted, on-request, never, or a granular object)", c.ApprovalPolicy.String)
+		}
+	case CodexApprovalKindGranular:
+		if _, err := canonicalGranularApproval(c.ApprovalPolicy.Granular); err != nil {
+			return err
+		}
+		if err := requireGranularShapeEvidence(c.ApprovalPolicy.Granular); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("approval_policy must be a string or a granular object")
+	}
+	if codexScalar(c.ApprovalsReviewer) != "user" {
+		return fmt.Errorf("approvals_reviewer %q must be %q: only the user answers approvals inside Council's visibility", c.ApprovalsReviewer, "user")
+	}
+	// Inventory-evidence gate AT FREEZE (AC-009 §3.8 errata): no committed
+	// evidence path proves a non-empty native MCP/plugin tool inventory,
+	// so a run must never durably freeze a profile the production adapter
+	// can never launch. Only empty inventories freeze.
+	if len(c.ExpectedMCPServers) > 0 || len(c.ExpectedMCPTools) > 0 || len(c.ExpectedPluginTools) > 0 {
+		return fmt.Errorf("expected_mcp_servers, expected_mcp_tools, and expected_plugin_tools must be empty: no committed evidence path proves a non-empty native tool inventory, so such a profile is not launchable and must not be frozen")
+	}
+	return nil
 }
 
 // ParseCanonicalProfileJSON unmarshals and validates profile JSON, rejecting unknown fields.
@@ -233,11 +620,22 @@ func ParseCanonicalProfileJSON(data []byte) (CanonicalProfile, error) {
 		return CanonicalProfile{}, errors.New("trailing characters after profile json")
 	}
 
-	if prof.AlgoVersion != "cprof-v1" && prof.AlgoVersion != "cprof-v2" {
-		return CanonicalProfile{}, fmt.Errorf("unsupported profile algo_version: %q (expected %q or %q)", prof.AlgoVersion, "cprof-v1", "cprof-v2")
-	}
-	if prof.AlgoVersion == "cprof-v2" && prof.ToolkitManifest == nil {
-		return CanonicalProfile{}, fmt.Errorf("algo_version %q requires toolkit_manifest", prof.AlgoVersion)
+	switch prof.AlgoVersion {
+	case "cprof-v1":
+		if err := prof.validateNoCodexBlocks(); err != nil {
+			return CanonicalProfile{}, err
+		}
+	case "cprof-v2", "cprof-v3":
+		if prof.ToolkitManifest == nil {
+			return CanonicalProfile{}, fmt.Errorf("algo_version %q requires toolkit_manifest", prof.AlgoVersion)
+		}
+		if prof.AlgoVersion == "cprof-v2" {
+			if err := prof.validateNoCodexBlocks(); err != nil {
+				return CanonicalProfile{}, err
+			}
+		}
+	default:
+		return CanonicalProfile{}, fmt.Errorf("unsupported profile algo_version: %q (expected %q, %q or %q)", prof.AlgoVersion, "cprof-v1", "cprof-v2", "cprof-v3")
 	}
 	switch prof.WorkspaceMode {
 	case "none", "readonly", "isolated_branch":
