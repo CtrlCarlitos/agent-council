@@ -32,8 +32,8 @@ func TestClaudeTurnLaunch_AcceptsCprofV3Profile(t *testing.T) {
 			},
 			ApprovalPolicy:             storage.CodexApprovalPolicy{Kind: "string", String: "on-request"},
 			ApprovalsReviewer:          "user",
-			ExpectedMCPServers:         []string{"context7"},
-			ExpectedMCPTools:           []string{"context7/resolve-library-id"},
+			ExpectedMCPServers:         []string{},
+			ExpectedMCPTools:           []string{},
 			ExpectedPluginTools:        []string{},
 			ExpectedInstructionSources: []string{"~/.codex/AGENTS.md"},
 			RulesEvidence: storage.CodexRulesEvidenceSpec{

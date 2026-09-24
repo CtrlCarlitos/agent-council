@@ -171,12 +171,15 @@ type CodexHarnessSpec struct {
 	RulesEvidence              CodexRulesEvidenceSpec `json:"rules_evidence"`
 	EventUniversePath          string                 `json:"event_universe_path"`
 	EventUniverseDigest        string                 `json:"event_universe_digest"`
-	// ToolInventoryPath / ToolInventoryDigest bind the provider-free
-	// NATIVE tool-inventory capture (repo-relative under the evidence
-	// root, sha256 of its bytes) that PROVES the two inventories above
-	// complete: validation re-hashes the capture and requires its server,
-	// MCP tool, and plugin tool sets to EQUAL the frozen lists. Required
-	// whenever the profile enables any MCP server or plugin tool.
+	// ToolInventoryPath / ToolInventoryDigest are the binding slot for
+	// the eventual native tool-inventory evidence (repo-relative under
+	// the evidence root, sha256 of its bytes). The adapter re-hashes a
+	// present capture and requires its server, MCP tool, and plugin tool
+	// sets to EQUAL the frozen lists, but a Council-shaped capture is
+	// operator-edited JSON, NOT native evidence: until a schema-pinned
+	// derivation of the raw native response exists, profile freeze
+	// REJECTS every non-empty inventory (validateCodexHarnessBlock), so
+	// today the slot can only ever agree with empty lists.
 	ToolInventoryPath   string `json:"tool_inventory_path"`
 	ToolInventoryDigest string `json:"tool_inventory_digest"`
 }
@@ -593,6 +596,13 @@ func validateCodexHarnessBlock(c *CodexHarnessSpec) error {
 	}
 	if codexScalar(c.ApprovalsReviewer) != "user" {
 		return fmt.Errorf("approvals_reviewer %q must be %q: only the user answers approvals inside Council's visibility", c.ApprovalsReviewer, "user")
+	}
+	// Inventory-evidence gate AT FREEZE (AC-009 §3.8 errata): no committed
+	// evidence path proves a non-empty native MCP/plugin tool inventory,
+	// so a run must never durably freeze a profile the production adapter
+	// can never launch. Only empty inventories freeze.
+	if len(c.ExpectedMCPServers) > 0 || len(c.ExpectedMCPTools) > 0 || len(c.ExpectedPluginTools) > 0 {
+		return fmt.Errorf("expected_mcp_servers, expected_mcp_tools, and expected_plugin_tools must be empty: no committed evidence path proves a non-empty native tool inventory, so such a profile is not launchable and must not be frozen")
 	}
 	return nil
 }

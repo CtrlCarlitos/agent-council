@@ -5,6 +5,7 @@ package storage
 // only under cprof-v3.
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -23,10 +24,12 @@ func v3CodexBlock() *CodexHarnessSpec {
 			WritableRoots: []string{"/home/op/ws"},
 			NetworkAccess: false,
 		},
-		ApprovalPolicy:             CodexApprovalPolicy{Kind: "string", String: "on-request"},
-		ApprovalsReviewer:          "user",
-		ExpectedMCPServers:         []string{"context7"},
-		ExpectedMCPTools:           []string{"context7/resolve-library-id"},
+		ApprovalPolicy:    CodexApprovalPolicy{Kind: "string", String: "on-request"},
+		ApprovalsReviewer: "user",
+		// Affirmatively empty: freeze rejects non-empty inventories until
+		// a native evidence path exists (see NonEmptyInventoriesRejectedAtFreeze).
+		ExpectedMCPServers:         []string{},
+		ExpectedMCPTools:           []string{},
 		ExpectedPluginTools:        []string{},
 		ExpectedInstructionSources: []string{"~/.codex/AGENTS.md"},
 		RulesEvidence: CodexRulesEvidenceSpec{
@@ -65,7 +68,7 @@ func TestCanonicalProfileV3_GoldenDigestVector(t *testing.T) {
 	}
 
 	hex64 := strings.Repeat("a", 64)
-	golden := fmt.Sprintf(`{"algo_version":"cprof-v3","code_index_scope":[],"harnesses":{"codex":{"codex":{"app_server_version":"0.154.0","approval_policy":"on-request","approvals_reviewer":"user","event_universe_digest":"sha256:%s","event_universe_path":"docs/superpowers/evidence/ac009-native-event-universe-0.154.0.json","expected_codex_home":"/home/op/.codex","expected_instruction_sources":["~/.codex/AGENTS.md"],"expected_mcp_servers":["context7"],"expected_mcp_tools":["context7/resolve-library-id"],"expected_plugin_tools":[],"model_provider":"openai","platform":{"family":"unix","os":"linux"},"rules_evidence":{"unverifiable":["~/.codex/rules/*.rules contents"],"verified":["sandbox workspace-write"]},"sandbox_policy":{"network_access":false,"type":"workspace-write","writable_roots":["/home/op/ws"]},"tool_inventory_digest":"sha256:%s","tool_inventory_path":"docs/superpowers/evidence/ac009-native-tool-inventory-0.154.0.json"},"extra_env_allowlist":[],"model":"gpt-5.6-sol","native_auth_mode":"inherited_codex_home"}},"isolation_strictness":"permissive_dev","network_allowlist":[],"network_mode":"unrestricted","tooling":["codex","git","go"],"toolkit_manifest":{"approved_tools":["Glob","Grep","Read"],"denied_complement":["Bash","Write"],"expected_hooks":["PreToolUse","SessionStart:startup"],"expected_plugins":["superpowers"],"expected_skills":["research"],"probed_cli_version":"2.1.278","turns_bound":8,"universe_evidence_digest":"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","universe_evidence_path":"docs/superpowers/evidence/ac008-native-tool-universe-2.1.278.json"},"workspace_mode":"none"}`, hex64, strings.Repeat("b", 64))
+	golden := fmt.Sprintf(`{"algo_version":"cprof-v3","code_index_scope":[],"harnesses":{"codex":{"codex":{"app_server_version":"0.154.0","approval_policy":"on-request","approvals_reviewer":"user","event_universe_digest":"sha256:%s","event_universe_path":"docs/superpowers/evidence/ac009-native-event-universe-0.154.0.json","expected_codex_home":"/home/op/.codex","expected_instruction_sources":["~/.codex/AGENTS.md"],"expected_mcp_servers":[],"expected_mcp_tools":[],"expected_plugin_tools":[],"model_provider":"openai","platform":{"family":"unix","os":"linux"},"rules_evidence":{"unverifiable":["~/.codex/rules/*.rules contents"],"verified":["sandbox workspace-write"]},"sandbox_policy":{"network_access":false,"type":"workspace-write","writable_roots":["/home/op/ws"]},"tool_inventory_digest":"sha256:%s","tool_inventory_path":"docs/superpowers/evidence/ac009-native-tool-inventory-0.154.0.json"},"extra_env_allowlist":[],"model":"gpt-5.6-sol","native_auth_mode":"inherited_codex_home"}},"isolation_strictness":"permissive_dev","network_allowlist":[],"network_mode":"unrestricted","tooling":["codex","git","go"],"toolkit_manifest":{"approved_tools":["Glob","Grep","Read"],"denied_complement":["Bash","Write"],"expected_hooks":["PreToolUse","SessionStart:startup"],"expected_plugins":["superpowers"],"expected_skills":["research"],"probed_cli_version":"2.1.278","turns_bound":8,"universe_evidence_digest":"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","universe_evidence_path":"docs/superpowers/evidence/ac008-native-tool-universe-2.1.278.json"},"workspace_mode":"none"}`, hex64, strings.Repeat("b", 64))
 
 	if string(canon) != golden {
 		t.Fatalf("canonical v3 JSON drifted from the golden vector:\n got: %s\nwant: %s", canon, golden)
@@ -170,10 +173,8 @@ func TestCanonicalProfileV1V2_ByteIdenticalEncodings(t *testing.T) {
 func TestCanonicalProfileV3_Normalization(t *testing.T) {
 	p := v3Profile()
 	c := p.Harnesses["codex"].Codex
-	c.ExpectedMCPServers = []string{"\ufeffZeta", "zeta", "Alpha", "Alpha"}
-	c.ExpectedMCPTools = []string{"zeta/b", "\ufeffAlpha/a", "Alpha/a"}
-	c.ExpectedPluginTools = []string{"skill:z", "\ufeffskill:a"}
-	c.ExpectedInstructionSources = []string{"\ufeff~/.codex/AGENTS.md"}
+	c.ExpectedInstructionSources = []string{"\ufeff~/.codex/AGENTS.md", "~/.codex/AGENTS.md", "\ufeff.codex/AGENTS.md"}
+	c.RulesEvidence.Verified = []string{"\ufeffzeta", "Alpha", "Alpha", "zeta"}
 	c.SandboxPolicy.WritableRoots = []string{"/home/op/ws///", "\ufeff/home/op/WS"}
 	p.Harnesses["codex"] = HarnessProfileSpec{Model: "\ufeffgpt-5.6-sol", NativeAuthMode: "inherited_codex_home", Codex: c}
 
@@ -182,18 +183,14 @@ func TestCanonicalProfileV3_Normalization(t *testing.T) {
 		t.Fatalf("digest: %v", err)
 	}
 	s := string(canon)
-	// Dedupe + case-sensitive byte-wise sort (no lowercasing).
+	// Dedupe + case-sensitive byte-wise sort (no lowercasing) + BOM trim.
 	for _, want := range []string{
-		`"expected_mcp_servers":["Alpha","Zeta","zeta"]`,
-		`"expected_mcp_tools":["Alpha/a","zeta/b"]`,
-		`"expected_plugin_tools":["skill:a","skill:z"]`,
+		`"expected_instruction_sources":[".codex/AGENTS.md","~/.codex/AGENTS.md"]`,
+		`"verified":["Alpha","zeta"]`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("normalized array %s missing from %s", want, s)
 		}
-	}
-	if !strings.Contains(s, `"expected_instruction_sources":["~/.codex/AGENTS.md"]`) {
-		t.Fatalf("array entries must be BOM-trimmed: %s", s)
 	}
 	if !strings.Contains(s, `"writable_roots":["/home/op/WS","/home/op/ws"]`) {
 		t.Fatalf("writable_roots must be path-cleaned and sorted: %s", s)
@@ -530,4 +527,49 @@ func v3CanonicalJSONWithSandboxType(sandboxType string) []byte {
 		panic(err)
 	}
 	return []byte(strings.Replace(base, old, `"type":`+string(repl), 1))
+}
+
+// Inventory-evidence gate AT FREEZE (AC-009 §3.8 errata): no committed
+// evidence path proves a non-empty native MCP/plugin tool inventory, so
+// a profile enabling any MCP server, MCP tool, or plugin tool is
+// rejected by ComputeProfileDigest — and therefore by durable run
+// creation — rather than frozen into a run the production adapter can
+// never launch.
+func TestCanonicalProfileV3_NonEmptyInventoriesRejectedAtFreeze(t *testing.T) {
+	cases := map[string]func(c *CodexHarnessSpec){
+		"mcp server": func(c *CodexHarnessSpec) { c.ExpectedMCPServers = []string{"context7"} },
+		"mcp tool": func(c *CodexHarnessSpec) {
+			c.ExpectedMCPServers = []string{"context7"}
+			c.ExpectedMCPTools = []string{"context7/toolA"}
+		},
+		"plugin tool": func(c *CodexHarnessSpec) { c.ExpectedPluginTools = []string{"skill:review"} },
+	}
+	store := openCodexStore(t)
+	for name, enable := range cases {
+		t.Run(name, func(t *testing.T) {
+			p := v3Profile()
+			enable(p.Harnesses["codex"].Codex)
+			if _, _, err := ComputeProfileDigest(p); err == nil || !strings.Contains(err.Error(), "must be empty") {
+				t.Fatalf("a %s-enabled profile must be rejected at freeze, got %v", name, err)
+			}
+			_, err := store.CreateRunWithProfile(context.Background(), CreateRunWithProfileRequest{
+				OpID: "op-run-" + name, ControllerLease: "lease-" + name, RunID: "run-" + name,
+				Brief: "inventory gate", SourceRepoIdentity: "example/repo",
+				SourceCommit: "0123456789012345678901234567890123456789",
+				SourceTree:   "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+				Profile:      p,
+			})
+			if err == nil || !strings.Contains(err.Error(), "must be empty") {
+				t.Fatalf("durable run creation must refuse a %s-enabled profile, got %v", name, err)
+			}
+			var count int
+			if err := store.DB().QueryRow(`SELECT count(*) FROM runs WHERE run_id = ?`, "run-"+name).Scan(&count); err != nil || count != 0 {
+				t.Fatalf("no run may be frozen for a refused profile, count=%d err=%v", count, err)
+			}
+		})
+	}
+	// The empty inventories freeze.
+	if _, _, err := ComputeProfileDigest(v3Profile()); err != nil {
+		t.Fatalf("empty inventories must freeze: %v", err)
+	}
 }
