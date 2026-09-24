@@ -15,13 +15,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/execpolicy"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/workspace"
@@ -84,6 +87,20 @@ func startAgyFixture(t *testing.T, scratch string, args []string) execpolicy.Man
 	t.Cleanup(func() {
 		_ = proc.Terminate(context.Background())
 	})
+
+	// Important 3: on Linux the sealed path must have actually run —
+	// prove it by asserting the ptrace-verified executable identity
+	// carries the exact fixture digest, not just that Start() succeeded.
+	if runtime.GOOS == "linux" {
+		got := proc.ExecutableIdentity()
+		if got.Digest == "" {
+			t.Fatalf("expected a non-empty ExecutableIdentity().Digest on Linux (sealed path), got empty")
+		}
+		if got.Digest != digest {
+			t.Fatalf("ExecutableIdentity().Digest = %q, want the fixture digest %q", got.Digest, digest)
+		}
+	}
+
 	return proc
 }
 
@@ -128,11 +145,19 @@ func streamAgyEvents(proc execpolicy.ManagedProcess) <-chan Event {
 
 // drainAgyStderr copies proc's stderr into a boundedBuffer in the
 // background (safe to read from concurrently via String(), including
-// while the child is still running).
-func drainAgyStderr(proc execpolicy.ManagedProcess) *boundedBuffer {
-	buf := newBoundedBuffer(1 << 20)
-	go func() { _, _ = io.Copy(buf, proc.Stderr()) }()
-	return buf
+// while the child is still running). The returned func blocks until the
+// copy goroutine has observed EOF on the stderr pipe; callers MUST join
+// it before calling proc.Wait(), because exec.Cmd.Wait closes the
+// parent's read end of stderr and would otherwise race an unjoined
+// io.Copy for any output written late in the child's lifetime.
+func drainAgyStderr(proc execpolicy.ManagedProcess) (buf *boundedBuffer, join func()) {
+	buf = newBoundedBuffer(1 << 20)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = io.Copy(buf, proc.Stderr())
+	}()
+	return buf, func() { <-done }
 }
 
 // runAgyFixture drains proc's stdout/stderr in the background, waits
@@ -150,7 +175,7 @@ func drainAgyStderr(proc execpolicy.ManagedProcess) *boundedBuffer {
 func runAgyFixture(t *testing.T, proc execpolicy.ManagedProcess, userLine string) (initEv Event, rest []Event, stderrText string, exitCode int) {
 	t.Helper()
 	events := streamAgyEvents(proc)
-	stderrBuf := drainAgyStderr(proc)
+	stderrBuf, joinStderr := drainAgyStderr(proc)
 
 	var ok bool
 	initEv, ok = <-events
@@ -165,6 +190,11 @@ func runAgyFixture(t *testing.T, proc execpolicy.ManagedProcess, userLine string
 	for ev := range events {
 		rest = append(rest, ev)
 	}
+
+	// Join the stderr drain BEFORE Wait: exec.Cmd.Wait closes the parent's
+	// stderr read end, so any late stderr written right before the child
+	// exits can otherwise be lost to an unjoined io.Copy goroutine.
+	joinStderr()
 
 	code, waitErr := proc.Wait()
 	if waitErr != nil {
@@ -234,7 +264,7 @@ func TestAgyFixture_EnvelopeValidation_MissingEventField(t *testing.T) {
 	if len(rest) != 0 {
 		t.Fatalf("expected no further events after init, got %+v", rest)
 	}
-	const wantErr = `error: stream input "user" message is missing the "event" field`
+	const wantErr = `error: stream input message is missing the "event" field`
 	if !strings.Contains(stderrText, wantErr) {
 		t.Fatalf("stderr = %q, want it to contain %q", stderrText, wantErr)
 	}
@@ -427,5 +457,189 @@ func TestAgyFixture_VersionAndModelsAndPluginList(t *testing.T) {
 	const wantPlugins = `{"imports":[{"components":["hooks","skills"],"importedAt":"2026-09-02T19:59:12Z","name":"superpowers","source":"gemini-cli"}]}`
 	if plugins != wantPlugins {
 		t.Fatalf("plugin list = %q, want the canonical committed bytes %q", plugins, wantPlugins)
+	}
+}
+
+// TestAgyFixture_ModelsNotSignedInAndPluginListDrift (Minor 5, untested
+// directives): models_not_signed_in and plugin_list_drift, run against
+// the compiled binary directly (the same pattern
+// TestAgyFixture_VersionAndModelsAndPluginList uses), since neither
+// touches the stream-json handshake.
+func TestAgyFixture_ModelsNotSignedInAndPluginListDrift(t *testing.T) {
+	scratch := t.TempDir()
+	binDir := compileAgyFixture(t)
+	fixturePath := filepath.Join(binDir, "agy")
+
+	run := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command(fixturePath, args...)
+		cmd.Dir = scratch
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("run agy %v: %v: %s", args, err, out)
+		}
+		return string(out)
+	}
+
+	writeAgyScenario(t, scratch, `{"models_not_signed_in":true}`)
+	notSignedIn := run("models")
+	if !strings.Contains(notSignedIn, "not logged into Antigravity") {
+		t.Fatalf("models_not_signed_in output = %q, want the not-signed-in text", notSignedIn)
+	}
+
+	const drifted = "plugin list drifted: no imports"
+	writeAgyScenario(t, scratch, `{"plugin_list_drift":"`+drifted+`"}`)
+	got := strings.TrimSpace(run("plugin", "list"))
+	if got != drifted {
+		t.Fatalf("plugin_list_drift output = %q, want %q", got, drifted)
+	}
+}
+
+// TestAgyFixture_SlowInit (Minor 5, untested directive: slow_init_ms):
+// the init event must not be observed before the directive's delay has
+// elapsed.
+func TestAgyFixture_SlowInit(t *testing.T) {
+	scratch := t.TempDir()
+	writeAgyScenario(t, scratch, `{"slow_init_ms":300}`)
+	proc := startAgyFixture(t, scratch, agyFrozenArgs("m"))
+
+	events := streamAgyEvents(proc)
+	start := time.Now()
+	initEv, ok := <-events
+	elapsed := time.Since(start)
+	if !ok || initEv.Kind != EventKindInit {
+		t.Fatalf("expected init event, got %+v ok=%v", initEv, ok)
+	}
+	if elapsed < 250*time.Millisecond {
+		t.Fatalf("init observed after only %v, want at least ~300ms (slow_init_ms honored)", elapsed)
+	}
+
+	sendRawStdinLine(t, proc, `{"event":"user","message":{"content":"hi"}}`)
+	for range events {
+	}
+	if _, err := proc.Wait(); err != nil {
+		t.Fatalf("proc.Wait: %v", err)
+	}
+}
+
+// TestAgyFixture_DirectiveMatrix (Minor 5, untested directives:
+// exit_without_result, a result override, and step usage/tool_info
+// replay) is table-driven per the reviewer's "one table-driven test is
+// fine" allowance.
+func TestAgyFixture_DirectiveMatrix(t *testing.T) {
+	cases := []struct {
+		name     string
+		scenario []string
+		check    func(t *testing.T, rest []Event, code int)
+	}{
+		{
+			name:     "exit_without_result",
+			scenario: []string{`{"exit_without_result":true}`},
+			check: func(t *testing.T, rest []Event, code int) {
+				if code != 0 {
+					t.Fatalf("exit code = %d, want 0", code)
+				}
+				if len(rest) != 0 {
+					t.Fatalf("expected no events after init (no result ever emitted), got %+v", rest)
+				}
+			},
+		},
+		{
+			name: "result_override",
+			scenario: []string{
+				`{"result":{"status":"SUCCESS","response":"custom response","duration_seconds":2.5,"num_turns":7,"usage":{"input_tokens":5,"output_tokens":6,"thinking_tokens":1,"cache_read_tokens":2,"total_tokens":14}}}`,
+			},
+			check: func(t *testing.T, rest []Event, code int) {
+				if code != 0 {
+					t.Fatalf("exit code = %d, want 0", code)
+				}
+				if len(rest) != 1 {
+					t.Fatalf("expected exactly one result event, got %+v", rest)
+				}
+				r := rest[0].Result
+				if r == nil || r.Status != "SUCCESS" || r.Response != "custom response" || r.NumTurns != 7 || r.Duration != 2.5 {
+					t.Fatalf("unexpected overridden result: %+v", r)
+				}
+				if r.Usage.InputTokens != 5 || r.Usage.TotalTokens != 14 {
+					t.Fatalf("unexpected overridden usage: %+v", r.Usage)
+				}
+			},
+		},
+		{
+			name: "step_usage_and_tool_info_replay",
+			scenario: []string{
+				`{"step":{"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"CommandLine":"echo hi"},"duration_seconds":0.2,"usage":{"input_tokens":3,"output_tokens":4,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":7}}}`,
+			},
+			check: func(t *testing.T, rest []Event, code int) {
+				if code != 0 {
+					t.Fatalf("exit code = %d, want 0", code)
+				}
+				if len(rest) != 2 {
+					t.Fatalf("expected a step_update then a result, got %+v", rest)
+				}
+				step := rest[0]
+				if step.Kind != EventKindStepUpdate || step.Step.ToolName != "run_command" {
+					t.Fatalf("unexpected step: %+v", step)
+				}
+				if step.Step.Usage == nil || step.Step.Usage.TotalTokens != 7 {
+					t.Fatalf("unexpected step usage: %+v", step.Step.Usage)
+				}
+				var info struct {
+					CommandLine string `json:"CommandLine"`
+				}
+				if err := json.Unmarshal(step.Step.ToolInfo, &info); err != nil {
+					t.Fatalf("tool_info not valid json: %v", err)
+				}
+				if info.CommandLine != "echo hi" {
+					t.Fatalf("tool_info.CommandLine = %q", info.CommandLine)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scratch := t.TempDir()
+			writeAgyScenario(t, scratch, tc.scenario...)
+			proc := startAgyFixture(t, scratch, agyFrozenArgs("m"))
+			_, rest, _, code := runAgyFixture(t, proc, `{"event":"user","message":{"content":"hi"}}`)
+			tc.check(t, rest, code)
+		})
+	}
+}
+
+// TestAgyFixture_ScenarioLoaderRejectsMistakes (Minor 4): a malformed
+// scenario directive line, and a syntactically valid line with zero
+// recognized directive keys, must make the fixture print a stderr error
+// and exit 2 — never silently default to a SUCCESS turn.
+func TestAgyFixture_ScenarioLoaderRejectsMistakes(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+	}{
+		{"malformed_json", `{"step": not-json}`},
+		{"zero_recognized_keys", `{"totally_unrecognized_key": true}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scratch := t.TempDir()
+			binDir := compileAgyFixture(t)
+			fixturePath := filepath.Join(binDir, "agy")
+			writeAgyScenario(t, scratch, tc.line)
+
+			cmd := exec.Command(fixturePath, agyFrozenArgs("m")...)
+			cmd.Dir = scratch
+			out, err := cmd.CombinedOutput()
+			exitErr, ok := err.(*exec.ExitError)
+			if !ok {
+				t.Fatalf("expected the fixture to exit non-zero, got err=%v output=%q", err, out)
+			}
+			if exitErr.ExitCode() != 2 {
+				t.Fatalf("exit code = %d, want 2; output: %q", exitErr.ExitCode(), out)
+			}
+			if !strings.Contains(string(out), "error: fixture scenario:") {
+				t.Fatalf("expected stderr to carry the scenario-error prefix, got: %q", out)
+			}
+		})
 	}
 }

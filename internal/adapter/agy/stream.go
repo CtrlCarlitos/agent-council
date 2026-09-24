@@ -7,14 +7,20 @@ package agy
 // markers the adapter must recognize without parsing the model's output.
 //
 // Strictness rules (spec "unknown ⇒ Uncertain, never terminal success"):
-// every typed envelope decode uses encoding/json's DisallowUnknownFields,
-// so an unrecognized field ANYWHERE in the envelope — top-level or inside
-// the nested init/step_update/result object — is protocol drift, exactly
-// like an unrecognized "event" value or an out-of-vocabulary "state"/
-// "status" enum. A line that is not valid JSON at all is a distinct,
-// non-drift condition (ErrMalformedEvent): the two are kept separate
-// because a caller may want to retry/reclassify a malformed line
-// differently than a line that parsed but violated the frozen contract.
+// every typed envelope decode is routed through the shared
+// internal/adapter/evidence.DecodeStrictObject, so an unrecognized field
+// ANYWHERE in the envelope — top-level or inside the nested
+// init/step_update/result object — a DUPLICATE object key at any nesting
+// level, or trailing content after the value are all protocol drift,
+// exactly like an unrecognized "event" value or an out-of-vocabulary
+// "state"/"status" enum. Duplicate keys are rejected, never silently
+// tolerated (encoding/json's own struct/map decoding would otherwise
+// silently collapse a duplicate key to its last value). A line that is
+// not valid JSON at all is a distinct, non-drift condition
+// (ErrMalformedEvent, detected with json.Valid before any semantic
+// decode is attempted): the two are kept separate because a caller may
+// want to retry/reclassify a malformed line differently than a line
+// that parsed but violated the frozen contract.
 //
 // This file has no storage import: agy's stream protocol is decoded the
 // same way regardless of how (or whether) a caller persists it.
@@ -28,6 +34,8 @@ import (
 	"io"
 	"strings"
 	"sync"
+
+	"github.com/CtrlCarlitos/agent-council/internal/adapter/evidence"
 )
 
 // maxEventLineBytes bounds a single stream-json line (stdout event or
@@ -181,12 +189,21 @@ func (w wireUsage) toUsage() Usage {
 	}
 }
 
-// wireProbe sniffs only the "event" discriminator. It is deliberately
-// lenient (no DisallowUnknownFields): its only job is routing to the
-// correct strict decode, which is where every field is actually
-// validated.
+// wireProbe sniffs the "event" discriminator and routes to the correct
+// strict decode. It lists every top-level key ANY of the three known
+// envelope shapes carries (as json.RawMessage for the nested payloads,
+// deferring their own strict decode to decodeInitEvent/decodeStepEvent/
+// decodeResultEvent) so that DecodeStrictObject's DisallowUnknownFields
+// only rejects a genuinely unrecognized top-level key — never a field
+// that legitimately belongs to whichever envelope this line turns out to
+// be — while still catching a duplicate key anywhere in the line (top
+// level or nested) on this very first pass.
 type wireProbe struct {
-	Event string `json:"event"`
+	Event          string          `json:"event"`
+	ConversationID string          `json:"conversation_id"`
+	Init           json.RawMessage `json:"init"`
+	StepUpdate     json.RawMessage `json:"step_update"`
+	Result         json.RawMessage `json:"result"`
 }
 
 type wireInitPayload struct {
@@ -242,18 +259,23 @@ type wireResultEnvelope struct {
 
 // DecodeEvent strictly decodes one stream-json line into an Event.
 // Unknown "event" values, unknown "step_type" values, a "state" outside
-// {ACTIVE, DONE}, a "status" outside {SUCCESS, ERROR}, and any
-// unrecognized field anywhere in the envelope are all ErrProtocolDrift.
-// A line that is not valid JSON is ErrMalformedEvent. A line over 1 MiB
-// is ErrLineTooLong, checked before any parsing.
+// {ACTIVE, DONE}, a "status" outside {SUCCESS, ERROR}, a duplicate object
+// key at any nesting level, and any unrecognized field anywhere in the
+// envelope are all ErrProtocolDrift. A line that is not valid JSON at
+// all is ErrMalformedEvent, checked first (via json.Valid) so a syntax
+// error is never misclassified as drift. A line over 1 MiB is
+// ErrLineTooLong, checked before any parsing.
 func DecodeEvent(line []byte) (Event, error) {
 	if len(line) > maxEventLineBytes {
 		return Event{}, fmt.Errorf("%w: got %d bytes", ErrLineTooLong, len(line))
 	}
+	if !json.Valid(line) {
+		return Event{}, fmt.Errorf("%w: not valid json", ErrMalformedEvent)
+	}
 
 	var probe wireProbe
-	if err := strictDecode(line, &probe, false); err != nil {
-		return Event{}, fmt.Errorf("%w: %v", ErrMalformedEvent, err)
+	if err := evidence.DecodeStrictObject(line, &probe); err != nil {
+		return Event{}, &ErrProtocolDrift{Reason: err.Error()}
 	}
 
 	switch probe.Event {
@@ -268,26 +290,9 @@ func DecodeEvent(line []byte) (Event, error) {
 	}
 }
 
-// strictDecode decodes exactly one JSON value from line into into. When
-// strict is true it disallows unknown fields on the typed target;
-// either way it rejects trailing content after the single value.
-func strictDecode(line []byte, into any, strict bool) error {
-	dec := json.NewDecoder(bytes.NewReader(line))
-	if strict {
-		dec.DisallowUnknownFields()
-	}
-	if err := dec.Decode(into); err != nil {
-		return err
-	}
-	if dec.More() {
-		return fmt.Errorf("trailing content after json value")
-	}
-	return nil
-}
-
 func decodeInitEvent(line []byte) (Event, error) {
 	var env wireInitEnvelope
-	if err := strictDecode(line, &env, true); err != nil {
+	if err := evidence.DecodeStrictObject(line, &env); err != nil {
 		return Event{}, &ErrProtocolDrift{Event: "init", Reason: err.Error()}
 	}
 	if env.Init == nil {
@@ -316,7 +321,7 @@ func validStepType(t string) bool {
 
 func decodeStepEvent(line []byte) (Event, error) {
 	var env wireStepEnvelope
-	if err := strictDecode(line, &env, true); err != nil {
+	if err := evidence.DecodeStrictObject(line, &env); err != nil {
 		return Event{}, &ErrProtocolDrift{Event: "step_update", Reason: err.Error()}
 	}
 	if env.StepUpdate == nil {
@@ -352,7 +357,7 @@ func decodeStepEvent(line []byte) (Event, error) {
 
 func decodeResultEvent(line []byte) (Event, error) {
 	var env wireResultEnvelope
-	if err := strictDecode(line, &env, true); err != nil {
+	if err := evidence.DecodeStrictObject(line, &env); err != nil {
 		return Event{}, &ErrProtocolDrift{Event: "result", Reason: err.Error()}
 	}
 	if env.Result == nil {
@@ -518,6 +523,9 @@ func ReadEvents(r io.Reader, sink func(Event) error, stderrTail *boundedBuffer) 
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		if errors.Is(err, bufio.ErrTooLong) {
+			return withStderrTail(fmt.Errorf("%w: scanner token exceeded buffer", ErrLineTooLong), stderrTail)
+		}
 		return withStderrTail(fmt.Errorf("read agy stream: %w", err), stderrTail)
 	}
 	return nil

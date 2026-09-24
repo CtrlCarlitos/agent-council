@@ -11,9 +11,11 @@ package agy
 // since NewSealedImage is Linux-only).
 //
 // It reads .agy-fixture-scenario.jsonl from its cwd, logs argv to
-// .agy-fixture-args (fields joined by U+001F) and the single stdin line
-// it reads to .agy-fixture-input, and replays the scripted behavior
-// described by the directives below (AC-010 research doc
+// .agy-fixture-args (fields joined by U+001F), and — since the real agy
+// process-per-turn protocol sends exactly one stdin line per invocation —
+// reads and logs exactly that one stdin line to .agy-fixture-input before
+// validating it and replaying the scripted behavior described by the
+// directives below (AC-010 research doc
 // docs/superpowers/evidence/ac010-agy-installed-interface-research.md
 // §7.1-§7.5). This file is built with //go:build unix, exactly like
 // codex/codexfake_test.go, because the generated fixture program relies
@@ -34,13 +36,18 @@ package agy
 //   - `plugin list` prints the plugin_list_drift directive's raw text, or
 //     else the canonical committed plugins JSON verbatim
 //     (docs/superpowers/evidence/ac010-agy-plugins-1.2.9.json).
-//   - the one stdin line is validated exactly like 1.2.9: a decode
-//     failure is a stderr error and exit 1; a missing "event" field is
-//     the exact stderr error text; an "event" other than "user" is the
-//     exact "ignoring unsupported..." warning (exit 0, no result); a
-//     missing "message" field (or empty content) yields a terminal
-//     ERROR result with the exact error text and exit 1—rejected
-//     input still yields a result, never a silent no-op.
+//   - the one stdin line is validated exactly like 1.2.9 (research §3
+//     line 213, §7.1 lines 337-344, evidence verbatim): a decode failure
+//     is a stderr error and exit 1; a missing "event" field is the exact
+//     stderr error text `error: stream input message is missing the
+//     "event" field` (no "user" qualifier), exit 1; an "event" other than
+//     "user" is the exact "ignoring unsupported..." warning (exit 0, no
+//     result); for "event":"user", a missing "message" field, or a
+//     message.content that is not a non-empty JSON string (numeric,
+//     empty string, array, object, null), yields a terminal ERROR result
+//     with error text `stream input "user" message is missing the
+//     "message" field` and exit 1 — rejected input still yields a
+//     result, never a silent no-op.
 //
 // Scenario directives (JSONL, one key set per line):
 //   {"known_conversation": "<id>"}       a --conversation value this
@@ -158,7 +165,6 @@ type directive struct {
 	ExitWithoutResult   bool              ` + "`" + `json:"exit_without_result"` + "`" + `
 	ModelsCatalog       []string          ` + "`" + `json:"models_catalog"` + "`" + `
 	ModelsNotSignedIn   bool              ` + "`" + `json:"models_not_signed_in"` + "`" + `
-	PluginListCanonical bool              ` + "`" + `json:"plugin_list_canonical"` + "`" + `
 	PluginListDrift     string            ` + "`" + `json:"plugin_list_drift"` + "`" + `
 	Version             string            ` + "`" + `json:"version"` + "`" + `
 }
@@ -208,8 +214,10 @@ func loadScenario() *scenarioState {
 		}
 		var d directive
 		if err := json.Unmarshal([]byte(ln), &d); err != nil {
-			continue
+			fmt.Fprintf(os.Stderr, "error: fixture scenario: %v\n", err)
+			os.Exit(2)
 		}
+		recognized := true
 		switch {
 		case d.KnownConversation != "":
 			st.knownConversations[d.KnownConversation] = true
@@ -241,6 +249,12 @@ func loadScenario() *scenarioState {
 			st.pluginListDrift = d.PluginListDrift
 		case d.Version != "":
 			st.version = d.Version
+		default:
+			recognized = false
+		}
+		if !recognized {
+			fmt.Fprintf(os.Stderr, "error: fixture scenario: no recognized directive key in line %q\n", ln)
+			os.Exit(2)
 		}
 	}
 	return st
@@ -336,7 +350,7 @@ func handlePluginList(st *scenarioState) {
 	fmt.Println(canonicalPluginList)
 }
 
-func runStreamJSON(args []string, st *scenarioState) {
+func runStreamJSON(args []string, st *scenarioState, sigCh chan os.Signal) {
 	model := argValue(args, "--model")
 	conversationArg, hasConversationArg := findConversationArg(args)
 
@@ -384,12 +398,12 @@ func runStreamJSON(args []string, st *scenarioState) {
 	}
 	eventRaw, hasEvent := rawFields["event"]
 	if !hasEvent {
-		fmt.Fprintln(os.Stderr, ` + "`" + `error: stream input "user" message is missing the "event" field` + "`" + `)
+		fmt.Fprintln(os.Stderr, ` + "`" + `error: stream input message is missing the "event" field` + "`" + `)
 		os.Exit(1)
 	}
 	var eventName string
 	if err := json.Unmarshal(eventRaw, &eventName); err != nil {
-		fmt.Fprintln(os.Stderr, ` + "`" + `error: stream input "user" message is missing the "event" field` + "`" + `)
+		fmt.Fprintln(os.Stderr, ` + "`" + `error: stream input message is missing the "event" field` + "`" + `)
 		os.Exit(1)
 	}
 	if eventName != "user" {
@@ -397,23 +411,29 @@ func runStreamJSON(args []string, st *scenarioState) {
 		return
 	}
 	messageRaw, hasMessage := rawFields["message"]
-	if !hasMessage {
-		emitResult(buildResultObj(convID, "ERROR", "", ` + "`" + `stream input "user" message is missing the "message" field` + "`" + `, 0, 0, nil, nil))
-		os.Exit(1)
-	}
 	var msg struct {
 		Content string ` + "`" + `json:"content"` + "`" + `
 	}
-	_ = json.Unmarshal(messageRaw, &msg)
-	if msg.Content == "" {
-		emitResult(buildResultObj(convID, "ERROR", "", ` + "`" + `stream input "user" message has no content` + "`" + `, 0, 0, nil, nil))
+	contentIsNonEmptyString := false
+	if hasMessage {
+		var rawMsgFields map[string]json.RawMessage
+		if err := json.Unmarshal(messageRaw, &rawMsgFields); err == nil {
+			if contentRaw, hasContent := rawMsgFields["content"]; hasContent {
+				var contentStr string
+				if err := json.Unmarshal(contentRaw, &contentStr); err == nil && contentStr != "" {
+					msg.Content = contentStr
+					contentIsNonEmptyString = true
+				}
+			}
+		}
+	}
+	if !hasMessage || !contentIsNonEmptyString {
+		emitResult(buildResultObj(convID, "ERROR", "", ` + "`" + `stream input "user" message is missing the "message" field` + "`" + `, 0, 0, nil, nil))
 		os.Exit(1)
 	}
 
 	if st.interruptOnSigint {
 		emitJSON(map[string]any{"event": "step_update", "step_update": map[string]any{"conversation_id": convID, "step_index": 0, "state": "ACTIVE", "step_type": "agent_response"}})
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT)
 		<-sigCh
 		emitResult(buildResultObj(convID, "ERROR", "", "interrupted", 0, 1, &usageDirective{}, nil))
 		os.Exit(1)
@@ -460,6 +480,12 @@ func runStreamJSON(args []string, st *scenarioState) {
 }
 
 func main() {
+	// Registered before any output (including argv/scenario logging): a
+	// SIGINT arriving the instant the driver sees the ACTIVE step_update
+	// must never race process startup.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT)
+
 	args := os.Args[1:]
 	appendLine(".agy-fixture-args", strings.Join(args, "\x1f"))
 
@@ -479,7 +505,7 @@ func main() {
 		handlePluginList(st)
 		return
 	}
-	runStreamJSON(args, st)
+	runStreamJSON(args, st, sigCh)
 }
 `
 

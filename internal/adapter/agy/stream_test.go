@@ -11,6 +11,7 @@ package agy
 // illustrative values, cited by doc line number at each test.
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -215,6 +216,9 @@ func TestDecodeEvent_DriftMatrix(t *testing.T) {
 		{"missing_init_object", `{"event":"init","conversation_id":"c1"}`},
 		{"missing_step_update_object", `{"event":"step_update"}`},
 		{"missing_result_object", `{"event":"result"}`},
+		{"duplicate_top_level_event", `{"event":"init","event":"result","conversation_id":"c1","init":{"cwd":"/tmp","tools":[],"permission_mode":"request-review"}}`},
+		{"duplicate_status_inside_result", `{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","status":"ERROR","response":"","error":"","duration_seconds":0,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0}}}`},
+		{"duplicate_key_inside_init", `{"event":"init","conversation_id":"c1","init":{"cwd":"/tmp","cwd":"/tmp2","tools":[],"permission_mode":"request-review"}}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -402,6 +406,22 @@ func TestReadEvents_LineTooLongSurfacesTypedError(t *testing.T) {
 	err := ReadEvents(strings.NewReader(huge), func(Event) error { return nil }, nil)
 	if !errors.Is(err, ErrLineTooLong) {
 		t.Fatalf("expected ErrLineTooLong, got %v", err)
+	}
+}
+
+// TestReadEvents_ScannerTooLongMapsToErrLineTooLong (Minor 2): a line
+// longer than the scanner's own token buffer (maxEventLineBytes+4096)
+// makes bufio.Scanner surface its own untyped bufio.ErrTooLong before
+// DecodeEvent ever sees the line; ReadEvents must still map that to the
+// typed ErrLineTooLong rather than leaking the untyped bufio error.
+func TestReadEvents_ScannerTooLongMapsToErrLineTooLong(t *testing.T) {
+	huge := `{"event":"init","conversation_id":"c1","init":{"cwd":"` + strings.Repeat("x", 2<<20) + `","tools":[],"permission_mode":"request-review"}}` + "\n"
+	err := ReadEvents(strings.NewReader(huge), func(Event) error { return nil }, nil)
+	if !errors.Is(err, ErrLineTooLong) {
+		t.Fatalf("expected ErrLineTooLong, got %v", err)
+	}
+	if errors.Is(err, bufio.ErrTooLong) {
+		t.Fatalf("expected the untyped bufio.ErrTooLong to be mapped, not just wrapped alongside ErrLineTooLong")
 	}
 }
 

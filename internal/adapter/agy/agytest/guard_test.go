@@ -22,6 +22,51 @@ import (
 	"testing"
 )
 
+// agyImportPath is the agy package's import path, used to resolve a
+// selector's package by import path rather than assuming the literal
+// identifier "agy" (Minor 7): an aliased import (import a "…/agy") must
+// still be recognized.
+const agyImportPath = "github.com/CtrlCarlitos/agent-council/internal/adapter/agy"
+
+// shouldSkipWalkDir reports whether a directory encountered during a
+// repo-wide AST walk must be skipped entirely (Minor 8): VCS/vendor/
+// scratch directories, and any nested checkout — a directory other than
+// the walk root that owns its own go.mod — so these guards never
+// descend into a worktree or an unrelated vendored/nested module.
+func shouldSkipWalkDir(root, path string, info os.FileInfo) bool {
+	switch info.Name() {
+	case ".git", "vendor", ".superpowers", ".worktrees", "node_modules":
+		return true
+	}
+	if path == root {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+		return true
+	}
+	return false
+}
+
+// agyImportLocalNames returns the set of local identifiers f binds to
+// the agy package's import path: the alias when one is given, otherwise
+// the conventional last path segment "agy".
+func agyImportLocalNames(f *ast.File) map[string]bool {
+	names := map[string]bool{}
+	for _, imp := range f.Imports {
+		if strings.Trim(imp.Path.Value, `"`) != agyImportPath {
+			continue
+		}
+		if imp.Name != nil {
+			if imp.Name.Name != "_" && imp.Name.Name != "." {
+				names[imp.Name.Name] = true
+			}
+			continue
+		}
+		names["agy"] = true
+	}
+	return names
+}
+
 func TestAgyTest_ImportGuard_ProductionPackagesDoNotImportAgyTest(t *testing.T) {
 	root, err := filepath.Abs(filepath.Join("..", "..", "..", ".."))
 	if err != nil {
@@ -32,8 +77,7 @@ func TestAgyTest_ImportGuard_ProductionPackagesDoNotImportAgyTest(t *testing.T) 
 			return err
 		}
 		if info.IsDir() {
-			switch info.Name() {
-			case "vendor", ".git":
+			if shouldSkipWalkDir(root, path, info) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -88,8 +132,7 @@ func TestAgyTest_ImportGuard_NoFixtureConstructorReferencesOutsideAgyPackage(t *
 			return err
 		}
 		if info.IsDir() {
-			switch info.Name() {
-			case "vendor", ".git":
+			if shouldSkipWalkDir(root, path, info) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -107,16 +150,21 @@ func TestAgyTest_ImportGuard_NoFixtureConstructorReferencesOutsideAgyPackage(t *
 		if parseErr != nil {
 			return parseErr
 		}
+		// Resolve the agy package's local identifier(s) by import PATH
+		// (Minor 7), not by assuming the literal identifier "agy": an
+		// aliased import (import a "…/adapter/agy") must still be
+		// recognized, and a same-named but unrelated package (e.g.
+		// codex's own FixtureMode) must not false-positive.
+		agyNames := agyImportLocalNames(f)
+		if len(agyNames) == 0 {
+			return nil
+		}
 		ast.Inspect(f, func(n ast.Node) bool {
 			sel, ok := n.(*ast.SelectorExpr)
 			if !ok {
 				return true
 			}
-			// Scope to the agy package's own selector: other packages
-			// (e.g. codex.FixtureMode) legitimately reuse these exact
-			// names for their own, unrelated fixture-scope markers, and
-			// must not false-positive here.
-			if identName(sel.X) != "agy" {
+			if !agyNames[identName(sel.X)] {
 				return true
 			}
 			if forbidden[sel.Sel.Name] {
