@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/workspace"
@@ -66,13 +67,26 @@ var agyForbiddenArgs = map[string]bool{
 	"mic-serve":                      true,
 }
 
-// IsAgyLaunch reports whether req is shaped like an agy stream-json
-// launch (AC-010 Global Constraints, frozen argv): the leading
-// "--print=" flag together with both "--input-format stream-json" and
-// "--output-format stream-json". This is sufficient for recognition;
-// the full exact-argv validation belongs to the agy launch source
-// (Task 5), not to this recognizer.
+// IsAgyLaunch reports whether req is shaped like an agy launch (AC-010
+// Global Constraints). Recognition succeeds when EITHER of two
+// independent signals holds, since a launch that is agy by binary
+// identity must not escape the production sealed-launch guard just
+// because its argv happens not to match the frozen stream-json shape
+// (e.g. a bare "agy install"), and conversely the frozen stream-json
+// shape is recognized regardless of argv order:
+//   - the frozen shape: the leading "--print=" flag together with both
+//     "--input-format stream-json" and "--output-format stream-json"
+//     anywhere in argv (order among the latter two is not required); or
+//   - filepath.Base(req.Command) is "agy" or "agy.exe".
+//
+// This is sufficient for recognition; the full exact-argv validation
+// belongs to the agy launch source (Task 5), not to this recognizer.
 func IsAgyLaunch(req LaunchRequest) bool {
+	base := filepath.Base(req.Command)
+	if base == "agy" || base == "agy.exe" {
+		return true
+	}
+
 	args := req.Args
 	if len(args) == 0 || args[0] != "--print=" {
 		return false
@@ -90,11 +104,23 @@ func IsAgyLaunch(req LaunchRequest) bool {
 	return hasInputStreamJSON && hasOutputStreamJSON
 }
 
-// agyForbiddenArg returns the first forbidden argv entry present, if any.
+// agyForbiddenArg returns the first forbidden argv entry present, if
+// any. A "--" flag is matched on the part before its first "=" (so
+// "--add-dir=/x", "--project=p", and
+// "--dangerously-skip-permissions=true" are refused exactly like their
+// bare forms); a bare subcommand word (e.g. "install") is matched as a
+// whole token, since "=" has no meaning there and splitting it could
+// let an unrelated argument value (e.g. a path containing "=install")
+// false-positive.
 func agyForbiddenArg(args []string) (string, bool) {
 	for _, a := range args {
 		if agyForbiddenArgs[a] {
 			return a, true
+		}
+		if strings.HasPrefix(a, "--") {
+			if flag, _, found := strings.Cut(a, "="); found && agyForbiddenArgs[flag] {
+				return a, true
+			}
 		}
 	}
 	return "", false
@@ -435,19 +461,27 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 	}
 
 	// agy-shaped launches (AC-010): forbidden argv is refused
-	// regardless of sealing, and production (no SealedImage, no
-	// explicit FixtureLaunch marker) is refused outright — an agy
-	// launch must always run the sealed, ptrace-verified binary except
-	// for the agytest fixture harness, which is the only caller
-	// authorized to set FixtureLaunch.
+	// regardless of sealing, and production (no SealedImage) is refused
+	// outright — an agy launch must always run the sealed, ptrace-
+	// verified binary except for the agytest fixture harness, which is
+	// the only caller authorized to set FixtureLaunch. On Linux,
+	// NewSealedImage is always available, so the FixtureLaunch marker
+	// NEVER relaxes the sealed-image requirement there: an agy-shaped
+	// launch without a SealedImage is refused unconditionally, marker or
+	// not (controller ruling). FixtureLaunch only matters off Linux,
+	// where NewSealedImage is unsupported and the agytest fixture
+	// harness has no other way to launch its fixture binary.
 	if IsAgyLaunch(req) {
 		if arg, found := agyForbiddenArg(req.Args); found {
 			cleanup()
 			return nil, fmt.Errorf("%w: %w: %q", ErrInvalidLaunchRequest, ErrAgyLaunchForbiddenArg, arg)
 		}
-		if req.SealedImage == nil && !req.FixtureLaunch {
-			cleanup()
-			return nil, fmt.Errorf("%w: %w", ErrInvalidLaunchRequest, ErrAgyLaunchNotSealed)
+		if req.SealedImage == nil {
+			fixtureBypassAllowed := req.FixtureLaunch && runtime.GOOS != "linux"
+			if !fixtureBypassAllowed {
+				cleanup()
+				return nil, fmt.Errorf("%w: %w", ErrInvalidLaunchRequest, ErrAgyLaunchNotSealed)
+			}
 		}
 	}
 
