@@ -89,22 +89,6 @@ func newAdapterHarnessProfile(t *testing.T, lines []string, mutate func(*storage
 		mutate(&profile)
 	}
 	cx := profile.Harnesses["codex"].Codex
-	if (len(cx.ExpectedMCPServers) > 0 || len(cx.ExpectedPluginTools) > 0) && cx.ToolInventoryPath == "" {
-		// A mutation that enables MCP servers or plugin tools needs the
-		// digest-bound native inventory capture the freeze re-hashes;
-		// the harness stages one agreeing with the frozen lists.
-		inv := NativeToolInventory{CodexCLIVersion: cx.AppServerVersion,
-			MCPServers: map[string][]string{}, PluginTools: append([]string{}, cx.ExpectedPluginTools...)}
-		for _, srv := range cx.ExpectedMCPServers {
-			inv.MCPServers[srv] = []string{}
-		}
-		for _, path := range cx.ExpectedMCPTools {
-			srv, tool, _ := strings.Cut(path, "/")
-			inv.MCPServers[srv] = append(inv.MCPServers[srv], tool)
-		}
-		profile = stageToolInventory(t, profile, evidenceRoot, inv)
-		cx = profile.Harnesses["codex"].Codex
-	}
 	cx.ExpectedCodexHome = filepath.Join(scratch, ".codex")
 	cx.Platform = storage.CodexPlatformSpec{OS: runtime.GOOS, Family: "unix"}
 	cx.SandboxPolicy.WritableRoots = []string{wsRoot}
@@ -362,28 +346,33 @@ func mcpDriftScenario(wsRoot string) []string {
 func TestCodexAdapter_MCPInventoryDriftFailsClosed(t *testing.T) {
 	cases := []struct {
 		name      string
-		mutate    func(*storage.CanonicalProfile)
-		inventory string // .codex-fixture-mcp content; empty = fixture default {"servers":[]}
+		frozen    []string // the frozen ExpectedMCPServers set; nil = affirmatively empty
+		inventory string   // .codex-fixture-mcp content; empty = fixture default {"servers":[]}
 		wantHave  string
 	}{
 		{
 			name:      "unknown server present",
-			mutate:    nil, // frozen inventory: affirmatively empty
+			frozen:    nil,
 			inventory: `[{"name":"context7"},{"name":"intruder"}]`,
 			wantHave:  "context7, intruder",
 		},
 		{
-			name: "expected server missing",
-			mutate: func(p *storage.CanonicalProfile) {
-				p.Harnesses["codex"].Codex.ExpectedMCPServers = []string{"context7"}
-			},
+			// A non-empty frozen set cannot currently be FROZEN (the
+			// inventory-evidence gate refuses it at validation), so the
+			// comparator is exercised on a test-mutated policy: it must
+			// still classify a missing expected server as drift.
+			name:      "expected server missing",
+			frozen:    []string{"context7"},
 			inventory: "",
 			wantHave:  "",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h := newAdapterHarnessProfile(t, nil, tc.mutate)
+			h := newAdapterHarness(t)
+			if tc.frozen != nil {
+				h.adapter.policy.ExpectedMCPServers = tc.frozen
+			}
 			writeScenario(t, h.scratch, mcpDriftScenario(h.wsRoot)...)
 			if tc.inventory != "" {
 				stageMCPInventory(t, h.scratch, tc.inventory)
@@ -417,9 +406,11 @@ func TestCodexAdapter_MCPInventoryDriftFailsClosed(t *testing.T) {
 // inventory exactly equal to the frozen pins lets the dispatch proceed
 // to the wire (turn/start transmitted, verified terminal).
 func TestCodexAdapter_MCPInventoryMatchProceeds(t *testing.T) {
-	h := newAdapterHarnessProfile(t, nil, func(p *storage.CanonicalProfile) {
-		p.Harnesses["codex"].Codex.ExpectedMCPServers = []string{"context7"}
-	})
+	// Test-mutated policy (see MCPInventoryDriftFailsClosed): the
+	// comparator's match case, on a frozen set production cannot
+	// currently freeze.
+	h := newAdapterHarness(t)
+	h.adapter.policy.ExpectedMCPServers = []string{"context7"}
 	writeScenario(t, h.scratch, mcpDriftScenario(h.wsRoot)...)
 	stageMCPInventory(t, h.scratch, `[{"name":"context7"}]`)
 	h.createAndPersist(t)

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -192,6 +193,22 @@ func ValidateCodexHarness(profile storage.CanonicalProfile, evidenceRoot string)
 	if err := rehashEventUniverse(evidenceRoot, c.EventUniversePath, c.EventUniverseDigest); err != nil {
 		return CodexLaunchPolicy{}, err
 	}
+	// Inventory-evidence gate (fail closed, honest gap): no evidence path
+	// exists yet that PROVES a non-empty MCP/plugin inventory equals the
+	// installed native inventory — the mcpServerStatus/list response
+	// shape is not pinned by committed schema evidence, so no
+	// deterministic parser can bind the raw response, and no native
+	// plugin/skill inventory surface is pinned at all. A committed
+	// Council-shaped capture is operator-edited JSON, not native
+	// evidence. Until a schema-pinned raw-response derivation (or an
+	// operator attestation binding the raw-response digest with a
+	// verified native plugin source) exists, a profile enabling ANY MCP
+	// server or plugin tool is not launchable. Empty inventories are
+	// unaffected: the dispatch-time server-level drift check keeps them
+	// affirmatively empty.
+	if len(c.ExpectedMCPServers) > 0 || len(c.ExpectedMCPTools) > 0 || len(c.ExpectedPluginTools) > 0 {
+		return unsupported("the profile enables MCP servers or plugin tools, but no committed evidence path proves a non-empty native tool inventory (the mcpServerStatus/list response shape and the native plugin inventory surface are not schema-pinned); production is not launchable for MCP/plugin-enabled profiles until that evidence exists — only empty inventories are eligible")
+	}
 	if err := verifyToolInventoryEvidence(evidenceRoot, c); err != nil {
 		return CodexLaunchPolicy{}, &ErrUnsupportedProfile{AlgoVersion: profile.AlgoVersion, Reason: err.Error()}
 	}
@@ -285,13 +302,18 @@ type NativeToolInventory struct {
 	PluginTools     []string            `json:"plugin_tools"`
 }
 
-// verifyToolInventoryEvidence enforces the inventory-completeness rule:
-// whenever the profile enables any MCP server or plugin tool, the
-// digest-bound native inventory capture is required, must re-hash
-// exactly, must be for the pinned app-server version, and its server
-// set, "<server>/<tool>" set, and plugin-tool set must EQUAL the frozen
+// verifyToolInventoryEvidence is the inventory-equality rule the
+// evidence path will be held to once a native-derived capture can be
+// bound (ValidateCodexHarness currently refuses every non-empty
+// inventory before reaching it — see the gate there): whenever the
+// profile enables any MCP server or plugin tool, the digest-bound
+// capture is required, must re-hash exactly, must be for the pinned
+// app-server version, must decode STRICTLY (one JSON value, no unknown
+// keys, no duplicate keys, no duplicate tools), and its server set,
+// "<server>/<tool>" set, and plugin-tool set must EQUAL the frozen
 // lists. A profile enabling nothing may omit the capture; when present
-// it is verified the same way.
+// it is verified the same way (a capture exposing servers the profile
+// hides is refused).
 func verifyToolInventoryEvidence(evidenceRoot string, c *storage.CodexHarnessSpec) error {
 	path := strings.TrimSpace(c.ToolInventoryPath)
 	digest := strings.TrimSpace(c.ToolInventoryDigest)
@@ -312,10 +334,8 @@ func verifyToolInventoryEvidence(evidenceRoot string, c *storage.CodexHarnessSpe
 	if err != nil {
 		return err
 	}
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	var inv NativeToolInventory
-	if err := dec.Decode(&inv); err != nil {
+	inv, err := decodeNativeToolInventory(raw)
+	if err != nil {
 		return fmt.Errorf("tool inventory evidence is not the Council capture shape: %w", err)
 	}
 	if strings.TrimSpace(inv.CodexCLIVersion) != strings.TrimSpace(c.AppServerVersion) {
@@ -324,16 +344,8 @@ func verifyToolInventoryEvidence(evidenceRoot string, c *storage.CodexHarnessSpe
 	servers := make([]string, 0, len(inv.MCPServers))
 	tools := make([]string, 0)
 	for server, list := range inv.MCPServers {
-		server = strings.TrimSpace(server)
-		if server == "" {
-			return errors.New("tool inventory evidence carries an empty MCP server name")
-		}
 		servers = append(servers, server)
 		for _, tool := range list {
-			tool = strings.TrimSpace(tool)
-			if tool == "" {
-				return fmt.Errorf("tool inventory evidence: server %q carries an empty tool name", server)
-			}
 			tools = append(tools, server+"/"+tool)
 		}
 	}
@@ -352,6 +364,133 @@ func verifyToolInventoryEvidence(evidenceRoot string, c *storage.CodexHarnessSpe
 		}
 	}
 	return nil
+}
+
+// decodeNativeToolInventory decodes the Council capture STRICTLY at the
+// token level, so the evidence file has exactly one canonical meaning:
+// one top-level object followed by EOF; only the three known keys, each
+// at most once and all present; server names, tool names, and plugin
+// names non-empty after trimming; no duplicate server key, no duplicate
+// tool within a server, no duplicate plugin tool. encoding/json's map
+// decoding would silently collapse duplicate keys and accept trailing
+// values, so it is not used for the shape.
+func decodeNativeToolInventory(raw []byte) (NativeToolInventory, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	expectDelim := func(want json.Delim) error {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if d, ok := tok.(json.Delim); !ok || d != want {
+			return fmt.Errorf("expected %q, got %v", want, tok)
+		}
+		return nil
+	}
+	stringToken := func(what string) (string, error) {
+		tok, err := dec.Token()
+		if err != nil {
+			return "", err
+		}
+		s, ok := tok.(string)
+		if !ok {
+			return "", fmt.Errorf("%s must be a string, got %v", what, tok)
+		}
+		if strings.TrimSpace(s) == "" {
+			return "", fmt.Errorf("%s must not be empty", what)
+		}
+		return strings.TrimSpace(s), nil
+	}
+	stringList := func(what string) ([]string, error) {
+		if err := expectDelim('['); err != nil {
+			return nil, fmt.Errorf("%s: %w", what, err)
+		}
+		seen := make(map[string]struct{})
+		var out []string
+		for dec.More() {
+			s, err := stringToken(what + " entry")
+			if err != nil {
+				return nil, err
+			}
+			if _, dup := seen[s]; dup {
+				return nil, fmt.Errorf("%s entry %q is duplicated", what, s)
+			}
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+		if err := expectDelim(']'); err != nil {
+			return nil, fmt.Errorf("%s: %w", what, err)
+		}
+		if out == nil {
+			out = []string{}
+		}
+		return out, nil
+	}
+
+	var inv NativeToolInventory
+	if err := expectDelim('{'); err != nil {
+		return inv, err
+	}
+	seenKeys := make(map[string]struct{}, 3)
+	for dec.More() {
+		key, err := stringToken("object key")
+		if err != nil {
+			return inv, err
+		}
+		if _, dup := seenKeys[key]; dup {
+			return inv, fmt.Errorf("key %q is duplicated", key)
+		}
+		seenKeys[key] = struct{}{}
+		switch key {
+		case "codex_cli_version":
+			v, err := stringToken("codex_cli_version")
+			if err != nil {
+				return inv, err
+			}
+			inv.CodexCLIVersion = v
+		case "mcp_servers":
+			if err := expectDelim('{'); err != nil {
+				return inv, fmt.Errorf("mcp_servers: %w", err)
+			}
+			inv.MCPServers = make(map[string][]string)
+			for dec.More() {
+				server, err := stringToken("mcp_servers server name")
+				if err != nil {
+					return inv, err
+				}
+				if _, dup := inv.MCPServers[server]; dup {
+					return inv, fmt.Errorf("mcp_servers server %q is duplicated", server)
+				}
+				list, err := stringList("mcp_servers." + server + " tool")
+				if err != nil {
+					return inv, err
+				}
+				inv.MCPServers[server] = list
+			}
+			if err := expectDelim('}'); err != nil {
+				return inv, fmt.Errorf("mcp_servers: %w", err)
+			}
+		case "plugin_tools":
+			list, err := stringList("plugin_tools")
+			if err != nil {
+				return inv, err
+			}
+			inv.PluginTools = list
+		default:
+			return inv, fmt.Errorf("unknown key %q", key)
+		}
+	}
+	if err := expectDelim('}'); err != nil {
+		return inv, err
+	}
+	for _, required := range []string{"codex_cli_version", "mcp_servers", "plugin_tools"} {
+		if _, ok := seenKeys[required]; !ok {
+			return inv, fmt.Errorf("missing key %q", required)
+		}
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return inv, errors.New("trailing content after the capture object")
+	}
+	return inv, nil
 }
 
 // readEvidenceFile resolves a repo-relative evidence path inside the

@@ -110,21 +110,6 @@ func codexServiceProfile(t *testing.T, scratch, evidenceRoot, wsRoot string) (st
 		t.Fatalf("write universe: %v", err)
 	}
 	digest := "sha256:" + sha256SumService(string(raw))
-	// The profile enables one MCP server: the native tool inventory that
-	// proves expected_mcp_tools complete is staged and digest-pinned.
-	invRaw, err := json.Marshal(map[string]any{
-		"codex_cli_version": "0.154.0",
-		"mcp_servers":       map[string][]string{"context7": {"resolve-library-id", "get-library-docs"}},
-		"plugin_tools":      []string{},
-	})
-	if err != nil {
-		t.Fatalf("marshal inventory: %v", err)
-	}
-	invRel := "docs/superpowers/evidence/ac009-native-tool-inventory-0.154.0.json"
-	if err := os.WriteFile(filepath.Join(evidenceRoot, filepath.FromSlash(invRel)), invRaw, 0o600); err != nil {
-		t.Fatalf("write inventory: %v", err)
-	}
-	invDigest := "sha256:" + sha256SumService(string(invRaw))
 
 	profile := storage.CanonicalProfile{
 		AlgoVersion:         "cprof-v3",
@@ -146,10 +131,12 @@ func codexServiceProfile(t *testing.T, scratch, evidenceRoot, wsRoot string) (st
 						WritableRoots: []string{wsRoot},
 						NetworkAccess: false,
 					},
-					ApprovalPolicy:             storage.CodexApprovalPolicy{Kind: "string", String: "on-request"},
-					ApprovalsReviewer:          "user",
-					ExpectedMCPServers:         []string{"context7"},
-					ExpectedMCPTools:           []string{"context7/resolve-library-id", "context7/get-library-docs"},
+					ApprovalPolicy:    storage.CodexApprovalPolicy{Kind: "string", String: "on-request"},
+					ApprovalsReviewer: "user",
+					// Affirmatively empty: non-empty inventories are not
+					// launchable until a native evidence path exists.
+					ExpectedMCPServers:         []string{},
+					ExpectedMCPTools:           []string{},
 					ExpectedPluginTools:        []string{},
 					ExpectedInstructionSources: []string{"~/.codex/AGENTS.md"},
 					RulesEvidence: storage.CodexRulesEvidenceSpec{
@@ -158,8 +145,6 @@ func codexServiceProfile(t *testing.T, scratch, evidenceRoot, wsRoot string) (st
 					},
 					EventUniversePath:   rel,
 					EventUniverseDigest: digest,
-					ToolInventoryPath:   invRel,
-					ToolInventoryDigest: invDigest,
 				},
 			},
 		},
@@ -609,7 +594,7 @@ func TestServiceAttestation_CodexOperatorAuthorityAndIdempotency(t *testing.T) {
 			Class: codex.RecordSiblingRead, ToolClass: codex.ToolMCP, ToolName: "rogue/read",
 			Operation: codex.OpRead, Denied: true, EnforcingCapability: codex.CapDenyList, DenialText: "x"})
 		r.Attestation = extra
-	})); err == nil || !strings.Contains(err.Error(), "not in the frozen MCP tool inventory") {
+	})); err == nil || !strings.Contains(err.Error(), "enables no MCP tool") {
 		t.Fatalf("unexpected coverage must be refused, got %v", err)
 	}
 	// denied=false evidence is invalid cprot-v2 and refused.
