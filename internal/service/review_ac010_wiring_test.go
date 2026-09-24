@@ -343,6 +343,48 @@ func (w *agyWireServer) creationLaunches() int {
 	return strings.Count(string(raw), "\n")
 }
 
+// openGate creates the wait_for_file gate in the child's cwd.
+func (w *agyWireServer) openGate(t *testing.T) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(w.root, "gate"), nil, 0o600); err != nil {
+		t.Fatalf("open gate: %v", err)
+	}
+}
+
+// waitCreationStarted polls the argv log until `want` creation children
+// have started.
+func (w *agyWireServer) waitCreationStarted(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for w.creationLaunches() < want {
+		if time.Now().After(deadline) {
+			t.Fatal("the creation child never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// assertOneEpisodeOpenFromOp asserts the session has exactly ONE open
+// episode in its whole history — the service's in-flight marker opened
+// by createOp.
+func (w *agyWireServer) assertOneEpisodeOpenFromOp(t *testing.T, store *storage.Store, createOp string) *storage.AgyCreationUncertaintyEpisode {
+	t.Helper()
+	eps, err := store.AgyCreationUncertaintyEpisodes(context.Background(), agyWireSession)
+	if err != nil {
+		t.Fatalf("episodes: %v", err)
+	}
+	var open []storage.AgyCreationUncertaintyEpisode
+	for _, ep := range eps {
+		if ep.Disposition == nil {
+			open = append(open, ep)
+		}
+	}
+	if len(open) != 1 || open[0].CauseOpID != createOp || open[0].RecordedBy != "agy-service" || !open[0].IsAgyCreationInFlight() {
+		t.Fatalf("exactly one open episode, the service marker of %s, got %+v", createOp, eps)
+	}
+	return &open[0]
+}
+
 // agyCoveringAttestation covers agyWireTools exactly: one sibling_read
 // for view_file (read class), the five self_mutation operations for
 // write_to_file (bash_absolute), and the single denied_actions approval.
@@ -584,9 +626,15 @@ func TestServiceAttestation_AgyAuthorityIdempotencyCoverage(t *testing.T) {
 	}
 	// The row is bound to the tuple DERIVED from the run's frozen profile.
 	manifest, _ := storage.ComputeToolkitManifestDigest(e.profile.ToolkitManifest.ToolkitManifest)
-	found, err := store.FindAgyProtectionAttestation(ctx, e.policy.CLIVersion, req.Attestation.PlatformIdentity(), manifest, e.digest)
+	frozenPlatform := e.policy.PlatformOS + "/" + e.policy.PlatformFamily
+	found, err := store.FindAgyProtectionAttestation(ctx, e.policy.CLIVersion, frozenPlatform, manifest, e.digest)
 	if err != nil || found != wantID {
 		t.Fatalf("the row must be found by the frozen tuple, got %q err=%v", found, err)
+	}
+	var rowPlatform string
+	if err := store.DB().QueryRow(`SELECT platform FROM agy_protection_attestations WHERE attestation_id = ?`, wantID).Scan(&rowPlatform); err != nil ||
+		rowPlatform != frozenPlatform {
+		t.Fatalf("the row's platform is the frozen coverage platform %q, got %q err=%v", frozenPlatform, rowPlatform, err)
 	}
 	var journalRun string
 	if err := store.DB().QueryRow(`SELECT run_id FROM journal_entries WHERE op_id = ?`, "op-agy-att").Scan(&journalRun); err != nil || journalRun != agyWireRunID {
@@ -659,6 +707,19 @@ func TestServiceAgySession_BirthDerivesModelWorkspaceAndDigest(t *testing.T) {
 	if n := w.creationLaunches(); n != 1 {
 		t.Fatalf("exactly one creation child, launches=%d", n)
 	}
+	// Fix round 1 (Important 2): the pre-launch marker was closed
+	// "bound" by the bind op in the bind's own transaction; the replay
+	// opened no new marker.
+	if open, err := store.OpenAgyCreationUncertainty(ctx, agyWireSession); err != nil || open != nil {
+		t.Fatalf("no open episode after a successful birth, got %+v err=%v", open, err)
+	}
+	eps, err := store.AgyCreationUncertaintyEpisodes(ctx, agyWireSession)
+	if err != nil || len(eps) != 1 || eps[0].Reason != storage.AgyCreationInFlightReason ||
+		eps[0].RecordedBy != "agy-service" || eps[0].CauseOpID != "op-create-agy" ||
+		eps[0].Disposition == nil || *eps[0].Disposition != storage.AgyUncertaintyBound ||
+		eps[0].ResolutionOpID == nil || *eps[0].ResolutionOpID != "op-create-agy" {
+		t.Fatalf("the history shows the one marker closed bound by the create op, got %+v err=%v", eps, err)
+	}
 }
 
 // A run frozen on a profile other than the wired one is refused at
@@ -699,7 +760,9 @@ func TestServiceAgySession_SupersededLeaseDuringCreationRecordsOrphan(t *testing
 	e.seed(t, store, e.profile)
 	w := e.fixtureServer(t, store)
 	ctx := context.Background()
-	w.stage(t, `{"conversation_id": "`+agyWireNativeID+`"}`, `{"slow_init_ms": 1500}`)
+	// Deterministic gate: the child blocks after logging argv until the
+	// test opens the gate AFTER the handoff committed.
+	w.stage(t, `{"conversation_id": "`+agyWireNativeID+`"}`, `{"wait_for_file": "gate"}`)
 
 	type outcome struct {
 		binding adapter.SessionBinding
@@ -721,6 +784,7 @@ func TestServiceAgySession_SupersededLeaseDuringCreationRecordsOrphan(t *testing
 	if err != nil {
 		t.Fatalf("handoff: %v", err)
 	}
+	w.openGate(t)
 	old := <-done
 	if old.err == nil || !errors.Is(old.err, storage.ErrLeaseSuperseded) || !strings.Contains(old.err.Error(), "persist binding") {
 		t.Fatalf("the superseded controller's bind must be refused by the in-transaction authority check, got %v", old.err)
@@ -732,8 +796,10 @@ func TestServiceAgySession_SupersededLeaseDuringCreationRecordsOrphan(t *testing
 	if err != nil || ep == nil || ep.OrphanNativeID == nil || *ep.OrphanNativeID != agyWireNativeID {
 		t.Fatalf("the created conversation must be recorded as an orphan episode, got %+v err=%v", ep, err)
 	}
+	w.assertOneEpisodeOpenFromOp(t, store, "op-create-old")
 
 	// The new controller is blocked (durably) until it resolves.
+	os.Remove(filepath.Join(w.root, "gate"))
 	w.stage(t, `{"conversation_id": "`+agyWireOtherID+`"}`)
 	_, _, err = w.srv.CreateAgySession(ctx, "op-create-new", grant.LeaseSecret, agyWireSession)
 	var unc *adapter.ErrSessionCreationUncertain
@@ -779,6 +845,7 @@ func TestServiceAgySession_UncertainCreationEpisodeAndResolution(t *testing.T) {
 	if ep.RunID != agyWireRunID || ep.CauseOpID != "op-create-unc" || ep.OrphanNativeID == nil || *ep.OrphanNativeID != "not-a-uuid" {
 		t.Fatalf("episode provenance (run, cause op, observed id) must be recorded, got %+v", ep)
 	}
+	w.assertOneEpisodeOpenFromOp(t, store, "op-create-unc")
 
 	// A restarted service (fresh adapter, no tombstone) is blocked by
 	// the durable episode before any child.
@@ -922,8 +989,8 @@ func TestServiceQueue_AgyRequiredToolsValidatedAtQueueTime(t *testing.T) {
 	}
 	code, resp := queue(agyWireSession, "t-unknown", []string{"view_file", "run_command", "bogus"})
 	if c, msg := errCode(resp); code != http.StatusBadRequest || c != "invalid_required_tools" ||
-		!strings.Contains(msg, "run_command") || !strings.Contains(msg, "bogus") || strings.Contains(msg, "view_file,") {
-		t.Fatalf("unknown names are refused 400 and listed, got %d %v", code, resp)
+		msg != `required_tools names not in the run's frozen expected_tools: "run_command", "bogus"` {
+		t.Fatalf("unknown names are refused 400 and listed exactly (quoted, in order), got %d %v", code, resp)
 	}
 	code, resp = queue(agyWireSession, "t-dup", []string{"view_file", "view_file"})
 	if c, _ := errCode(resp); code != http.StatusBadRequest || c != "invalid_required_tools" {
@@ -961,14 +1028,36 @@ func TestServiceQueue_AgyRequiredToolsValidatedAtQueueTime(t *testing.T) {
 			t.Fatalf("release %s: %v", rel.key, err)
 		}
 	}
-	tools, ok := src.RequiredToolsFor(ctx, adapter.TurnRef{SessionID: agyWireSession, TurnKey: "t-ok"})
-	if !ok || len(tools) != 2 || tools[0] != "write_to_file" || tools[1] != "view_file" {
-		t.Fatalf("the seam returns the journaled set, got %v ok=%v", tools, ok)
+	tools, ok, err := src.RequiredToolsFor(ctx, adapter.TurnRef{SessionID: agyWireSession, TurnKey: "t-ok"})
+	if err != nil || !ok || len(tools) != 2 || tools[0] != "write_to_file" || tools[1] != "view_file" {
+		t.Fatalf("the seam returns the journaled set, got %v ok=%v err=%v", tools, ok, err)
 	}
-	if tools, ok := src.RequiredToolsFor(ctx, adapter.TurnRef{SessionID: "sess-ac010-claude", TurnKey: "t-claude-plain"}); ok {
-		t.Fatalf("an absent set reports ok=false (frozen defaults), got %v", tools)
+	if tools, ok, err := src.RequiredToolsFor(ctx, adapter.TurnRef{SessionID: "sess-ac010-claude", TurnKey: "t-claude-plain"}); ok || err != nil {
+		t.Fatalf("an intent with an empty set reports ok=false, nil (frozen defaults), got %v ok=%v err=%v", tools, ok, err)
 	}
-	if _, ok := src.RequiredToolsFor(ctx, adapter.TurnRef{SessionID: agyWireSession, TurnKey: "t-never"}); ok {
-		t.Fatal("no dispatch intent reports ok=false")
+	// Fix round 1 (Important 3): a missing intent and a storage read
+	// failure are errors, never the defaults.
+	if _, ok, err := src.RequiredToolsFor(ctx, adapter.TurnRef{SessionID: agyWireSession, TurnKey: "t-never"}); err == nil || ok ||
+		!strings.Contains(err.Error(), "no durable dispatch intent") {
+		t.Fatalf("no dispatch intent is an error, got ok=%v err=%v", ok, err)
+	}
+	broken, err := storage.Open(storage.StoreOptions{StateDir: filepath.Join(t.TempDir(), "broken")})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	_ = broken.Close()
+	if _, ok, err := (&agyRequiredToolsSource{store: broken}).RequiredToolsFor(ctx, adapter.TurnRef{SessionID: agyWireSession, TurnKey: "t-ok"}); err == nil || ok {
+		t.Fatalf("a storage read error is an error, got ok=%v err=%v", ok, err)
+	}
+
+	// Minor: a session that vanished between the path check and the
+	// validation maps to the queue path's 404, not a 500.
+	verr := srv.validateQueuedRequiredTools(ctx, "sess-absent", []string{"view_file"})
+	if status, code := queuedRequiredToolsErrorStatus(verr); !errors.Is(verr, storage.ErrSessionNotFound) ||
+		status != http.StatusNotFound || code != "session_not_found" {
+		t.Fatalf("a missing session maps to 404 session_not_found, got %d %s (%v)", status, code, verr)
+	}
+	if status, code := queuedRequiredToolsErrorStatus(errors.New("disk I/O error")); status != http.StatusInternalServerError || code != "storage_error" {
+		t.Fatalf("other failures stay 500 storage_error, got %d %s", status, code)
 	}
 }

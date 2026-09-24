@@ -734,12 +734,8 @@ func (s *Server) handleQueuePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.validateQueuedRequiredTools(r.Context(), sessionID, req.RequiredTools); err != nil {
-		var invalid *invalidRequiredToolsError
-		if errors.As(err, &invalid) {
-			writeError(w, http.StatusBadRequest, "invalid_required_tools", err.Error(), req.OpID)
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), req.OpID)
+		status, code := queuedRequiredToolsErrorStatus(err)
+		writeError(w, status, code, err.Error(), req.OpID)
 		return
 	}
 
@@ -772,6 +768,24 @@ func (s *Server) handleQueuePrompt(w http.ResponseWriter, r *http.Request) {
 		OpID:       req.OpID,
 		Receipt:    receipt,
 	})
+}
+
+// queuedRequiredToolsErrorStatus maps a validateQueuedRequiredTools
+// failure to its HTTP status: a caller error is 400
+// invalid_required_tools; a session (or its run) that vanished between
+// the path check and the validation is the same 404 session_not_found
+// the queue path returns for an unknown session; anything else is a
+// storage error.
+func queuedRequiredToolsErrorStatus(err error) (int, string) {
+	var invalid *invalidRequiredToolsError
+	switch {
+	case errors.As(err, &invalid):
+		return http.StatusBadRequest, "invalid_required_tools"
+	case errors.Is(err, storage.ErrSessionNotFound), errors.Is(err, storage.ErrRunSessionMismatch), errors.Is(err, storage.ErrRunNotFound):
+		return http.StatusNotFound, "session_not_found"
+	default:
+		return http.StatusInternalServerError, "storage_error"
+	}
 }
 
 // invalidRequiredToolsError is a queue-time required_tools refusal (a

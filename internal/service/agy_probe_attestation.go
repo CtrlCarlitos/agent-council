@@ -14,12 +14,11 @@ package service
 //   - CreateAgySession: the production birth path (§3.3): model and
 //     workspace DERIVED (frozen profile; the AC-005 allocation root —
 //     Agy has no sandbox writable roots), authority pre-flighted and
-//     re-validated inside BindAgySession's transaction. An uncertain
-//     creation opens a durable episode (the adapter only tombstones in
-//     memory); a binding refused after the native conversation was
-//     created (e.g. the lease was superseded in flight) records that
-//     conversation as the orphan of an episode, so no future birth can
-//     silently create a second one.
+//     re-validated inside the bind's transaction. A durable pre-launch
+//     creation marker is opened before the child and closed "bound" in
+//     the bind's own transaction; any other outcome (uncertain, drift,
+//     refused bind, crash) leaves it open with the observed/orphan id,
+//     so no future birth can silently create a second conversation.
 //   - ResolveAgySessionCreationUncertainty: controller-authorized
 //     resolution of ONE exact open episode, journaled; only then is the
 //     adapter's in-process tombstone cleared.
@@ -147,7 +146,7 @@ func (s *Server) RecordAgyProbeAttestation(ctx context.Context, req AgyProbeAtte
 		AttestationID:  digest,
 		RunID:          req.RunID,
 		AgyVersion:     frozen.policy.CLIVersion,
-		Platform:       req.Attestation.PlatformIdentity(),
+		Platform:       cov.PlatformOS + "/" + cov.PlatformFamily,
 		ManifestDigest: frozen.manifestDigest,
 		ProfileDigest:  frozen.profileDigest,
 		ProbeResults:   string(records),
@@ -207,17 +206,34 @@ const agyCreationRecorder = "agy-service"
 // frozen profile (which must be the profile this service's agy adapter
 // froze to), the workspace root is the AC-005 allocation for (run,
 // session), and the persisted binding carries the run's re-derived
-// profile digest. Controller authority is pre-flighted, the durable
-// creation-uncertainty block is checked before any child, the wired
-// adapter creates the native conversation provider-free, and the
-// binding is persisted by BindAgySession (authority re-validated inside
-// its transaction, journaled, receipt-replayed).
+// profile digest. Controller authority is pre-flighted and re-validated
+// inside the bind's transaction.
 //
-// Unlike the codex path, a binding refused AFTER the native conversation
-// was created is recorded as the orphan of a durable uncertainty
-// episode: an agy conversation is a file the adapter cannot re-offer
-// across processes, so the current controller must dispose of it
-// explicitly before a fresh one is created.
+// Durable transitions (§3.11), in order:
+//
+//  1. BEFORE the creation child starts, a pre-launch creation marker is
+//     opened (storage.BeginAgyCreationInFlight: an open episode with
+//     reason creation_in_flight, cause = this op). It blocks every other
+//     birth exactly like any open uncertainty episode, so a crash at any
+//     point from here to step 3 leaves a durable block, never a silent
+//     second conversation.
+//  2. The adapter creates the native conversation, admitting only this
+//     marker (agy.WithCreationEpisode). An uncertain or drifted creation
+//     annotates the marker with the observed/orphan id and leaves it
+//     open; a creation the adapter rejected before any child existed
+//     closes it not_created.
+//  3. BindAgySessionClosingEpisode binds and closes the marker "bound"
+//     in ONE transaction. A refused bind records the created
+//     conversation as the marker's orphan; the marker stays open until a
+//     controller resolves it.
+//
+// Once the native conversation may exist (step 2 onward) every durable
+// write runs under context.WithoutCancel: a client disconnect is not a
+// cancellation, and the record of what was created must land.
+//
+// A replay of an op whose binding exists opens no marker: the adapter
+// returns the stored binding without a child and the bind replays its
+// receipt.
 func (s *Server) CreateAgySession(ctx context.Context, opID, controllerLease, sessionID string) (adapter.SessionBinding, storage.OperationReceipt, error) {
 	if strings.TrimSpace(opID) == "" || strings.TrimSpace(controllerLease) == "" || strings.TrimSpace(sessionID) == "" {
 		return adapter.SessionBinding{}, storage.OperationReceipt{}, errors.New(
@@ -245,7 +261,7 @@ func (s *Server) CreateAgySession(ctx context.Context, opID, controllerLease, se
 	}
 	runID := meta.RunID
 	// Pre-flight authority: the cheap early refusal before any child;
-	// BindAgySession re-validates inside its transaction.
+	// the bind re-validates inside its transaction.
 	if err := s.store.CheckControllerAuthority(ctx, runID, controllerLease); err != nil {
 		return adapter.SessionBinding{}, storage.OperationReceipt{}, fmt.Errorf("controller authority: %w", err)
 	}
@@ -264,23 +280,10 @@ func (s *Server) CreateAgySession(ctx context.Context, opID, controllerLease, se
 			runID, frozen.profileDigest, wired)
 	}
 
-	// Durable block: an OPEN episode survives restarts; no child starts.
-	if open, err := s.store.OpenAgyCreationUncertainty(ctx, sessionID); err != nil {
-		return adapter.SessionBinding{}, storage.OperationReceipt{}, fmt.Errorf("creation-uncertainty lookup: %w", err)
-	} else if open != nil {
-		return adapter.SessionBinding{}, storage.OperationReceipt{}, &adapter.ErrSessionCreationUncertain{
-			SessionID:   adapter.SessionID(sessionID),
-			Contributor: council.Agy,
-			Err: fmt.Errorf("a durable creation uncertainty is recorded for this session (episode %d); automatic recreation is blocked until it is explicitly resolved",
-				open.Episode),
-		}
-	}
-
 	workspaceRoot, err := s.agySessionWorkspace(runID, sessionID, frozen.rec)
 	if err != nil {
 		return adapter.SessionBinding{}, storage.OperationReceipt{}, err
 	}
-
 	req := adapter.CreateSessionRequest{
 		SessionID:   adapter.SessionID(sessionID),
 		Contributor: council.Agy,
@@ -289,61 +292,144 @@ func (s *Server) CreateAgySession(ctx context.Context, opID, controllerLease, se
 			Model:         frozen.policy.Model,
 		},
 	}
-	binding, err := s.adapter.CreateSession(ctx, req)
+	bindingRecord := func(nativeID string) storage.AgySessionBinding {
+		return storage.AgySessionBinding{
+			SessionID:     sessionID,
+			NativeID:      nativeID,
+			Model:         frozen.policy.Model,
+			Workspace:     workspaceRoot,
+			ProfileDigest: frozen.profileDigest,
+			CreatedAt:     time.Now().UTC(),
+		}
+	}
+
+	// Replay: a bound session opens no marker and starts no child — the
+	// adapter returns the stored binding (config compared) and the bind
+	// replays the committed receipt for this op (any other op is refused
+	// "already bound").
+	if existing, err := s.store.GetAgySessionBinding(ctx, sessionID); err != nil {
+		return adapter.SessionBinding{}, storage.OperationReceipt{}, fmt.Errorf("binding lookup: %w", err)
+	} else if existing != nil {
+		binding, err := s.adapter.CreateSession(ctx, req)
+		if err != nil {
+			return adapter.SessionBinding{}, storage.OperationReceipt{}, fmt.Errorf("native session creation: %w", err)
+		}
+		receipt, err := s.store.BindAgySession(ctx, opID, controllerLease, bindingRecord(binding.NativeSessionID))
+		if err != nil {
+			return adapter.SessionBinding{}, storage.OperationReceipt{}, fmt.Errorf("persist binding: %w", err)
+		}
+		return binding, receipt, nil
+	}
+
+	// Step 1: the durable pre-launch marker, atomic with the "no open
+	// episode, not bound" checks. An open episode survives restarts; no
+	// child starts.
+	s.agyBirthMu.Lock()
+	if ep, live := s.agyInFlight[sessionID]; live {
+		s.agyBirthMu.Unlock()
+		return adapter.SessionBinding{}, storage.OperationReceipt{}, fmt.Errorf(
+			"an agy creation for session %s is already in progress in this service (marker episode %d)", sessionID, ep)
+	}
+	episode, _, err := s.store.BeginAgyCreationInFlight(ctx, runID, sessionID, opID, agyCreationRecorder)
+	if err == nil {
+		if s.agyInFlight == nil {
+			s.agyInFlight = map[string]int64{}
+		}
+		s.agyInFlight[sessionID] = episode
+	}
+	s.agyBirthMu.Unlock()
 	if err != nil {
-		// The native conversation MAY exist: open the durable episode
-		// (idempotent while open; the creation-drift path already opened
-		// it with the orphan id, which this replays).
+		var open *storage.ErrAgyCreationUncertaintyOpen
+		if errors.As(err, &open) {
+			return adapter.SessionBinding{}, storage.OperationReceipt{}, &adapter.ErrSessionCreationUncertain{
+				SessionID:   adapter.SessionID(sessionID),
+				Contributor: council.Agy,
+				Err: fmt.Errorf("a durable creation uncertainty is recorded for this session (episode %d, %s); automatic recreation is blocked until it is explicitly resolved",
+					open.Episode, open.Reason),
+			}
+		}
+		return adapter.SessionBinding{}, storage.OperationReceipt{}, fmt.Errorf("open creation marker: %w", err)
+	}
+	defer func() {
+		s.agyBirthMu.Lock()
+		if s.agyInFlight[sessionID] == episode {
+			delete(s.agyInFlight, sessionID)
+		}
+		s.agyBirthMu.Unlock()
+	}()
+
+	// Step 2. From here the native conversation MAY exist: durable
+	// writes no longer follow the caller's cancellation.
+	durable := context.WithoutCancel(ctx)
+	binding, err := s.adapter.CreateSession(agy.WithCreationEpisode(ctx, req.SessionID, episode), req)
+	if err != nil {
 		var unc *adapter.ErrSessionCreationUncertain
-		if errors.As(err, &unc) {
-			if _, _, jerr := s.store.RecordAgyCreationUncertain(ctx, storage.AgyCreationUncertainty{
-				RunID:          runID,
-				SessionID:      sessionID,
-				Reason:         unc.Error(),
-				RecordedBy:     agyCreationRecorder,
-				CauseOpID:      opID,
-				OrphanNativeID: unc.PartialNativeID,
-			}); jerr != nil {
+		var drift *agy.ErrCreationDrift
+		switch {
+		case errors.As(err, &drift):
+			// The adapter already annotated this marker before killing the
+			// child; restating the orphan is idempotent.
+			if jerr := s.store.SetAgyCreationUncertaintyOrphan(durable, sessionID, episode, drift.NativeID, err.Error()); jerr != nil {
 				return adapter.SessionBinding{}, storage.OperationReceipt{}, fmt.Errorf(
-					"record durable creation uncertainty: %w (original: %w)", jerr, err)
+					"record creation drift orphan on marker episode %d: %w (original: %w)", episode, jerr, err)
+			}
+		case errors.As(err, &unc):
+			if jerr := s.store.SetAgyCreationUncertaintyOrphan(durable, sessionID, episode, unc.PartialNativeID, err.Error()); jerr != nil {
+				return adapter.SessionBinding{}, storage.OperationReceipt{}, fmt.Errorf(
+					"record durable creation uncertainty on marker episode %d: %w (original: %w)", episode, jerr, err)
+			}
+		default:
+			// Every post-start adapter outcome is uncertain or drift
+			// (typed); any other error is a rejection before a child
+			// existed, so no native identity can exist.
+			if jerr := s.store.CloseAgyCreationInFlight(durable, sessionID, episode, storage.AgyUncertaintyNotCreated,
+				"creation rejected before any child: "+err.Error()); jerr != nil {
+				return adapter.SessionBinding{}, storage.OperationReceipt{}, fmt.Errorf(
+					"native session creation: %w; the creation marker episode %d stays open: %v", err, episode, jerr)
 			}
 		}
 		return adapter.SessionBinding{}, storage.OperationReceipt{}, fmt.Errorf("native session creation: %w", err)
 	}
+	if s.agyAfterNativeCreate != nil && s.agyAfterNativeCreate(binding.NativeSessionID) {
+		return adapter.SessionBinding{}, storage.OperationReceipt{}, errors.New("test crash seam: stopped after native creation, before the bind")
+	}
 
-	receipt, err := s.store.BindAgySession(ctx, opID, controllerLease, storage.AgySessionBinding{
-		SessionID:     sessionID,
-		NativeID:      binding.NativeSessionID,
-		Model:         frozen.policy.Model,
-		Workspace:     workspaceRoot,
-		ProfileDigest: frozen.profileDigest,
-		CreatedAt:     time.Now().UTC(),
-	})
+	// Step 3: bind + close the marker in one transaction.
+	receipt, err := s.store.BindAgySessionClosingEpisode(durable, opID, controllerLease, bindingRecord(binding.NativeSessionID), episode)
 	if err != nil {
-		return adapter.SessionBinding{}, storage.OperationReceipt{}, s.recordAgyBindingOrphan(ctx, runID, sessionID, opID, binding.NativeSessionID, err)
+		return adapter.SessionBinding{}, storage.OperationReceipt{}, s.recordAgyBindingOrphan(durable, sessionID, episode, binding.NativeSessionID, err)
 	}
 	return binding, receipt, nil
 }
 
 // recordAgyBindingOrphan handles a refused binding after the native
-// conversation was created: unless the session is already bound to that
-// very conversation (a replay under another op id), the conversation is
-// recorded as the orphan of a durable uncertainty episode. The returned
-// error always wraps the binding refusal.
-func (s *Server) recordAgyBindingOrphan(ctx context.Context, runID, sessionID, opID, nativeID string, bindErr error) error {
-	if existing, lerr := s.store.GetAgySessionBinding(ctx, sessionID); lerr == nil && existing != nil && existing.NativeID == nativeID {
+// conversation was created (ctx is already detached from the caller):
+// unless the session is already bound to that very conversation (then
+// the marker is closed "bound"), the conversation is recorded as the
+// orphan of the open marker episode, which stays open until a controller
+// resolves it. A failing binding lookup is retried once; if it still
+// fails the orphan is recorded anyway (conservative) with the lookup
+// error in the episode's outcome. The returned error always wraps the
+// binding refusal.
+func (s *Server) recordAgyBindingOrphan(ctx context.Context, sessionID string, episode int64, nativeID string, bindErr error) error {
+	existing, lerr := s.store.GetAgySessionBinding(ctx, sessionID)
+	if lerr != nil {
+		existing, lerr = s.store.GetAgySessionBinding(ctx, sessionID)
+	}
+	if lerr == nil && existing != nil && existing.NativeID == nativeID {
+		if cerr := s.store.CloseAgyCreationInFlight(ctx, sessionID, episode, storage.AgyUncertaintyBound,
+			"the session is already bound to the created conversation "+nativeID); cerr != nil {
+			return fmt.Errorf("persist binding: %w; the creation marker episode %d stays open: %v", bindErr, episode, cerr)
+		}
 		return fmt.Errorf("persist binding: %w", bindErr)
 	}
-	episode, _, jerr := s.store.RecordAgyCreationUncertain(ctx, storage.AgyCreationUncertainty{
-		RunID:          runID,
-		SessionID:      sessionID,
-		Reason:         "native conversation created but its binding was refused: " + bindErr.Error(),
-		RecordedBy:     agyCreationRecorder,
-		CauseOpID:      opID,
-		OrphanNativeID: nativeID,
-	})
-	if jerr != nil {
-		return fmt.Errorf("persist binding: %w; the created conversation %s could not be recorded as an orphan: %v", bindErr, nativeID, jerr)
+	outcome := "native conversation created but its binding was refused: " + bindErr.Error()
+	if lerr != nil {
+		outcome += "; binding lookup failed: " + lerr.Error()
+	}
+	if jerr := s.store.SetAgyCreationUncertaintyOrphan(ctx, sessionID, episode, nativeID, outcome); jerr != nil {
+		return fmt.Errorf("persist binding: %w; the created conversation %s could not be recorded as the orphan of marker episode %d (which stays open): %v",
+			bindErr, nativeID, episode, jerr)
 	}
 	return fmt.Errorf("persist binding: %w; the created conversation %s is recorded as the orphan of creation-uncertainty episode %d",
 		bindErr, nativeID, episode)
@@ -414,7 +500,8 @@ func (s *Server) ResolveAgySessionCreationUncertainty(ctx context.Context, req A
 // agyRequiredToolsSource is the service's agy.RequiredToolsSource: the
 // required_tools set validated at queue time and copied onto the durable
 // dispatch intent at release (§3.5). An empty set reports absent, so the
-// adapter applies the frozen default_required_tools.
+// adapter applies the frozen default_required_tools; a read failure or a
+// missing intent is an error.
 type agyRequiredToolsSource struct {
 	store *storage.Store
 }

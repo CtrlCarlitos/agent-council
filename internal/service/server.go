@@ -366,8 +366,19 @@ type Server struct {
 	// creation reservation afterwards).
 	codexBirthMu sync.Mutex
 	// agyBirthMu is codexBirthMu's agy counterpart (AC-010 birth).
-	agyBirthMu  sync.Mutex
-	teardownErr error
+	agyBirthMu sync.Mutex
+	// agyInFlight maps a session to the in-flight creation marker episode
+	// a live CreateAgySession of THIS process owns (guarded by
+	// agyBirthMu): a concurrent birth is refused as "in progress" rather
+	// than as an uncertainty, which is what the same durable marker means
+	// after a crash.
+	agyInFlight map[string]int64
+	// agyAfterNativeCreate is a TEST-ONLY crash seam: when set and it
+	// returns true after the native conversation was created, the birth
+	// stops before ANY further durable write, exactly as a process death
+	// between the creation child and the binding commit would.
+	agyAfterNativeCreate func(nativeID string) bool
+	teardownErr          error
 }
 
 func NewServer(store *storage.Store, lock *ServiceLock, cfg ServerConfig) (*Server, error) {
