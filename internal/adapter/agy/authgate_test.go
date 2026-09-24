@@ -46,6 +46,10 @@ func TestClassifyModelsOutput(t *testing.T) {
 		"catalog_nonzero_exit":  {"gpt-oss-120b-medium\n", "", 1, inconclusive},
 		"garbage_line":          {"gpt-oss-120b-medium\nError: partial catalog\n", "", 0, inconclusive},
 		"prefix_not_id":         {"gpt-oss-120b-medium-preview\n", "", 0, profileDrift},
+		"one_word_header":       {"Models:\n", "", 0, inconclusive},
+		"one_word_error":        {"Error\n", "", 0, inconclusive},
+		"one_word_status_tab":   {"Loading\tplease wait\n", "", 0, inconclusive},
+		"one_other_model":       {"claude-sonnet-4-6\n", "", 0, profileDrift},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

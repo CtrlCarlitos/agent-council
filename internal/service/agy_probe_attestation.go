@@ -202,6 +202,21 @@ func (s *Server) agyFrozenRun(ctx context.Context, runID string) (agyFrozenRunRe
 	return agyFrozenRunRecord{rec: rec, policy: policy, profileDigest: digest, manifestDigest: manifest}, nil
 }
 
+// ErrCreationInProgress refuses a concurrent agy session birth while a
+// live CreateAgySession of THIS process owns the session's in-flight
+// creation marker (Episode). It is distinct from a durable creation
+// uncertainty (adapter.ErrSessionCreationUncertain), which is what the
+// same open marker means after a crash: retrying after the live birth
+// finishes is safe; no child was started for the refused call.
+type ErrCreationInProgress struct {
+	SessionID string
+	Episode   int64
+}
+
+func (e *ErrCreationInProgress) Error() string {
+	return fmt.Sprintf("an agy creation for session %s is already in progress in this service (marker episode %d)", e.SessionID, e.Episode)
+}
+
 // agyCreationRecorder is the identity attributed on the durable
 // creation-uncertainty episodes the service opens.
 const agyCreationRecorder = "agy-service"
@@ -336,8 +351,7 @@ func (s *Server) CreateAgySession(ctx context.Context, opID, controllerLease, se
 	s.agyBirthMu.Lock()
 	if ep, live := s.agyInFlight[sessionID]; live {
 		s.agyBirthMu.Unlock()
-		return adapter.SessionBinding{}, storage.OperationReceipt{}, fmt.Errorf(
-			"an agy creation for session %s is already in progress in this service (marker episode %d)", sessionID, ep)
+		return adapter.SessionBinding{}, storage.OperationReceipt{}, &ErrCreationInProgress{SessionID: sessionID, Episode: ep}
 	}
 	episode, _, err := s.store.BeginAgyCreationInFlight(ctx, runID, sessionID, opID, agyCreationRecorder)
 	if err == nil {
@@ -428,9 +442,11 @@ func (s *Server) recordAgyBindingOrphan(ctx context.Context, sessionID string, e
 	if lerr == nil && existing != nil && existing.NativeID == nativeID {
 		if cerr := s.store.CloseAgyCreationInFlight(ctx, sessionID, episode, storage.AgyUncertaintyBound,
 			"the session is already bound to the created conversation "+nativeID); cerr != nil {
-			return fmt.Errorf("persist binding: %w; the creation marker episode %d stays open: %v", bindErr, episode, cerr)
+			return fmt.Errorf("persist binding: %w; the session is already bound to the created conversation %s, but the creation marker episode %d stays open: %v",
+				bindErr, nativeID, episode, cerr)
 		}
-		return fmt.Errorf("persist binding: %w", bindErr)
+		return fmt.Errorf("persist binding: %w; the session is already bound to the created conversation %s (no orphan; creation marker episode %d closed bound)",
+			bindErr, nativeID, episode)
 	}
 	outcome := "native conversation created but its binding was refused: " + bindErr.Error()
 	if lerr != nil {

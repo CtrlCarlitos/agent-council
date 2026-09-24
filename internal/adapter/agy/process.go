@@ -241,9 +241,13 @@ func runCapture(executor execpolicy.PolicyExecutor, req execpolicy.LaunchRequest
 
 	timer := time.NewTimer(bound)
 	defer timer.Stop()
+	// A gate child past its bound has no work worth a graceful exit:
+	// Terminate with an already-expired context goes straight to the
+	// forced kill, which SIGKILLs the whole process group of a sealed
+	// launch (no descendant outlives the capture).
 	terminate := func() (captureResult, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), terminateTimeout)
-		defer cancel()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
 		_ = proc.Terminate(ctx)
 		return captureResult{}, errCaptureTimeout
 	}
@@ -255,11 +259,20 @@ func runCapture(executor execpolicy.PolicyExecutor, req execpolicy.LaunchRequest
 			return terminate()
 		}
 	}
-	exited := make(chan int, 1)
-	go func() { code, _ := proc.Wait(); exited <- code }()
+	type waited struct {
+		code int
+		err  error
+	}
+	exited := make(chan waited, 1)
+	go func() { code, err := proc.Wait(); exited <- waited{code, err} }()
 	select {
-	case code := <-exited:
-		return captureResult{stdout: out.buf, stderr: errOut.buf, overflow: out.overflow || errOut.overflow, exitCode: code}, nil
+	case w := <-exited:
+		if w.err != nil {
+			// The exit status is unknown: never classified as a result
+			// (callers report it inconclusive / drift, fail closed).
+			return captureResult{}, fmt.Errorf("gate launch wait: %w", w.err)
+		}
+		return captureResult{stdout: out.buf, stderr: errOut.buf, overflow: out.overflow || errOut.overflow, exitCode: w.code}, nil
 	case <-timer.C:
 		return terminate()
 	}

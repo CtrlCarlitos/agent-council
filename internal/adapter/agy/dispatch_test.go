@@ -590,3 +590,147 @@ func TestLaunchArgv_ExactGrammar(t *testing.T) {
 		t.Fatalf("create argv carries no --conversation, default mode omits --mode, sandbox=false omits --sandbox: %v", create)
 	}
 }
+
+// A drifted dispatch whose orphan id cannot be recorded durably surfaces
+// the id TYPED in the returned error (not only in the reason text).
+func TestAgyDispatch_OrphanRecordFailureSurfacesTyped(t *testing.T) {
+	h := newAgyHarness(t)
+	h.persist(testNativeID)
+	disk := errors.New("disk full")
+	h.adapter.fault = func(op string) error {
+		if op == opOrphan {
+			return disk
+		}
+		return nil
+	}
+	h.scenario(`{"conversation_id": "`+otherNativeID+`"}`, userInputDone, successResult("x"))
+	_, err := h.dispatch("t1", "p")
+	var notRecorded *ErrOrphanNotRecorded
+	if !errors.As(err, &notRecorded) || notRecorded.OrphanID != otherNativeID || notRecorded.AttemptID != "att-t1" || !errors.Is(err, disk) {
+		t.Fatalf("the unrecorded orphan id must be typed in the returned error, got %v", err)
+	}
+	var drift *ErrConversationDrift
+	if !errors.As(err, &drift) {
+		t.Fatalf("the drift cause is preserved, got %v", err)
+	}
+}
+
+// The last-resort clamp keeps the verification record (truncated lists,
+// the incomplete flag as recorded, the full record's size and digest).
+func TestClampRawEvidence_LastResortKeepsVerification(t *testing.T) {
+	huge := make([]string, 0, 200000)
+	for i := 0; len(huge) < cap(huge); i++ {
+		huge = append(huge, "tool_name_with_some_length")
+	}
+	raw, err := clampRawEvidence(rawEvidenceRecord{
+		Result:       json.RawMessage(`{"event":"result","result":{"response":"` + strings.Repeat("r", 4096) + `"}}`),
+		Verification: verificationRecord{RequiredTools: []string{"view_file"}, ExecutedTools: huge, Incomplete: true},
+	})
+	if err != nil {
+		t.Fatalf("clamp: %v", err)
+	}
+	if len(raw) > adapter.MaxRawEvidenceBytes {
+		t.Fatalf("clamped evidence is %d bytes, bound %d", len(raw), adapter.MaxRawEvidenceBytes)
+	}
+	var got rawEvidenceRecord
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("clamped evidence stays valid JSON: %v", err)
+	}
+	if got.Result != nil || got.ResultOmitted == nil {
+		t.Fatalf("the result line is dropped first: %+v", got.ResultOmitted)
+	}
+	if !got.Verification.Incomplete || got.VerificationTruncated == nil || got.VerificationTruncated.Bytes <= adapter.MaxRawEvidenceBytes ||
+		len(got.Verification.ExecutedTools) == 0 || len(got.Verification.ExecutedTools) >= len(huge) {
+		t.Fatalf("the verification record is kept (truncated, flag preserved, full size named), got incomplete=%v truncated=%+v executed=%d",
+			got.Verification.Incomplete, got.VerificationTruncated, len(got.Verification.ExecutedTools))
+	}
+}
+
+// waitErrProcess is a ManagedProcess whose Wait fails (exit status
+// unknown) after empty output.
+type waitErrProcess struct{ terminated chan struct{} }
+
+func (p *waitErrProcess) Stdin() io.WriteCloser { return nopWriteCloser{} }
+func (p *waitErrProcess) Stdout() io.Reader     { return strings.NewReader("gpt-oss-120b-medium\n") }
+func (p *waitErrProcess) Stderr() io.Reader     { return strings.NewReader("") }
+func (p *waitErrProcess) Wait() (int, error)    { return -1, errors.New("wait: no child processes") }
+func (p *waitErrProcess) Terminate(context.Context) error {
+	close(p.terminated)
+	return nil
+}
+func (p *waitErrProcess) ExecutableIdentity() execpolicy.ExeIdentity { return execpolicy.ExeIdentity{} }
+func (p *waitErrProcess) Interrupt() error                           { return nil }
+
+type nopWriteCloser struct{}
+
+func (nopWriteCloser) Write(b []byte) (int, error) { return len(b), nil }
+func (nopWriteCloser) Close() error                { return nil }
+
+type fixedProcExecutor struct{ proc execpolicy.ManagedProcess }
+
+func (e fixedProcExecutor) Start(context.Context, execpolicy.LaunchRequest) (execpolicy.ManagedProcess, error) {
+	return e.proc, nil
+}
+
+// A gate child whose Wait fails is never classified from its output:
+// runCapture errors, and the models gate reports it inconclusive.
+func TestRunCapture_WaitErrorIsInconclusive(t *testing.T) {
+	proc := &waitErrProcess{terminated: make(chan struct{})}
+	if _, err := runCapture(fixedProcExecutor{proc: proc}, execpolicy.LaunchRequest{}, 5*time.Second); err == nil ||
+		!strings.Contains(err.Error(), "wait") {
+		t.Fatalf("a failed Wait must fail the capture, got %v", err)
+	}
+	h := newAgyHarness(t)
+	h.adapter.executor = fixedProcExecutor{proc: proc}
+	err := h.adapter.runAuthGate(context.Background(), testSessionID)
+	var inc *ErrAgyAuthInconclusive
+	if !errors.As(err, &inc) || !strings.Contains(inc.Reason, "wait") {
+		t.Fatalf("the models gate reports a failed Wait inconclusive (the catalog output is ignored), got %T: %v", err, err)
+	}
+}
+
+// hangingProcess never finishes its output until terminated; Terminate
+// records whether it was asked for an immediate forced (group) kill.
+type hangingProcess struct {
+	outR, errR *io.PipeReader
+	outW, errW *io.PipeWriter
+	ctxErr     chan error
+}
+
+func newHangingProcess() *hangingProcess {
+	p := &hangingProcess{ctxErr: make(chan error, 1)}
+	p.outR, p.outW = io.Pipe()
+	p.errR, p.errW = io.Pipe()
+	return p
+}
+
+func (p *hangingProcess) Stdin() io.WriteCloser { return nopWriteCloser{} }
+func (p *hangingProcess) Stdout() io.Reader     { return p.outR }
+func (p *hangingProcess) Stderr() io.Reader     { return p.errR }
+func (p *hangingProcess) Wait() (int, error)    { return -1, nil }
+func (p *hangingProcess) Terminate(ctx context.Context) error {
+	p.ctxErr <- ctx.Err()
+	_ = p.outW.Close()
+	_ = p.errW.Close()
+	return nil
+}
+func (p *hangingProcess) ExecutableIdentity() execpolicy.ExeIdentity { return execpolicy.ExeIdentity{} }
+func (p *hangingProcess) Interrupt() error                           { return nil }
+
+// A capture past its bound is killed at once: Terminate receives an
+// already-expired context, which the executor turns into the forced
+// process-group kill (no SIGTERM grace period for a gate child).
+func TestRunCapture_TimeoutForcesImmediateGroupKill(t *testing.T) {
+	proc := newHangingProcess()
+	if _, err := runCapture(fixedProcExecutor{proc: proc}, execpolicy.LaunchRequest{}, 50*time.Millisecond); err != errCaptureTimeout {
+		t.Fatalf("want errCaptureTimeout, got %v", err)
+	}
+	select {
+	case err := <-proc.ctxErr:
+		if err == nil {
+			t.Fatal("the capture timeout must terminate with an already-expired context (forced group kill)")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the timed-out capture was never terminated")
+	}
+}

@@ -60,6 +60,27 @@ func TestHooksConfig_Accepts(t *testing.T) {
 	}
 }
 
+// A symlinked hooks.json is refused even when its target holds the
+// frozen bytes: the digest names the file at the path, not a link.
+func TestHooksConfig_SymlinkRefused(t *testing.T) {
+	home, digest := hooksHome(t, defaultHooksJSON)
+	target := filepath.Join(t.TempDir(), "hooks.json")
+	if err := os.WriteFile(target, []byte(defaultHooksJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, "config", "hooks.json")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	requireToolkitDrift(t, verifyHooksConfig(home, digest, []string{"/guardrail"}), "hooks")
+	if _, err := openNoFollow(path); err == nil {
+		t.Fatal("openNoFollow must refuse a symlink leaf")
+	}
+}
+
 func TestHooksConfig_CanonicalDigestPreservesNumbers(t *testing.T) {
 	a, err := CanonicalHooksConfigDigest([]byte(`{"g":{"timeout":1.50,"command":"x"}}`))
 	if err != nil {

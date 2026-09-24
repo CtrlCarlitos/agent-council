@@ -133,12 +133,14 @@ func (p *managedProcess) Terminate(ctx context.Context) error {
 	case <-p.waitDoneChan():
 		return nil
 	case <-ctx.Done():
-		_ = terminateForcefully(proc)
 		if p.killGroup {
-			// The leader is not reaped yet (or its group still has
-			// members), so its pid still names this process group.
+			// Group kill FIRST, while the leader is certainly unreaped:
+			// its pid still names this process group, so no member can
+			// outlive the leader's SIGKILL (killProcessGroup keeps the
+			// pgid <= 1 guard).
 			_ = killProcessGroup(proc.Pid)
 		}
+		_ = terminateForcefully(proc)
 		<-p.waitDoneChan()
 		return ctx.Err()
 	}

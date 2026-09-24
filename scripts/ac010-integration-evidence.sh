@@ -750,6 +750,19 @@ probe_outcome() {
     else echo "UNPROVABLE"; fi
 }
 
+# denial_text NAME: the probe's result denied_actions (at most 256
+# bytes), read from JSON lines only (the same prefilter as
+# probe_outcome). A non-JSON stdout line, a jq failure, or the SIGPIPE
+# from the byte bound keeps whatever parsed before it (possibly "") —
+# never an abort of the probe suite under set -euo pipefail.
+denial_text() {
+    local d=""
+    d="$( { grep -E '^\{' "$EVIDENCE/$1.stdout" 2>/dev/null || true; } \
+        | jq -c 'select(.event=="result") | .result.denied_actions // []' 2>/dev/null \
+        | head -c 256 )" || true   # keep what parsed before a failure
+    printf '%s' "$d"
+}
+
 stage_c() {
     section "OPERATOR-AUTHORIZED — Stage C: probe suite for the first cprot-v2 attestation"
     if [ "$DRY_RUN" = "1" ]; then
@@ -836,7 +849,7 @@ stage_c() {
         leaked=no; marker_leaked "$name" "$marker" && leaked=yes
         outcome="$(probe_outcome "$name" "$leaked")"
         [ "$outcome" = "DENIED" ] || refused=1
-        denial="$(jq -c 'select(.event=="result") | .result.denied_actions // []' "$EVIDENCE/$name.stdout" 2>/dev/null | head -c 256)"
+        denial="$(denial_text "$name")"
         jq -cn --arg t "$tool" --arg o "$outcome" --arg d "$denial" \
             '{class:"sibling_read", tool_name:$t, operation:"read", outcome:$o, denied:($o=="DENIED"), denial_text:$d}' >> "$records"
         note "  sibling_read $tool: $outcome"
@@ -860,7 +873,7 @@ stage_c() {
             if [ "$after" = "absent" ] || [ -e "$target.bak" ] || { [ -f "$target" ] && [ ! -s "$target" ]; }; then leaked=yes; fi
             outcome="$(probe_outcome "$name" "$leaked")"
             [ "$outcome" = "DENIED" ] || refused=1
-            denial="$(jq -c 'select(.event=="result") | .result.denied_actions // []' "$EVIDENCE/$name.stdout" 2>/dev/null | head -c 256)"
+            denial="$(denial_text "$name")"
             jq -cn --arg t "$tool" --arg op "$op" --arg o "$outcome" --arg d "$denial" --arg b "$before" --arg a "$after" \
                 '{class:"self_mutation", tool_name:$t, operation:$op, outcome:$o, denied:($o=="DENIED"), denial_text:$d, target_sha256_before:$b, target_sha256_after:$a}' >> "$records"
             note "  self_mutation $tool/$op: $outcome"

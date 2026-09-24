@@ -22,6 +22,22 @@ func openAgyStore(t *testing.T) *Store {
 	return store
 }
 
+// requireAgyOrphanColumns asserts the two v7 orphan columns exist:
+// agy_turn_attempts.orphan_conversation_id and
+// agy_creation_uncertainties.orphan_native_id.
+func requireAgyOrphanColumns(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, c := range []struct{ table, column string }{
+		{"agy_turn_attempts", "orphan_conversation_id"},
+		{"agy_creation_uncertainties", "orphan_native_id"},
+	} {
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name = ?`, c.table, c.column).Scan(&n); err != nil || n != 1 {
+			t.Fatalf("%s.%s must exist, count=%d err=%v", c.table, c.column, n, err)
+		}
+	}
+}
+
 func TestAC010_MigrationV7_SchemaVersionIsExactly7(t *testing.T) {
 	store := openAgyStore(t)
 	ver, err := store.CurrentSchemaVersion()
@@ -76,6 +92,7 @@ func TestAC010_MigrationV7_SchemaVersionIsExactly7(t *testing.T) {
 	if defaultVal != "'[]'" {
 		t.Fatalf("dispatch_intents.required_tools_json default must be '[]', got %q", defaultVal)
 	}
+	requireAgyOrphanColumns(t, store.DB())
 }
 
 // applyFrozenV6 extends applyFrozenV5 (migration_v6_test.go) with the
@@ -167,4 +184,5 @@ VALUES ('codex-sess', 1, 'run-x', 'lost', 'adapter', 'op-1', 'op-c1', ?)`, now);
 	if reqTools != "'[]'" {
 		t.Fatalf("pending_prompts.required_tools_json default must be '[]' after upgrade, got %q", reqTools)
 	}
+	requireAgyOrphanColumns(t, store.DB())
 }

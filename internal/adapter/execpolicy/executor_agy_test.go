@@ -372,20 +372,67 @@ func checkFixtureLaunchIdentifierMisuse(fset *token.FileSet, f *ast.File) []stri
 // composite literal of execpolicy.LaunchRequest, resolved by import
 // path: a positional literal can set the FixtureLaunch bool field
 // without ever naming the identifier, forging the marker past a guard
-// that only looks for the name "FixtureLaunch".
+// that only looks for the name "FixtureLaunch". It also covers three
+// indirect spellings: a dot import of execpolicy (flagged outright — an
+// unqualified LaunchRequest cannot be told apart reliably), a type
+// alias or defined type over LaunchRequest declared in the same file,
+// and elided-type inner literals ([]execpolicy.LaunchRequest{{…}},
+// map[K]execpolicy.LaunchRequest{k: {…}}). Known remaining blind spot:
+// an alias declared in ANOTHER file of the same package (per-file AST,
+// no type checking).
 func checkPositionalLaunchRequestLiteral(fset *token.FileSet, f *ast.File) []string {
+	var violations []string
+	for _, imp := range f.Imports {
+		if strings.Trim(imp.Path.Value, `"`) == execpolicyImportPath && imp.Name != nil && imp.Name.Name == "." {
+			violations = append(violations, fmt.Sprintf("%s: illegal dot import of execpolicy", fset.Position(imp.Pos())))
+		}
+	}
 	execpolicyNames := importLocalNames(f, execpolicyImportPath)
 	if len(execpolicyNames) == 0 {
-		return nil
+		return violations
 	}
-	var violations []string
+	local := map[string]bool{} // same-file aliases / defined types over LaunchRequest
+	ast.Inspect(f, func(n ast.Node) bool {
+		if ts, ok := n.(*ast.TypeSpec); ok && isLaunchRequestType(ts.Type, execpolicyNames) {
+			local[ts.Name.Name] = true
+		}
+		return true
+	})
+	isLR := func(t ast.Expr) bool {
+		if id, ok := t.(*ast.Ident); ok {
+			return local[id.Name]
+		}
+		return isLaunchRequestType(t, execpolicyNames)
+	}
+	flag := func(lit *ast.CompositeLit) {
+		if hasPositionalElement(lit) {
+			violations = append(violations, fmt.Sprintf("%s: illegal positional (unkeyed) execpolicy.LaunchRequest composite literal", fset.Position(lit.Pos())))
+		}
+	}
 	ast.Inspect(f, func(n ast.Node) bool {
 		lit, ok := n.(*ast.CompositeLit)
 		if !ok {
 			return true
 		}
-		if isLaunchRequestType(lit.Type, execpolicyNames) && hasPositionalElement(lit) {
-			violations = append(violations, fmt.Sprintf("%s: illegal positional (unkeyed) execpolicy.LaunchRequest composite literal", fset.Position(lit.Pos())))
+		if isLR(lit.Type) {
+			flag(lit)
+		}
+		var elem ast.Expr
+		switch ct := lit.Type.(type) {
+		case *ast.ArrayType:
+			elem = ct.Elt
+		case *ast.MapType:
+			elem = ct.Value
+		}
+		if elem != nil && isLR(elem) {
+			for _, elt := range lit.Elts {
+				if kv, ok := elt.(*ast.KeyValueExpr); ok {
+					elt = kv.Value
+				}
+				if inner, ok := elt.(*ast.CompositeLit); ok && inner.Type == nil {
+					flag(inner)
+				}
+			}
 		}
 		return true
 	})
@@ -508,6 +555,62 @@ func f() ep.LaunchRequest { return ep.LaunchRequest{"cmd", nil, true} }
 `,
 			path:       "internal/adapter/somewhere/thing.go",
 			wantCaught: true,
+		},
+		{
+			name: "dot_import",
+			src: `package p
+import . "github.com/CtrlCarlitos/agent-council/internal/adapter/execpolicy"
+func f() LaunchRequest { return LaunchRequest{"cmd", nil, true} }
+`,
+			path:       "internal/adapter/somewhere/thing.go",
+			wantCaught: true,
+		},
+		{
+			name: "positional_literal_via_type_alias",
+			src: `package p
+import "github.com/CtrlCarlitos/agent-council/internal/adapter/execpolicy"
+type lr = execpolicy.LaunchRequest
+func f() lr { return lr{"cmd", nil, true} }
+`,
+			path:       "internal/adapter/somewhere/thing.go",
+			wantCaught: true,
+		},
+		{
+			name: "positional_literal_via_defined_type",
+			src: `package p
+import "github.com/CtrlCarlitos/agent-council/internal/adapter/execpolicy"
+type lr execpolicy.LaunchRequest
+func f() execpolicy.LaunchRequest { return execpolicy.LaunchRequest(lr{"cmd", nil, true}) }
+`,
+			path:       "internal/adapter/somewhere/thing.go",
+			wantCaught: true,
+		},
+		{
+			name: "elided_type_inner_literal_slice",
+			src: `package p
+import "github.com/CtrlCarlitos/agent-council/internal/adapter/execpolicy"
+var reqs = []execpolicy.LaunchRequest{{"cmd", nil, true}}
+`,
+			path:       "internal/adapter/somewhere/thing.go",
+			wantCaught: true,
+		},
+		{
+			name: "elided_type_inner_literal_map",
+			src: `package p
+import "github.com/CtrlCarlitos/agent-council/internal/adapter/execpolicy"
+var reqs = map[string]*execpolicy.LaunchRequest{"a": {"cmd", nil, true}}
+`,
+			path:       "internal/adapter/somewhere/thing.go",
+			wantCaught: true,
+		},
+		{
+			name: "positive_keyed_elided_inner_literal",
+			src: `package p
+import "github.com/CtrlCarlitos/agent-council/internal/adapter/execpolicy"
+var reqs = []execpolicy.LaunchRequest{{RunID: "run"}}
+`,
+			path:       "internal/adapter/somewhere/thing.go",
+			wantCaught: false,
 		},
 		{
 			name: "positional_literal_inside_agytest_still_caught",

@@ -530,7 +530,8 @@ func (s *Store) SetAgyCreationUncertaintyOrphan(ctx context.Context, sessionID s
 // existed) or AgyUncertaintyBound (the session is already bound to the
 // very conversation the creation reported). Any other episode — an
 // annotated marker, an adapter/uncertain episode — is refused: those
-// need a controller resolution.
+// need a controller resolution. The marker's resolution_op_id is its own
+// cause_op_id: the creating operation is what closed it.
 func (s *Store) CloseAgyCreationInFlight(ctx context.Context, sessionID string, episode int64, disposition, reason string) error {
 	switch disposition {
 	case AgyUncertaintyNotCreated, AgyUncertaintyBound:
@@ -543,7 +544,7 @@ func (s *Store) CloseAgyCreationInFlight(ctx context.Context, sessionID string, 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	res, err := s.DB().ExecContext(ctx, `
 UPDATE agy_creation_uncertainties
-SET disposition = ?, resolution_reason = ?, resolved_at = ?
+SET disposition = ?, resolution_reason = ?, resolution_op_id = cause_op_id, resolved_at = ?
 WHERE session_id = ? AND episode = ? AND disposition IS NULL AND reason = ?`,
 		disposition, reason, now, sessionID, episode, AgyCreationInFlightReason)
 	if err != nil {

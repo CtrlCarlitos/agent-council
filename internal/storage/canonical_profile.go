@@ -768,7 +768,8 @@ func (p CanonicalProfile) validateAgyBlocks() error {
 var semverPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
 
 // isJSONPointer accepts the empty pointer (whole document) or a pointer
-// starting with "/" (RFC 6901).
+// starting with "/" (RFC 6901). Accepting "" is deliberate: RFC 6901 §5
+// defines it as the whole-document pointer.
 func isJSONPointer(s string) bool {
 	return s == "" || strings.HasPrefix(s, "/")
 }

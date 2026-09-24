@@ -1083,3 +1083,63 @@ func TestServiceQueue_AgyRequiredToolsValidatedAtQueueTime(t *testing.T) {
 		t.Fatalf("other failures stay 500 storage_error, got %d %s", status, code)
 	}
 }
+
+// A second birth while THIS process's birth owns the in-flight marker is
+// refused with the typed ErrCreationInProgress (not as a durable
+// uncertainty), and starts no child.
+func TestServiceAgySession_ConcurrentBirthRefusedTypedInProgress(t *testing.T) {
+	e := newAgyWireEnv(t, nil)
+	store := e.openStore(t)
+	e.seed(t, store, e.profile)
+	w := e.fixtureServer(t, store)
+	w.stage(t, `{"conversation_id": "`+agyWireNativeID+`"}`, `{"wait_for_file": "gate"}`)
+	ctx := context.Background()
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := w.srv.CreateAgySession(ctx, "op-create-first", agyWireLease, agyWireSession)
+		done <- err
+	}()
+	w.waitCreationStarted(t, 1)
+	_, _, err := w.srv.CreateAgySession(ctx, "op-create-second", agyWireLease, agyWireSession)
+	var inProgress *ErrCreationInProgress
+	var unc *adapter.ErrSessionCreationUncertain
+	if !errors.As(err, &inProgress) || inProgress.SessionID != agyWireSession || errors.As(err, &unc) {
+		t.Fatalf("want the typed in-progress refusal (not an uncertainty), got %T: %v", err, err)
+	}
+	if n := w.creationLaunches(); n != 1 {
+		t.Fatalf("the refused birth starts no child, launches=%d", n)
+	}
+	w.openGate(t)
+	if err := <-done; err != nil {
+		t.Fatalf("the first birth completes: %v", err)
+	}
+}
+
+// recordAgyBindingOrphan's `bound` branch: the session is already bound
+// to the very conversation the creation reported — the error says so
+// (no orphan) and the marker is closed bound.
+func TestServiceAgySession_BindingRefusedButAlreadyBoundClosesMarker(t *testing.T) {
+	e := newAgyWireEnv(t, nil)
+	store := e.openStore(t)
+	e.seed(t, store, e.profile)
+	ctx := context.Background()
+	ep, _, err := store.BeginAgyCreationInFlight(ctx, agyWireRunID, agyWireSession, "op-create-bound", agyCreationRecorder)
+	if err != nil {
+		t.Fatalf("begin marker: %v", err)
+	}
+	if err := store.InsertAgySessionBinding(ctx, storage.AgySessionBinding{
+		SessionID: agyWireSession, NativeID: agyWireNativeID, Model: agyWireModel, Workspace: "/tmp/ws", ProfileDigest: e.digest,
+	}); err != nil {
+		t.Fatalf("insert binding: %v", err)
+	}
+	srv := &Server{store: store}
+	err = srv.recordAgyBindingOrphan(ctx, agyWireSession, ep, agyWireNativeID, errors.New("session already bound"))
+	if err == nil || !strings.Contains(err.Error(), "already bound to the created conversation "+agyWireNativeID) ||
+		!strings.Contains(err.Error(), "closed bound") || strings.Contains(err.Error(), "orphan of") {
+		t.Fatalf("the bound branch must say the session is bound to the created conversation, got %v", err)
+	}
+	eps, err := store.AgyCreationUncertaintyEpisodes(ctx, agyWireSession)
+	if err != nil || len(eps) != 1 || eps[0].Disposition == nil || *eps[0].Disposition != storage.AgyUncertaintyBound || eps[0].OrphanNativeID != nil {
+		t.Fatalf("the marker is closed bound with no orphan, got %+v err=%v", eps, err)
+	}
+}

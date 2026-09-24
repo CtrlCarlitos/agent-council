@@ -158,7 +158,16 @@ func verifyHooksConfig(expectedHome, wantDigest string, required []string) error
 		return &ErrToolkitDrift{Component: "hooks", Reason: fmt.Sprintf(format, args...)}
 	}
 	path := hooksConfigPath(expectedHome)
-	f, err := os.Open(path)
+	// Never follow a symlink at the leaf: the frozen digest names the
+	// file at this path, not whatever a link points to (Lstat refusal
+	// everywhere; O_NOFOLLOW additionally closes the Lstat→open race
+	// where the platform provides it).
+	if fi, err := os.Lstat(path); err != nil {
+		return drift("read %s: %v", path, err)
+	} else if !fi.Mode().IsRegular() {
+		return drift("%s is not a regular file (mode %s); symlinks are refused", path, fi.Mode().Type())
+	}
+	f, err := openNoFollow(path)
 	if err != nil {
 		return drift("read %s: %v", path, err)
 	}

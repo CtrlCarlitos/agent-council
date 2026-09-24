@@ -102,6 +102,13 @@ func classifyModelsOutput(stdout, stderr []byte, exitCode int, model string) err
 	if len(ids) == 0 {
 		return &ErrAgyAuthInconclusive{Reason: "models printed an empty catalog"}
 	}
+	// A lone plain word (a header or an error/status word such as
+	// "Models:", "Error" or "Loading" — no digit, no '-', unlike every
+	// catalog id) proves no catalog was printed: inconclusive, never a
+	// model drift.
+	if len(ids) == 1 && ids[0] != model && !strings.ContainsAny(ids[0], "0123456789-") {
+		return &ErrAgyAuthInconclusive{Reason: fmt.Sprintf("models printed a single plain word %q, not a catalog", clampPayload(ids[0]))}
+	}
 	for _, id := range ids {
 		if id == model {
 			return nil

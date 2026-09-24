@@ -138,7 +138,8 @@ func NewProductionAgyAdapter(
 	}()
 
 	attestation := storageAttestationLookup(store, policy, manifestDigest, profileDigest)
-	if err := checkProductionEligibility(policy, image, attestation); err != nil {
+	explain := storageAttestationExplain(store, policy, manifestDigest, profileDigest)
+	if err := checkProductionEligibilityExplained(policy, image, attestation, explain); err != nil {
 		return nil, err
 	}
 
@@ -148,6 +149,9 @@ func NewProductionAgyAdapter(
 	probe, err := constructionPluginListLaunch(policy, image, cfgProfile, profileDigest, wantHome, scratchRoot)
 	if err != nil {
 		return nil, err
+	}
+	if err := validateConstructionLaunch(probe, policy, image, profileDigest, wantHome); err != nil {
+		return nil, fmt.Errorf("construction plugin-list launch: %w", err)
 	}
 	if err := capturePluginList(executor, probe, policy.PluginsEvidenceDigest); err != nil {
 		return nil, err
@@ -159,8 +163,34 @@ func NewProductionAgyAdapter(
 	if err != nil {
 		return nil, err
 	}
+	a.attestationWhy = explain
 	built = true
 	return a, nil
+}
+
+// validateConstructionLaunch applies the adapter's launch checks to the
+// construction-scoped `plugin list` launch (which runs before any
+// adapter exists): the production launch matrix, the held sealed image
+// of the pinned binary as the command, the operator HOME, the frozen
+// profile digest and model, and the exact frozen argv.
+func validateConstructionLaunch(req execpolicy.LaunchRequest, policy AgyLaunchPolicy, image *execpolicy.SealedImage,
+	profileDigest, home string) error {
+	if err := checkLaunchMatrix(req.Profile, false); err != nil {
+		return err
+	}
+	switch {
+	case image == nil || req.SealedImage != image || image.Digest != policy.BinaryDigest:
+		return errors.New("the launch does not carry the held sealed image of the pinned binary")
+	case req.Command != image.ArgV0:
+		return fmt.Errorf("launch command %q is not the pinned binary %q", req.Command, image.ArgV0)
+	case req.HomeDir != home:
+		return fmt.Errorf("launch HOME %q is not the operator home %q derived from the frozen expected_home", req.HomeDir, home)
+	case req.ProfileDigest != profileDigest:
+		return fmt.Errorf("launch profile digest %q is not the frozen %q", req.ProfileDigest, profileDigest)
+	case req.Model != policy.Model:
+		return &ErrProfileDrift{Field: "model", Want: policy.Model, Have: req.Model}
+	}
+	return validateLaunchArgv(req.Args, argvSpec{kind: LaunchPluginList, model: policy.Model, policy: policy})
 }
 
 // constructionPluginListLaunch assembles the construction-scoped `plugin

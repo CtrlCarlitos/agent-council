@@ -157,6 +157,9 @@ func TestAgyInFlight_CleanRejectionClosesUnannotatedMarker(t *testing.T) {
 	if len(eps) != 1 || eps[0].Disposition == nil || *eps[0].Disposition != AgyUncertaintyNotCreated {
 		t.Fatalf("closed not_created, got %+v", eps)
 	}
+	if eps[0].ResolutionOpID == nil || *eps[0].ResolutionOpID != "op-create-1" {
+		t.Fatalf("the not_created close names the creating op as its resolution op, got %v", eps[0].ResolutionOpID)
+	}
 	if ep2, _, err := store.BeginAgyCreationInFlight(ctx, agyUncRunID, agyUncSession, "op-create-2", "agy-service"); err != nil || ep2 != 2 {
 		t.Fatalf("the next creation opens the next episode, got %d err=%v", ep2, err)
 	}

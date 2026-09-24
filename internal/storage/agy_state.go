@@ -45,6 +45,8 @@ func marshalStrings(v []string) string {
 // unmarshalStrings is the inverse of marshalStrings: "[]", "", and
 // malformed JSON all decode to nil (never an error — these columns are
 // evidence, not caller input, so a decode failure must not break reads).
+// The silent nil is the codebase convention; a caller must never read nil
+// as proof that a set was recorded empty.
 func unmarshalStrings(raw string) []string {
 	if strings.TrimSpace(raw) == "" || raw == "[]" {
 		return nil

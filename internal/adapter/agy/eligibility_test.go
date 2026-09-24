@@ -246,3 +246,63 @@ func TestAttestationLookup_AbsentOrFailingIneligible(t *testing.T) {
 		}
 	}
 }
+
+// The specific lookup refusal is surfaced through ErrNotEligible (via
+// the explain seam); a missing row keeps the generic reason.
+func TestEligibility_SpecificIneligibilityReasonSurfaced(t *testing.T) {
+	withHostOS(t, "linux")
+	p := eligiblePolicy()
+	src := coveredSource(t, p)
+	src.rec.AgyVersion = "1.3.0"
+	lookup := storageAttestationLookup(src, p, eligManifest, eligProfile)
+	explain := storageAttestationExplain(src, p, eligManifest, eligProfile)
+	ne := requireNotEligible(t, checkProductionEligibilityExplained(p, heldImage(p), lookup, explain), "attestation")
+	var missing *ErrProductionEligibilityMissing
+	if !errors.As(ne, &missing) || !strings.Contains(missing.Reason, "agy version") || !strings.Contains(ne.Error(), "1.3.0") {
+		t.Fatalf("the stored-tuple disagreement must be named, got %v", ne)
+	}
+	absent := &fakeAttestationSource{}
+	ne = requireNotEligible(t, checkProductionEligibilityExplained(p, heldImage(p),
+		storageAttestationLookup(absent, p, eligManifest, eligProfile),
+		storageAttestationExplain(absent, p, eligManifest, eligProfile)), "attestation")
+	if !errors.As(ne, &missing) || strings.HasSuffix(missing.Reason, ": ") || !strings.HasSuffix(missing.Reason, "tuple") {
+		t.Fatalf("a missing row keeps the generic reason, got %q", missing.Reason)
+	}
+}
+
+// The construction `plugin list` launch is validated with the same
+// matrix / sealed-image / HOME / digest / model / argv rules as every
+// adapter launch.
+func TestValidateConstructionLaunch(t *testing.T) {
+	p := eligiblePolicy()
+	img := heldImage(p)
+	good := func() execpolicy.LaunchRequest {
+		return execpolicy.LaunchRequest{
+			Command: img.ArgV0, Args: []string{"plugin", "list"}, SealedImage: img, HomeDir: "/home/op",
+			ProfileDigest: eligProfile, Model: p.Model,
+			Profile: storage.CanonicalProfile{IsolationStrictness: "permissive_dev", NetworkMode: "unrestricted"},
+		}
+	}
+	if err := validateConstructionLaunch(good(), p, img, eligProfile, "/home/op"); err != nil {
+		t.Fatalf("the frozen construction launch validates: %v", err)
+	}
+	other := &execpolicy.SealedImage{ArgV0: img.ArgV0, Digest: img.Digest}
+	for name, mutate := range map[string]func(*execpolicy.LaunchRequest){
+		"matrix none":    func(r *execpolicy.LaunchRequest) { r.Profile.NetworkMode = "none" },
+		"no image":       func(r *execpolicy.LaunchRequest) { r.SealedImage = nil },
+		"other image":    func(r *execpolicy.LaunchRequest) { r.SealedImage = other },
+		"command":        func(r *execpolicy.LaunchRequest) { r.Command = "/usr/bin/agy" },
+		"home":           func(r *execpolicy.LaunchRequest) { r.HomeDir = "/tmp" },
+		"profile digest": func(r *execpolicy.LaunchRequest) { r.ProfileDigest = "cprof-v4:sha256:" + strings.Repeat("0", 64) },
+		"model":          func(r *execpolicy.LaunchRequest) { r.Model = "other-model" },
+		"argv":           func(r *execpolicy.LaunchRequest) { r.Args = []string{"plugin", "list", "--json"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := good()
+			mutate(&req)
+			if err := validateConstructionLaunch(req, p, img, eligProfile, "/home/op"); err == nil {
+				t.Fatalf("%s must be refused", name)
+			}
+		})
+	}
+}

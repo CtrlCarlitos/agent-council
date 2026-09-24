@@ -49,6 +49,16 @@ var hostOS = runtime.GOOS
 // platform → sealed image → inventories → attestation. It never
 // launches a process.
 func checkProductionEligibility(policy AgyLaunchPolicy, image *execpolicy.SealedImage, attestation AttestationLookup) error {
+	return checkProductionEligibilityExplained(policy, image, attestation, nil)
+}
+
+// checkProductionEligibilityExplained is checkProductionEligibility with
+// an optional explain seam: when the attestation lookup fails, explain
+// (storageAttestationExplain in production) names the specific reason
+// — a stored tuple disagreement, an uncovered frame, a lookup error —
+// in the ErrProductionEligibilityMissing reason. A nil explain, or an
+// explain returning nil (no row at all), keeps the generic reason.
+func checkProductionEligibilityExplained(policy AgyLaunchPolicy, image *execpolicy.SealedImage, attestation AttestationLookup, explain func() error) error {
 	if hostOS != "linux" || policy.PlatformOS != "linux" || policy.PlatformFamily != "unix" {
 		return &ErrNotEligible{Reason: fmt.Sprintf(
 			"production agy is eligible only for the linux/unix platform on a linux host (frozen platform %s/%s, host %s)",
@@ -72,9 +82,14 @@ func checkProductionEligibility(policy AgyLaunchPolicy, image *execpolicy.Sealed
 			Err: &ErrProductionEligibilityMissing{Reason: "no attestation lookup is wired"}}
 	}
 	if _, ok := attestation(); !ok {
+		reason := "no valid, covering isolation attestation for the frozen (agy version, platform, manifest, profile) tuple"
+		if explain != nil {
+			if err := explain(); err != nil {
+				reason += ": " + err.Error()
+			}
+		}
 		return &ErrNotEligible{Reason: "attestation required",
-			Err: &ErrProductionEligibilityMissing{
-				Reason: "no valid, covering isolation attestation for the frozen (agy version, platform, manifest, profile) tuple"}}
+			Err: &ErrProductionEligibilityMissing{Reason: reason}}
 	}
 	return nil
 }
@@ -152,5 +167,14 @@ func storageAttestationLookup(src attestationRecordSource, policy AgyLaunchPolic
 			return "", false
 		}
 		return id, true
+	}
+}
+
+// storageAttestationExplain is the production explain seam: the specific
+// reason the durable lookup refused (nil when no row matched at all).
+func storageAttestationExplain(src attestationRecordSource, policy AgyLaunchPolicy, manifestDigest, profileDigest string) func() error {
+	return func() error {
+		_, err := lookupCoveredAttestation(context.Background(), src, policy, manifestDigest, profileDigest)
+		return err
 	}
 }

@@ -168,6 +168,52 @@ func TestAgyAdapter_CreateSessionDurableUncertaintyBlocksAcrossRestart(t *testin
 	}
 }
 
+// Resolve-then-recreate: a durable episode blocks creation across a
+// restart; once a controller resolves THAT episode durably, the same
+// (restarted) adapter creates the session with exactly one child.
+func TestAgyAdapter_ResolveThenRecreate(t *testing.T) {
+	h := newAgyHarness(t)
+	ctx := context.Background()
+	h.scenario(`{"conversation_id": "` + testNativeID + `"}`)
+	ep, _, err := h.store.RecordAgyCreationUncertain(ctx, storage.AgyCreationUncertainty{
+		RunID: testRunID, SessionID: testSessionID, Reason: "lost init",
+		RecordedBy: "agy-adapter", CauseOpID: "op-create-crashed",
+	})
+	if err != nil {
+		t.Fatalf("record episode: %v", err)
+	}
+	h.reopen()
+	if _, err := h.adapter.CreateSession(ctx, h.createRequest()); err == nil {
+		t.Fatal("the open episode blocks creation")
+	}
+	if n := h.exec.starts.Load(); n != 0 {
+		t.Fatalf("no child while the episode is open, launches=%d", n)
+	}
+	// Clearing the in-process tombstone alone never unblocks: the
+	// durable episode is still open.
+	h.adapter.ResolveCreationUncertainty(testSessionID)
+	if _, err := h.adapter.CreateSession(ctx, h.createRequest()); err == nil || h.exec.starts.Load() != 0 {
+		t.Fatalf("an in-memory clear without the durable resolution still blocks, err=%v launches=%d", err, h.exec.starts.Load())
+	}
+	if _, err := h.store.AdoptController(ctx, "op-adopt-agy", testRunID, "agy", "controller-ref-agy", testLease, nil, testLease); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	if _, err := h.store.ResolveAgyCreationUncertainty(ctx, "op-resolve-agy", testLease, 1, string(testSessionID), ep,
+		storage.AgyUncertaintyVerifiedAbsent, "operator verified no conversation file exists"); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	// The service clears the tombstone only after the durable resolution
+	// (Server.ResolveAgySessionCreationUncertainty); mirror that order.
+	h.adapter.ResolveCreationUncertainty(testSessionID)
+	binding, err := h.adapter.CreateSession(ctx, h.createRequest())
+	if err != nil || binding.NativeSessionID != testNativeID {
+		t.Fatalf("after the durable resolution creation proceeds, got %+v err=%v", binding, err)
+	}
+	if n := h.exec.starts.Load(); n != 1 {
+		t.Fatalf("exactly one creation child after resolution, launches=%d", n)
+	}
+}
+
 func TestAgyAdapter_CreateSessionNonUUIDConversationUncertain(t *testing.T) {
 	h := newAgyHarness(t)
 	h.scenario(`{"conversation_id": "not-a-uuid"}`)

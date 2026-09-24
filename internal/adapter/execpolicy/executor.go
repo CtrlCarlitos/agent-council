@@ -173,19 +173,20 @@ type LaunchRequest struct {
 	// FixtureLaunch is the explicit, construction-time marker (AC-010,
 	// mirroring the codex/opencode fixture-scope discipline: never
 	// inferred from absent state) that authorizes an agy-shaped launch
-	// (IsAgyLaunch) to proceed WITHOUT a SealedImage. Its only reason to
-	// exist: NewSealedImage is Linux-only (ErrSealedLaunchUnsupported
-	// elsewhere), so the agytest fixture harness cannot build a sealed
-	// image off Linux and needs an explicit, auditable bypass instead of
-	// a platform-sniffed one. Only the internal/adapter/agy/agytest
-	// package may set it — production packages never do (enforced by
-	// TestFixtureLaunch_NeverSetOutsideAgytest in executor_agy_test.go,
-	// mirroring the codex/codextest import/reference guards). On Linux,
-	// agytest always builds a real SealedImage from the compiled fixture
-	// binary and sets this too, so Task 3's sealed-launch path is
-	// exercised by every fixture test there as well — this field is not
-	// a substitute for SealedImage, only the documented escape hatch
-	// where SealedImage cannot exist.
+	// (IsAgyLaunch) to proceed WITHOUT a SealedImage — OFF LINUX ONLY.
+	// Its only reason to exist: NewSealedImage is Linux-only
+	// (ErrSealedLaunchUnsupported elsewhere), so the agytest fixture
+	// harness cannot build a sealed image off Linux and needs an
+	// explicit, auditable bypass instead of a platform-sniffed one. On
+	// Linux the marker is IGNORED: an agy-shaped launch without a
+	// SealedImage is refused (ErrAgyLaunchNotSealed) marker or not, and
+	// agytest always launches through a real SealedImage there. Only the
+	// internal/adapter/agy/agytest package may set it — production
+	// packages never do (enforced by
+	// TestFixtureLaunch_NeverForgedOutsideExecpolicyAndAgytest in
+	// executor_agy_test.go, mirroring the codex/codextest import/reference
+	// guards). It is not a substitute for SealedImage, only the
+	// documented escape hatch where SealedImage cannot exist.
 	FixtureLaunch bool
 	// HomeDir, when set, is emitted as HOME INSTEAD of Paths.Config. It
 	// exists for one launch shape only: an agy launch (IsAgyLaunch) must

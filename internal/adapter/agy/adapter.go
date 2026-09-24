@@ -67,6 +67,23 @@ func (e *ErrProductionEligibilityMissing) Error() string {
 	return fmt.Sprintf("agy production eligibility missing for session %s: %s", e.SessionID, e.Reason)
 }
 
+// ErrOrphanNotRecorded reports a drifted dispatch whose observed orphan
+// conversation id could NOT be recorded durably on the attempt: the id
+// then exists only in this error (and the outcome reason), so it is
+// surfaced typed rather than as reason text alone. Err is the cause of
+// the failed durable write.
+type ErrOrphanNotRecorded struct {
+	AttemptID string
+	OrphanID  string
+	Err       error
+}
+
+func (e *ErrOrphanNotRecorded) Error() string {
+	return fmt.Sprintf("orphan conversation id %s of attempt %s could not be recorded durably: %v", e.OrphanID, e.AttemptID, e.Err)
+}
+
+func (e *ErrOrphanNotRecorded) Unwrap() error { return e.Err }
+
 // ErrConversationDrift reports an init.conversation_id that is not the
 // requested id (a resume that silently fell back to a NEW conversation,
 // hazard 2) or, on creation, not a UUIDv4. The child was terminated and
@@ -177,6 +194,9 @@ type AgyAdapter struct {
 	identity      AttemptIdentitySource
 	required      RequiredToolsSource
 	attestation   AttestationLookup
+	// attestationWhy explains a failed attestation lookup (production
+	// only; nil keeps the generic reason).
+	attestationWhy func() error
 	// fixtureScope is the explicit test-only construction marker: set
 	// ONLY by NewFixtureScopedAdapter. It skips the production-
 	// eligibility gate and admits the fixture/diagnostic launch-matrix
@@ -703,7 +723,7 @@ func (a *AgyAdapter) checkEligibility(sessionID adapter.SessionID) error {
 	// The full Task 6 gate (eligibility.go) — platform, sealed image,
 	// inventories, covering attestation — re-checked before every
 	// creation and turn launch (durable lookups only, no process).
-	err := checkProductionEligibility(a.policy, a.image, a.attestation)
+	err := checkProductionEligibilityExplained(a.policy, a.image, a.attestation, a.attestationWhy)
 	var missing *ErrProductionEligibilityMissing
 	if errors.As(err, &missing) {
 		missing.SessionID = sessionID
@@ -1136,7 +1156,7 @@ func (a *AgyAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt s
 			if recErr := a.durable(opOrphan, func() error {
 				return a.store.RecordAgyOrphanConversation(bg, attempt, drift.Observed)
 			}); recErr != nil {
-				err = fmt.Errorf("%w (orphan id could not be recorded: %v)", err, recErr)
+				err = fmt.Errorf("%w (%w)", err, &ErrOrphanNotRecorded{AttemptID: attempt, OrphanID: drift.Observed, Err: recErr})
 			}
 		}
 		return abort("pre-transmission verification failed: "+err.Error(), err)
@@ -1410,7 +1430,7 @@ loop:
 				if err := a.durable(opOrphan, func() error {
 					return a.store.RecordAgyOrphanConversation(bg, run.attemptID, observedID)
 				}); err != nil {
-					drift = fmt.Errorf("%w (orphan id could not be recorded: %v)", drift, err)
+					drift = fmt.Errorf("%w (%w)", drift, &ErrOrphanNotRecorded{AttemptID: run.attemptID, OrphanID: observedID, Err: err})
 				}
 				run.p.kill()
 				continue
@@ -1734,6 +1754,11 @@ type rawEvidenceRecord struct {
 	// attempt; its size and digest identify it.
 	ResultOmitted *omittedResult     `json:"result_omitted,omitempty"`
 	Verification  verificationRecord `json:"verification"`
+	// VerificationTruncated is set only in the last resort (the
+	// verification lists alone exceed the bound): the lists are cut to
+	// prefixes, verification_incomplete is kept verbatim, and the full
+	// verification record's size and digest identify it.
+	VerificationTruncated *omittedResult `json:"verification_truncated,omitempty"`
 }
 
 type omittedResult struct {
@@ -1743,7 +1768,11 @@ type omittedResult struct {
 }
 
 // clampRawEvidence bounds RawEvidence to adapter.MaxRawEvidenceBytes by
-// omitting the verbatim result line (never by cutting JSON mid-value).
+// omitting the verbatim result line first (never by cutting JSON
+// mid-value). The verification record is never dropped: in the last
+// resort its lists are cut to halving prefixes (verification_truncated
+// names the full record by size and digest) and verification_incomplete
+// is kept as recorded.
 func clampRawEvidence(rec rawEvidenceRecord) ([]byte, error) {
 	raw, err := json.Marshal(rec)
 	if err != nil || len(raw) <= adapter.MaxRawEvidenceBytes {
@@ -1757,7 +1786,32 @@ func clampRawEvidence(rec rawEvidenceRecord) ([]byte, error) {
 	if err != nil || len(raw) <= adapter.MaxRawEvidenceBytes {
 		return raw, err
 	}
-	return json.Marshal(rawEvidenceRecord{ResultOmitted: rec.ResultOmitted})
+	full, err := json.Marshal(rec.Verification)
+	if err != nil {
+		return nil, err
+	}
+	vsum := sha256.Sum256(full)
+	rec.VerificationTruncated = &omittedResult{Bytes: len(full), SHA256: hex.EncodeToString(vsum[:]),
+		Reason: fmt.Sprintf("verification lists exceed %d bytes; they are truncated prefixes (verification_incomplete is as recorded)", adapter.MaxRawEvidenceBytes)}
+	v := &rec.Verification
+	lists := []*[]string{&v.RequiredTools, &v.ExecutedTools, &v.MissingRequiredTools, &v.DeniedTools,
+		&v.AmbiguousDenials, &v.UnattributedDenials, &v.UnmappedDenials}
+	for {
+		raw, err = json.Marshal(rec)
+		if err != nil || len(raw) <= adapter.MaxRawEvidenceBytes {
+			return raw, err
+		}
+		shrunk := false
+		for _, l := range lists {
+			if len(*l) > 0 {
+				*l = (*l)[:len(*l)/2]
+				shrunk = true
+			}
+		}
+		if !shrunk {
+			return nil, fmt.Errorf("raw evidence cannot be bounded to %d bytes", adapter.MaxRawEvidenceBytes)
+		}
+	}
 }
 
 func nonNil(s []string) []string {
