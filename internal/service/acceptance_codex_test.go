@@ -1000,8 +1000,11 @@ func TestAcceptance_Codex_CreationUncertainBlocksAcrossRestart(t *testing.T) {
 	var journalCount int
 	if err := acc.store.DB().QueryRowContext(ctx,
 		`SELECT count(*) FROM journal_entries WHERE op_id = ?`,
-		"op-codex-creation-uncertain-"+codexAcceptanceSession).Scan(&journalCount); err != nil || journalCount != 1 {
+		"op-codex-creation-uncertain-"+codexAcceptanceSession+"-e1").Scan(&journalCount); err != nil || journalCount != 1 {
 		t.Fatalf("the durable record must exist exactly once, got %d err=%v", journalCount, err)
+	}
+	if episodes, err := acc.store.CodexCreationUncertaintyEpisodes(ctx, codexAcceptanceSession); err != nil || len(episodes) != 1 {
+		t.Fatalf("three callers sharing one uncertain creation must open exactly ONE episode, got %d err=%v", len(episodes), err)
 	}
 
 	// Restart: same durable state directory, fresh server instance
@@ -1101,9 +1104,14 @@ func TestAcceptance_Codex_CreationUncertainBlocksAcrossRestart(t *testing.T) {
 		t.Fatalf("no prompt may ever reach a child for the blocked session, turn/starts: %d", got)
 	}
 
-	// Explicit resolution (controller-visible seam) clears the durable
-	// block; automatic retries never reach it.
-	if _, err := srv2.ResolveCodexSessionCreationUncertainty(ctx, "op-resolve-acc-cx", codexAcceptanceSession, "controller-acc-cx"); err != nil {
+	// Explicit resolution (controller-authorized seam: current lease,
+	// expected generation, exact episode, disposition) clears the
+	// durable block; automatic retries never reach it.
+	if _, err := srv2.ResolveCodexSessionCreationUncertainty(ctx, CodexCreationUncertaintyResolution{
+		OpID: "op-resolve-acc-cx", ControllerLease: lease, ExpectedGeneration: 1,
+		SessionID: codexAcceptanceSession, Episode: 1,
+		Disposition: storage.CodexUncertaintyAbandonOrphan, Reason: "acceptance: orphan thread abandoned",
+	}); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
 	if blocked, err := store2.HasCodexCreationUncertainty(ctx, codexAcceptanceSession); err != nil || blocked {

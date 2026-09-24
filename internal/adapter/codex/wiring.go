@@ -164,16 +164,16 @@ func (s *storageDispatchIdentitySource) AttemptFor(ctx context.Context, ref adap
 // the durable cprot-v2 rows are consulted on EVERY call (freeze-at-
 // launch — every CreateSession/Dispatch re-checks), matching the frozen
 // (codex version, platform, manifest digest, profile digest) tuple
-// exactly. The manifest digest comes from the SAME frozen policy the
-// launch freezes (ValidateCodexHarness → storage.ComputeToolkitManifest
-// Digest), so the tuple match can never disagree on manifest identity.
-// A missing row, a lookup failure, or any tuple disagreement reports
-// NOT eligible: there is no inference of eligibility from absent or
-// drifted evidence.
+// exactly AND requiring the row's records to cover the frozen profile
+// (coverage.go). The manifest digest comes from the SAME frozen policy
+// the launch freezes (ValidateCodexHarness → storage.ComputeToolkit
+// ManifestDigest), so the tuple match can never disagree on manifest
+// identity. A missing row, a lookup failure, any tuple disagreement, or
+// an uncovered record set reports NOT eligible: there is no inference
+// of eligibility from absent, drifted, or partial evidence.
 func storageAttestationLookup(store *storage.Store, policy CodexLaunchPolicy, profileDigest string) AttestationLookup {
 	return func() (string, bool) {
-		id, err := store.FindCodexProtectionAttestation(context.Background(),
-			policy.AppServerVersion, codexPlatformIdentity(policy), policy.ManifestDigest, profileDigest)
+		id, err := lookupCoveredAttestation(context.Background(), store, policy, profileDigest)
 		if err != nil || strings.TrimSpace(id) == "" {
 			return "", false
 		}

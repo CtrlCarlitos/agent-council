@@ -1914,11 +1914,40 @@ func nativeTurnIDFromResult(raw json.RawMessage) string {
 
 // ── Rollout baseline (first acceptance; §3.7) ───────────────────────────
 
+// lookupCoveredAttestation is the durable half of the §3.3/§3.7
+// attestation lookup shared by the production eligibility seam and the
+// launch-time protection freeze: the cprot-v2 row must match the frozen
+// (codex version, platform, manifest digest, profile digest) tuple
+// EXACTLY, and its record frame must decode and COVER the frozen
+// profile (coverage.go — every enabled path, every mutation operation,
+// every pinned approval method). A tuple match whose records do not
+// cover the profile is reported as no attestation ("", nil): absent or
+// partial evidence never unlocks anything. A storage failure is
+// returned as an error so protection is never silently downgraded.
+func lookupCoveredAttestation(ctx context.Context, store *storage.Store, policy CodexLaunchPolicy, profileDigest string) (string, error) {
+	id, err := store.FindCodexProtectionAttestation(ctx,
+		policy.AppServerVersion, codexPlatformIdentity(policy), policy.ManifestDigest, profileDigest)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(id) == "" {
+		return "", nil
+	}
+	raw, err := store.CodexProtectionProbeResults(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	if err := CoverageFor(policy, profileDigest).ValidateFrame(raw); err != nil {
+		return "", nil
+	}
+	return id, nil
+}
+
 // resolveRolloutProtection freezes the rollout protection class for a
 // new attempt (§3.7): the isolation-attestation seam must report a valid
 // attestation AND a durable cprot-v2 row must exist matching the frozen
 // (codex version, platform, manifest digest, profile digest) tuple for
-// the same id. Advisory is the default; the unverified platform degrades
+// the same id, with records covering the frozen profile. Advisory is the default; the unverified platform degrades
 // to integrity=unverified. A lookup FAILURE is returned — protection is
 // never silently downgraded by an error (the AC-008 rule).
 func (a *CodexAdapter) resolveRolloutProtection(ctx context.Context) (string, *string, error) {
@@ -1929,8 +1958,7 @@ func (a *CodexAdapter) resolveRolloutProtection(ctx context.Context) (string, *s
 	rowID := ""
 	if seamOK && strings.TrimSpace(seamID) != "" {
 		var err error
-		rowID, err = a.store.FindCodexProtectionAttestation(ctx,
-			a.policy.AppServerVersion, codexPlatformIdentity(a.policy), a.policy.ManifestDigest, a.profileDigest)
+		rowID, err = lookupCoveredAttestation(ctx, a.store, a.policy, a.profileDigest)
 		if err != nil {
 			return "", nil, err
 		}

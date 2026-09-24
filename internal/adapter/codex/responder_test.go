@@ -234,10 +234,14 @@ func encodedDenyEquivalents(denies ...ApprovalDenyRecord) ([]byte, error) {
 }
 
 // insertHarnessAttestationWithRecords inserts the harness-matching
-// cprot-v2 row whose probe_results carry exactly the given deny records.
+// cprot-v2 row whose probe_results carry the profile-covering suite
+// (coverage.go — the launch-time freeze refuses anything less) plus the
+// given live-verified deny-equivalent records.
 func insertHarnessAttestationWithRecords(t *testing.T, h *adapterHarness, id string, records ...ApprovalDenyRecord) {
 	t.Helper()
-	raw, err := encodedDenyEquivalents(records...)
+	att := coveringAttestation(CoverageFor(h.policy, h.profileDigest))
+	att.ApprovalDenies = append(att.ApprovalDenies, records...)
+	raw, err := att.EncodeProbeRecords()
 	if err != nil {
 		t.Fatalf("encode attestation records: %v", err)
 	}

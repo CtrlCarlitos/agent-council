@@ -1,7 +1,7 @@
 package storage
 
 // The schema-v5 migration must be asserted exactly: at least one test
-// pins the version to 5 to prevent v5 migration omission from passing,
+// pins the version to 6 to prevent v5/v6 migration omission from passing,
 // with the AC-009 tables present and all prior tables intact.
 
 import (
@@ -11,14 +11,14 @@ import (
 	"time"
 )
 
-func TestAC009_MigrationV5_SchemaVersionIsExactly5(t *testing.T) {
+func TestAC009_MigrationV5_SchemaVersionIsExactly6(t *testing.T) {
 	store := openCodexStore(t)
 	ver, err := store.CurrentSchemaVersion()
 	if err != nil {
 		t.Fatalf("schema version: %v", err)
 	}
-	if ver != 5 {
-		t.Fatalf("expected schema version exactly 5, got %d", ver)
+	if ver != 6 {
+		t.Fatalf("expected schema version exactly 6, got %d", ver)
 	}
 	// The AC-009 tables must exist.
 	for _, table := range []string{
@@ -130,8 +130,8 @@ VALUES ('claude-sess', '11111111-2222-4333-8444-555555555555', 0, 'm', 'w', 'cr'
 	if err != nil {
 		t.Fatalf("CurrentSchemaVersion: %v", err)
 	}
-	if ver != 5 {
-		t.Fatalf("expected schema version exactly 5, got %d", ver)
+	if ver != 6 {
+		t.Fatalf("expected schema version exactly 6, got %d", ver)
 	}
 
 	// Check the schema_migrations row for v5.

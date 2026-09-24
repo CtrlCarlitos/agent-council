@@ -21,12 +21,10 @@ package codex
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
-	"unicode/utf8"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
 	"github.com/CtrlCarlitos/agent-council/internal/council"
@@ -276,94 +274,31 @@ var approvalVariants = map[string]*approvalVariant{
 
 // DecodeApprovalDenies decodes the approval_deny records from a cprot-v2
 // encoded record frame (ProtectionAttestation.EncodeProbeRecords output).
-// The frame is a uint32-BE record count followed by fixed-layout records;
-// probe records are skipped by length, approval_deny records carry
-// method_name + refusal_kind. Truncation, an unknown class, or trailing
-// bytes is an error (the caller fails closed).
+// Truncation, an unknown class, or trailing bytes is an error (the
+// caller fails closed). The full decoder lives in coverage.go.
 func DecodeApprovalDenies(raw []byte) ([]ApprovalDenyRecord, error) {
-	if len(raw) < 4 {
-		return nil, errors.New("cprot record frame too short")
-	}
-	pos := 0
-	count := int(binary.BigEndian.Uint32(raw[:4]))
-	pos = 4
-	take := func(n int) ([]byte, error) {
-		if n < 0 || pos+n > len(raw) {
-			return nil, errors.New("truncated cprot record frame")
-		}
-		b := raw[pos : pos+n]
-		pos += n
-		return b, nil
-	}
-	takeU32 := func() (int, error) {
-		b, err := take(4)
-		if err != nil {
-			return 0, err
-		}
-		return int(binary.BigEndian.Uint32(b)), nil
-	}
-	var denies []ApprovalDenyRecord
-	for i := 0; i < count; i++ {
-		classB, err := take(1)
-		if err != nil {
-			return nil, err
-		}
-		switch RecordClass(classB[0]) {
-		case RecordApprovalDeny:
-			mlen, err := takeU32()
-			if err != nil {
-				return nil, err
-			}
-			name, err := take(mlen)
-			if err != nil {
-				return nil, err
-			}
-			if !utf8.Valid(name) {
-				return nil, errors.New("approval_deny method_name is not valid UTF-8")
-			}
-			kindB, err := take(1)
-			if err != nil {
-				return nil, err
-			}
-			switch RefusalKind(kindB[0]) {
-			case RefusalNativeEnum, RefusalLiveVerifiedEquivalent:
-			default:
-				return nil, fmt.Errorf("unknown refusal kind %d", kindB[0])
-			}
-			denies = append(denies, ApprovalDenyRecord{
-				MethodName:  string(name),
-				RefusalKind: RefusalKind(kindB[0]),
-			})
-		case RecordSiblingRead, RecordSelfMutation:
-			// tool_class byte, name, operation, capability, denied, text.
-			if _, err := take(1); err != nil {
-				return nil, err
-			}
-			nlen, err := takeU32()
-			if err != nil {
-				return nil, err
-			}
-			if _, err := take(nlen); err != nil {
-				return nil, err
-			}
-			if _, err := take(3); err != nil {
-				return nil, err
-			}
-			tlen, err := takeU32()
-			if err != nil {
-				return nil, err
-			}
-			if _, err := take(tlen); err != nil {
-				return nil, err
-			}
-		default:
-			return nil, fmt.Errorf("unknown cprot record class %d", classB[0])
-		}
-	}
-	if pos != len(raw) {
-		return nil, errors.New("trailing bytes after cprot record frame")
+	_, denies, err := DecodeProbeRecords(raw)
+	if err != nil {
+		return nil, err
 	}
 	return denies, nil
+}
+
+// PinnedApprovalMethods is the pinned §3.6 approval surface (the
+// 0.154.0 schema captures): method name → whether the variant is a
+// deny-EQUIVALENT (no schema-native refusal enum). It is the approval
+// half of the attestation coverage universe (coverage.go). The returned
+// map is a fresh copy.
+func PinnedApprovalMethods() map[string]bool {
+	return pinnedApprovalMethods()
+}
+
+func pinnedApprovalMethods() map[string]bool {
+	out := make(map[string]bool, len(approvalVariants))
+	for name, v := range approvalVariants {
+		out[name] = v.denyEquivalent
+	}
+	return out
 }
 
 // ── Routing ─────────────────────────────────────────────────────────────

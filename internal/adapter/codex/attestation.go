@@ -180,12 +180,21 @@ func (a ProtectionAttestation) Validate() error {
 	if strings.TrimSpace(a.Actor) == "" {
 		return fmt.Errorf("attestation requires the operator actor")
 	}
-	if len(a.ProbeRecords)+len(a.ApprovalDenies) == 0 {
+	return validateRecords(a.ProbeRecords, a.ApprovalDenies)
+}
+
+// validateRecords enforces the record-level invariants shared by the
+// typed attestation and a decoded durable frame: at least one record,
+// known enums, class-bound operations, complete denials, valid UTF-8,
+// and no duplicate keys. Coverage against the frozen profile is a
+// separate, stricter check (coverage.go).
+func validateRecords(probes []ProbeRecord, denies []ApprovalDenyRecord) error {
+	if len(probes)+len(denies) == 0 {
 		return fmt.Errorf("attestation requires at least one record")
 	}
 
-	seen := make(map[string]struct{}, len(a.ProbeRecords))
-	for i, r := range a.ProbeRecords {
+	seen := make(map[string]struct{}, len(probes))
+	for i, r := range probes {
 		switch r.Class {
 		case RecordSiblingRead, RecordSelfMutation:
 		default:
@@ -234,8 +243,8 @@ func (a ProtectionAttestation) Validate() error {
 		seen[key] = struct{}{}
 	}
 
-	methods := make(map[string]struct{}, len(a.ApprovalDenies))
-	for i, r := range a.ApprovalDenies {
+	methods := make(map[string]struct{}, len(denies))
+	for i, r := range denies {
 		if !utf8.ValidString(r.MethodName) {
 			return fmt.Errorf("approval deny record %d: method name is not valid UTF-8", i)
 		}

@@ -56,6 +56,11 @@ type CodexLaunchPolicy struct {
 	EventUniversePath          string
 	EventUniverseDigest        string
 	ManifestDigest             string
+	// PluginTools are the frozen skill/plugin-contributed tool names
+	// (toolkit manifest expected_plugins ∪ expected_skills, trimmed,
+	// deduplicated, byte-wise sorted): the plugin-class half of the
+	// attestation coverage universe (coverage.go).
+	PluginTools []string
 }
 
 // ValidateCodexHarness validates the frozen codex harness block of a run
@@ -166,6 +171,9 @@ func ValidateCodexHarness(profile storage.CanonicalProfile, evidenceRoot string)
 		EventUniversePath:          c.EventUniversePath,
 		EventUniverseDigest:        c.EventUniverseDigest,
 		ManifestDigest:             manifestDigest,
+		PluginTools: sortedUniqueTrimmed(append(
+			append([]string(nil), profile.ToolkitManifest.ExpectedPlugins...),
+			profile.ToolkitManifest.ExpectedSkills...)),
 	}, nil
 }
 

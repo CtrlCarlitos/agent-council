@@ -14,10 +14,11 @@ var schemaSQL string
 
 // schema.sql is the frozen released v1 schema; schemaV2DDL is the immutable
 // v2 migration body; schemaV3DDL is the immutable v3 migration body;
-// claudeStateV4DDL and codexStateV5DDL are the immutable v4/v5 bodies.
+// claudeStateV4DDL, codexStateV5DDL, and codexUncertaintyV6DDL are the
+// immutable v4/v5/v6 bodies.
 // Fresh databases apply v1 then v2 then v3 sequentially — there
 // is no separate "latest schema" path that could diverge from upgrading.
-const currentSchemaVersion = 5
+const currentSchemaVersion = 6
 
 func schemaChecksum() string {
 	sum := sha256.Sum256([]byte(schemaSQL))
@@ -155,7 +156,7 @@ VALUES (2, 'controller_leases_provenance', ?, ?);`, schemaV2Checksum(), now)
 		}
 	}
 
-	if currentVer >= 5 {
+	if currentVer >= 6 {
 		// Fully migrated: nothing to do.
 		return nil
 	}
@@ -182,15 +183,21 @@ VALUES (4, 'claude_adapter_state', ?, ?);`, "claude-state-v4", now); err != nil 
 				return fmt.Errorf("record migration v4: %w", err)
 			}
 		}
-		// Apply v5: AC-009 Codex adapter durable state tables.
-		if _, err := tx.Tx().Exec(codexStateV5DDL); err != nil {
-			return fmt.Errorf("execute schema v5: %w", err)
-		}
-		now := time.Now().UTC().Format(time.RFC3339Nano)
-		if _, err := tx.Tx().Exec(`
+		if currentVer < 5 {
+			// Apply v5: AC-009 Codex adapter durable state tables.
+			if _, err := tx.Tx().Exec(codexStateV5DDL); err != nil {
+				return fmt.Errorf("execute schema v5: %w", err)
+			}
+			now := time.Now().UTC().Format(time.RFC3339Nano)
+			if _, err := tx.Tx().Exec(`
 INSERT INTO schema_migrations (version, name, checksum, applied_at)
 VALUES (5, 'codex_adapter_state', ?, ?);`, "codex-state-v5", now); err != nil {
-			return fmt.Errorf("record migration v5: %w", err)
+				return fmt.Errorf("record migration v5: %w", err)
+			}
+		}
+		// Apply v6: AC-009 creation-uncertainty episodes.
+		if err := applyMigrationV6(tx.Tx()); err != nil {
+			return err
 		}
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit migration: %w", err)
@@ -249,6 +256,11 @@ VALUES (4, 'claude_adapter_state', ?, ?);`, "claude-state-v4", now); err != nil 
 INSERT INTO schema_migrations (version, name, checksum, applied_at)
 VALUES (5, 'codex_adapter_state', ?, ?);`, "codex-state-v5", now); err != nil {
 		return fmt.Errorf("record migration v5: %w", err)
+	}
+
+	// Apply v6: AC-009 creation-uncertainty episodes.
+	if err := applyMigrationV6(tx.Tx()); err != nil {
+		return err
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -394,3 +406,44 @@ CREATE TABLE IF NOT EXISTS codex_protection_attestations (
 	actor              TEXT NOT NULL
 );
 `
+
+// codexUncertaintyV6DDL creates the AC-009 durable creation-uncertainty
+// EPISODE table (spec §3.4): one row per uncertain creation outcome of a
+// logical session, monotonically numbered, resolved one exact episode at
+// a time by a controller-authorized journal operation. The partial
+// unique index enforces at most ONE open episode per session at the
+// schema level. Resolution provenance is the controller generation and
+// the resolving op_id (the journal entry carries the credential).
+const codexUncertaintyV6DDL = `
+CREATE TABLE IF NOT EXISTS codex_creation_uncertainties (
+	session_id         TEXT NOT NULL,
+	episode            INTEGER NOT NULL CHECK (episode >= 1),
+	run_id             TEXT NOT NULL,
+	reason             TEXT NOT NULL,
+	recorded_by        TEXT NOT NULL,
+	record_op_id       TEXT NOT NULL,
+	cause_op_id        TEXT NOT NULL,
+	recorded_at        TEXT NOT NULL,
+	disposition        TEXT,
+	resolution_reason  TEXT,
+	resolution_generation INTEGER,
+	resolution_op_id   TEXT,
+	resolved_at        TEXT,
+	PRIMARY KEY (session_id, episode)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS codex_creation_uncertainties_open
+	ON codex_creation_uncertainties(session_id) WHERE disposition IS NULL;
+`
+
+func applyMigrationV6(tx *sql.Tx) error {
+	if _, err := tx.Exec(codexUncertaintyV6DDL); err != nil {
+		return fmt.Errorf("execute schema v6: %w", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.Exec(`
+INSERT INTO schema_migrations (version, name, checksum, applied_at)
+VALUES (6, 'codex_creation_uncertainty_episodes', ?, ?);`, "codex-uncertainty-v6", now); err != nil {
+		return fmt.Errorf("record migration v6: %w", err)
+	}
+	return nil
+}

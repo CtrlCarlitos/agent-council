@@ -32,6 +32,9 @@ type CodexSessionBinding struct {
 // InsertCodexSessionBinding persists a new unmaterialized binding. The
 // native_id is a server-generated UUIDv7 enforced by the schema CHECK;
 // fail closed if the session or native identity is already bound.
+// Direct use is reserved for adapter contract tests and fixtures; the
+// production birth path is BindCodexSession (controller authority
+// re-validated inside the transaction, journaled, receipt-replayed).
 func (s *Store) InsertCodexSessionBinding(ctx context.Context, b CodexSessionBinding) error {
 	tx, err := s.BeginWrite(ctx)
 	if err != nil {
@@ -54,6 +57,81 @@ VALUES (?, ?, 0, ?, ?, ?, ?)`,
 		return fmt.Errorf("insert codex session binding: %w", err)
 	}
 	return nil
+}
+
+// BindCodexSession is the production session-birth persistence path
+// (§3.4, AC-008 BindClaudeSession pattern): the adapter does not
+// persist; the service records the binding returned by CreateSession
+// under the run controller's authority. Authority is re-validated
+// INSIDE the write transaction — a lease handed off while the native
+// creation was in flight can no longer publish the binding — before the
+// idempotency check; the operation is idempotent by op_id with receipt
+// replay; a session that already has a binding is rejected (one native
+// identity per session); the native_id shape is enforced by the schema.
+func (s *Store) BindCodexSession(ctx context.Context, opID, callerLease string, b CodexSessionBinding) (OperationReceipt, error) {
+	if strings.TrimSpace(opID) == "" || strings.TrimSpace(callerLease) == "" {
+		return OperationReceipt{}, errors.New("binding requires the operation id and the controller lease")
+	}
+	if strings.TrimSpace(b.SessionID) == "" || strings.TrimSpace(b.NativeID) == "" {
+		return OperationReceipt{}, errors.New("binding requires the session id and the native id")
+	}
+	if strings.TrimSpace(b.ProfileDigest) == "" {
+		return OperationReceipt{}, errors.New("binding requires the frozen profile digest")
+	}
+	runID, err := s.GetSessionRunID(ctx, b.SessionID)
+	if err != nil {
+		return OperationReceipt{}, fmt.Errorf("session run lookup: %w", err)
+	}
+	fp := computeFingerprint("bind_codex_session", b.SessionID, b.NativeID, b.Model, b.Workspace, b.ProfileDigest)
+
+	tx, err := s.BeginWrite(ctx)
+	if err != nil {
+		return OperationReceipt{}, err
+	}
+	defer tx.Rollback()
+
+	if _, err := classifyCredential(ctx, tx.Tx(), runID, callerLease, true); err != nil {
+		return OperationReceipt{}, fmt.Errorf("controller authority: %w", err)
+	}
+	if receipt, err := checkOrRecordIdempotency(tx.Tx(), opID, callerLease, "bind_codex_session", fp); err != nil {
+		return OperationReceipt{}, err
+	} else if receipt != nil {
+		return *receipt, nil
+	}
+
+	var existing string
+	err = tx.Tx().QueryRowContext(ctx,
+		`SELECT native_id FROM codex_session_bindings WHERE session_id = ?`, b.SessionID).Scan(&existing)
+	if err == nil {
+		return OperationReceipt{}, fmt.Errorf("session %s is already bound to native thread %s", b.SessionID, existing)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return OperationReceipt{}, fmt.Errorf("query existing binding: %w", err)
+	}
+
+	now := time.Now().UTC()
+	receipt := OperationReceipt{
+		OpID:             opID,
+		CommandType:      "bind_codex_session",
+		SessionID:        b.SessionID,
+		CommittedVersion: 1,
+		CreatedAt:        now,
+		Payload:          b.NativeID,
+	}
+	if err := recordJournalEntry(tx.Tx(), opID, "bind_codex_session", fp, runID, b.SessionID, "",
+		"codex_session_binding", receipt, callerLease); err != nil {
+		return OperationReceipt{}, err
+	}
+	if b.CreatedAt.IsZero() {
+		b.CreatedAt = now
+	}
+	if err := insertCodexSessionBindingTx(ctx, tx.Tx(), b); err != nil {
+		return OperationReceipt{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return OperationReceipt{}, err
+	}
+	return receipt, nil
 }
 
 // GetCodexSessionBinding returns the binding for a logical session.

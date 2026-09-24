@@ -34,21 +34,36 @@ import (
 
 // insertHarnessAttestation records the cprot-v2 attestation row the
 // harness's eligibility seam reports, bound to the harness's frozen
-// (version, platform, manifest, profile) tuple. Pass manifestDigest ""
-// to use the harness's frozen manifest digest, or a divergent value to
-// prove the tuple match fails closed.
+// (version, platform, manifest, profile) tuple and carrying a record
+// frame that COVERS the frozen profile (coverage.go). Pass
+// manifestDigest "" to use the harness's frozen manifest digest, or a
+// divergent value to prove the tuple match fails closed.
 func insertHarnessAttestation(t *testing.T, h *adapterHarness, id string, manifestDigest ...string) {
 	t.Helper()
 	md := h.policy.ManifestDigest
 	if len(manifestDigest) > 0 && manifestDigest[0] != "" {
 		md = manifestDigest[0]
 	}
+	cov := CoverageFor(h.policy, h.profileDigest)
+	raw, err := coveringAttestation(cov).EncodeProbeRecords()
+	if err != nil {
+		t.Fatalf("encode covering frame: %v", err)
+	}
+	insertHarnessAttestationRaw(t, h, id, md, raw)
+}
+
+// insertHarnessAttestationRaw records a tuple-matching row (modulo the
+// manifest digest) whose probe_results column carries exactly raw — the
+// seam for proving that an undecodable or uncovered record set never
+// freezes protected evidence.
+func insertHarnessAttestationRaw(t *testing.T, h *adapterHarness, id, manifestDigest string, raw []byte) {
+	t.Helper()
 	_, err := h.store.DB().ExecContext(context.Background(), `
 INSERT INTO codex_protection_attestations
 	(attestation_id, codex_version, platform, manifest_digest, profile_digest,
 	 probe_results, probed_at, actor)
-VALUES (?, ?, ?, ?, ?, '[]', '2026-09-23T00:00:00Z', 'op')`,
-		id, h.policy.AppServerVersion, codexPlatformIdentity(h.policy), md, h.profileDigest)
+VALUES (?, ?, ?, ?, ?, ?, '2026-09-23T00:00:00Z', 'op')`,
+		id, h.policy.AppServerVersion, codexPlatformIdentity(h.policy), manifestDigest, h.profileDigest, raw)
 	if err != nil {
 		t.Fatalf("insert harness attestation: %v", err)
 	}
@@ -521,6 +536,43 @@ func TestCodexAdapter_ProtectionFrozenAtLaunch(t *testing.T) {
 		att := waitAttempt(t, h, "t-adv", func(a *storage.CodexTurnAttempt) bool { return a.Terminal })
 		if att.RolloutProtection != "advisory" || att.AttestationID != nil {
 			t.Fatalf("advisory freeze: %q %v", att.RolloutProtection, att.AttestationID)
+		}
+	})
+
+	t.Run("uncoveredRowStaysAdvisory", func(t *testing.T) {
+		h := newAdapterHarness(t)
+		scenario := append([]string{authOKLine()}, threadStartRules(testThreadID, h.wsRoot, h.model)...)
+		scenario = append(scenario, resumeRule(testThreadID, h.wsRoot, h.model, nil))
+		scenario = append(scenario, turnAcceptedRules(testThreadID, testTurnID, true)...)
+		writeScenario(t, h.scratch, scenario...)
+		h.createAndPersist(t)
+		seedRollout(t, h, testThreadID)
+		// A tuple-matching row whose records do NOT cover the frozen
+		// profile (one sibling_read record and one approval record —
+		// the minimal shape the §3.7 encoder accepts) never freezes
+		// protected evidence: coverage is enforced at lookup, not only
+		// at recording.
+		partial := ProtectionAttestation{
+			CodexVersion: h.policy.AppServerVersion, PlatformOS: h.policy.PlatformOS, PlatformFamily: h.policy.PlatformFamily,
+			ManifestDigest: h.policy.ManifestDigest, ProfileDigest: h.profileDigest,
+			ProbeRecords: []ProbeRecord{{Class: RecordSiblingRead, ToolClass: ToolRead, ToolName: "Read",
+				Operation: OpRead, Denied: true, EnforcingCapability: CapSandboxRestrictedFS, DenialText: "denied"}},
+			ApprovalDenies: []ApprovalDenyRecord{{MethodName: "execCommandApproval", RefusalKind: RefusalNativeEnum}},
+			ProbedAt:       "2026-09-23T00:00:00Z", Actor: "op",
+		}
+		raw, err := partial.EncodeProbeRecords()
+		if err != nil {
+			t.Fatalf("encode partial frame: %v", err)
+		}
+		insertHarnessAttestationRaw(t, h, testAttestationID(), h.policy.ManifestDigest, raw)
+
+		out, err := h.dispatch(t, "t-uncovered", "prompt")
+		if err != nil || out.Status != adapter.DispatchAccepted {
+			t.Fatalf("dispatch: %+v err=%v", out, err)
+		}
+		att := waitAttempt(t, h, "t-uncovered", func(a *storage.CodexTurnAttempt) bool { return a.Terminal })
+		if att.RolloutProtection != "advisory" || att.AttestationID != nil {
+			t.Fatalf("an uncovered row must degrade to advisory, got %q %v", att.RolloutProtection, att.AttestationID)
 		}
 	})
 
