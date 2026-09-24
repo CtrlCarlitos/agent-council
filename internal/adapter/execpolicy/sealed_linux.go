@@ -95,7 +95,11 @@ func NewSealedImage(path, wantDigest string) (*SealedImage, error) {
 // Close releases the sealed memfd. Safe to call on a nil *SealedImage or
 // more than once.
 func (s *SealedImage) Close() error {
-	if s == nil || s.fd < 0 {
+	// fd <= 0 covers both "already closed" (fd set to -1 below) and a
+	// zero-value *SealedImage built outside NewSealedImage: fd 0 is
+	// always stdin in a running process, never a real memfd, so there
+	// is nothing of ours to close.
+	if s == nil || s.fd <= 0 {
 		return nil
 	}
 	err := unix.Close(s.fd)
