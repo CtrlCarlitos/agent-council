@@ -938,3 +938,36 @@ none is claimed by the design.
 16. Attestation recording authority (§3.2) is the operator credential,
     matching the codex precedent; the tuple written to the row comes
     from the run's frozen profile and coverage, never from the request.
+17. Turn-attempt disposition surface (§3.10, §6.1 rows 2–3) — an
+    acceptance-pass GAP, like 7. An Uncertain turn attempt blocks the
+    native conversation durably (across restarts) exactly as specified,
+    but no controller operation that records its disposition is
+    shipped: the service has no endpoint or method that writes
+    `agy_turn_attempts.uncertainty_disposition`, and the service turn
+    stays non-terminal. The Task 8 acceptance test for row 3 writes the
+    disposition directly to show the specified post-disposition behavior
+    (a new process on the same conversation after `init` equality) and
+    says so; the operator surface is follow-up work (AC-008/AC-009 share
+    the same gap).
+18. First-attestation bootstrap (§3.2, §4 Stage C) — a GAP.
+    `RecordAgyProbeAttestation` is a Go method with no HTTP route, and a
+    service configured with `AgyBinaryPath` refuses construction until a
+    covering row exists, so no production entry point can record the
+    FIRST row. The acceptance test records it through the service
+    operation on a configured fixture-scoped instance; the evidence
+    script's Stage C produces the draft record set and names the
+    operation, and never writes storage rows. An operator entry point is
+    follow-up work (the AC-009 script records the same absence).
+19. Evidence helpers (§4 Stage A). The sealed-vs-path comparison and the
+    freeze-time canonical digests use two `-tags evidence` Go test
+    helpers instead of a new binary: `TestSealedProbe`
+    (`internal/adapter/execpolicy/sealed_probe_evidence_test.go`:
+    `NewSealedImage` + `PolicyExecutor.Start` with the operator's argv,
+    home, and cwd) and `TestEvidenceCanonicalDigests`
+    (`internal/adapter/agy/evidence_digests_test.go`:
+    `canonicalPluginsBytes` and `CanonicalHooksConfigDigest`). Both are
+    excluded from every build without the tag and skip without their
+    operator environment. The script's path launches reproduce the
+    executor's child environment exactly (PATH TMPDIR TERM LANG LC_ALL
+    USER, HOME, COUNCIL_*), so the comparison isolates the exec
+    mechanism.
