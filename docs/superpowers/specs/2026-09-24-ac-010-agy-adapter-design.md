@@ -183,9 +183,17 @@ scoped:
   digest, `profile_digest` the cprof-v4 digest), stored in a contributor-
   scoped `agy_protection_attestations` table with the same digest-bound
   columns. Coverage binding (AC-009 §3.7 errata) is enforced at recording
-  and lookup, and because freeze rejects non-empty MCP/plugin inventories
-  (§3.7), the expected coverage set is exactly the built-in classes
-  (read, glob, grep, shell) — fully derivable from the frozen profile.
+  and lookup. The expected coverage set is DERIVED, never asserted:
+  `expected_tools` ∩ the pinned coverage map (below) yields the exact
+  record set — one `sibling_read` per `sibling_read_path` tool name and
+  the five `self_mutation` operations per `own_mutation_path` tool name —
+  and because freeze rejects non-empty MCP/plugin inventories (§3.7) the
+  set contains built-in tools only. Unlike the Codex validator, the Agy
+  coverage validator allows several tool NAMES under one cprot-v2 tool
+  class (e.g. `view_file` and `read_resource` both `read`), because the
+  map, not the class, is the unit of coverage; duplicate coverage means
+  the same name twice, and unexpected coverage means a name outside
+  `expected_tools` or a class the map does not assign to it.
 - **Version-pinned tool-to-capability coverage map (closes the built-in
   path gap).** Every name in `expected_tools` MUST appear in the pinned
   coverage map for the frozen `cli_version` (committed with the
