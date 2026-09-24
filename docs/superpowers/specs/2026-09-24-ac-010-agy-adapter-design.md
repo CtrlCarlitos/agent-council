@@ -891,3 +891,25 @@ none is claimed by the design.
 7. §3.8 diagnostics (conversation file size and step counts at first
    acceptance and at reconcile) are not implemented by the adapter task
    and are tracked as an acceptance-pass gap.
+8. Gate order at construction (§3.2). `NewProductionAgyAdapter` runs the
+   durable eligibility checks (platform, sealed image digest, empty
+   inventories, attestation tuple re-compare and coverage) BEFORE the
+   filesystem toolkit checks and before the construction `plugin list`
+   child; no child starts until eligibility passes. The `homeDir`
+   argument must equal the parent of `expected_home`.
+9. Auth gate at resume (§3.2). `ResumeSession` does not itself launch
+   `models`; it invalidates the adapter's cached auth pass so the gate
+   runs again before the next dispatch of that session. Passes are
+   cached per adapter for a bounded TTL (default 5 minutes); failures
+   are never cached.
+10. Gate children (`models`, `plugin list`) leave no launch rows: §3.11
+    keys launch rows by turn attempt, and these children carry no
+    attempt. Their evidence is the typed gate outcome only.
+11. Hooks configured state (§3.2): a `command`/`handler` value that is
+    present but not a non-empty string is treated as drift (stricter
+    than the text, which names the string case only); disabled markers
+    are checked on the resolved subtree, not on its ancestors.
+12. The recorded `models` catalog shape is "14 entries" without a column
+    layout; the auth gate parses one id per row and treats any other
+    layout as inconclusive (fails closed). Stage A of the evidence script
+    records the real layout before any profile freeze.
