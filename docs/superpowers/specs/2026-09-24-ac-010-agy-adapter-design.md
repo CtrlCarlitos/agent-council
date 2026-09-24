@@ -1,6 +1,6 @@
 # AC-010 Design — Agy (Antigravity CLI) persistent contributor adapter
 
-Status: DRAFT v3 for review (v1: 7 findings, v2: 5 findings — all
+Status: DRAFT v4 for review (v1: 7, v2: 5, v3: 5 findings — all
 addressed; change logs at the end)
 Date: 2026-09-24
 Issue: #10
@@ -197,37 +197,60 @@ scoped:
 - **Version-pinned tool-to-capability coverage map (closes the built-in
   path gap).** Every name in `expected_tools` MUST appear in the pinned
   coverage map for the frozen `cli_version` (committed with the
-  evidence, digest-bound like the `init` capture); the map assigns each
-  tool exactly one class, and the attestation must cover every tool of a
-  probed class that the profile enables:
+  evidence, digest-bound like the `init` capture). The map assigns each
+  tool a canonical NON-EMPTY SET of capabilities drawn from the closed
+  enum {`sibling_read_path`, `own_mutation_path`, `network_only`,
+  `control`, `uncovered`} — encoded as a sorted array in that enum order,
+  duplicates rejected, `uncovered` exclusive of every other value — and
+  the attestation must satisfy every obligation of every capability of
+  every tool the profile enables:
 
   | Class | 1.2.9 tools | Attestation obligation |
   |---|---|---|
-  | `sibling_read_path` | `view_file`, `read_resource`, `list_dir`, `find_by_name`, `grep_search`, `run_command`, `send_command_input`, `notebook_execution`, `open_browser_url`, `read_browser_page`, `execute_browser_javascript` (browser tools can dereference `file://`), `call_mcp_tool` (per frozen MCP tool) | one `sibling_read` record per tool name (cprot-v2 tool_class: read/glob/grep/bash_absolute/mcp; browser and notebook execution are recorded under `bash_absolute` semantics — "arbitrary code with filesystem reach") |
+  | Capability | 1.2.9 tools carrying it (a tool may carry several) | Attestation obligation |
+  |---|---|---|
+  | `sibling_read_path` | `view_file`, `read_resource`, `list_dir`, `find_by_name`, `grep_search`, `run_command`, `send_command_input`, `notebook_execution`, `open_browser_url`, `read_browser_page`, `execute_browser_javascript` (browser tools can dereference `file://`), `read_url_content` (its `file://` form), `call_mcp_tool` (per frozen MCP tool) | one `sibling_read` record per tool name (cprot-v2 tool_class: read/glob/grep/bash_absolute/mcp; browser, notebook execution, and `file://` URL reads are recorded under `bash_absolute` semantics — "arbitrary code or URL with filesystem reach") |
   | `own_mutation_path` | `write_to_file`, `replace_file_content`, `multi_replace_file_content`, `sed_file`, `notebook_edit`, `run_command`, `send_command_input`, `notebook_execution`, `execute_browser_javascript` | `self_mutation` records for write, append, truncate, rename, delete per tool name (a tool that cannot express an operation records that operation as denied-by-construction only when the probe suite proves the tool refuses it) |
-  | `network_only` | `search_web`, `read_url_content` (non-`file://` only — a `file://` probe is part of `sibling_read_path` above), `generate_image` | none for isolation; governed by `sandbox`/permission rules |
-  | `control` | `ask_permission`, `ask_custom_permission`, `ask_question`, `finish`, `wait`, `wait_5_seconds`, `schedule`, `send_message`, `manage_inbox`, `manage_task`, `manage_subagents`, `define_subagent`, `invoke_subagent`, `browser_subagent`, `list_permissions`, `list_resources`, `delete_knowledge`, `command_status`, `capture_browser_screenshot`, `capture_browser_console_logs`, `list_browser_pages`, and the remaining `browser_*` interaction tools (`click`, `input`, `scroll`, `drag`, `mouse_*`, `press_key`, `refresh_page`, `resize_window`, `select_option`, `get_dom`, `get_network_request`, `list_network_requests`, `scroll_dom`) | none — no independent filesystem reach beyond the paths above; subagents inherit the same tool set, so their reach is covered transitively by the tool-level probes (recorded as an assumption in the suite) |
-  | `uncovered` | any tool NOT in the map for this version | **profile rejected at freeze** — the path to production is a native denial that removes the tool from `init.tools` (operator `settings.json` rule) proven by the `init` capture, or a later evidence run that extends the map |
+  | `network_only` | `search_web`, `read_url_content` (its non-`file://` forms), `generate_image` | none for isolation; governed by `sandbox`/permission rules |
+  | `control` | `ask_permission`, `ask_custom_permission`, `ask_question`, `finish`, `wait`, `wait_5_seconds`, `list_permissions`, `list_resources`, `command_status`, `capture_browser_screenshot`, `capture_browser_console_logs`, `list_browser_pages`, and the `browser_*` interaction tools (`click`, `input`, `scroll`, `drag`, `mouse_*`, `press_key`, `refresh_page`, `resize_window`, `select_option`, `get_dom`, `get_network_request`, `list_network_requests`, `scroll_dom`) — tools that only act on state already opened by a probed tool or return status | none |
+  | `uncovered` | `invoke_subagent`, `browser_subagent`, `define_subagent`, `manage_subagents` (a subagent's inherited tool set and restrictions are NOT verified — an escape path until a live probe proves the inherited boundary), `schedule` (work executed outside the turn), `send_message`, `manage_inbox`, `manage_task` (cross-conversation channels), `delete_knowledge` (shared-state mutation), and any tool NOT in the map for this version | **profile rejected at freeze** — the path to production is a native denial that removes the tool from `init.tools` (operator `settings.json` rule) proven by the `init` capture, or a later evidence run that extends the map with probes (e.g. a subagent-boundary probe promoting the subagent tools to `control`) |
 
-  A tool listed in two classes carries both obligations. The map is
-  evidence, not code: it lives at `docs/superpowers/evidence/
-  ac010-agy-tool-coverage-<version>.json`, is digest-bound in the profile
-  (`tool_coverage_path`/`tool_coverage_digest`, §3.7), and coverage
-  validation derives the expected record set from `expected_tools` ∩ map.
-- **Skills, plugins, and guardrail hooks — configured state verified,
-  execution not claimed.** The profile freezes `expected_skills` (the
-  skill directory names under `<home>/antigravity-cli/skills` and the
-  enabled plugins' skill dirs), `expected_plugins` (from `agy plugin
-  list`, provider-free), and `hooks_config_digest` (sha256 of the
-  operator's `<home>/config/hooks.json` bytes). Construction and every
-  launch re-derive all three and fail closed on drift
-  (`ErrToolkitDrift`); `--disable-slash-commands` is pinned so skills
-  cannot be invoked as slash commands. What this proves: the configured
-  toolkit is the frozen one. What it does NOT prove (recorded as a gap,
-  never claimed): that a hook executed on a given tool call, or that the
-  model loaded a given skill. Issue #10's "verify expected
-  skills/tools/plugins and enabled guardrails" is met at the
-  configured-state level and stated as such in §6.
+  Consequence stated plainly: on an unmodified 1.2.9 install `init.tools`
+  contains uncovered tools, so a production-eligible Agy profile requires
+  the operator to deny them natively first; Council never claims
+  coverage it did not probe. The map is evidence, not code: it lives at
+  `docs/superpowers/evidence/ac010-agy-tool-coverage-<version>.json`
+  (shape in §3.7), is digest-bound in the profile
+  (`tool_coverage_path`/`tool_coverage_digest`), and coverage validation
+  derives the expected record set from `expected_tools` ∩ map.
+- **Skills, plugins, and guardrail hooks — configured state verified
+  strictly, execution not claimed.** The profile freezes
+  `expected_skills` (skill directory names under
+  `<home>/antigravity-cli/skills` plus the enabled plugins' skill dirs),
+  `expected_plugins` (each `{name, source, components[]}` from `agy
+  plugin list --json`-equivalent output, provider-free), and a
+  **hooks configured-state capture**: the operator's
+  `<home>/config/hooks.json` is parsed STRICTLY (one JSON value, no
+  duplicate keys, no trailing content), re-encoded canonically (sorted
+  keys, no insignificant whitespace), and its sha256 frozen as
+  `hooks_config_digest`; the profile additionally freezes
+  `required_hooks`, a non-empty list of JSON-pointer paths into that
+  document (e.g. `/guardrail`) that must each resolve to a non-empty
+  value whose subtree contains no `"enabled": false` / `"disabled":
+  true` marker and, when the entry has a `command`/`handler` string,
+  that string non-empty. Construction and every launch re-parse the
+  live file, recompute the canonical digest, re-check every required
+  pointer, re-list skills, and re-derive plugins; any difference is
+  `ErrToolkitDrift` before any process starts. `--disable-slash-commands`
+  is pinned so skills cannot be invoked as slash commands. What this
+  proves: the frozen hooks (including the guardrail entry) are present,
+  unchanged, and not marked disabled in the operator's configuration,
+  and the configured skills/plugins are the frozen ones. What it does
+  NOT prove (recorded as a gap, never claimed): that Agy actually ran a
+  hook on a given tool call, or that the model loaded a given skill.
+  Issue #10's "verify expected skills/tools/plugins and enabled
+  guardrails" is met at the configured-state level and stated as such in
+  §6.
 - **Approval records:** Agy has no per-variant approval wire protocol; the
   permission decision is native (`request-review` auto-deny) and surfaces
   in `result.denied_actions`. The attestation's `approval_deny` records
@@ -315,22 +338,31 @@ that never binds).
   **Identity namespace and correlation rule.** Native tool names are the
   single namespace. `result.denied_actions` speaks a different vocabulary
   (`action:"command"`, `display_name:"RunCommand"`), so the version-
-  pinned denial map (part of the tool-coverage evidence file, §3.2)
-  translates each `(action, display_name)` pair to the set of native
-  tool names it denies (1.2.9: `command`/`RunCommand` → `run_command`,
-  `send_command_input`; further pairs are added only from live
-  evidence). Because a denied `tool` step still reports `state:DONE`
-  in-stream (live-verified), execution is established as: `executed(T)`
-  ⇔ a `tool` step with `tool_name == T` reached `DONE` for this process
-  AND no denial in `denied_actions` maps to `T`. A `denied_actions` entry
-  whose pair is NOT in the pinned map fails closed: every observed tool
-  step of this process is treated as NOT executed and the attempt is
-  flagged incomplete with `unmapped_denials` recorded. The result is
-  flagged `verification_incomplete` when `required_tools − executed_tools
-  ≠ ∅` (a required tool silently SKIPPED) or `denied_tools ≠ ∅`, with
-  `missing_required_tools`, `denied_tools`, and `unmapped_denials`
-  recorded on the attempt and one `tool_denied` event emitted per mapped
-  denial. `SUCCESS` with exit 0 never clears the flag; acceptance of the
+  pinned `denial_map` in the coverage evidence file (§3.7 shape; 1.2.9:
+  `command`/`RunCommand` → {`run_command`, `send_command_input`}; further
+  pairs only from live evidence) translates each `(action,
+  display_name)` pair to the set of native tools it CAN deny. Because a
+  denied `tool` step still reports `state:DONE` in-stream
+  (live-verified), attribution is intersected with observation: for each
+  denial entry, `attributed = map(entry) ∩ observed_tools` where
+  `observed_tools` are the `tool_name`s of `tool` steps of THIS process.
+  `|attributed| = 1` ⇒ that tool is denied. `|attributed| > 1` ⇒ the
+  denial is ambiguous: ALL attributed tools are treated as not executed
+  and the entry is recorded in `ambiguous_denials` (conservative, never
+  a false "executed"). `|attributed| = 0` ⇒ the denial is recorded in
+  `unattributed_denials` (the native side denied something no observed
+  step names; never attributed to a tool that was not attempted). An
+  entry whose pair is NOT in the map ⇒ `unmapped_denials`, and every
+  observed tool of the process is treated as not executed. Then
+  `executed(T)` ⇔ T observed `DONE` AND T not denied/ambiguous AND no
+  unmapped denial exists; `denied_tools` = the attributed and ambiguous
+  tools. The result is flagged `verification_incomplete` when
+  `required_tools − executed_tools ≠ ∅` (a required tool silently
+  SKIPPED) or any of `denied_tools`, `ambiguous_denials`,
+  `unattributed_denials`, `unmapped_denials` is non-empty; all five are
+  recorded on the attempt and one `tool_denied` event is emitted per
+  denial entry (naming the attributed tools, or the raw pair when
+  unattributed/unmapped). `SUCCESS` with exit 0 never clears the flag; acceptance of the
   contributor's output is the controller's decision, never automatic.
 - Bound: Council's turn bound is enforced by SIGINT (§3.6), with
   `--print-timeout` set strictly LARGER as a backstop; if the stderr
@@ -381,8 +413,9 @@ number literals verbatim); the digest is
       "default_required_tools": [],
       "hooks_evidence": {"verified": ["…"], "unverifiable": ["hook execution at the Agy layer", "settings.json permissions.allow contents"]},
       "expected_skills": ["…"],
-      "expected_plugins": ["superpowers"],
+      "expected_plugins": [{"name": "superpowers", "source": "gemini-cli", "components": ["hooks", "skills"]}],
       "hooks_config_digest": "sha256:<hex>",
+      "required_hooks": ["/guardrail"],
       "init_evidence_path": "docs/superpowers/evidence/ac010-agy-init-1.2.9.json",
       "init_evidence_digest": "sha256:<hex>",
       "tool_coverage_path": "docs/superpowers/evidence/ac010-agy-tool-coverage-1.2.9.json",
@@ -436,10 +469,23 @@ with a typed validation error):
   the root, or a capture that fails any rule, is rejected at freeze and
   at construction. This is the native, digest-bound proof of the built-in
   inventory that AC-009 lacked for Codex.
-- `expected_skills`, `expected_plugins`: required (`[]` when none),
-  duplicates rejected. `hooks_config_digest`: `sha256:` + 64 hex over the
-  operator's `hooks.json` bytes (re-derived at construction and launch,
-  §3.2).
+- `expected_skills`: required (`[]` when none), duplicates rejected.
+  `expected_plugins`: required, objects sorted by `name`, `components`
+  sorted/deduplicated, duplicate names rejected. `hooks_config_digest`:
+  `sha256:` + 64 hex over the CANONICAL re-encoding of the strictly
+  parsed `hooks.json` (§3.2). `required_hooks`: required, non-empty,
+  RFC 6901 JSON pointers, sorted, duplicates rejected; each must resolve
+  in the capture at freeze.
+- **Coverage evidence file shape** (`tool_coverage_path`), strictly
+  decoded (single value, no unknown or duplicate keys, trailing content
+  rejected): `{"cli_version": "1.2.9", "tools": {"<tool>": ["<cap>",
+  …]}, "denial_map": [{"action": "<a>", "display_name": "<d>", "tools":
+  ["<tool>", …]}, …]}`. `tools` keys are unique and sorted; each value is
+  a non-empty array in enum order (§3.2) with no duplicates and with
+  `uncovered` exclusive. `denial_map` is sorted by (`action`,
+  `display_name`), duplicate pairs rejected, each `tools` array sorted,
+  deduplicated, non-empty, and a subset of the `tools` keys.
+  `cli_version` must equal the frozen one.
 - `hooks_evidence.verified`/`unverifiable`: at least one list present.
 - Unknown fields: `DisallowUnknownFields` on the typed block; an `agy`
   block under any `algo_version` other than `cprof-v4` is a validation
@@ -464,16 +510,28 @@ One run profile serves all four harnesses; a run including Agy is frozen
 as v4 and every other contributor on it remains valid. No record-only
 mode; no backfill.
 
-**Binary pin (hazard 1).** Production construction and EVERY launch
-(creation, auth gate, and each turn child) re-verify `binary_path` (must
-be the resolved absolute path, no symlink escape, regular file) and
-compute the FULL sha256 of its bytes against `binary_digest` — no
-metadata cache: an in-place modification that preserves size, mtime, and
-inode is inside the threat model. The cost (~1 s for a 217 MB binary) is
-accepted per launch. Drift ⇒ typed `ErrBinaryDrift`, no process started,
-and every attestation for the old digest is invalid by construction.
-The hash is taken immediately before the executor launch; the
-executor-observed executable identity is recorded on the launch row. The operator obligation to disable the auto-updater is
+**Binary pin (hazard 1) — two checks, the second closes the race.**
+(1) Pre-launch: production construction and EVERY launch (creation, auth
+gate, each turn child) re-verify `binary_path` (resolved absolute path,
+no symlink escape, regular file) and compute the FULL sha256 of its
+bytes against `binary_digest` — no metadata cache. Drift ⇒
+`ErrBinaryDrift`, no process started. (2) **Post-exec, pre-trust
+(Linux, the only production platform, §3.12):** because the installed
+binary demonstrably self-updates, the file can be replaced between the
+pre-launch hash and `exec`. So after the executor reports the child pid
+and BEFORE any output of that child is trusted — the `models` catalog,
+the creation `init`, or the turn `init` — and therefore before any
+prompt byte is written, the adapter opens `/proc/<pid>/exe` (the kernel
+handle to the image actually mapped, valid even if the path was replaced
+or unlinked), requires its `readlink` target to equal the frozen
+resolved path WITHOUT a ` (deleted)` suffix and its `st_dev:st_ino` to
+equal the pre-launch stat, and hashes the bytes read THROUGH that handle
+against `binary_digest`. Any mismatch or read failure ⇒ child terminated,
+`ErrBinaryDrift`, nothing transmitted, nothing bound. The digest observed
+through `/proc/<pid>/exe` is recorded on the launch row as the
+executable identity. The cost (~1 s per launch for a 217 MB image) is
+accepted. Every attestation for a superseded digest is invalid by
+construction. The operator obligation to disable the auto-updater is
 recorded as unverified; the pin is the defense either way.
 
 ### 3.8 Trust model of the durable conversation file
@@ -528,6 +586,7 @@ agy_turn_attempts         -- attempt_id, session_id, turn_key, prompt_digest,
                           --   accepted, terminal, result_payload, result_usage,
                           --   required_tools_json, executed_tools_json,
                           --   missing_required_tools_json, denied_tools_json,
+                          --   ambiguous_denials_json, unattributed_denials_json,
                           --   unmapped_denials_json, verification_incomplete BOOL,
                           --   observed_status (completed|failed|cancelled|missing|uncertain),
                           --   uncertainty_disposition NULL, transition_version, timestamps
@@ -605,8 +664,8 @@ eligibility is limited accordingly:
 |---|---|
 | Probe the installed CLI and supported output fields with sanitized fixtures | §2, evidence file; fixture executable (§4) |
 | Start independently and resume a specified conversation | §3.3 (provider-free creation), §3.1/§3.5 (`--conversation` + `init` equality) |
-| Verify expected skills/tools/plugins and enabled guardrails | §3.7 `expected_tools` = `init.tools` at freeze (digest-bound `init_evidence`) and every launch; every tool classified by the pinned coverage map (uncovered ⇒ rejected); `expected_skills`/`expected_plugins`/`hooks_config_digest` re-derived at every launch (configured state verified; execution explicitly not claimed); `permission_mode` attestation; MCP/plugin tool inventories gated to empty until natively provable |
-| Required skipped/denied tools keep verification incomplete regardless of exit code | §3.5 queue-validated immutable `required_tools` (native names) vs observed executed `tool` steps under the pinned denial map ⇒ `missing_required_tools`; `denied_actions` ⇒ `denied_tools`; unmapped denials fail closed; any ⇒ `verification_incomplete`; exit code never classifies (§2.1/§3.9) |
+| Verify expected skills/tools/plugins and enabled guardrails | §3.7 `expected_tools` = `init.tools` at freeze (digest-bound `init_evidence`) and every launch; every tool classified by the pinned coverage map (subagent, scheduling, messaging, and shared-state tools are uncovered ⇒ rejected until natively denied or probed); skills, plugins, and the strictly parsed hooks capture with `required_hooks` present-and-not-disabled re-derived at every launch (configured guardrail state verified; hook EXECUTION explicitly not claimed); `permission_mode` attestation; MCP/plugin tool inventories gated to empty until natively provable |
+| Required skipped/denied tools keep verification incomplete regardless of exit code | §3.5 queue-validated immutable `required_tools` (native names) vs observed executed `tool` steps under the pinned denial map intersected with observation ⇒ `missing_required_tools`; `denied_actions` ⇒ `denied_tools`/`ambiguous_denials`/`unattributed_denials`; unmapped denials fail closed; any ⇒ `verification_incomplete`; exit code never classifies (§2.1/§3.9) |
 | Bounded cancellation, unknown outcomes, client-close recovery, no fallback harness | §3.6 SIGINT → verified `interrupted`; §3.9/§3.10 Uncertain rules; §3.1 detached context; no other adapter is ever substituted |
 
 ### 6.1 Concrete acceptance scenarios
@@ -637,7 +696,10 @@ eligibility is limited accordingly:
 `--mode`/`--sandbox` effect headlessly; `denied_tools` rule denial shape
 and whether a natively denied tool disappears from `init.tools`; hook
 EXECUTION and skill LOADING at the Agy layer (configured state is
-verified, §3.2); the transitive-subagent coverage assumption;
+verified, §3.2); the subagent inherited tool boundary (subagent tools are
+uncovered until probed, §3.2); whether `/proc/<pid>/exe` hashing is
+observable by the executor seam on all supported kernels (assumed
+Linux-standard);
 workspace-trust gating; healthy-turn print-timeout; content-block user
 messages; `AGY_ERROR` exit-3 path; MCP tool naming in `call_mcp_tool` steps;
 plugin/skill tool surfacing; auto-updater off switch; `GEMINI_API_KEY`
@@ -682,3 +744,23 @@ none is claimed by the design.
    rule, unmapped-denial fail-closed, queue-time validation and
    immutability of `required_tools` (§3.5, §3.11, §6).
 5. Binary pin: full sha256 at every launch, no metadata cache (§3.7).
+
+## 10. v4 changes (review of v3)
+
+1. Coverage map cardinality: each tool maps to a canonical non-empty SET
+   of capabilities (closed enum, sorted, deduplicated, `uncovered`
+   exclusive); the file shape is specified (§3.2, §3.7).
+2. Subagent, scheduling, cross-conversation messaging, and shared-state
+   tools are `uncovered` until a live probe proves their boundary; on an
+   unmodified install production requires the operator to deny them
+   natively, stated plainly (§3.2, §7).
+3. Binary pin closes the updater race: post-exec verification through
+   `/proc/<pid>/exe` (path, dev:ino, full hash) before any child output is
+   trusted or any prompt byte is written (§3.7).
+4. Guardrail verification is a strict, canonical, digest-bound hooks
+   capture with `required_hooks` pointers that must be present and not
+   disabled, re-derived at every launch; execution still not claimed
+   (§3.2, §3.7, §6).
+5. Denial-map canonical contract and observation-intersected attribution
+   with ambiguous/unattributed/unmapped classes, all fail-closed toward
+   "not executed" (§3.5, §3.7, §3.11, §6).
