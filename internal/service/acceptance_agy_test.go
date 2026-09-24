@@ -610,12 +610,14 @@ func TestAcceptance_Agy_Lifecycle(t *testing.T) {
 
 // ── Production construction through the service-recorded attestation ──
 
-// newAgyProductionServer records the covering cprot-v2 attestation
-// through the SERVICE operation (RecordAgyProbeAttestation on a
-// configured fixture-scoped instance — see the evidence matrix note: a
-// production-configured service cannot be constructed before the first
-// row exists), then builds the PRODUCTION service from configuration
-// alone (NewServerWithAdapter(…, nil)).
+// newAgyProductionAcceptance drives the REAL spec §14.18 bootstrap from
+// configuration alone (NewServerWithAdapter(…, nil)): with no covering
+// row the production-configured service starts in awaiting_attestation
+// (no agy adapter, no child); when attest is set, the covering cprot-v2
+// row is recorded through the SERVICE operation on that awaiting server
+// (RecordAgyProbeAttestation — no wired adapter needed), and a restart
+// over the same store and state dir constructs the production adapter.
+// When attest is false it returns the awaiting server's typed refusal.
 func newAgyProductionAcceptance(t *testing.T, attest bool) (*agyAcceptance, error) {
 	t.Helper()
 	if runtime.GOOS != "linux" {
@@ -624,25 +626,39 @@ func newAgyProductionAcceptance(t *testing.T, attest bool) (*agyAcceptance, erro
 	e := newAgyWireEnv(t, nil)
 	store := e.openStore(t)
 	e.seedAdopted(t, store, e.profile)
-	if attest {
-		rec := e.fixtureServer(t, store)
-		att := e.coveringAttestation(t, "operator-acc")
-		id, err := att.Digest()
-		if err != nil {
-			t.Fatalf("digest: %v", err)
-		}
-		receipt, err := rec.srv.RecordAgyProbeAttestation(context.Background(), AgyProbeAttestationRequest{
-			OpID: "op-att-acc-agy", OperatorToken: e.cfg.AuthToken, Actor: "operator-acc",
-			RunID: agyWireRunID, AttestationID: id, Attestation: att,
-		})
-		if err != nil || receipt.Payload != id {
-			t.Fatalf("service-recorded attestation: %+v err=%v", receipt, err)
-		}
-		rec.srv.lock.Release()
+	awaiting, err := NewServerWithAdapter(store, mustLock(t, e.stateDir), e.cfg, nil)
+	if err != nil {
+		t.Fatalf("an unattested production-configured service starts awaiting attestation: %v", err)
 	}
+	if st := awaiting.AgyStatus(); st.State != AgyAwaitingAttestation || awaiting.adapter != nil {
+		t.Fatalf("want awaiting_attestation with no adapter, got %+v %T", st, awaiting.adapter)
+	}
+	if !attest {
+		return &agyAcceptance{t: t, e: e, store: store}, awaiting.agyAwaiting()
+	}
+	att := e.coveringAttestation(t, "operator-acc")
+	id, err := att.Digest()
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	receipt, err := awaiting.RecordAgyProbeAttestation(context.Background(), AgyProbeAttestationRequest{
+		OpID: "op-att-acc-agy", OperatorToken: e.cfg.AuthToken, Actor: "operator-acc",
+		RunID: agyWireRunID, AttestationID: id, Attestation: att,
+	})
+	if err != nil || receipt.Payload != id {
+		t.Fatalf("attestation recorded on the awaiting service: %+v err=%v", receipt, err)
+	}
+	if constructionProbeRan(e.scratch) {
+		t.Fatal("no child runs while awaiting attestation")
+	}
+	// Restart (no hot reload): same store, same state dir.
+	awaiting.lock.Release()
 	srv, err := NewServerWithAdapter(store, mustLock(t, e.stateDir), e.cfg, nil)
 	if err != nil {
 		return &agyAcceptance{t: t, e: e, store: store}, err
+	}
+	if st := srv.AgyStatus(); st.State != AgyWired {
+		t.Fatalf("the restart wires the production adapter, got %+v", st)
 	}
 	adp, ok := srv.adapter.(*agy.AgyAdapter)
 	if !ok {
@@ -659,8 +675,9 @@ func newAgyProductionAcceptance(t *testing.T, attest bool) (*agyAcceptance, erro
 	return acc, nil
 }
 
-// The production path end to end on Linux: the row recorded by the
-// service operation unlocks NewProductionAgyAdapter (the construction
+// The production path end to end on Linux, through the real §14.18
+// bootstrap: the row recorded by the service operation on the awaiting
+// server unlocks NewProductionAgyAdapter at the restart (the construction
 // `plugin list` ran), and a birth + queued turn run through the
 // production adapter: the sealed fixture child inherits HOME = the
 // parent of expected_home (§14.2), the attempt identity comes from the
@@ -1151,8 +1168,10 @@ func TestAcceptance_Agy_S10_BinaryDriftStartsNoProcess(t *testing.T) {
 
 // §6.1 row 11 — Unattested authenticated dispatch:
 // ErrProductionEligibilityMissing before any child starts. (a) without a
-// covering row the production service is not constructed at all (typed
-// ErrNotEligible wrapping ErrProductionEligibilityMissing; no child);
+// covering row the production service starts WITHOUT the agy adapter in
+// the §14.18 awaiting_attestation state, and its agy operations refuse
+// typed (ErrNotEligible wrapping ErrProductionEligibilityMissing; no
+// child);
 // (b) a row that disappears after construction (an operator purge)
 // fails the NEXT launch before any child, through the bridge. The purge
 // below (DELETE FROM agy_protection_attestations) is the OTHER of the
@@ -1163,7 +1182,7 @@ func TestAcceptance_Agy_S11_UnattestedDispatchRefusedBeforeAnyChild(t *testing.T
 	var ne *agy.ErrNotEligible
 	var missing *agy.ErrProductionEligibilityMissing
 	if !errors.As(err, &ne) || !errors.As(err, &missing) {
-		t.Fatalf("an unattested production service is refused typed, got %T: %v", err, err)
+		t.Fatalf("an unattested production service refuses agy operations typed, got %T: %v", err, err)
 	}
 	if constructionProbeRan(acc.e.scratch) {
 		t.Fatal("eligibility fails closed before any child")
