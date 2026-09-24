@@ -58,7 +58,11 @@ func codexPlatformIdentity(policy CodexLaunchPolicy) string {
 // bounded UUID-suffix scan under $CODEX_HOME/sessions, verifies
 // session_meta.session_id == the native id, and enforces the
 // path-integrity rules (no symlinks, contained under the sessions root).
-// The resolved path is what first acceptance records on the binding.
+// The returned path is the PHYSICAL path (the scan walks the symlink-
+// resolved sessions root, so a home behind a symlinked ancestor such as
+// macOS /var → /private/var resolves to the spelling the native child
+// experiences); it is what first acceptance records on the binding, and
+// checkRolloutPath accepts it against either spelling of the home.
 func ResolveRollout(codexHome, nativeID string) (string, error) {
 	path, err := locateRollout(codexHome, nativeID)
 	if err != nil {

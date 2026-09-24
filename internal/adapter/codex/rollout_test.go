@@ -126,13 +126,42 @@ func harnessTaskComplete(message string, withError bool) string {
 func TestResolveRollout_BoundedScanGolden(t *testing.T) {
 	h := newAdapterHarness(t)
 	path := seedRollout(t, h, testThreadID)
+	// The resolver walks the symlink-RESOLVED sessions root and records
+	// the physical path the native child experiences (macOS temp dirs
+	// live behind /var → /private/var), so the golden is the physical
+	// spelling of the seeded file.
+	want, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("resolve seeded path: %v", err)
+	}
 
 	got, err := ResolveRollout(h.policy.ExpectedCodexHome, testThreadID)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if got != path {
-		t.Fatalf("resolved %q, want %q", got, path)
+	if got != want {
+		t.Fatalf("resolved %q, want the physical path %q", got, want)
+	}
+	// A codex home reached THROUGH a symlink (the macOS shape, reproduced
+	// on every platform) resolves to the same physical rollout path, and
+	// the recorded path passes the integrity check against either
+	// spelling of the home.
+	linkedHome := filepath.Join(h.scratch, "home-link")
+	if err := os.Symlink(h.policy.ExpectedCodexHome, linkedHome); err != nil {
+		t.Fatalf("symlink home: %v", err)
+	}
+	viaLink, err := ResolveRollout(linkedHome, testThreadID)
+	if err != nil {
+		t.Fatalf("resolve through the symlinked home: %v", err)
+	}
+	if viaLink != want {
+		t.Fatalf("resolved %q through the symlinked home, want %q", viaLink, want)
+	}
+	if err := checkRolloutPath(got, linkedHome); err != nil {
+		t.Fatalf("physical path must pass the check against the symlinked home: %v", err)
+	}
+	if err := checkRolloutPath(got, h.policy.ExpectedCodexHome); err != nil {
+		t.Fatalf("physical path must pass the check against the home: %v", err)
 	}
 
 	// A thread with no rollout fails closed.
