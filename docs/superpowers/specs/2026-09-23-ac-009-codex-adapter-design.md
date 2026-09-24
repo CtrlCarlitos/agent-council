@@ -656,6 +656,9 @@ adapter side effect.
         "expected_mcp_servers": ["…"],
         "expected_mcp_tools": ["<server>/<tool>", "…"],
         "expected_plugin_tools": ["…"],
+        "tool_inventory_path":
+          "docs/superpowers/evidence/ac009-native-tool-inventory-0.154.0.json",
+        "tool_inventory_digest": "sha256:<hex>",
         "expected_instruction_sources": ["…"],
         "rules_evidence": {
           "verified": ["…"],
@@ -681,9 +684,20 @@ adapter side effect.
   `expected_mcp_servers`) and `expected_plugin_tools` (exact
   skill/plugin-contributed tool names) are the EXACT, digest-bound tool
   inventories the attestation coverage rule (§3.7) enumerates; both are
-  required (`[]` when none). Tool-level live verification against the
-  native inventory remains an integration obligation — the pinned
-  `mcpServerStatus/list` shape is verified at server granularity only.
+  required (`[]` when none). They are PROVEN complete, not asserted:
+  whenever the profile enables any MCP server or plugin tool it must
+  bind `tool_inventory_path`/`tool_inventory_digest` — a committed,
+  provider-free native tool-inventory capture (Council shape:
+  `{codex_cli_version, mcp_servers: {server: [tool…]}, plugin_tools}`,
+  produced from the Stage A `mcpServerStatus/list` capture plus the
+  native skills inventory, operator-reviewed, digest-pinned). Freeze
+  re-hashes it and requires its server, `<server>/<tool>`, and plugin
+  sets to EQUAL the frozen lists, so a profile cannot omit an enabled
+  tool and still pass exact-set coverage. The capture is version-bound
+  evidence: tool-level LIVE verification at dispatch remains an
+  integration obligation (the pinned `mcpServerStatus/list` shape is
+  verified at server granularity only) and is listed as unverified in
+  the evidence matrix until the real integration run proves it.
   - **Normalization**: the existing family — BOM trim, NFC, dedupe,
     byte-wise lexicographic sort for array fields (case-sensitive; the
     lowercasing quirk of `tooling` is NOT applied here); scalars trimmed +
@@ -888,6 +902,16 @@ Template materialization is NOT required (no per-session config root,
 attestation's manifest digest.
 
 ## 4. Evidence plan (fixtures vs integration)
+
+Errata (implementation review) — recorded as UNVERIFIED until the real
+integration run proves them: (a) Codex trust of the operator-trusted
+workspace base applying to the per-session AC-005 subdirectory the
+thread runs in (§3.4 birth path); (b) the native tool inventory at tool
+granularity (`tool_inventory_path` capture vs. the live inventory; the
+`mcpServerStatus/list` entry shape and the plugin/skills inventory
+surface are not pinned by committed schema evidence); (c) the analogous
+caller-supplied model/workspace concern in the AC-008 Claude birth path
+is tracked separately under AC-008, not here.
 
 - **Fixture layer (CI, provider-free)**: a fake `codex` binary via the
   PolicyExecutor speaking recorded JSON-RPC fixtures: initialize handshake
