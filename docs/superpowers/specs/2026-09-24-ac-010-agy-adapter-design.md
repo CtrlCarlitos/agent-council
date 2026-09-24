@@ -1,7 +1,6 @@
 # AC-010 Design — Agy (Antigravity CLI) persistent contributor adapter
 
-Status: DRAFT v6 for review (v1: 7, v2: 5, v3: 5, v4: 4, v5: 2 findings —
-all addressed; change logs at the end)
+Status: DRAFT v7 for review (v1: 7, v2: 5, v3: 5, v4: 4, v5: 2, v6: 3 findings — all addressed; change logs at the end)
 Date: 2026-09-24
 Issue: #10
 Depends on: AC-003 (controller grants), AC-005 (workspaces/execution policy),
@@ -233,14 +232,7 @@ scoped:
   "components":["hooks","skills"]}]}`: the capture is decoded strictly
   (single JSON value, no unknown or duplicate keys, trailing content
   rejected, `importedAt` RFC3339, `components` ⊆ {`hooks`,`skills`,
-  `mcp`,`commands`,`agents`}), re-encoded canonically (sorted keys,
-  imports sorted by `name`, components sorted/deduplicated), and its
-  sha256 frozen as `plugins_evidence_digest` alongside the committed
-  capture (`plugins_evidence_path`, evidence-root rules of §3.7). At
-  construction and every launch the adapter re-runs `plugin list`
-  through the executor (provider-free; `/proc/<pid>/exe`-verified like
-  every launch), re-decodes and re-canonicalizes, and requires digest
-  equality; any parse failure or difference is `ErrToolkitDrift`. If the
+  `mcp`,`commands`,`agents`}), re-encoded canonically (sorted keys, no insignificant whitespace, imports sorted by `name`, components sorted/deduplicated), and **the committed capture IS that canonical encoding** — raw file bytes and canonical bytes are identical by construction, so ONE digest, `plugins_evidence_digest`, serves both the evidence-root raw re-hash and the semantic comparison. Validation order at freeze and construction: (1) evidence-root containment (§3.7); (2) raw bytes re-hash == `plugins_evidence_digest`; (3) strict decode; (4) canonical re-encode must equal the raw bytes exactly (a non-canonical committed file is rejected); (5) at construction and every launch the adapter re-runs `plugin list` through the executor (provider-free, sealed-image verified like every launch), strictly decodes and canonicalizes the LIVE output, and requires its sha256 == `plugins_evidence_digest`. Any failure at any step is `ErrToolkitDrift`. If the
   live output ever fails the pinned shape, the profile is not launchable
   until the shape evidence is refreshed. Plus a
   **hooks configured-state capture**: the operator's
@@ -484,12 +476,7 @@ with a typed validation error):
   at construction. This is the native, digest-bound proof of the built-in
   inventory that AC-009 lacked for Codex.
 - `expected_skills`: required (`[]` when none), duplicates rejected,
-  each a bare directory name (no separators). `plugins_evidence_path`/
-  `plugins_evidence_digest`: required; the committed strict capture of
-  `agy plugin list` (§3.2) under the same evidence-root and strict-
-  decoding contract as the `init` capture; the digest is over the
-  CANONICAL re-encoding so a byte-different but semantically identical
-  live output still matches, while any semantic difference fails.
+  each a bare directory name (no separators). `plugins_evidence_path`/`plugins_evidence_digest`: required; the committed capture of `agy plugin list` (§3.2) MUST be canonical JSON (raw bytes == canonical re-encoding, checked at freeze), under the same evidence-root and strict-decoding contract as the `init` capture; the single digest is over those bytes, and the live re-derivation is compared after canonicalization so a byte-different but semantically identical live output still matches while any semantic difference fails. The same canonical-bytes rule applies to the `init` and coverage captures.
   `hooks_config_digest`:
   `sha256:` + 64 hex over the CANONICAL re-encoding of the strictly
   parsed `hooks.json` (§3.2). `required_hooks`: required, non-empty,
@@ -547,47 +534,19 @@ others are mandatory defense in depth, all Gate 1 fixture-tested.**
    lifetime; its `st_dev:st_ino` is the launch identity. Every launch
    (creation, auth gate, `plugin list`, each turn child) execs the image
    through a new AC-005 executor capability, **sealed-image launch**
-   (`LaunchRequest.SealedImage{fd, digest, argv0}`): the executor
-   verifies the seals are present, re-hashes the descriptor against the
-   frozen digest, and execs `/proc/self/fd/<n>` with `argv[0]` set to
-   the frozen `binary_path` for process-list readability; the frozen
-   argv template is validated exactly as for path launches, and a path
-   launch of Agy is refused in production. The operator-path
+   (`LaunchRequest.SealedImage{fd, digest, argv0}`): the executor DUPLICATES and owns the descriptor for the launch, verifies the seals are present, re-hashes the descriptor against the frozen digest, and execs `/proc/self/fd/<n>` with `argv[0]` set to the frozen `binary_path` for process-list readability; the frozen argv template is validated exactly as for path launches, and a path launch of Agy is refused in production. The adapter's own held descriptor is only the source it hands over; the adapter never launches anything itself. The operator-path
    self-updater can update the operator's install freely without
    touching what Council runs; a new install becomes launchable only
    after the operator refreshes `binary_digest` at profile freeze, never
    implicitly. Linux-only, consistent with §3.12.
-2. **Post-exec identity through `/proc/<pid>/exe` — mandatory, with the
-   child held at the exec boundary until it completes.** The sealed-
-   image launch starts the child under an **exec-stop**: the executor
-   forks a Council-owned trampoline that requests `PTRACE_TRACEME` and
-   execs `/proc/self/fd/<n>`; the kernel stops the child at the exec
-   boundary with `PTRACE_O_EXITKILL` armed, so `/proc/<pid>/exe` is
-   populated and the child cannot run or exit until released. While it
-   is stopped and BEFORE any output of that child is trusted — the
-   `models` catalog, the `plugin list` capture, the creation `init`, the
-   turn `init` — and therefore before any prompt byte is written, the
-   adapter verifies identity: for a sealed image the `readlink` target
-   is `/memfd:<name> (deleted)` BY DESIGN, so the check is
-   `st_dev:st_ino` of `/proc/<pid>/exe` == `fstat` of the held sealed
-   descriptor, plus a hash of the bytes read THROUGH `/proc/<pid>/exe`
-   against `binary_digest`. Pass ⇒ the executor detaches and the child
-   runs. Mismatch, unreadable link, or a child not stopped at the exec
-   boundary ⇒ child killed, `ErrBinaryDrift`, nothing transmitted,
-   nothing bound. There is no `inconclusive` outcome: fast children are
-   observable by construction, and the check either passes or the launch
-   is refused.
-3. **Pre-launch re-hash of the sealed descriptor** and the executor-
-   observed executable identity (`memfd` dev:ino, digest), both recorded
-   on the launch row.
+2. **Post-exec identity through `/proc/<pid>/exe` — mandatory, and entirely INSIDE `PolicyExecutor.Start` (the unbypassable seam).** The executor, not the adapter, performs the whole sequence within `Start`: fork a Council-owned trampoline that requests `PTRACE_TRACEME` and execs `/proc/self/fd/<n>`; the kernel stops the child at the exec boundary with `PTRACE_O_EXITKILL` armed, so `/proc/<pid>/exe` is populated and the child cannot run or exit; the executor then verifies identity — for a sealed image the `readlink` target is `/memfd:<name> (deleted)` BY DESIGN, so the check is `st_dev:st_ino` of `/proc/<pid>/exe` == `fstat` of the executor-owned sealed descriptor, plus a hash of the bytes read THROUGH `/proc/<pid>/exe` against the frozen digest — and only on success detaches and returns a RUNNABLE `ManagedProcess` (with pipes armed) carrying the verified executable identity (`memfd` dev:ino, digest) for the launch row. On any failure (mismatch, unreadable link, child not stopped at the exec boundary, ptrace unavailable) `Start` kills the child and returns an error and NO process. The adapter never receives a pid, a stopped child, or ptrace controls, so no caller can skip, reorder, or mishandle the release; every output the adapter ever reads — `models`, `plugin list`, the creation `init`, the turn `init` — comes from a process the executor already verified, and the prompt byte is written only to such a process. There is no `inconclusive` outcome: fast children are observable by construction, and the check either passes or the launch is refused.
+3. **Pre-launch re-hash of the sealed descriptor** (adapter, before handing the source to the executor) and the executor-verified executable identity returned by `Start`, both recorded on the launch row.
 
 This is core production evidence, not an operator obligation: Gate 1
 (§4) must prove, with Council's own fixture executable and no provider,
 (a) a sealed descriptor rejects writes/truncation after sealing and a
 descriptor missing any seal is refused, (b) a digest mismatch through
-the sealed descriptor is refused pre-launch, (c) a child whose
-`/proc/<pid>/exe` dev:ino or hash does not match the held descriptor is
-killed before its first output is consumed, (d) a fast-exiting fixture
+the sealed descriptor is refused pre-launch, (c) `Start` returns no process (child killed) when `/proc/<pid>/exe` dev:ino or hash does not match the executor-owned descriptor, and the executor test suite — not the adapter's — is where this is proven, (d) a fast-exiting fixture
 child is verified at the exec boundary and released — never refused,
 never trusted unverified, (e) a slow child is verified before its first
 output is consumed, (f) production construction refuses to fall back to
@@ -864,3 +823,16 @@ none is claimed by the design.
 2. Plugin and `init` contracts are now backed by committed, sanitized,
    provider-free captures with SHA-256 sums; the research file records
    the observed payload shape (§3.2, §3.7; evidence directory).
+
+## 13. v7 changes (review of v6)
+
+1. Plugin evidence: the committed capture is canonical JSON, so the raw
+   evidence-root re-hash and the semantic digest are one value; the
+   validation order is stated; the canonical-bytes rule applies to every
+   capture (§3.2, §3.7; evidence file rewritten, sums refreshed).
+2. Sealed-image verification is owned end-to-end by
+   `PolicyExecutor.Start`: descriptor duplication, seal/digest checks,
+   exec-stop, `/proc/<pid>/exe` verification, detach, and only then a
+   runnable `ManagedProcess`; the adapter never sees a pid, a stopped
+   child, or ptrace controls (§3.7, §4).
+3. Research tool count corrected to 57 everywhere.

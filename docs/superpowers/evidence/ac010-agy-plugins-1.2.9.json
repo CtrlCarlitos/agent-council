@@ -1,13 +1,1 @@
-{
-  "imports": [
-    {
-      "name": "superpowers",
-      "source": "gemini-cli",
-      "importedAt": "2026-09-02T19:59:12Z",
-      "components": [
-        "skills",
-        "hooks"
-      ]
-    }
-  ]
-}
+{"imports":[{"components":["hooks","skills"],"importedAt":"2026-09-02T19:59:12Z","name":"superpowers","source":"gemini-cli"}]}
