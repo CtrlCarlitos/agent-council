@@ -65,9 +65,11 @@ table to committed tests, and has an explicit "unverified live" column.
   - §14.17: no controller operation records a disposition for an
     Uncertain turn attempt. The durable block holds; clearing it needs
     follow-up work. AC-008 and AC-009 have the same gap.
-  - §14.18: the first attestation cannot be recorded in production. A
-    configured service refuses construction until a covering row exists,
-    and `RecordAgyProbeAttestation` has no HTTP route.
+  - §14.18 is closed in this branch's final wave (see spec §14.18):
+    `RecordAgyProbeAttestation` depends only on the store, the operator
+    credential, and the configured agy profile and evidence root — never
+    on a wired adapter — so the first row can be recorded that way before
+    the adapter exists.
 - **Descendants.** A descendant that leaves the child's process group
   escapes the forced kill (§14.6).
 

@@ -271,6 +271,20 @@ func agyArgvHasConversation(line, id string) bool {
 	return strings.Contains(line, "\x1f--conversation\x1f"+id)
 }
 
+// agyGateLinesWithPrefix counts .agy-fixture-gate-args lines (the
+// provider-free models/plugin-list gate log, kept apart from the
+// stream-json .agy-fixture-args log — see agyfake_test.go's doc
+// comment) whose argv starts with prefix.
+func agyGateLinesWithPrefix(root, prefix string) int {
+	n := 0
+	for _, g := range agyFixtureLines(root, ".agy-fixture-gate-args") {
+		if strings.HasPrefix(g, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
 // restart models a service process death and restart over the same
 // durable state: live workers stop (never recording a fabricated
 // terminal), the server closes (storage closed), and a NEW server with
@@ -574,7 +588,11 @@ func TestAcceptance_Agy_Lifecycle(t *testing.T) {
 	}
 
 	// 13. The restarted service (fresh adapter, auth gate re-run) serves
-	// the next turn on the same exact conversation.
+	// the next turn on the same exact conversation. The restart built a
+	// FRESH adapter (no in-memory auth cache, implementation note 9), so
+	// this dispatch's models gate must be a NEW launch, not a reuse of
+	// the pre-restart pass.
+	preRestartModelsGates := agyGateLinesWithPrefix(w.root, "models")
 	w.stage(t, agyKnown(agyWireNativeID), agyUserInputDone, agySuccess("after restart"))
 	acc.queueRelease("t-acc-3", "after restart", nil)
 	acc.waitTurn("t-acc-3", isTerminalStatus)
@@ -584,6 +602,9 @@ func TestAcceptance_Agy_Lifecycle(t *testing.T) {
 	}
 	if args := acc.streamArgs(); len(args) != 4 || !agyArgvHasConversation(args[3], agyWireNativeID) {
 		t.Fatalf("the post-restart turn addressed the exact conversation, got %q", args)
+	}
+	if got := agyGateLinesWithPrefix(w.root, "models"); got != preRestartModelsGates+1 {
+		t.Fatalf("the restart must re-run the models auth gate before the post-restart turn, before=%d after=%d", preRestartModelsGates, got)
 	}
 }
 
@@ -667,8 +688,17 @@ func TestAcceptance_Agy_ProductionConstructionUnlockedByServiceRecordedAttestati
 	if strings.HasPrefix(att.AttemptID, "att-") {
 		t.Fatalf("production attempt identity comes from the dispatch intent, not the fixture identity, got %q", att.AttemptID)
 	}
+	// Exactly two stream-json launches log HOME here: the create() birth
+	// and the t-prod-1 turn (the models/plugin-list gates and the
+	// construction plugin list log to .agy-fixture-gate-env instead —
+	// see agyfake_test.go's doc comment). Asserting the count first keeps
+	// the loop below from passing vacuously if nothing was logged.
+	envLines := agyFixtureLines(acc.w.root, ".agy-fixture-env")
+	if len(envLines) != 2 {
+		t.Fatalf("expected exactly 2 sealed launches recording HOME (create + t-prod-1), got %d: %q", len(envLines), envLines)
+	}
 	wantHome := "HOME=" + filepath.Dir(acc.e.home)
-	for _, l := range agyFixtureLines(acc.w.root, ".agy-fixture-env") {
+	for _, l := range envLines {
 		if l != wantHome {
 			t.Fatalf("every sealed launch inherits the operator home parent %q, got %q", wantHome, l)
 		}
@@ -768,9 +798,20 @@ func TestAcceptance_Agy_S02_CrashAfterStdinWriteResultLost(t *testing.T) {
 	if err != nil || out.Status != adapter.ReconciliationUncertain {
 		t.Fatalf("the restarted adapter reconciles Uncertain (evidence never invents an outcome), got %+v err=%v", out, err)
 	}
+	// The refusal here is the session's generic non-terminal-turn guard,
+	// not a dedicated "unresolved agy attempt" check: t-lost's loss never
+	// clears the session's active_key (no terminal was ever recorded), so
+	// ReleaseTurn sees the session still "running" with t-lost active and
+	// refuses release_failed/400 before any new attempt is reserved.
 	ver := acc.queue(agyWireSession, "t-after", "must never transmit", nil)
-	if code := acc.release(agyWireSession, "t-after", ver); code == http.StatusAccepted {
-		t.Fatal("the next turn cannot be released while the lost turn is unresolved")
+	relOpID := acc.op("op-rel-acc-agy-after")
+	relBody := fmt.Sprintf(`{"op_id": %q, "controller_lease": %q, "expected_version": %d}`, relOpID, agyWireLease, ver)
+	code, resp := acc.bridge.do("POST", "/v1/runs/"+agyWireRunID+"/sessions/"+agyWireSession+"/turns/t-after/release", relBody)
+	errObj, _ := resp["error"].(map[string]any)
+	msg, _ := errObj["message"].(string)
+	if code != http.StatusBadRequest || errObj["code"] != "release_failed" ||
+		!strings.Contains(msg, "already has active turn") || !strings.Contains(msg, "t-lost") {
+		t.Fatalf("the next turn cannot be released while the lost turn is unresolved: want 400 release_failed naming t-lost as the active turn, got %d %v", code, resp)
 	}
 	if args := acc.streamArgs(); len(args) != 2 {
 		t.Fatalf("no process for the blocked turn, launches=%d", len(args))
@@ -792,9 +833,12 @@ func (agyDefaultsRequired) RequiredToolsFor(context.Context, adapter.TurnRef) ([
 // equality. The turn is accepted (user_input DONE) and the child dies
 // without a result. Because no controller-disposition operation for
 // turn attempts is shipped (gap recorded in the evidence matrix), the
-// disposition is written to the attempt row directly — the ONE place in
-// this file that edits storage by hand, labelled as the missing surface.
-// The next turn is dispatched on the adapter over the service's store.
+// disposition is written to the attempt row directly — ONE of two places
+// in this file that edit storage by hand (the other is
+// TestAcceptance_Agy_S11_…'s attestation-row purge), each a labelled
+// stand-in for a missing operator surface: here, the missing turn-
+// attempt disposition endpoint. The next turn is dispatched on the
+// adapter over the service's store.
 func TestAcceptance_Agy_S03_ProcessDeathBlocksUntilDisposition(t *testing.T) {
 	acc := newAgyAcceptance(t, nil, agyDefaultsRequired{})
 	acc.create()
@@ -1110,7 +1154,10 @@ func TestAcceptance_Agy_S10_BinaryDriftStartsNoProcess(t *testing.T) {
 // covering row the production service is not constructed at all (typed
 // ErrNotEligible wrapping ErrProductionEligibilityMissing; no child);
 // (b) a row that disappears after construction (an operator purge)
-// fails the NEXT launch before any child, through the bridge.
+// fails the NEXT launch before any child, through the bridge. The purge
+// below (DELETE FROM agy_protection_attestations) is the OTHER of the
+// two hand storage edits in this file (see TestAcceptance_Agy_S03_…'s
+// comment) — a labelled stand-in for a real operator purge action.
 func TestAcceptance_Agy_S11_UnattestedDispatchRefusedBeforeAnyChild(t *testing.T) {
 	acc, err := newAgyProductionAcceptance(t, false)
 	var ne *agy.ErrNotEligible

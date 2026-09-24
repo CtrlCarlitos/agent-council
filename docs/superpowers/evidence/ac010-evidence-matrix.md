@@ -85,9 +85,12 @@ directly to storage (`recordAttestationDirect`).
   Uncertain turn attempt. The block is durable and specified, but it can
   only be cleared by editing storage by hand. AC-008 and AC-009 have the
   same gap.
-- **§14.18:** the first attestation cannot be recorded in production. A
-  service configured with `AgyBinaryPath` refuses construction until a
-  row exists, and `RecordAgyProbeAttestation` has no HTTP route.
+
+**§14.18** is closed in this branch's final wave (see spec §14.18):
+`RecordAgyProbeAttestation` depends only on the store, the operator
+credential, and the configured agy profile and evidence root — never on
+a wired adapter — so the first row can be recorded that way before the
+adapter exists.
 
 ## What only the operator's stages can establish (all open)
 
