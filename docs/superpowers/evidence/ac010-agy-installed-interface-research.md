@@ -273,8 +273,15 @@ inventory evidence channel but verify against the frozen expected set.
   `updater/`, `installation_id`, the keyring-fallback credential file.
 - `~/.gemini/antigravity/` and `~/.gemini/antigravity-ide/`: IDE-side state
   (`conversations/<uuid>.pb`) — separate products, not used by the CLI runs.
-- Plugins imported: `superpowers` (source `gemini-cli`, components skills +
-  hooks). Models catalog (network): 14 entries incl. `gemini-3.8-flash-*`,
+- Plugins imported (live-verified `agy plugin list`, 1.2.9): the command
+  prints ONE JSON object on stdout, shape
+  `{"imports":[{"name":"superpowers","source":"gemini-cli","importedAt":
+  "2026-09-02T19:59:12Z","components":["skills","hooks"]}]}` — keys per
+  import exactly `components`, `importedAt`, `name`, `source`; committed
+  verbatim as `ac010-agy-plugins-1.2.9.json` (sha256 in
+  `SHA256SUMS-ac010`). The `init` event shape is committed as
+  `ac010-agy-init-1.2.9.json` with the workspace path and conversation id
+  redacted (58 tool names verbatim). Models catalog (network): 14 entries incl. `gemini-3.8-flash-*`,
   `gemini-3.1-pro-*`, `claude-sonnet-4-6`, `claude-opus-4-6-thinking`,
   `gpt-oss-120b-medium` — model choice is per-session `--model`; provider is
   the signed-in Antigravity backend (alternative `GEMINI_API_KEY` mode exists,
