@@ -8,15 +8,13 @@ package codex
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"strings"
 
+	"github.com/CtrlCarlitos/agent-council/internal/adapter/evidence"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
@@ -75,10 +73,13 @@ type CodexLaunchPolicy struct {
 // must match the frozen digest. Any incompleteness fails closed with
 // ErrUnsupportedProfile.
 func ValidateCodexHarness(profile storage.CanonicalProfile, evidenceRoot string) (CodexLaunchPolicy, error) {
-	if profile.AlgoVersion != "cprof-v3" {
+	// cprof-v4 is additive (AC-010 spec §3.7 compatibility matrix): the
+	// Codex adapter accepts it too, with the codex block validated
+	// exactly as under cprof-v3.
+	if profile.AlgoVersion != "cprof-v3" && profile.AlgoVersion != "cprof-v4" {
 		return CodexLaunchPolicy{}, &ErrUnsupportedProfile{
 			AlgoVersion: profile.AlgoVersion,
-			Reason:      "the Codex adapter requires cprof-v3 with a complete codex harness block",
+			Reason:      "the Codex adapter requires cprof-v3 or cprof-v4 with a complete codex harness block",
 		}
 	}
 	spec, ok := profile.Harnesses["codex"]
@@ -97,7 +98,7 @@ func ValidateCodexHarness(profile storage.CanonicalProfile, evidenceRoot string)
 	// cprof-v3 requires the toolkit manifest; its canonical digest is
 	// part of the frozen launch tuple (§3.7 protected-evidence match).
 	if profile.ToolkitManifest == nil {
-		return unsupported("cprof-v3 profile requires toolkit_manifest")
+		return unsupported("profile requires toolkit_manifest")
 	}
 	manifestDigest, err := storage.ComputeToolkitManifestDigest(profile.ToolkitManifest.ToolkitManifest)
 	if err != nil {
@@ -285,7 +286,7 @@ func canonicalApprovalPolicyEncoding(p storage.CodexApprovalPolicy) (string, err
 // trusted evidence root (symlink-safe containment), re-hashes the raw
 // bytes, and requires an exact digest match.
 func rehashEventUniverse(evidenceRoot, relPath, wantDigest string) error {
-	_, err := readEvidenceFile(evidenceRoot, relPath, wantDigest, "event universe", "event_universe_path")
+	_, err := evidence.ReadFile(evidenceRoot, relPath, wantDigest, "event universe", "event_universe_path")
 	return err
 }
 
@@ -330,7 +331,7 @@ func verifyToolInventoryEvidence(evidenceRoot string, c *storage.CodexHarnessSpe
 	if err := storage.ValidateSHA256Digest(digest); err != nil {
 		return fmt.Errorf("tool_inventory_digest: %w", err)
 	}
-	raw, err := readEvidenceFile(evidenceRoot, path, digest, "tool inventory", "tool_inventory_path")
+	raw, err := evidence.ReadFile(evidenceRoot, path, digest, "tool inventory", "tool_inventory_path")
 	if err != nil {
 		return err
 	}
@@ -491,61 +492,4 @@ func decodeNativeToolInventory(raw []byte) (NativeToolInventory, error) {
 		return inv, errors.New("trailing content after the capture object")
 	}
 	return inv, nil
-}
-
-// readEvidenceFile resolves a repo-relative evidence path inside the
-// trusted evidence root (symlink-safe containment), re-hashes the raw
-// bytes, requires an exact digest match, and returns the bytes.
-func readEvidenceFile(evidenceRoot, relPath, wantDigest, label, field string) ([]byte, error) {
-	rel := strings.TrimSpace(relPath)
-	if rel == "" {
-		return nil, fmt.Errorf("%s is empty", field)
-	}
-	rel = filepath.ToSlash(filepath.Clean(rel))
-	if filepath.IsAbs(rel) || rel == "." || rel == ".." ||
-		strings.HasPrefix(rel, "../") || strings.HasPrefix(rel, "/") {
-		return nil, fmt.Errorf("%s %q escapes the evidence root", field, relPath)
-	}
-
-	resolvedRoot, err := filepath.EvalSymlinks(evidenceRoot)
-	if err != nil {
-		return nil, fmt.Errorf("resolve evidence root: %w", err)
-	}
-	parts := strings.Split(rel, "/")
-	cur := resolvedRoot
-	for _, part := range parts[:len(parts)-1] {
-		cur = filepath.Join(cur, part)
-		fi, err := os.Lstat(cur)
-		if err != nil {
-			return nil, fmt.Errorf("evidence path component: %w", err)
-		}
-		if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
-			return nil, fmt.Errorf("evidence path component %q is not a real directory", part)
-		}
-	}
-	final := filepath.Join(cur, parts[len(parts)-1])
-	fi, err := os.Lstat(final)
-	if err != nil {
-		return nil, fmt.Errorf("read %s evidence: %w", label, err)
-	}
-	if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s evidence must be a regular file", label)
-	}
-	real, err := filepath.EvalSymlinks(final)
-	if err != nil {
-		return nil, fmt.Errorf("resolve %s evidence: %w", label, err)
-	}
-	if !strings.HasPrefix(real, resolvedRoot+string(os.PathSeparator)) {
-		return nil, fmt.Errorf("%s evidence %q resolves outside the evidence root", label, relPath)
-	}
-
-	raw, err := os.ReadFile(final)
-	if err != nil {
-		return nil, fmt.Errorf("read %s evidence: %w", label, err)
-	}
-	got := fmt.Sprintf("sha256:%x", sha256.Sum256(raw))
-	if got != wantDigest {
-		return nil, fmt.Errorf("%s digest mismatch: got %s want %s", label, got, wantDigest)
-	}
-	return raw, nil
 }
