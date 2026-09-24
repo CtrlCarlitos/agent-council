@@ -37,10 +37,13 @@ func gate2Fixture(t *testing.T, invocationsFile string) (*execpolicy.ManagedWork
 	// test staged a ".hold" marker beside the invocations log, in which
 	// case it stays alive until the ".release" marker appears. Tests that
 	// assert on a LIVE execution use the hold so the assertion never races
-	// the child's natural exit under load.
+	// the child's natural exit under load. The wait is BOUNDED (about ten
+	// seconds) so a test that fails before releasing — and whose temp
+	// directory is then removed — can never leave the shell looping
+	// forever; holdWorker also registers a cleanup that releases it.
 	script := "#!/bin/sh\n" +
 		"echo \"$PATH_TEST_TOKEN $4\" >> " + invocationsFile + "\n" +
-		"if [ -e " + invocationsFile + ".hold ]; then while [ ! -e " + invocationsFile + ".release ]; do sleep 0.02; done; fi\n" +
+		"if [ -e " + invocationsFile + ".hold ]; then n=0; while [ ! -e " + invocationsFile + ".release ] && [ $n -lt 500 ]; do sleep 0.02; n=$((n+1)); done; fi\n" +
 		"echo NATIVE_OK\nexit 0\n"
 	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0755); err != nil {
 		t.Fatalf("write script: %v", err)
@@ -180,9 +183,7 @@ func TestGate2Review_ReconcileReportsVerifiableStateOnly(t *testing.T) {
 
 	// Hold the worker alive so "live" is a fact, not a race against the
 	// child's exit (the race detector and CI load made it lose).
-	if err := os.WriteFile(invocations+".hold", []byte("hold\n"), 0o600); err != nil {
-		t.Fatalf("stage hold: %v", err)
-	}
+	release := holdWorker(t, invocations)
 	ref := adapter.TurnRef{SessionID: "sess-g2", TurnKey: "t-live"}
 	if _, err := adp.Dispatch(ctx, ref, "live work"); err != nil {
 		t.Fatalf("dispatch: %v", err)
@@ -203,9 +204,7 @@ func TestGate2Review_ReconcileReportsVerifiableStateOnly(t *testing.T) {
 	// Release the worker, wait for natural completion, then reconcile:
 	// the process is gone and the adapter can no longer verify live
 	// execution — uncertainty, never a fabricated running worker.
-	if err := os.WriteFile(invocations+".release", []byte("go\n"), 0o600); err != nil {
-		t.Fatalf("stage release: %v", err)
-	}
+	release()
 	_, err = adp.Collect(ctx, ref)
 	if err != nil {
 		t.Fatalf("collect after completion: %v", err)
@@ -230,6 +229,26 @@ func TestGate2Review_ReconcileReportsVerifiableStateOnly(t *testing.T) {
 	if out.Status != adapter.ReconciliationUncertain || out.Reachability != council.VisibilityHostLost {
 		t.Fatalf("unrecorded execution must reconcile as uncertain/host_lost, got %+v", out)
 	}
+}
+
+// holdWorker stages the ".hold" marker that keeps the fixture worker
+// alive and returns the release function. The release is ALSO registered
+// as a test cleanup, ahead of the temp-directory removal (cleanups run
+// last-registered-first), so a failing assertion between hold and
+// release never orphans a worker waiting on a path that no longer
+// exists. Calling release more than once is harmless.
+func holdWorker(t *testing.T, invocations string) func() {
+	t.Helper()
+	if err := os.WriteFile(invocations+".hold", []byte("hold\n"), 0o600); err != nil {
+		t.Fatalf("stage hold: %v", err)
+	}
+	release := func() {
+		if err := os.WriteFile(invocations+".release", []byte("go\n"), 0o600); err != nil && !os.IsNotExist(err) {
+			t.Errorf("stage release: %v", err)
+		}
+	}
+	t.Cleanup(release)
+	return release
 }
 
 func waitDone(t *testing.T, adp *execpolicy.ManagedWorkerAdapter, ref adapter.TurnRef) {
