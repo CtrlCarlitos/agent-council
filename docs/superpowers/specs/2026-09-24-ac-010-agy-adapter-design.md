@@ -1,6 +1,6 @@
 # AC-010 Design — Agy (Antigravity CLI) persistent contributor adapter
 
-Status: DRAFT v4 for review (v1: 7, v2: 5, v3: 5 findings — all
+Status: DRAFT v5 for review (v1: 7, v2: 5, v3: 5, v4: 4 findings — all
 addressed; change logs at the end)
 Date: 2026-09-24
 Issue: #10
@@ -205,15 +205,13 @@ scoped:
   the attestation must satisfy every obligation of every capability of
   every tool the profile enables:
 
-  | Class | 1.2.9 tools | Attestation obligation |
-  |---|---|---|
   | Capability | 1.2.9 tools carrying it (a tool may carry several) | Attestation obligation |
   |---|---|---|
   | `sibling_read_path` | `view_file`, `read_resource`, `list_dir`, `find_by_name`, `grep_search`, `run_command`, `send_command_input`, `notebook_execution`, `open_browser_url`, `read_browser_page`, `execute_browser_javascript` (browser tools can dereference `file://`), `read_url_content` (its `file://` form), `call_mcp_tool` (per frozen MCP tool) | one `sibling_read` record per tool name (cprot-v2 tool_class: read/glob/grep/bash_absolute/mcp; browser, notebook execution, and `file://` URL reads are recorded under `bash_absolute` semantics — "arbitrary code or URL with filesystem reach") |
   | `own_mutation_path` | `write_to_file`, `replace_file_content`, `multi_replace_file_content`, `sed_file`, `notebook_edit`, `run_command`, `send_command_input`, `notebook_execution`, `execute_browser_javascript` | `self_mutation` records for write, append, truncate, rename, delete per tool name (a tool that cannot express an operation records that operation as denied-by-construction only when the probe suite proves the tool refuses it) |
   | `network_only` | `search_web`, `read_url_content` (its non-`file://` forms), `generate_image` | none for isolation; governed by `sandbox`/permission rules |
-  | `control` | `ask_permission`, `ask_custom_permission`, `ask_question`, `finish`, `wait`, `wait_5_seconds`, `list_permissions`, `list_resources`, `command_status`, `capture_browser_screenshot`, `capture_browser_console_logs`, `list_browser_pages`, and the `browser_*` interaction tools (`click`, `input`, `scroll`, `drag`, `mouse_*`, `press_key`, `refresh_page`, `resize_window`, `select_option`, `get_dom`, `get_network_request`, `list_network_requests`, `scroll_dom`) — tools that only act on state already opened by a probed tool or return status | none |
-  | `uncovered` | `invoke_subagent`, `browser_subagent`, `define_subagent`, `manage_subagents` (a subagent's inherited tool set and restrictions are NOT verified — an escape path until a live probe proves the inherited boundary), `schedule` (work executed outside the turn), `send_message`, `manage_inbox`, `manage_task` (cross-conversation channels), `delete_knowledge` (shared-state mutation), and any tool NOT in the map for this version | **profile rejected at freeze** — the path to production is a native denial that removes the tool from `init.tools` (operator `settings.json` rule) proven by the `init` capture, or a later evidence run that extends the map with probes (e.g. a subagent-boundary probe promoting the subagent tools to `control`) |
+  | `control` | `ask_permission`, `ask_custom_permission`, `ask_question`, `finish`, `wait`, `wait_5_seconds`, `list_permissions` (reads the session's own permission state), `command_status` (status of commands this conversation started) — tools with no reach into any other conversation's state | none |
+  | `uncovered` | `invoke_subagent`, `browser_subagent`, `define_subagent`, `manage_subagents` (a subagent's inherited tool set and restrictions are NOT verified — an escape path until a live probe proves the inherited boundary); `schedule` (work executed outside the turn); `send_message`, `manage_inbox`, `manage_task` (cross-conversation channels); `delete_knowledge` (shared-state mutation); **every remaining `browser_*` tool** plus `list_browser_pages`, `capture_browser_screenshot`, `capture_browser_console_logs`, `browser_get_dom`, `browser_get_network_request`, `browser_list_network_requests` (a shared browser instance may expose pages, DOM, network, and console state opened by another session — unproven until a cross-session probe); `list_resources` (may enumerate shared resources); and any tool NOT in the map for this version | **profile rejected at freeze** — the path to production is a native denial that removes the tool from `init.tools` (operator `settings.json` rule) proven by the `init` capture, or a later evidence run that extends the map with cross-session probes (e.g. a subagent-boundary probe, or a browser-state probe showing a second session cannot list or read pages opened by the first) |
 
   Consequence stated plainly: on an unmodified 1.2.9 install `init.tools`
   contains uncovered tools, so a production-eligible Agy profile requires
@@ -225,10 +223,28 @@ scoped:
   derives the expected record set from `expected_tools` ∩ map.
 - **Skills, plugins, and guardrail hooks — configured state verified
   strictly, execution not claimed.** The profile freezes
-  `expected_skills` (skill directory names under
-  `<home>/antigravity-cli/skills` plus the enabled plugins' skill dirs),
-  `expected_plugins` (each `{name, source, components[]}` from `agy
-  plugin list --json`-equivalent output, provider-free), and a
+  `expected_skills` = the sorted, deduplicated names of the REAL
+  directories (no symlinks) directly under `<home>/antigravity-cli/
+  skills` — a deterministic filesystem fact, provider-free; plugin-
+  contributed skill directories are NOT enumerated because the
+  `plugin_data` layout is not pinned (recorded as a gap; their plugins
+  are captured below). `expected_plugins` is derived from a **strict
+  digest-bound provider-free capture** of `agy plugin list` stdout,
+  whose 1.2.9 shape is live-verified as
+  `{"imports":[{"name":"…","source":"…","importedAt":"<RFC3339>",
+  "components":["hooks","skills"]}]}`: the capture is decoded strictly
+  (single JSON value, no unknown or duplicate keys, trailing content
+  rejected, `importedAt` RFC3339, `components` ⊆ {`hooks`,`skills`,
+  `mcp`,`commands`,`agents`}), re-encoded canonically (sorted keys,
+  imports sorted by `name`, components sorted/deduplicated), and its
+  sha256 frozen as `plugins_evidence_digest` alongside the committed
+  capture (`plugins_evidence_path`, evidence-root rules of §3.7). At
+  construction and every launch the adapter re-runs `plugin list`
+  through the executor (provider-free; `/proc/<pid>/exe`-verified like
+  every launch), re-decodes and re-canonicalizes, and requires digest
+  equality; any parse failure or difference is `ErrToolkitDrift`. If the
+  live output ever fails the pinned shape, the profile is not launchable
+  until the shape evidence is refreshed. Plus a
   **hooks configured-state capture**: the operator's
   `<home>/config/hooks.json` is parsed STRICTLY (one JSON value, no
   duplicate keys, no trailing content), re-encoded canonically (sorted
@@ -413,7 +429,8 @@ number literals verbatim); the digest is
       "default_required_tools": [],
       "hooks_evidence": {"verified": ["…"], "unverifiable": ["hook execution at the Agy layer", "settings.json permissions.allow contents"]},
       "expected_skills": ["…"],
-      "expected_plugins": [{"name": "superpowers", "source": "gemini-cli", "components": ["hooks", "skills"]}],
+      "plugins_evidence_path": "docs/superpowers/evidence/ac010-agy-plugins-1.2.9.json",
+      "plugins_evidence_digest": "sha256:<hex>",
       "hooks_config_digest": "sha256:<hex>",
       "required_hooks": ["/guardrail"],
       "init_evidence_path": "docs/superpowers/evidence/ac010-agy-init-1.2.9.json",
@@ -469,9 +486,14 @@ with a typed validation error):
   the root, or a capture that fails any rule, is rejected at freeze and
   at construction. This is the native, digest-bound proof of the built-in
   inventory that AC-009 lacked for Codex.
-- `expected_skills`: required (`[]` when none), duplicates rejected.
-  `expected_plugins`: required, objects sorted by `name`, `components`
-  sorted/deduplicated, duplicate names rejected. `hooks_config_digest`:
+- `expected_skills`: required (`[]` when none), duplicates rejected,
+  each a bare directory name (no separators). `plugins_evidence_path`/
+  `plugins_evidence_digest`: required; the committed strict capture of
+  `agy plugin list` (§3.2) under the same evidence-root and strict-
+  decoding contract as the `init` capture; the digest is over the
+  CANONICAL re-encoding so a byte-different but semantically identical
+  live output still matches, while any semantic difference fails.
+  `hooks_config_digest`:
   `sha256:` + 64 hex over the CANONICAL re-encoding of the strictly
   parsed `hooks.json` (§3.2). `required_hooks`: required, non-empty,
   RFC 6901 JSON pointers, sorted, duplicates rejected; each must resolve
@@ -510,28 +532,51 @@ One run profile serves all four harnesses; a run including Agy is frozen
 as v4 and every other contributor on it remains valid. No record-only
 mode; no backfill.
 
-**Binary pin (hazard 1) — two checks, the second closes the race.**
-(1) Pre-launch: production construction and EVERY launch (creation, auth
-gate, each turn child) re-verify `binary_path` (resolved absolute path,
-no symlink escape, regular file) and compute the FULL sha256 of its
-bytes against `binary_digest` — no metadata cache. Drift ⇒
-`ErrBinaryDrift`, no process started. (2) **Post-exec, pre-trust
-(Linux, the only production platform, §3.12):** because the installed
-binary demonstrably self-updates, the file can be replaced between the
-pre-launch hash and `exec`. So after the executor reports the child pid
-and BEFORE any output of that child is trusted — the `models` catalog,
-the creation `init`, or the turn `init` — and therefore before any
-prompt byte is written, the adapter opens `/proc/<pid>/exe` (the kernel
-handle to the image actually mapped, valid even if the path was replaced
-or unlinked), requires its `readlink` target to equal the frozen
-resolved path WITHOUT a ` (deleted)` suffix and its `st_dev:st_ino` to
-equal the pre-launch stat, and hashes the bytes read THROUGH that handle
-against `binary_digest`. Any mismatch or read failure ⇒ child terminated,
-`ErrBinaryDrift`, nothing transmitted, nothing bound. The digest observed
-through `/proc/<pid>/exe` is recorded on the launch row as the
-executable identity. The cost (~1 s per launch for a 217 MB image) is
-accepted. Every attestation for a superseded digest is invalid by
-construction. The operator obligation to disable the auto-updater is
+**Binary pin (hazard 1) — three layers; the first removes the race, the
+others are mandatory defense in depth, all Gate 1 fixture-tested.**
+
+1. **Council-owned immutable launch copy (primary).** At production
+   construction the adapter reads the operator's `binary_path`, hashes
+   the FULL bytes, requires equality with `binary_digest`, and copies
+   them ONCE to `<state>/agy/bin/<digest>/agy` inside a directory and
+   file both mode `0500` owned by the service user (a copy of the
+   executable is not credential material; it carries no auth). Every
+   launch (creation, auth gate, `plugin list`, each turn child) execs
+   ONLY that copy, so the operator-path self-updater can never replace
+   what Council runs; the executor's frozen argv template pins the copy's
+   path. The copy's full sha256 is re-verified before every launch
+   (~1 s, no metadata cache) — state-dir write access is the same threat
+   boundary as the durable store itself.
+2. **Post-exec identity through `/proc/<pid>/exe` (Linux, the only
+   production platform, §3.12).** Immediately after the executor reports
+   the pid, and BEFORE any output of that child is trusted — the `models`
+   catalog, the `plugin list` capture, the creation `init`, the turn
+   `init` — and therefore before any prompt byte is written, the adapter
+   opens `/proc/<pid>/exe`, requires the `readlink` target to equal the
+   copy's path WITHOUT a ` (deleted)` suffix and its `st_dev:st_ino` to
+   equal the copy's stat, and hashes the bytes read THROUGH that handle
+   against `binary_digest`. Mismatch or unreadable ⇒ child terminated,
+   `ErrBinaryDrift`, nothing transmitted, nothing bound. **Fast-exiting
+   children:** if `/proc/<pid>` is already gone when the check runs (the
+   child exited), the check is `inconclusive`; because layer 1 makes the
+   launched path immutable and layer 3 has already verified it, the
+   child's output is accepted ONLY when layer 1 was in force for that
+   launch, and the launch row records `exe_check=inconclusive`; in
+   fixture scope without layer 1 an inconclusive check is a refusal.
+3. **Pre-launch hash of the copy** (layer 1's per-launch re-verify) and
+   the executor-observed executable identity, both recorded on the
+   launch row.
+
+This is core production evidence, not an operator obligation: Gate 1
+(§4) must prove, with Council's own fixture executable and no provider,
+(a) an in-place modification of the copy is refused pre-launch, (b) the
+`0500` copy directory rejects writes (the updater's shape), (c) a
+replaced or unlinked image after exec is refused through
+`/proc/<pid>/exe` (`(deleted)` target, dev:ino mismatch, hash mismatch),
+(d) a fast-exiting child yields `inconclusive` without a false refusal
+in production scope and a refusal in fixture scope, (e) a slow child is
+verified before its first output is consumed. Every attestation for a
+superseded digest is invalid by construction. The operator obligation to disable the auto-updater is
 recorded as unverified; the pin is the defense either way.
 
 ### 3.8 Trust model of the durable conversation file
@@ -628,7 +673,14 @@ eligibility is limited accordingly:
   stderr markers (print timeout, ignored event), malformed lines, exit
   without result, SIGINT handling (fixture emits `interrupted`), slow
   `init`, creation with empty stdin; cprot-v2 vectors reused; crash
-  boundaries; concurrent duplicate creation and dispatch.
+  boundaries; concurrent duplicate creation and dispatch; **binary pin
+  (§3.7, mandatory Gate 1 acceptance): immutable copy creation and
+  re-verify, in-place modification refused, read-only copy dir rejects
+  writes, `/proc/<pid>/exe` replaced/unlinked/mismatched image refused
+  before first output, fast-exit inconclusive handling in both scopes,
+  slow-child verification ordering**; strict `plugin list` capture
+  parsing and drift; hooks capture parsing, `required_hooks` presence and
+  disabled-marker rejection; coverage-map decoding and derivation.
 - **Integration (operator-invoked, sanitized):** Stage A provider-free
   (version, digest, `mcp list`, `plugin list`, empty-stdin `init` capture
   → `expected_tools`); Stage B authenticated (≤ 8 turns: trivial success,
@@ -664,7 +716,7 @@ eligibility is limited accordingly:
 |---|---|
 | Probe the installed CLI and supported output fields with sanitized fixtures | §2, evidence file; fixture executable (§4) |
 | Start independently and resume a specified conversation | §3.3 (provider-free creation), §3.1/§3.5 (`--conversation` + `init` equality) |
-| Verify expected skills/tools/plugins and enabled guardrails | §3.7 `expected_tools` = `init.tools` at freeze (digest-bound `init_evidence`) and every launch; every tool classified by the pinned coverage map (subagent, scheduling, messaging, and shared-state tools are uncovered ⇒ rejected until natively denied or probed); skills, plugins, and the strictly parsed hooks capture with `required_hooks` present-and-not-disabled re-derived at every launch (configured guardrail state verified; hook EXECUTION explicitly not claimed); `permission_mode` attestation; MCP/plugin tool inventories gated to empty until natively provable |
+| Verify expected skills/tools/plugins and enabled guardrails | §3.7 `expected_tools` = `init.tools` at freeze (digest-bound `init_evidence`) and every launch; every tool classified by the pinned coverage map (subagent, scheduling, messaging, and shared-state tools are uncovered ⇒ rejected until natively denied or probed); top-level skill directories, the strict digest-bound `plugin list` capture, and the strictly parsed hooks capture with `required_hooks` present-and-not-disabled re-derived at every launch (configured guardrail state verified; hook EXECUTION and plugin-contributed skill loading explicitly not claimed); `permission_mode` attestation; MCP/plugin tool inventories gated to empty until natively provable |
 | Required skipped/denied tools keep verification incomplete regardless of exit code | §3.5 queue-validated immutable `required_tools` (native names) vs observed executed `tool` steps under the pinned denial map intersected with observation ⇒ `missing_required_tools`; `denied_actions` ⇒ `denied_tools`/`ambiguous_denials`/`unattributed_denials`; unmapped denials fail closed; any ⇒ `verification_incomplete`; exit code never classifies (§2.1/§3.9) |
 | Bounded cancellation, unknown outcomes, client-close recovery, no fallback harness | §3.6 SIGINT → verified `interrupted`; §3.9/§3.10 Uncertain rules; §3.1 detached context; no other adapter is ever substituted |
 
@@ -696,10 +748,11 @@ eligibility is limited accordingly:
 `--mode`/`--sandbox` effect headlessly; `denied_tools` rule denial shape
 and whether a natively denied tool disappears from `init.tools`; hook
 EXECUTION and skill LOADING at the Agy layer (configured state is
-verified, §3.2); the subagent inherited tool boundary (subagent tools are
-uncovered until probed, §3.2); whether `/proc/<pid>/exe` hashing is
-observable by the executor seam on all supported kernels (assumed
-Linux-standard);
+verified, §3.2); the subagent inherited tool boundary and the shared-
+browser/resource state boundary (those tools are uncovered until probed,
+§3.2); the self-updater's behavior against a read-only launch-copy
+directory (the copy is verified regardless, §3.7); the `plugin_data`
+layout for plugin-contributed skills;
 workspace-trust gating; healthy-turn print-timeout; content-block user
 messages; `AGY_ERROR` exit-3 path; MCP tool naming in `call_mcp_tool` steps;
 plugin/skill tool surfacing; auto-updater off switch; `GEMINI_API_KEY`
@@ -764,3 +817,21 @@ none is claimed by the design.
 5. Denial-map canonical contract and observation-intersected attribution
    with ambiguous/unattributed/unmapped classes, all fail-closed toward
    "not executed" (§3.5, §3.7, §3.11, §6).
+
+## 11. v5 changes (review of v4)
+
+1. Browser state-reading and interaction tools and `list_resources` are
+   `uncovered` until cross-session probes establish isolation; `control`
+   is reduced to tools with no reach into another conversation's state
+   (§3.2).
+2. Plugins: a strict, digest-bound, provider-free capture of the
+   live-verified `agy plugin list` JSON shape with a canonical
+   re-derivation contract at every launch; skills limited to top-level
+   real skill directories; plugin-contributed skill dirs recorded as a
+   gap (§3.2, §3.7, §6, §7).
+3. Binary pin: Council-owned immutable `0500` launch copy removes the
+   updater race; `/proc/<pid>/exe` verification and pre-launch hashing
+   are mandatory Gate 1 fixture evidence (modification, read-only dir,
+   replaced/unlinked image, fast-exit inconclusive, slow-child ordering),
+   moved out of the carried-forward list (§3.7, §4, §7).
+4. Stale duplicate header row removed from the coverage table (§3.2).
