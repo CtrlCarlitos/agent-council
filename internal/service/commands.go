@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
+	"github.com/CtrlCarlitos/agent-council/internal/adapter/agy"
 	"github.com/CtrlCarlitos/agent-council/internal/council"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
@@ -499,6 +500,10 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 
 	// Step 4: Load the saved native-session binding and attach to the
 	// original execution. Recovery must never substitute a fresh session.
+	if err := s.agyAwaitingForSession(r.Context(), sessionID); err != nil {
+		writeAgyAwaitingError(w, err, req.OpID)
+		return
+	}
 	if s.adapter == nil {
 		writeError(w, http.StatusServiceUnavailable, "harness_unavailable", "harness adapter unavailable", req.OpID)
 		return
@@ -778,9 +783,12 @@ func (s *Server) handleQueuePrompt(w http.ResponseWriter, r *http.Request) {
 // storage error.
 func queuedRequiredToolsErrorStatus(err error) (int, string) {
 	var invalid *invalidRequiredToolsError
+	var notEligible *agy.ErrNotEligible
 	switch {
 	case errors.As(err, &invalid):
 		return http.StatusBadRequest, "invalid_required_tools"
+	case errors.As(err, &notEligible):
+		return http.StatusServiceUnavailable, "agy_not_eligible"
 	case errors.Is(err, storage.ErrSessionNotFound), errors.Is(err, storage.ErrRunSessionMismatch), errors.Is(err, storage.ErrRunNotFound):
 		return http.StatusNotFound, "session_not_found"
 	default:
@@ -811,6 +819,10 @@ func (s *Server) validateQueuedRequiredTools(ctx context.Context, sessionID stri
 	if meta.Contributor != string(council.Agy) {
 		return &invalidRequiredToolsError{msg: fmt.Sprintf(
 			"required_tools is only supported for agy sessions; session %s contributor is %q", sessionID, meta.Contributor)}
+	}
+	// Spec §14.18: no agy operation proceeds while awaiting attestation.
+	if err := s.agyAwaiting(); err != nil {
+		return err
 	}
 	rec, err := s.store.GetRunProfile(ctx, meta.RunID)
 	if err != nil {
@@ -1032,4 +1044,16 @@ func (s *Server) handleRecordDecision(w http.ResponseWriter, r *http.Request) {
 		OpID:       req.OpID,
 		Receipt:    receipt,
 	})
+}
+
+// writeAgyAwaitingError maps a spec §14.18 awaiting-attestation refusal
+// (a wrapped *agy.ErrNotEligible) to 503 agy_not_eligible; any other
+// error (a session lookup failure) is a storage error.
+func writeAgyAwaitingError(w http.ResponseWriter, err error, opID string) {
+	var notEligible *agy.ErrNotEligible
+	if errors.As(err, &notEligible) {
+		writeError(w, http.StatusServiceUnavailable, "agy_not_eligible", err.Error(), opID)
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), opID)
 }

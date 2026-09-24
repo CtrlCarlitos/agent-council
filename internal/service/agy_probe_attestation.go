@@ -63,9 +63,11 @@ type AgyProbeAttestationRequest struct {
 
 // RecordAgyProbeAttestation validates the attestation against the run's
 // frozen profile and persists the durable cprot-v2 row with its journal
-// entry (idempotent by op_id with receipt replay). Fail closed before
-// any write on: a missing op_id, operator credential, actor, or run; an
-// actor mismatch; no agy wiring; a run profile that is not a launchable
+// entry (idempotent by op_id with receipt replay). It does NOT require a
+// wired agy adapter (spec §14.18: the first row is recorded on a server
+// awaiting attestation). Fail closed before any write on: a missing
+// op_id, operator credential, actor, or run; an actor mismatch; no
+// configured agy evidence root; a run profile that is not a launchable
 // agy profile or does not re-derive its digest; any tuple member of the
 // attestation disagreeing with the profile-derived tuple; incomplete or
 // unexpected coverage (a frame missing a mapped tool included); or an
@@ -93,9 +95,13 @@ func (s *Server) RecordAgyProbeAttestation(ctx context.Context, req AgyProbeAtte
 		return storage.OperationReceipt{}, errors.New(
 			"attestation actor does not match the requesting operator; refusing to record")
 	}
-	if strings.TrimSpace(s.cfg.AgyBinaryPath) == "" || strings.TrimSpace(s.cfg.AgyEvidenceRoot) == "" {
+	// Spec §14.18: recording depends only on the store, the operator
+	// credential and the configured agy evidence root (the run's frozen
+	// profile is validated against it below) — never on a wired adapter,
+	// so the first row can be recorded on a server awaiting attestation.
+	if strings.TrimSpace(s.cfg.AgyEvidenceRoot) == "" {
 		return storage.OperationReceipt{}, errors.New(
-			"no agy adapter is wired; cannot validate or record an agy attestation")
+			"no agy evidence root is configured; cannot validate or record an agy attestation")
 	}
 
 	frozen, err := s.agyFrozenRun(ctx, req.RunID)
@@ -238,6 +244,9 @@ func (s *Server) CreateAgySession(ctx context.Context, opID, controllerLease, se
 	if strings.TrimSpace(opID) == "" || strings.TrimSpace(controllerLease) == "" || strings.TrimSpace(sessionID) == "" {
 		return adapter.SessionBinding{}, storage.OperationReceipt{}, errors.New(
 			"session creation requires the operation id, the controller lease, and the session id")
+	}
+	if err := s.agyAwaiting(); err != nil {
+		return adapter.SessionBinding{}, storage.OperationReceipt{}, fmt.Errorf("cannot create an Agy session: %w", err)
 	}
 	if s.adapter == nil {
 		return adapter.SessionBinding{}, storage.OperationReceipt{}, errors.New(

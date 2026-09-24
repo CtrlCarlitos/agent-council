@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/execpolicy"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/opencode"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/workspace"
+	"github.com/CtrlCarlitos/agent-council/internal/council"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
 
@@ -338,6 +340,32 @@ type StatusResponse struct {
 	LiveWorkers     int       `json:"live_workers"`
 	ReservedTurns   int       `json:"reserved_turns"`
 	UnresolvedTurns int       `json:"unresolved_turns"`
+	// Agy is the AC-010 agy adapter wiring state (spec §14.18); omitted
+	// when no agy adapter is configured.
+	Agy *AgyWiringStatus `json:"agy,omitempty"`
+}
+
+// Agy wiring states (spec §14.18).
+const (
+	// AgyNotConfigured: no AgyBinaryPath; the server has no agy adapter.
+	AgyNotConfigured = "not_configured"
+	// AgyWired: the production agy adapter was constructed (eligible).
+	AgyWired = "wired"
+	// AgyAwaitingAttestation: AgyBinaryPath is configured but production
+	// construction was refused ONLY because no covering cprot-v2
+	// attestation row exists for the frozen tuple. The server runs
+	// without the agy adapter; every agy operation refuses with the typed
+	// ineligibility error and no agy child is started. Recording the row
+	// (RecordAgyProbeAttestation) does not hot-reload: a restart
+	// constructs the adapter.
+	AgyAwaitingAttestation = "awaiting_attestation"
+)
+
+// AgyWiringStatus is the server's agy adapter wiring state, surfaced on
+// GET /v1/status and logged once at construction.
+type AgyWiringStatus struct {
+	State  string `json:"state"`
+	Reason string `json:"reason,omitempty"`
 }
 
 type Server struct {
@@ -378,7 +406,14 @@ type Server struct {
 	// stops before ANY further durable write, exactly as a process death
 	// between the creation child and the binding commit would.
 	agyAfterNativeCreate func(nativeID string) bool
-	teardownErr          error
+	// agyStatus is the agy wiring state fixed at construction (§14.18).
+	agyStatus AgyWiringStatus
+	// agyAwaitingErr is the typed construction refusal (an
+	// *agy.ErrNotEligible wrapping *agy.ErrProductionEligibilityMissing)
+	// held while agyStatus is awaiting_attestation; every agy operation
+	// returns it wrapped.
+	agyAwaitingErr error
+	teardownErr    error
 }
 
 func NewServer(store *storage.Store, lock *ServiceLock, cfg ServerConfig) (*Server, error) {
@@ -488,15 +523,86 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 	// Linux host (§3.12) — refused typed BEFORE any child; the
 	// production constructor then runs the §3.2 gates (eligibility from
 	// the durable cprot-v2 rows before the construction `plugin list`).
+	//
+	// Spec §14.18 bootstrap: a refusal whose ONLY cause is a missing
+	// covering attestation (agy.ErrNotEligible wrapping
+	// agy.ErrProductionEligibilityMissing) does not fail the server — it
+	// starts WITHOUT the agy adapter in the explicit awaiting_attestation
+	// state, so the operator can record the first row through
+	// RecordAgyProbeAttestation and restart. Every other construction
+	// error (configuration, platform, sealed image, other ineligibility
+	// rules a row cannot fix) still fails the server.
+	var agyAwaitingErr error
 	if adp == nil && strings.TrimSpace(cfg.AgyBinaryPath) != "" {
 		agyAdapter, err := newProductionAgyAdapter(store, pe, wm, cfg)
-		if err != nil {
+		switch {
+		case err == nil:
+			adp = agyAdapter
+		case isAgyAwaitingAttestation(err):
+			agyAwaitingErr = err
+		default:
 			return nil, fmt.Errorf("Agy adapter construction: %w", err)
 		}
-		adp = agyAdapter
 	}
 
-	return newServerWithAdapter(store, lock, cfg, adp, wm, pe)
+	srv, err := newServerWithAdapter(store, lock, cfg, adp, wm, pe)
+	if err != nil {
+		return nil, err
+	}
+	if agyAwaitingErr != nil {
+		srv.agyAwaitingErr = agyAwaitingErr
+		// The configured contributor adapter of this instance is agy:
+		// no generic worker adapter stands in for it while awaiting.
+		srv.adapter = nil
+		srv.agyStatus = AgyWiringStatus{State: AgyAwaitingAttestation, Reason: agyAwaitingReason(agyAwaitingErr)}
+		slog.Warn("agy adapter not wired: awaiting attestation", "instance_id", cfg.InstanceID, "reason", srv.agyStatus.Reason)
+	}
+	return srv, nil
+}
+
+// isAgyAwaitingAttestation reports a production construction refusal
+// that recording a covering attestation row can clear: the typed
+// ineligibility error whose cause is the missing/uncovered attestation.
+func isAgyAwaitingAttestation(err error) bool {
+	var ne *agy.ErrNotEligible
+	var missing *agy.ErrProductionEligibilityMissing
+	return errors.As(err, &ne) && errors.As(err, &missing)
+}
+
+func agyAwaitingReason(err error) string {
+	return err.Error() + "; record a covering attestation with RecordAgyProbeAttestation and restart the service (no hot reload)"
+}
+
+// AgyStatus reports the agy adapter wiring state fixed at construction
+// (spec §14.18).
+func (s *Server) AgyStatus() AgyWiringStatus {
+	return s.agyStatus
+}
+
+// agyAwaiting returns the typed ineligibility refusal (wrapping
+// *agy.ErrNotEligible) when the server is awaiting attestation, else nil.
+func (s *Server) agyAwaiting() error {
+	if s.agyAwaitingErr == nil {
+		return nil
+	}
+	return fmt.Errorf("the agy adapter is not wired (awaiting attestation; a restart after recording constructs it): %w", s.agyAwaitingErr)
+}
+
+// agyAwaitingForSession is agyAwaiting scoped to one session: it refuses
+// only when the session's contributor is agy (a lookup failure refuses
+// too — fail closed while awaiting).
+func (s *Server) agyAwaitingForSession(ctx context.Context, sessionID string) error {
+	if s.agyAwaitingErr == nil || s.store == nil {
+		return nil
+	}
+	meta, err := s.store.GetSessionMetadata(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("session lookup: %w", err)
+	}
+	if meta.Contributor != string(council.Agy) {
+		return nil
+	}
+	return s.agyAwaiting()
 }
 
 // newProductionAgyAdapter validates the Agy configuration fail closed
@@ -672,6 +778,12 @@ func newServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 		tokenPath:        tokenPath,
 		startedAt:        time.Now().UTC(),
 		shutdown:         make(chan struct{}),
+	}
+	switch {
+	case strings.TrimSpace(cfg.AgyBinaryPath) == "":
+		srv.agyStatus = AgyWiringStatus{State: AgyNotConfigured}
+	default:
+		srv.agyStatus = AgyWiringStatus{State: AgyWired}
 	}
 
 	mux := http.NewServeMux()
@@ -875,6 +987,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		LiveWorkers:     s.coordinator.LiveWorkers(),
 		ReservedTurns:   reservedTurns,
 		UnresolvedTurns: unresolvedTurns,
+	}
+	if s.agyStatus.State != "" && s.agyStatus.State != AgyNotConfigured {
+		st := s.agyStatus
+		resp.Agy = &st
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)

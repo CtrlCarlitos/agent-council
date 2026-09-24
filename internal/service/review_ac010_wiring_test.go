@@ -541,10 +541,17 @@ func TestServiceWiring_AgyProductionConstruction(t *testing.T) {
 	e.seed(t, store, e.profile)
 
 	t.Run("ineligible", func(t *testing.T) {
-		_, err := NewServerWithAdapter(store, mustLock(t, e.stateDir), e.cfg, nil)
+		// Spec §14.18: the server starts awaiting attestation, unwired.
+		srv, err := NewServerWithAdapter(store, mustLock(t, e.stateDir), e.cfg, nil)
+		if err != nil {
+			t.Fatalf("without an attestation the server starts awaiting attestation, got %v", err)
+		}
+		if st := srv.AgyStatus(); st.State != AgyAwaitingAttestation || srv.adapter != nil {
+			t.Fatalf("want awaiting_attestation with no adapter, got %+v %T", st, srv.adapter)
+		}
 		var ne *agy.ErrNotEligible
-		if !errors.As(err, &ne) {
-			t.Fatalf("without an attestation construction is ineligible, got %T: %v", err, err)
+		if !errors.As(srv.agyAwaiting(), &ne) {
+			t.Fatalf("the awaiting refusal is the typed ineligibility, got %v", srv.agyAwaiting())
 		}
 		if constructionProbeRan(e.scratch) {
 			t.Fatal("eligibility fails closed before any child")
@@ -666,10 +673,11 @@ func TestServiceAttestation_AgyAuthorityIdempotencyCoverage(t *testing.T) {
 		t.Fatalf("exactly one row, got %d", n)
 	}
 
-	// Without an agy wiring nothing can be validated or recorded.
-	unwired := &Server{store: store, cfg: ServerConfig{AuthToken: e.cfg.AuthToken}}
-	if _, err := unwired.RecordAgyProbeAttestation(ctx, valid()); err == nil || !strings.Contains(err.Error(), "no agy adapter is wired") {
-		t.Fatalf("an unwired service refuses, got %v", err)
+	// Without a configured evidence root nothing can be validated or
+	// recorded (a wired adapter is NOT required — spec §14.18).
+	unconfigured := &Server{store: store, cfg: ServerConfig{AuthToken: e.cfg.AuthToken}}
+	if _, err := unconfigured.RecordAgyProbeAttestation(ctx, valid()); err == nil || !strings.Contains(err.Error(), "no agy evidence root is configured") {
+		t.Fatalf("a service without an agy evidence root refuses, got %v", err)
 	}
 }
 

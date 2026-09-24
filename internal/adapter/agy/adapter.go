@@ -60,6 +60,10 @@ type ErrProductionEligibilityMissing struct {
 }
 
 func (e *ErrProductionEligibilityMissing) Error() string {
+	if e.SessionID == "" {
+		// Construction-time refusal: no session is involved.
+		return "agy production eligibility missing: " + e.Reason
+	}
 	return fmt.Sprintf("agy production eligibility missing for session %s: %s", e.SessionID, e.Reason)
 }
 
