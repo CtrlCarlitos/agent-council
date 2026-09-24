@@ -416,3 +416,65 @@ func TestValidateAgyHarness_PathScalarsShareStorageNFCNormalization(t *testing.T
 		t.Fatalf("AgyLaunchPolicy.ExpectedHome %q does not equal the canonical profile's frozen expected_home %q", policy.ExpectedHome, wantExpectedHome)
 	}
 }
+
+func TestDecodeCoverageEvidence_StrictRejections(t *testing.T) {
+	// Read the canonical coverage evidence once
+	validRaw := readCommittedEvidence(t, "docs/superpowers/evidence/ac010-agy-tool-coverage-1.2.9.json")
+
+	tests := []struct {
+		name        string
+		raw         []byte
+		wantErrText string
+	}{
+		{
+			name:        "valid coverage evidence",
+			raw:         validRaw,
+			wantErrText: "",
+		},
+		{
+			name:        "duplicate top-level key",
+			raw:         []byte(`{"cli_version":"1.2.9","cli_version":"1.2.9","tools":{},"denial_map":[]}`),
+			wantErrText: "duplicate object key",
+		},
+		{
+			name:        "duplicate key inside tools object",
+			raw:         []byte(`{"cli_version":"1.2.9","tools":{"a":["control"],"a":["control"]},"denial_map":[]}`),
+			wantErrText: "duplicate object key",
+		},
+		{
+			name:        "trailing content after closing brace",
+			raw:         append(validRaw, []byte(" x")...),
+			wantErrText: "trailing content",
+		},
+		{
+			name:        "unsorted tools keys",
+			raw:         []byte(`{"cli_version":"1.2.9","tools":{"z":["control"],"a":["control"]},"denial_map":[]}`),
+			wantErrText: "sorted",
+		},
+		{
+			name:        "unknown top-level field",
+			raw:         []byte(`{"cli_version":"1.2.9","tools":{},"denial_map":[],"unknown_field":"value"}`),
+			wantErrText: "unknown field",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := decodeCoverageEvidence(tt.raw)
+			if tt.wantErrText == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.wantErrText)
+				}
+				errStr := strings.ToLower(err.Error())
+				wantStr := strings.ToLower(tt.wantErrText)
+				if !strings.Contains(errStr, wantStr) {
+					t.Fatalf("error %q does not contain %q", err, tt.wantErrText)
+				}
+			}
+		})
+	}
+}
