@@ -531,7 +531,9 @@ others are mandatory defense in depth, all Gate 1 fixture-tested.**
    anonymous memory file**: at production construction the adapter
    reads the operator's `binary_path`, hashes the FULL bytes, requires
    equality with `binary_digest`, writes the bytes into a
-   `memfd_create` file, applies `F_SEAL_WRITE | F_SEAL_SHRINK |
+   `memfd_create` file (created with `MFD_CLOEXEC | MFD_ALLOW_SEALING |
+   MFD_EXEC`, retrying without `MFD_EXEC` only on `EINVAL` from a
+   pre-6.3 kernel; see §14.1), applies `F_SEAL_WRITE | F_SEAL_SHRINK |
    F_SEAL_GROW | F_SEAL_SEAL` (kernel-enforced: no process, Council and
    the updater included, can alter the content or the seals for the
    descriptor's lifetime), and re-hashes THROUGH the sealed descriptor
@@ -841,3 +843,18 @@ none is claimed by the design.
    runnable `ManagedProcess`; the adapter never sees a pid, a stopped
    child, or ptrace controls (§3.7, §4).
 3. Research tool count corrected to 57 everywhere.
+
+## 14. Implementation notes (deltas recorded during plan execution)
+
+1. `memfd_create` flags (§3.7). The v7 text named `MFD_ALLOW_SEALING`
+   and close-on-exec only. The implementation additionally passes
+   `MFD_EXEC` (Linux 6.3+) and retries with the two-flag set only when
+   the kernel returns `EINVAL`. Reason: on 6.3+ kernels a memfd created
+   without `MFD_EXEC` is logged as a deprecation warning and, when the
+   host sets `vm.memfd_noexec=1`, silently becomes `MFD_NOEXEC_SEAL`
+   (adding `F_SEAL_EXEC`); the executor's exact-equality seal check
+   would then refuse the launch. Asking for `MFD_EXEC` explicitly keeps
+   the image executable where policy allows it and still fails closed
+   (typed `ErrSealedImageMismatch`) where the host forbids executable
+   memfds (`vm.memfd_noexec=2` returns `EACCES`, which is not retried).
+   The seal set and the exact-equality check are unchanged.
