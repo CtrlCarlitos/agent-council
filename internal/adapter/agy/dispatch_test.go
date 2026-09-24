@@ -276,6 +276,49 @@ func TestAgyDispatch_RequiredToolsOutsideExpectedRejected(t *testing.T) {
 	}
 }
 
+// Task 7 fix round 1 (Important 3): the required-tools seam's error
+// channel refuses the dispatch before any reservation — a read failure
+// or a missing dispatch intent never falls back to the frozen defaults.
+func TestAgyDispatch_RequiredToolsSourceErrorRejectsBeforeReservation(t *testing.T) {
+	for name, cause := range map[string]error{
+		"storage read error": errors.New("database is locked"),
+		"missing intent":     errors.New("no dispatch intent for turn"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newAgyHarness(t)
+			h.persist(testNativeID)
+			h.required.failWith("t1", cause)
+			h.turnScenario(userInputDone, successResult("x"))
+			out, err := h.dispatch("t1", "p")
+			var typed *ErrRequiredToolsUnavailable
+			if !errors.As(err, &typed) || !errors.Is(err, cause) || out.Status != adapter.DispatchRejected {
+				t.Fatalf("a seam error is a typed pre-transmission rejection, got %+v err=%v", out, err)
+			}
+			if n := h.exec.starts.Load(); n != 0 {
+				t.Fatalf("no child, launches=%d", n)
+			}
+			if a, err := h.store.GetLatestAgyTurnAttempt(context.Background(), string(testSessionID), "t1"); err != nil || a != nil {
+				t.Fatalf("no attempt row may be reserved, got %+v err=%v", a, err)
+			}
+		})
+	}
+}
+
+// An intent present with an EMPTY set applies the frozen defaults.
+func TestAgyDispatch_RequiredToolsEmptySetAppliesDefaults(t *testing.T) {
+	h := newAgyHarness(t)
+	h.adapter.policy.DefaultRequiredTools = []string{"view_file"}
+	h.required.set("t1", []string{})
+	got, err := h.adapter.requiredTools(context.Background(), h.ref("t1"))
+	if err != nil || len(got) != 1 || got[0] != "view_file" {
+		t.Fatalf("an empty journaled set applies default_required_tools [view_file], got %v err=%v", got, err)
+	}
+	h.required.set("t2", []string{"run_command"})
+	if got, err := h.adapter.requiredTools(context.Background(), h.ref("t2")); err != nil || len(got) != 1 || got[0] != "run_command" {
+		t.Fatalf("a non-empty journaled set replaces the defaults, got %v err=%v", got, err)
+	}
+}
+
 func TestAgyDispatch_DenialClassesRecorded(t *testing.T) {
 	cases := []struct {
 		name  string

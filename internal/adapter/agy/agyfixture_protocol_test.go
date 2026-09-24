@@ -522,6 +522,45 @@ func TestAgyFixture_SlowInit(t *testing.T) {
 	}
 }
 
+// TestAgyFixture_WaitForFile: the wait_for_file directive blocks the
+// child after its argv is logged until the named gate file exists in
+// its cwd — a deterministic gate for in-flight scenarios.
+func TestAgyFixture_WaitForFile(t *testing.T) {
+	scratch := t.TempDir()
+	writeAgyScenario(t, scratch, `{"wait_for_file":"gate"}`)
+	proc := startAgyFixture(t, scratch, agyFrozenArgs("m"))
+	events := streamAgyEvents(proc)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if raw, err := os.ReadFile(filepath.Join(scratch, ".agy-fixture-args")); err == nil && len(raw) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("argv was never logged")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case ev := <-events:
+		t.Fatalf("no event may be emitted before the gate file exists, got %+v", ev)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := os.WriteFile(filepath.Join(scratch, "gate"), nil, 0o600); err != nil {
+		t.Fatalf("gate: %v", err)
+	}
+	initEv, ok := <-events
+	if !ok || initEv.Kind != EventKindInit {
+		t.Fatalf("expected init after the gate opened, got %+v ok=%v", initEv, ok)
+	}
+	sendRawStdinLine(t, proc, `{"event":"user","message":{"content":"hi"}}`)
+	for range events {
+	}
+	if _, err := proc.Wait(); err != nil {
+		t.Fatalf("proc.Wait: %v", err)
+	}
+}
+
 // TestAgyFixture_DirectiveMatrix (Minor 5, untested directives:
 // exit_without_result, a result override, and step usage/tool_info
 // replay) is table-driven per the reviewer's "one table-driven test is

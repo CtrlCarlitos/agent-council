@@ -9,6 +9,7 @@ package agy
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
@@ -23,11 +24,31 @@ type AttemptIdentitySource interface {
 
 // RequiredToolsSource supplies the required_tools set journaled with the
 // queued prompt (spec §3.5: validated at queue time, immutable
-// thereafter). ok=false means "absent": the frozen
-// default_required_tools apply.
+// thereafter). err != nil — a storage read failure, or a turn with no
+// durable dispatch intent (dispatch cannot legitimately reach the lookup
+// without one) — makes the adapter refuse the dispatch before any
+// reservation (*ErrRequiredToolsUnavailable, DispatchRejected). ok=false
+// with a nil error means ONLY "the intent is present and its set is
+// empty": the frozen default_required_tools apply.
 type RequiredToolsSource interface {
-	RequiredToolsFor(ctx context.Context, ref adapter.TurnRef) (tools []string, ok bool)
+	RequiredToolsFor(ctx context.Context, ref adapter.TurnRef) (tools []string, ok bool, err error)
 }
+
+// ErrRequiredToolsUnavailable is the pre-transmission refusal of a
+// dispatch whose journaled required_tools could not be read: the adapter
+// never substitutes the frozen defaults for an unreadable set.
+type ErrRequiredToolsUnavailable struct {
+	SessionID adapter.SessionID
+	TurnKey   string
+	Err       error
+}
+
+func (e *ErrRequiredToolsUnavailable) Error() string {
+	return fmt.Sprintf("required_tools for %s/%s are unavailable; refusing the dispatch before any reservation: %v",
+		e.SessionID, e.TurnKey, e.Err)
+}
+
+func (e *ErrRequiredToolsUnavailable) Unwrap() error { return e.Err }
 
 // AttestationLookup reports a valid isolation attestation for the exact
 // frozen tuple (spec §3.2 gate step 1). Production construction requires

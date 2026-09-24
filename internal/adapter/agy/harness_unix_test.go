@@ -148,16 +148,33 @@ func (i fnIdentity) AttemptFor(_ context.Context, ref adapter.TurnRef) (string, 
 	return i.fn(ref)
 }
 
+// mapRequired is the harness RequiredToolsSource: a turn key absent
+// from m stands for a present intent with an EMPTY set (defaults apply);
+// fail injects the seam's error channel (a read failure or a missing
+// intent) per turn key.
 type mapRequired struct {
-	mu sync.Mutex
-	m  map[string][]string
+	mu   sync.Mutex
+	m    map[string][]string
+	fail map[string]error
 }
 
-func (r *mapRequired) RequiredToolsFor(_ context.Context, ref adapter.TurnRef) ([]string, bool) {
+func (r *mapRequired) RequiredToolsFor(_ context.Context, ref adapter.TurnRef) ([]string, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.fail[ref.TurnKey]; err != nil {
+		return nil, false, err
+	}
 	tools, ok := r.m[ref.TurnKey]
-	return tools, ok
+	return tools, ok && len(tools) > 0, nil
+}
+
+func (r *mapRequired) failWith(turnKey string, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.fail == nil {
+		r.fail = map[string]error{}
+	}
+	r.fail[turnKey] = err
 }
 
 func (r *mapRequired) set(turnKey string, tools []string) {

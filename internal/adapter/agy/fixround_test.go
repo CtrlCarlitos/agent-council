@@ -160,6 +160,40 @@ func TestAgyCreate_ProfileDriftRecordsOrphanOnEpisode(t *testing.T) {
 	}
 }
 
+// Task 7 fix round 1 (Important 2): a service-owned in-flight marker
+// admits ONLY the creation that carries it; the drift orphan lands on
+// that marker, so exactly one open episode results.
+func TestAgyCreate_InFlightMarkerAdmitsOnlyItsOwnerAndCarriesDriftOrphan(t *testing.T) {
+	h := newAgyHarness(t)
+	ctx := context.Background()
+	h.scenario(`{"conversation_id": "`+testNativeID+`"}`, `{"permission_mode": "strict"}`)
+	ep, _, err := h.store.BeginAgyCreationInFlight(ctx, testRunID, string(testSessionID), "op-create-svc", "agy-service")
+	if err != nil {
+		t.Fatalf("begin marker: %v", err)
+	}
+	var unc *adapter.ErrSessionCreationUncertain
+	if _, err := h.adapter.CreateSession(ctx, h.createRequest()); !errors.As(err, &unc) {
+		t.Fatalf("a marker the caller does not carry blocks creation, got %v", err)
+	}
+	if _, err := h.adapter.CreateSession(WithCreationEpisode(ctx, testSessionID, ep+1), h.createRequest()); !errors.As(err, &unc) {
+		t.Fatalf("a different carried episode blocks creation, got %v", err)
+	}
+	if n := h.exec.starts.Load(); n != 0 {
+		t.Fatalf("no child for a blocked creation, launches=%d", n)
+	}
+	h.adapter.ResolveCreationUncertainty(testSessionID)
+	_, err = h.adapter.CreateSession(WithCreationEpisode(ctx, testSessionID, ep), h.createRequest())
+	var cd *ErrCreationDrift
+	if !errors.As(err, &cd) || cd.NativeID != testNativeID || cd.Episode != ep {
+		t.Fatalf("the owner's drift names the service's marker, got %v", err)
+	}
+	eps, err := h.store.AgyCreationUncertaintyEpisodes(ctx, string(testSessionID))
+	if err != nil || len(eps) != 1 || eps[0].Disposition != nil || eps[0].OrphanNativeID == nil ||
+		*eps[0].OrphanNativeID != testNativeID || eps[0].CauseOpID != "op-create-svc" || eps[0].RecordedBy != "agy-service" {
+		t.Fatalf("exactly one open episode: the service marker carrying the orphan, got %+v err=%v", eps, err)
+	}
+}
+
 // ── Important 3: surfaced transition errors (fault seam) ───────────────
 
 func faultOn(op string, err error) func(string) error {

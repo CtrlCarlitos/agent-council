@@ -476,15 +476,43 @@ func compareSharedCreation(req adapter.CreateSessionRequest, call *agyCreationCa
 	return nil
 }
 
+// creationEpisodeKey carries the caller's own service-owned in-flight
+// creation marker (storage.BeginAgyCreationInFlight) into CreateSession.
+type creationEpisodeKey struct{}
+
+type creationEpisode struct {
+	sessionID adapter.SessionID
+	episode   int64
+}
+
+// WithCreationEpisode marks ctx as the creation that OWNS the session's
+// open in-flight marker `episode` (opened by the service immediately
+// before this call). The adapter's durable block then admits exactly
+// that unannotated marker — every other open episode (a crashed
+// creation's marker, an annotated one, any uncertainty episode) still
+// blocks. Drift/orphan records land on the marker itself
+// (RecordAgyCreationUncertain annotates the one open episode), so one
+// creation never yields two open episodes.
+func WithCreationEpisode(ctx context.Context, sessionID adapter.SessionID, episode int64) context.Context {
+	return context.WithValue(ctx, creationEpisodeKey{}, creationEpisode{sessionID: sessionID, episode: episode})
+}
+
+func ownsCreationEpisode(ctx context.Context, sessionID adapter.SessionID, open *storage.AgyCreationUncertaintyEpisode) bool {
+	carried, ok := ctx.Value(creationEpisodeKey{}).(creationEpisode)
+	return ok && open != nil && carried.sessionID == sessionID && carried.episode == open.Episode &&
+		open.Disposition == nil && open.Reason == storage.AgyCreationInFlightReason
+}
+
 func (a *AgyAdapter) createBinding(ctx context.Context, req adapter.CreateSessionRequest) (adapter.SessionBinding, error) {
 	// Durable §3.3 block: an open creation-uncertainty episode survives
-	// restarts; no child may start until the controller resolves it.
-	if open, err := a.store.HasAgyCreationUncertainty(ctx, string(req.SessionID)); err != nil {
+	// restarts; no child may start until the controller resolves it —
+	// except the caller's own, still-unannotated in-flight marker.
+	if open, err := a.store.OpenAgyCreationUncertainty(ctx, string(req.SessionID)); err != nil {
 		return adapter.SessionBinding{}, fmt.Errorf("creation uncertainty lookup: %w", err)
-	} else if open {
+	} else if open != nil && !ownsCreationEpisode(ctx, req.SessionID, open) {
 		return adapter.SessionBinding{}, &adapter.ErrSessionCreationUncertain{
 			SessionID: req.SessionID, Contributor: req.Contributor,
-			Err: errors.New("an open durable creation-uncertainty episode blocks recreation"),
+			Err: fmt.Errorf("an open durable creation-uncertainty episode (%d) blocks recreation", open.Episode),
 		}
 	}
 	if err := a.checkEligibility(req.SessionID); err != nil {
@@ -1152,12 +1180,18 @@ func (a *AgyAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt s
 }
 
 // requiredTools resolves the attempt's required set: the journaled
-// dispatch intent, else the frozen default; re-validated ⊆ expected_tools
+// dispatch intent (an unreadable or missing intent is refused typed —
+// never replaced by the defaults), else, for an empty journaled set,
+// the frozen default; re-validated ⊆ expected_tools
 // with no duplicates (defense in depth behind queue-time validation).
 func (a *AgyAdapter) requiredTools(ctx context.Context, ref adapter.TurnRef) ([]string, error) {
 	tools := a.policy.DefaultRequiredTools
 	if a.required != nil {
-		if t, ok := a.required.RequiredToolsFor(ctx, ref); ok {
+		t, ok, err := a.required.RequiredToolsFor(ctx, ref)
+		if err != nil {
+			return nil, &ErrRequiredToolsUnavailable{SessionID: ref.SessionID, TurnKey: ref.TurnKey, Err: err}
+		}
+		if ok {
 			tools = t
 		}
 	}

@@ -58,6 +58,10 @@ package agy
 //   {"permission_mode": "<mode>"}        overrides "request-review"
 //   {"tools": [...]}                     overrides the 57-name default
 //   {"slow_init_ms": N}                  sleep N ms before emitting init
+//   {"wait_for_file": "<name>"}          after argv is logged, block until
+//                                        <name> exists in the cwd (10 s
+//                                        cap, then exit 3); runs before
+//                                        slow_init_ms
 //   {"step": {...}}                      emit one step_update (state,
 //                                        step_type, text_delta,
 //                                        tool_name, tool_info,
@@ -180,6 +184,7 @@ type directive struct {
 	PermissionMode      string            ` + "`" + `json:"permission_mode"` + "`" + `
 	Tools               []string          ` + "`" + `json:"tools"` + "`" + `
 	SlowInitMs          int64             ` + "`" + `json:"slow_init_ms"` + "`" + `
+	WaitForFile         string            ` + "`" + `json:"wait_for_file"` + "`" + `
 	Step                *stepDirective    ` + "`" + `json:"step"` + "`" + `
 	Result              *resultDirective  ` + "`" + `json:"result"` + "`" + `
 	DeniedActions       []deniedDirective ` + "`" + `json:"denied_actions"` + "`" + `
@@ -202,6 +207,7 @@ type scenarioState struct {
 	permissionMode     string
 	tools              []string
 	slowInitMs         int64
+	waitForFile        string
 	steps              []stepDirective
 	result             *resultDirective
 	deniedActions      []deniedDirective
@@ -260,6 +266,8 @@ func loadScenario() *scenarioState {
 			st.tools = d.Tools
 		case d.SlowInitMs > 0:
 			st.slowInitMs = d.SlowInitMs
+		case d.WaitForFile != "":
+			st.waitForFile = d.WaitForFile
 		case d.Step != nil:
 			st.steps = append(st.steps, *d.Step)
 		case d.Result != nil:
@@ -418,6 +426,21 @@ func runStreamJSON(args []string, st *scenarioState, sigCh chan os.Signal) {
 		}
 	}
 
+	if st.waitForFile != "" {
+		// A deterministic gate: block (argv already logged) until the
+		// test creates the named file in the cwd; 10 s safety cap.
+		gateDeadline := time.Now().Add(10 * time.Second)
+		for {
+			if _, err := os.Stat(st.waitForFile); err == nil {
+				break
+			}
+			if time.Now().After(gateDeadline) {
+				fmt.Fprintf(os.Stderr, "error: fixture wait_for_file %q never appeared\n", st.waitForFile)
+				os.Exit(3)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 	if st.slowInitMs > 0 {
 		time.Sleep(time.Duration(st.slowInitMs) * time.Millisecond)
 	}
