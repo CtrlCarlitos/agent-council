@@ -30,7 +30,13 @@ import (
 // fixtureSource is a tiny Go program built once in TestMain. Its
 // behavior is selected by argv[1]:
 //   - "fast" (default): prints a line and exits immediately.
-//   - "slow": sleeps 300ms, then prints a line.
+//   - "slow": sleeps 300ms, then prints a line carrying a wall-clock
+//     marker (its own time.Now().UnixNano()) so a caller can assert the
+//     marker is later than some point it captured itself, instead of
+//     racing a short non-blocking read.
+//   - "sleep": sleeps 10s — long enough that a test can reliably act on
+//     the tracee (EXITKILL, Interrupt) well before it would exit on its
+//     own.
 //   - "fds": lists /proc/self/fd link targets, one per line (used by
 //     the CLOEXEC test: no target should start with "/memfd:").
 const fixtureSource = `package main
@@ -49,7 +55,10 @@ func main() {
 	switch mode {
 	case "slow":
 		time.Sleep(300 * time.Millisecond)
-		fmt.Println("slow-done")
+		fmt.Println("slow-done", time.Now().UnixNano())
+	case "sleep":
+		time.Sleep(10 * time.Second)
+		fmt.Println("sleep-done")
 	case "fds":
 		entries, err := os.ReadDir("/proc/self/fd")
 		if err != nil {
@@ -373,9 +382,10 @@ func TestVerifyExecIdentity_DifferentImageKillsChild(t *testing.T) {
 	}
 	defer img.Close()
 
+	var stdout bytes.Buffer
 	cmd := exec.Command(fixturePath, "fast")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Ptrace: true, Setpgid: true}
-	cmd.Stdout = io.Discard
+	cmd.Stdout = &stdout
 	cmd.Stderr = io.Discard
 
 	type result struct {
@@ -404,6 +414,135 @@ func TestVerifyExecIdentity_DifferentImageKillsChild(t *testing.T) {
 	}
 	if !pollGone(t, r.pid) {
 		t.Fatalf("expected tracee %d to be killed and reaped after exe mismatch", r.pid)
+	}
+	// The child was killed at the exec-stop, before it ran a single
+	// instruction: it must never have gotten far enough to write
+	// "fast-done" to stdout.
+	if stdout.Len() != 0 {
+		t.Fatalf("expected no stdout to have been produced before the dev:ino mismatch killed the child, got %q", stdout.String())
+	}
+}
+
+// TestVerifyExecIdentity_DigestMismatchKillsChild exercises the digest
+// branch of verifyExecIdentity specifically: dev:ino and the memfd
+// readlink prefix both pass (the child really is the sealed image, exec'd
+// through the sealed fd via buildSealedCmd), but the SealedImage handed to
+// the verification call has a tampered Digest, so only the final content-hash
+// comparison can catch it. This is unreachable through TestVerifyExecIdentity_DifferentImageKillsChild,
+// which fails at the earlier dev:ino check.
+func TestVerifyExecIdentity_DigestMismatchKillsChild(t *testing.T) {
+	requireFixture(t)
+
+	img, err := NewSealedImage(fixturePath, fixtureDigest)
+	if err != nil {
+		t.Fatalf("NewSealedImage: %v", err)
+	}
+	defer img.Close()
+
+	req := LaunchRequest{
+		SessionID:   "sess-digest-branch",
+		Command:     img.ArgV0,
+		Args:        []string{"fast"},
+		Paths:       sealedTestPaths(t),
+		Profile:     sealedTestProfile([]string{img.ArgV0}),
+		SealedImage: img,
+	}
+
+	type result struct {
+		pid    int
+		stdout string
+		err    error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
+		// Build and start the launch normally, against the real
+		// (untampered) image, so dev:ino and the memfd readlink prefix
+		// both genuinely pass.
+		cmd, closeDup, berr := buildSealedCmd(context.Background(), req, os.Environ())
+		if berr != nil {
+			resCh <- result{err: berr}
+			return
+		}
+		defer closeDup()
+		var stdout bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = io.Discard
+
+		if serr := cmd.Start(); serr != nil {
+			resCh <- result{err: serr}
+			return
+		}
+		pid := cmd.Process.Pid
+
+		ws, werr := waitForStopRetryingEINTR(pid, sealedPtraceHooks)
+		if werr != nil {
+			killAndReap(cmd, sealedPtraceHooks)
+			resCh <- result{pid: pid, err: werr}
+			return
+		}
+		if !ws.Stopped() || ws.StopSignal() != syscall.SIGTRAP {
+			killAndReap(cmd, sealedPtraceHooks)
+			resCh <- result{pid: pid, err: fmt.Errorf("not a SIGTRAP stop: %v", ws)}
+			return
+		}
+		if soerr := sealedPtraceHooks.setOptions(pid, unix.PTRACE_O_EXITKILL); soerr != nil {
+			killAndReap(cmd, sealedPtraceHooks)
+			resCh <- result{pid: pid, err: soerr}
+			return
+		}
+
+		// Only the verification call gets a tampered Digest: dev:ino
+		// and the readlink prefix are checked against the real memfd
+		// (same fd underlying both img and tampered), so only the
+		// content-hash comparison can fail here.
+		tampered := *img
+		tampered.Digest = "sha256:" + strings.Repeat("f", 64)
+		_, verr := verifyExecIdentity(pid, &tampered)
+		killAndReap(cmd, sealedPtraceHooks)
+		resCh <- result{pid: pid, stdout: stdout.String(), err: verr}
+	}()
+	r := <-resCh
+
+	if !errors.Is(r.err, ErrSealedImageMismatch) {
+		t.Fatalf("expected ErrSealedImageMismatch (digest branch), got %v", r.err)
+	}
+	if r.pid == 0 {
+		t.Fatalf("expected a tracee pid to have been observed")
+	}
+	if !pollGone(t, r.pid) {
+		t.Fatalf("expected tracee %d to be killed and reaped after digest mismatch", r.pid)
+	}
+	if r.stdout != "" {
+		t.Fatalf("expected no stdout before the digest mismatch killed the child, got %q", r.stdout)
+	}
+}
+
+// TestIsMemfdExeTarget unit-tests the readlink-prefix comparison
+// verifyExecIdentity relies on, including the "(deleted)" suffix the
+// kernel appends once a memfd has no directory links (always true for a
+// sealed image), independent of any real ptrace/exec machinery.
+func TestIsMemfdExeTarget(t *testing.T) {
+	cases := []struct {
+		name   string
+		target string
+		want   bool
+	}{
+		{"plain memfd target", "/memfd:agy", true},
+		{"deleted-suffix memfd target accepted", "/memfd:agy (deleted)", true},
+		{"regular on-disk exe rejected", "/usr/bin/agy", false},
+		{"deleted regular file rejected", "/usr/bin/agy (deleted)", false},
+		{"empty target rejected", "", false},
+		{"memfd-like prefix without colon rejected", "/memfdagy", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isMemfdExeTarget(c.target); got != c.want {
+				t.Fatalf("isMemfdExeTarget(%q) = %v, want %v", c.target, got, c.want)
+			}
+		})
 	}
 }
 
@@ -469,22 +608,38 @@ func TestStart_SealedImage_SlowChildVerifiedBeforeOutput(t *testing.T) {
 		SealedImage: img,
 	}
 
-	start := time.Now()
+	// Structural, not timing-based: capture the instant Start returns,
+	// then require the child's own wall-clock marker (printed only
+	// after its 300ms sleep, from its own process) to be later than
+	// that instant. That can only hold if exec-stop verification
+	// finished, and Start returned, before the child ran past its
+	// sleep — a non-blocking-read timing window would flake under
+	// -race on a loaded runner; this cannot.
+	startReturned := time.Now()
 	proc, err := New().Start(context.Background(), req)
-	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
-	}
-	if elapsed > 200*time.Millisecond {
-		t.Fatalf("Start took %v; expected exec-stop verification to complete well before the 300ms sleep", elapsed)
 	}
 
 	out, err := io.ReadAll(proc.Stdout())
 	if err != nil {
 		t.Fatalf("read stdout: %v", err)
 	}
-	if strings.TrimSpace(string(out)) != "slow-done" {
-		t.Fatalf("stdout = %q, want %q", out, "slow-done")
+	fields := strings.Fields(strings.TrimSpace(string(out)))
+	if len(fields) != 2 || fields[0] != "slow-done" {
+		t.Fatalf("stdout = %q, want %q", out, "slow-done <marker>")
+	}
+	markerNanos, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil {
+		t.Fatalf("parse child wall-clock marker %q: %v", fields[1], err)
+	}
+	childPrinted := time.Unix(0, markerNanos)
+	if !childPrinted.After(startReturned) {
+		t.Fatalf("child printed at %v, which is not after Start returned at %v; exec-stop verification must complete (and Start must return) before the child runs its sleep and prints", childPrinted, startReturned)
+	}
+
+	if _, err := proc.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
 	}
 }
 
@@ -613,6 +768,16 @@ func runSealedTracerFailureCase(t *testing.T, fake *fakePtraceOps, capturedPID *
 		Profile:     sealedTestProfile([]string{img.ArgV0}),
 		SealedImage: img,
 	}
+
+	// fd-count regression guard for Important-2: the failure path must
+	// reap via cmd.Wait() (which closes the parent stdin/stdout/stderr
+	// pipe ends and releases the ctx-watcher goroutine's grip on the
+	// pidfd), not a raw wait4 that drops cmd and leaks all three. The
+	// only fd this call is expected to hold open across the failed
+	// Start is img's own sealed memfd (deferred Close above), which is
+	// open in both snapshots, so before == after exactly.
+	before := openFDCount(t)
+
 	proc, err := New().Start(context.Background(), req)
 	if proc != nil {
 		t.Fatalf("expected no process on tracer failure")
@@ -626,6 +791,23 @@ func runSealedTracerFailureCase(t *testing.T, fake *fakePtraceOps, capturedPID *
 	if !pollGone(t, *capturedPID) {
 		t.Fatalf("expected pid %d to be gone (no zombie) after tracer failure", *capturedPID)
 	}
+
+	after := openFDCount(t)
+	if after != before {
+		t.Fatalf("open fd count regression: before=%d after=%d; failed sealed launch leaked fds (expected the stdin/stdout/stderr pipe parent ends and the ctx-watcher's pidfd grip to be released by cmd.Wait())", before, after)
+	}
+}
+
+// openFDCount counts this process's currently open file descriptors via
+// /proc/self/fd. Used to catch fd leaks (pipes, pidfds) on the sealed
+// launch failure path without depending on any particular fd number.
+func openFDCount(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatalf("read /proc/self/fd: %v", err)
+	}
+	return len(entries)
 }
 
 // --- PTRACE_O_EXITKILL -------------------------------------------------
@@ -651,9 +833,16 @@ func TestHelperSealedTracer(t *testing.T) {
 	}
 
 	req := LaunchRequest{
-		SessionID:   "sess-exitkill-helper",
-		Command:     img.ArgV0,
-		Args:        []string{"fast"},
+		SessionID: "sess-exitkill-helper",
+		Command:   img.ArgV0,
+		// "sleep" (long-running), not "fast": without PTRACE_O_EXITKILL
+		// the kernel's tracer-exit path detaches and wakes the stopped
+		// tracee, and a "fast" tracee would print and exit 0 on its
+		// own within milliseconds, making the outer test's reap check
+		// pass whether or not EXITKILL actually fired. "sleep" cannot
+		// exit on its own inside the poll window, so a positive
+		// SIGKILL reap is only possible if EXITKILL did its job.
+		Args:        []string{"sleep"},
 		Paths:       workspace.WorkspacePaths{Root: filepath.Dir(fixture), Config: filepath.Dir(fixture), Worktree: filepath.Dir(fixture)},
 		Profile:     sealedTestProfile([]string{img.ArgV0}),
 		SealedImage: img,
@@ -720,20 +909,217 @@ func TestPtraceExitKillOnTracerDeath(t *testing.T) {
 	}
 }
 
+// pollTraceeReaped requires a positive wait4 reap of pid whose exit
+// status is a SIGKILL signal death — proof PTRACE_O_EXITKILL actually
+// fired, not merely that the pid is no longer visible. The caller
+// (TestPtraceExitKillOnTracerDeath) has made itself a
+// PR_SET_CHILD_SUBREAPER, so the orphaned tracee always reparents to it
+// and is always reapable here; a bare ESRCH ("no such process") success
+// path — the previous version of this helper — would also be produced
+// by an EXITKILL-less tracee that simply ran to completion and exited
+// 0 on its own, which is exactly the bug this test exists to catch, so
+// ESRCH/ECHILD/any wait error is treated as failure, not success.
 func pollTraceeReaped(t *testing.T, pid int) bool {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	// The "sleep" fixture used by the helper sleeps 10s; give a broken
+	// (unarmed) EXITKILL time to let it run to completion on its own
+	// before concluding it never got reaped at all.
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		var ws syscall.WaitStatus
-		if wpid, _ := syscall.Wait4(pid, &ws, syscall.WNOHANG, nil); wpid == pid {
-			return true
+		wpid, err := syscall.Wait4(pid, &ws, syscall.WNOHANG, nil)
+		if err != nil && err != syscall.EINTR {
+			// ECHILD here would mean the subreaper never saw pid as
+			// its child at all — a real failure, not a race to retry.
+			return false
 		}
-		if err := unix.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
-			return true
+		if wpid == pid {
+			return ws.Signaled() && ws.Signal() == syscall.SIGKILL
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	return false
+}
+
+// --- ManagedProcess.Interrupt / ExecutableIdentity coverage --------------
+
+// TestManagedProcess_Interrupt_SealedImage launches the long-running
+// "sleep" fixture through a sealed-image Start, calls Interrupt(), and
+// confirms the child dies of SIGINT — the fixture installs no signal
+// handler, so an unhandled SIGINT terminates it via the OS default
+// disposition.
+func TestManagedProcess_Interrupt_SealedImage(t *testing.T) {
+	requireFixture(t)
+
+	img, err := NewSealedImage(fixturePath, fixtureDigest)
+	if err != nil {
+		t.Fatalf("NewSealedImage: %v", err)
+	}
+	defer img.Close()
+
+	req := LaunchRequest{
+		SessionID:   "sess-interrupt",
+		Command:     img.ArgV0,
+		Args:        []string{"sleep"},
+		Paths:       sealedTestPaths(t),
+		Profile:     sealedTestProfile([]string{img.ArgV0}),
+		SealedImage: img,
+	}
+	proc, err := New().Start(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if err := proc.Interrupt(); err != nil {
+		t.Fatalf("Interrupt: %v", err)
+	}
+
+	if _, err := proc.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+
+	mp, ok := proc.(*managedProcess)
+	if !ok {
+		t.Fatalf("expected *managedProcess, got %T", proc)
+	}
+	ws, ok := mp.cmd.ProcessState.Sys().(syscall.WaitStatus)
+	if !ok {
+		t.Fatalf("expected syscall.WaitStatus, got %T", mp.cmd.ProcessState.Sys())
+	}
+	if !ws.Signaled() || ws.Signal() != syscall.SIGINT {
+		t.Fatalf("expected the child to have been killed by SIGINT, got wait status %v", ws)
+	}
+}
+
+// TestManagedProcess_ExecutableIdentity_PathLaunch exercises the
+// ordinary (non-sealed) path-launch branch of ExecutableIdentity: it
+// must report {Path: req.Command, Digest: ""}, not the sealed-launch
+// {DevIno, Digest} shape.
+func TestManagedProcess_ExecutableIdentity_PathLaunch(t *testing.T) {
+	requireFixture(t)
+
+	req := LaunchRequest{
+		SessionID: "sess-path-identity",
+		Command:   fixturePath,
+		Args:      []string{"fast"},
+		Paths:     sealedTestPaths(t),
+		Profile:   sealedTestProfile([]string{fixturePath}),
+	}
+	proc, err := New().Start(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	ident := proc.ExecutableIdentity()
+	if ident.Path != fixturePath {
+		t.Fatalf("ExecutableIdentity.Path = %q, want %q", ident.Path, fixturePath)
+	}
+	if ident.Digest != "" {
+		t.Fatalf("ExecutableIdentity.Digest = %q, want empty for a path launch", ident.Digest)
+	}
+	if ident.DevIno != "" {
+		t.Fatalf("ExecutableIdentity.DevIno = %q, want empty for a path launch", ident.DevIno)
+	}
+
+	if _, err := io.ReadAll(proc.Stdout()); err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	if _, err := proc.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+}
+
+// --- controller ruling: strict isolation + sealed image ------------------
+
+// strictNetworkNoneUnavailable probes, with a real trial launch, whether
+// this host can actually create the new user+net namespaces strict
+// network_mode=none isolation requires — the availability check baked
+// into checkPlatformCapabilities (os.Stat on /proc/self/ns/user|net)
+// only confirms the kernel exposes namespaces at all, not that
+// unprivileged user-namespace creation is allowed (e.g. distros/hosts
+// that set kernel.unprivileged_userns_clone=0, or containers/sandboxes
+// that block CLONE_NEWUSER outright).
+func strictNetworkNoneUnavailable(t *testing.T) string {
+	t.Helper()
+	trial := exec.Command(fixturePath, "fast")
+	trial.Stdout = io.Discard
+	trial.Stderr = io.Discard
+	trial.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNET,
+		UidMappings: []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: os.Getuid(), Size: 1},
+		},
+		GidMappings: []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: os.Getgid(), Size: 1},
+		},
+		GidMappingsEnableSetgroups: false,
+	}
+	if err := trial.Run(); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// TestStart_SealedImage_StrictNetworkNone is the controller-ruling test:
+// a sealed-image launch under a strict, network_mode=none profile
+// (request shape copied from executor_linux_test.go's
+// TestPolicyExecutor_LinuxStrictKernelIsolation) must still pass sealed
+// verification and read fully — the strict Cloneflags merge
+// (TestBuildSealedCmd_MergesPtraceIntoStrictSysProcAttr) must actually
+// produce a working launch end to end, not just a correctly-shaped
+// SysProcAttr. Skip-guarded: not hard-required, since some hosts refuse
+// unprivileged user namespaces outright.
+func TestStart_SealedImage_StrictNetworkNone(t *testing.T) {
+	requireFixture(t)
+
+	if msg := strictNetworkNoneUnavailable(t); msg != "" {
+		t.Skipf("user/network namespaces unavailable for strict network_mode=none: %s", msg)
+	}
+
+	img, err := NewSealedImage(fixturePath, fixtureDigest)
+	if err != nil {
+		t.Fatalf("NewSealedImage: %v", err)
+	}
+	defer img.Close()
+
+	profile := sealedTestProfile([]string{img.ArgV0})
+	profile.IsolationStrictness = "strict"
+	profile.NetworkMode = "none"
+	profile.Harnesses = map[string]storage.HarnessProfileSpec{
+		"agy": {Model: "gemini-2.5-pro", NativeAuthMode: "inherited_host_keychain"},
+	}
+
+	req := LaunchRequest{
+		SessionID:   "sess-strict-none-sealed",
+		Command:     img.ArgV0,
+		Args:        []string{"fast"},
+		Paths:       sealedTestPaths(t),
+		Profile:     profile,
+		SealedImage: img,
+	}
+	proc, err := New().Start(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	ident := proc.ExecutableIdentity()
+	if ident.Digest != img.Digest {
+		t.Fatalf("ExecutableIdentity.Digest = %q, want %q", ident.Digest, img.Digest)
+	}
+	if ident.DevIno == "" {
+		t.Fatalf("expected non-empty DevIno for a sealed-image launch")
+	}
+
+	out, err := io.ReadAll(proc.Stdout())
+	if err != nil {
+		t.Fatalf("read stdout: %v", err)
+	}
+	if strings.TrimSpace(string(out)) != "fast-done" {
+		t.Fatalf("stdout = %q, want %q", out, "fast-done")
+	}
+	if _, err := proc.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
 }
 
 // sanity: sha256Hex matches the standard library for a trivial input,

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,8 +21,35 @@ import (
 
 // requiredSeals is the exact seal set a sealed image must carry before it
 // may be launched: no shrinking, no growing, no writing, and the seal set
-// itself may never be extended again.
+// itself may never be extended again. Equality (not "at least") is
+// checked everywhere this is used, so a host that additionally forces
+// MFD_NOEXEC_SEAL (adding F_SEAL_EXEC/F_SEAL_FUTURE_WRITE to the memfd
+// unasked) fails closed instead of silently accepting a differently
+// sealed image.
 const requiredSeals = unix.F_SEAL_SHRINK | unix.F_SEAL_GROW | unix.F_SEAL_WRITE | unix.F_SEAL_SEAL
+
+// createSealedMemfd creates the memfd that will hold the pinned
+// executable's bytes. It asks for MFD_EXEC first: without it, a kernel
+// built with CONFIG_MEMFD_CREATE's default-noexec behavior (or one
+// where the sysctl vm.memfd_noexec forces it) marks the memfd
+// non-executable regardless of MFD_ALLOW_SEALING, which would make the
+// later exec of /proc/self/fd/<dup> fail with ENOEXEC/EACCES even
+// though every seal check passed. MFD_EXEC was added in Linux 6.3
+// (golang.org/x/sys v0.47.0's unix.MFD_EXEC); older kernels reject the
+// flag combination with EINVAL, so on that specific error we retry
+// once without MFD_EXEC — a kernel that predates MFD_EXEC also
+// predates the noexec default, so the memfd is executable there
+// regardless.
+func createSealedMemfd() (int, error) {
+	fd, err := unix.MemfdCreate("agy", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING|unix.MFD_EXEC)
+	if err == nil {
+		return fd, nil
+	}
+	if !errors.Is(err, unix.EINVAL) {
+		return -1, err
+	}
+	return unix.MemfdCreate("agy", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
+}
 
 // NewSealedImage reads the executable at path, verifies its content
 // digest matches wantDigest, copies it into a sealed memfd (kernel-backed,
@@ -44,7 +72,7 @@ func NewSealedImage(path, wantDigest string) (*SealedImage, error) {
 		return nil, fmt.Errorf("%w: %q digest %s does not match expected %s", ErrSealedImageMismatch, absPath, digest, wantDigest)
 	}
 
-	fd, err := unix.MemfdCreate("agy", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
+	fd, err := createSealedMemfd()
 	if err != nil {
 		return nil, fmt.Errorf("%w: memfd_create: %v", ErrSealedLaunch, err)
 	}
@@ -140,10 +168,13 @@ func startSealed(ctx context.Context, req LaunchRequest, env []string, cleanup f
 	}
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
+		_ = stdinPipe.Close()
 		return nil, fmt.Errorf("create stdout pipe: %w", err)
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
+		_ = stdinPipe.Close()
+		_ = stdoutPipe.Close()
 		return nil, fmt.Errorf("create stderr pipe: %w", err)
 	}
 
@@ -286,30 +317,30 @@ func runSealedTracer(cmd *exec.Cmd, img *SealedImage, hooks ptraceOps, detach bo
 	}
 	pid := cmd.Process.Pid
 
-	var ws syscall.WaitStatus
-	if _, err := hooks.wait4(pid, &ws, 0); err != nil {
-		killAndReap(pid, hooks)
+	ws, err := waitForStopRetryingEINTR(pid, hooks)
+	if err != nil {
+		killAndReap(cmd, hooks)
 		return ExeIdentity{}, fmt.Errorf("%w: wait4 for exec-stop: %v", ErrSealedLaunch, err)
 	}
 	if !ws.Stopped() || ws.StopSignal() != syscall.SIGTRAP {
-		killAndReap(pid, hooks)
+		killAndReap(cmd, hooks)
 		return ExeIdentity{}, fmt.Errorf("%w: exec-stop wait status %v is not a SIGTRAP stop", ErrSealedLaunch, ws)
 	}
 
 	if err := hooks.setOptions(pid, unix.PTRACE_O_EXITKILL); err != nil {
-		killAndReap(pid, hooks)
+		killAndReap(cmd, hooks)
 		return ExeIdentity{}, fmt.Errorf("%w: PTRACE_O_EXITKILL: %v", ErrSealedLaunch, err)
 	}
 
 	ident, err := verifyExecIdentity(pid, img)
 	if err != nil {
-		killAndReap(pid, hooks)
+		killAndReap(cmd, hooks)
 		return ExeIdentity{}, err
 	}
 
 	if detach {
 		if err := hooks.detach(pid); err != nil {
-			killAndReap(pid, hooks)
+			killAndReap(cmd, hooks)
 			return ExeIdentity{}, fmt.Errorf("%w: ptrace detach: %v", ErrSealedLaunch, err)
 		}
 	}
@@ -317,18 +348,48 @@ func runSealedTracer(cmd *exec.Cmd, img *SealedImage, hooks ptraceOps, detach bo
 	return ident, nil
 }
 
-// killAndReap kills pid and blocks until it is reaped, leaving no
-// zombie. Used on every sealed-launch failure path.
-func killAndReap(pid int, hooks ptraceOps) {
-	_ = hooks.kill(pid)
+// waitForStopRetryingEINTR waits for pid's next ptrace stop using
+// syscall.WALL, as the brief specifies, retrying on EINTR rather than
+// surfacing it — the same retry rule killAndReap's reap applies.
+func waitForStopRetryingEINTR(pid int, hooks ptraceOps) (syscall.WaitStatus, error) {
 	var ws syscall.WaitStatus
 	for {
-		_, err := hooks.wait4(pid, &ws, 0)
+		_, err := hooks.wait4(pid, &ws, syscall.WALL)
 		if err == syscall.EINTR {
 			continue
 		}
-		return
+		return ws, err
 	}
+}
+
+// killAndReap SIGKILLs cmd's process and reaps it via cmd.Wait(). Unlike
+// a raw wait4, cmd.Wait() also closes the parent ends of the stdin/
+// stdout/stderr pipes exec.Cmd opened for this launch (its
+// "close-after-wait" set) and releases the exec.CommandContext
+// ctx-watcher goroutine tied to cmd.Process — a raw reap leaves both
+// leaked. SIGKILL clears a ptrace-stop synchronously (the kernel never
+// defers SIGKILL for a traced task, even mid-stop), and a traced
+// child's exit is reapable from any thread in the tracer's thread
+// group, so calling cmd.Wait() here — from the same
+// runtime.LockOSThread-pinned goroutine that called cmd.Start() — is
+// safe and loops internally until the child is Exited() or Signaled().
+// Used on every sealed-launch failure path after cmd.Start() has
+// succeeded; never called more than once per cmd (a successful
+// runSealedTracer return hands cmd to a managedProcess, whose own
+// Wait() owns cmd.Wait() from then on, and Cmd.Wait() itself rejects a
+// second call).
+func killAndReap(cmd *exec.Cmd, hooks ptraceOps) {
+	_ = hooks.kill(cmd.Process.Pid)
+	_ = cmd.Wait()
+}
+
+// isMemfdExeTarget reports whether target — the os.Readlink of a
+// /proc/<pid>/exe symlink — points at a memfd-backed image. The kernel
+// appends " (deleted)" once a memfd has no remaining directory links,
+// which is immediately true for a sealed image (it is never linked
+// into any directory), so that suffix is accepted by design.
+func isMemfdExeTarget(target string) bool {
+	return strings.HasPrefix(target, "/memfd:")
 }
 
 // verifyExecIdentity checks, at the ptrace exec-stop (before the tracee
@@ -363,7 +424,7 @@ func verifyExecIdentity(pid int, img *SealedImage) (ExeIdentity, error) {
 	if err != nil {
 		return ExeIdentity{}, fmt.Errorf("%w: readlink %s: %v", ErrSealedImageMismatch, exePath, err)
 	}
-	if !strings.HasPrefix(target, "/memfd:") {
+	if !isMemfdExeTarget(target) {
 		return ExeIdentity{}, fmt.Errorf("%w: %s target %q is not a sealed memfd image", ErrSealedImageMismatch, exePath, target)
 	}
 
