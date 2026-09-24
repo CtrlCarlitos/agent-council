@@ -11,6 +11,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -695,5 +696,62 @@ VALUES (?, '1.2.9', 'linux/unix', 'sha256:md', 'cprof-v4:sha256:pd', 'frame', '2
 	}
 	if blank, err := store.GetAgyProtectionAttestation(ctx, "  "); err != nil || blank != nil {
 		t.Fatalf("a blank id is nil without error, got %+v err=%v", blank, err)
+	}
+}
+
+// required_tools are validated at queue time and IMMUTABLE thereafter
+// (AC-010 spec §3.5): replacing a queued prompt's text keeps the
+// journaled set (the dispatch intent still carries it), and a replace
+// that names a DIFFERENT set is refused rather than silently ignored.
+func TestAgyState_ReplacePendingPromptKeepsImmutableRequiredTools(t *testing.T) {
+	store := newAgyUncertaintyFixture(t)
+	ctx := context.Background()
+	version := func() int64 {
+		t.Helper()
+		v, err := store.GetSessionVersion(ctx, agyUncSession)
+		if err != nil {
+			t.Fatalf("get version: %v", err)
+		}
+		return v
+	}
+	tools := []string{"view_file", "run_command"}
+	if _, err := store.QueuePrompt(ctx, "op-q-rt", agyUncLease, agyUncSession, version(), PendingPrompt{
+		SessionID: agyUncSession, TurnKey: "t-rt", Prompt: "first text", RequiredTools: tools,
+	}); err != nil {
+		t.Fatalf("queue prompt: %v", err)
+	}
+
+	// A replace naming a different set is refused, nothing changes.
+	if _, err := store.ReplacePendingPrompt(ctx, "op-r-rt-diff", agyUncLease, agyUncSession, version(), PendingPrompt{
+		SessionID: agyUncSession, TurnKey: "t-rt", Prompt: "other text", RequiredTools: []string{"view_file"},
+	}); err == nil || !errors.Is(err, ErrRequiredToolsImmutable) {
+		t.Fatalf("a replace that changes required_tools must be refused typed, got %v", err)
+	}
+	// Restating the same set is accepted.
+	if _, err := store.ReplacePendingPrompt(ctx, "op-r-rt-same", agyUncLease, agyUncSession, version(), PendingPrompt{
+		SessionID: agyUncSession, TurnKey: "t-rt", Prompt: "second text", RequiredTools: tools,
+	}); err != nil {
+		t.Fatalf("a replace restating the same set: %v", err)
+	}
+	// Omitting the set keeps the journaled one.
+	if _, err := store.ReplacePendingPrompt(ctx, "op-r-rt-omit", agyUncLease, agyUncSession, version(), PendingPrompt{
+		SessionID: agyUncSession, TurnKey: "t-rt", Prompt: "third text",
+	}); err != nil {
+		t.Fatalf("a replace that omits the set: %v", err)
+	}
+
+	if _, err := store.ReleaseTurn(ctx, "op-rel-rt", agyUncLease, agyUncSession, version(), "t-rt"); err != nil {
+		t.Fatalf("release turn: %v", err)
+	}
+	details, err := store.GetTurnDetails(ctx, agyUncSession, "t-rt")
+	if err != nil || details == nil || details.DispatchIntent == nil {
+		t.Fatalf("turn details: %+v err=%v", details, err)
+	}
+	if details.Prompt != "third text" {
+		t.Fatalf("the replaced prompt text must be dispatched, got %q", details.Prompt)
+	}
+	got := details.DispatchIntent.RequiredTools
+	if len(got) != 2 || got[0] != "view_file" || got[1] != "run_command" {
+		t.Fatalf("the queue-time required_tools must survive every replace into the dispatch intent, got %v", got)
 	}
 }

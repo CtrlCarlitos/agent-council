@@ -607,7 +607,18 @@ func (s *Store) ReplacePendingPrompt(ctx context.Context, opID string, callerLea
 	}
 
 	sanitized := SanitizeText(prompt.Prompt)
-	fp := computeFingerprint("replace_pending_prompt", sessionID, prompt.TurnKey, sanitized)
+	// required_tools are validated at queue time and immutable thereafter
+	// (AC-010 §3.5): a replace may restate the journaled set or omit it
+	// (nil keeps it); a different set is refused, never silently ignored.
+	// The set joins the fingerprint only when stated, so replays of
+	// replaces recorded without one keep their fingerprint.
+	fpParts := []string{"replace_pending_prompt", sessionID, prompt.TurnKey, sanitized}
+	var statedTools string
+	if prompt.RequiredTools != nil {
+		statedTools = marshalStrings(prompt.RequiredTools)
+		fpParts = append(fpParts, statedTools)
+	}
+	fp := computeFingerprint(fpParts...)
 
 	tx, err := s.BeginWrite(ctx)
 	if err != nil {
@@ -653,9 +664,26 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &lifec
 		return OperationReceipt{}, ErrControllerDisconnected
 	}
 
+	if prompt.RequiredTools != nil {
+		var storedTools string
+		err := tx.Tx().QueryRowContext(ctx, `
+SELECT required_tools_json FROM pending_prompts WHERE session_id = ? AND turn_key = ?;`, sessionID, prompt.TurnKey).Scan(&storedTools)
+		if errors.Is(err, sql.ErrNoRows) {
+			return OperationReceipt{}, ErrPromptNotQueued
+		}
+		if err != nil {
+			return OperationReceipt{}, fmt.Errorf("query pending required tools: %w", err)
+		}
+		if storedTools != statedTools {
+			return OperationReceipt{}, fmt.Errorf("%w: turn %s was queued with %s, replace names %s",
+				ErrRequiredToolsImmutable, prompt.TurnKey, storedTools, statedTools)
+		}
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 
-	// Update ONLY the specified pending prompt row
+	// Update ONLY the specified pending prompt row (prompt text and queue
+	// time; required_tools_json is immutable and deliberately untouched)
 	res, err := tx.Tx().ExecContext(ctx, `
 UPDATE pending_prompts SET prompt = ?, queued_at = ? WHERE session_id = ? AND turn_key = ?;`, sanitized, now, sessionID, prompt.TurnKey)
 	if err != nil {
