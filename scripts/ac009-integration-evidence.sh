@@ -59,8 +59,8 @@ AC009_FROZEN_APPROVAL="${AC009_FROZEN_APPROVAL:-on-request}"
 # Stage C: the CODEX_HOME the probes run against (auth is inherited by
 # the child natively; this script never reads or copies credentials).
 AC009_PROBE_CODEX_HOME="${AC009_PROBE_CODEX_HOME:-${HOME:-}/.codex}"
-AC009_MCP_TOOLS="${AC009_MCP_TOOLS-}"                 # frozen-profile MCP tool inventory (comma-separated "<server>/<tool>" entries — the coverage rule keys MCP paths to the frozen expected_mcp_servers; empty = affirmatively none; unset = unproven)
-AC009_PLUGIN_TOOLS="${AC009_PLUGIN_TOOLS-}"           # same contract for plugin-contributed tools (entries named exactly as the frozen expected_plugins/expected_skills)
+AC009_MCP_TOOLS="${AC009_MCP_TOOLS-}"                 # the frozen profile's expected_mcp_tools EXACTLY (comma-separated "<server>/<tool>"; the coverage rule requires set equality; empty = affirmatively none; unset = unproven)
+AC009_PLUGIN_TOOLS="${AC009_PLUGIN_TOOLS-}"           # the frozen profile's expected_plugin_tools EXACTLY (same contract)
 
 HOME_PREFIX="$(cd "${HOME:-/}" && pwd)"
 
@@ -767,8 +767,10 @@ stage_c() {
         echo "  of the expected coverage), and the typed cprot-v2 attestation built from THIS"
         echo "  capture: sibling_read[] + self_mutation[] + approval_deny[] (spec §3.6/§3.7)."
         echo "  The service REFUSES anything that does not cover the run's frozen profile:"
-        echo "  every built-in class (Read/Glob/Grep/Bash) exactly once, every expected MCP"
-        echo "  server and plugin tool, all five mutation operations on every mutation-capable"
+        echo "  every built-in class (Read/Glob/Grep/Bash) exactly once, EXACTLY the frozen"
+        echo "  expected_mcp_tools and expected_plugin_tools inventories (set equality — a"
+        echo "  server is never covered by probing one of its tools), all five mutation"
+        echo "  operations on every mutation-capable"
         echo "  path, and a native_refusal_enum approval_deny record for every pinned approval"
         echo "  method with a schema-native refusal enum; unexpected or duplicate coverage is"
         echo "  refused too. Live-verified records for the two deny-EQUIVALENT variants are"

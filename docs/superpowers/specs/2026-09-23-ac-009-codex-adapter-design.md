@@ -325,7 +325,15 @@ adapter side effect.
   handed off while the native creation was in flight cannot publish the
   binding), the op_id is journaled with receipt replay, and one binding
   per session is enforced. The pre-flight authority check is an early
-  refusal, not the authority.
+  refusal, not the authority. The birth path trusts NOTHING from the
+  caller beyond the session identity and the credential: the model is
+  the run's stored frozen `harnesses.codex.model`, the thread cwd is
+  the AC-005 workspace allocation for (run, session) and must lie
+  inside the frozen `sandbox_policy.writable_roots` (the operator
+  freezes the workspace base as the writable root and trusts it in the
+  Codex config), the run's re-derived profile digest must be the digest
+  the service's codex adapter froze to, and the persisted binding
+  carries those derived values.
 - `thread/start` accepts the frozen thread parameters that the schema
   supports at creation (cwd = workspace root; model/sandbox/approval are
   pinned per turn at dispatch, §3.5, because resume re-derives them —
@@ -567,14 +575,15 @@ adapter side effect.
   - **Coverage binding (errata, implementation review)**: "the suite
     enumerates every enabled class" is ENFORCED, not assumed. The
     expected coverage set is derived from the run's STORED frozen
-    profile (the launch policy: platform, version, manifest digest,
-    `expected_mcp_servers`, toolkit `expected_plugins`/`expected_skills`)
-    and the pinned §3.6 approval table — never from the evidence. A
-    valid attestation carries: exactly one `sibling_read` per built-in
+    profile (the launch policy: platform, version, manifest digest, the
+    EXACT `expected_mcp_tools` and `expected_plugin_tools` inventories,
+    §3.8) and the pinned §3.6 approval table — never from the evidence.
+    A valid attestation carries: exactly one `sibling_read` per built-in
     class (Read, Glob, Grep, shell-absolute); `sibling_read` plus all
     five `self_mutation` operations for every mutation-capable path
-    (shell, each expected MCP server tool named `<server>` or
-    `<server>/<tool>`, each expected plugin tool); no mutation records
+    (shell, and EXACTLY the frozen MCP tool paths and plugin tools — set
+    equality, so a server is never covered by probing one of its tools);
+    no mutation records
     for read-only classes; a `native_refusal_enum` `approval_deny` for
     every pinned method with a schema-native refusal enum; optional
     `live_verified_equivalent` records for the two deny-equivalent
@@ -645,6 +654,8 @@ adapter side effect.
         "approval_policy": "on-request",
         "approvals_reviewer": "user",
         "expected_mcp_servers": ["…"],
+        "expected_mcp_tools": ["<server>/<tool>", "…"],
+        "expected_plugin_tools": ["…"],
         "expected_instruction_sources": ["…"],
         "rules_evidence": {
           "verified": ["…"],
@@ -665,7 +676,14 @@ adapter side effect.
   network access (resume + `turn_context` compare), `approval_policy` and
   `approvals_reviewer` (resume effective-config + `turn_context` compare;
   §3.6 responder), and the explicit unverifiable rules/hooks list —
-  recorded as a gap, never claimed.
+  recorded as a gap, never claimed. Errata (implementation review):
+  `expected_mcp_tools` (exact `<server>/<tool>` paths, each server in
+  `expected_mcp_servers`) and `expected_plugin_tools` (exact
+  skill/plugin-contributed tool names) are the EXACT, digest-bound tool
+  inventories the attestation coverage rule (§3.7) enumerates; both are
+  required (`[]` when none). Tool-level live verification against the
+  native inventory remains an integration obligation — the pinned
+  `mcpServerStatus/list` shape is verified at server granularity only.
   - **Normalization**: the existing family — BOM trim, NFC, dedupe,
     byte-wise lexicographic sort for array fields (case-sensitive; the
     lowercasing quirk of `tooling` is NOT applied here); scalars trimmed +
