@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -821,6 +822,21 @@ func (a *CodexAdapter) Dispatch(ctx context.Context, ref adapter.TurnRef, prompt
 			Reason: "resume verification failed: " + err.Error()}, err
 	}
 	if drift := compareEffectiveConfig(cfg, nativeID, a.policy, binding.Model, binding.Workspace); drift != nil {
+		a.server.stop(ctx, ref.SessionID)
+		releaseIfRejected()
+		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
+			Reason: drift.Error()}, drift
+	}
+
+	// §3.8 toolkit verification — dispatch-time MCP inventory check on
+	// the SESSION child (the same verification path as the resume
+	// compare, before any prompt byte is written): the observed
+	// mcpServerStatus/list inventory must EQUAL the frozen
+	// ExpectedMCPServers set. An unknown or missing server is drift; an
+	// unavailable or unparseable inventory fails closed. The wiring's
+	// probe capture stays operator evidence; this check is the
+	// enforceable gate.
+	if drift := a.checkMCPInventory(ctx, child, nativeID); drift != nil {
 		a.server.stop(ctx, ref.SessionID)
 		releaseIfRejected()
 		return adapter.DispatchOutcome{Ref: ref, Status: adapter.DispatchRejected,
@@ -1708,6 +1724,71 @@ func (a *CodexAdapter) releaseSlot(nativeID, owner string) {
 }
 
 // ── Effective-config verification (spec §3.5 step 1) ────────────────────
+
+// checkMCPInventory verifies the session child's live mcpServerStatus/list
+// inventory against the frozen ExpectedMCPServers set (spec §3.8): exact
+// set equality — an unknown server and a missing server are both drift;
+// an unavailable or unparseable inventory fails closed. The typed
+// ErrProfileDrift fires BEFORE any prompt byte is written. The response
+// item shape is not pinned by the committed schema evidence (not
+// live-exercised at 0.154.0 research time), so name extraction is
+// tolerant — each entry may be a bare name string or an object carrying a
+// "name" field — and any other shape is drift, never a guess.
+func (a *CodexAdapter) checkMCPInventory(ctx context.Context, child *codexChild, nativeID string) *ErrProfileDrift {
+	frozen := append([]string(nil), a.policy.ExpectedMCPServers...)
+	sort.Strings(frozen)
+	want := strings.Join(frozen, ", ")
+	raw, err := child.client.MCPServerStatusList(ctx)
+	if err != nil {
+		return &ErrProfileDrift{ThreadID: nativeID, Field: "mcpServers",
+			Want: want, Have: "inventory unavailable: " + err.Error()}
+	}
+	observed, err := mcpServerNames(raw)
+	if err != nil {
+		return &ErrProfileDrift{ThreadID: nativeID, Field: "mcpServers",
+			Want: want, Have: "unparseable inventory: " + err.Error()}
+	}
+	sort.Strings(observed)
+	if strings.Join(frozen, ", ") != strings.Join(observed, ", ") {
+		return &ErrProfileDrift{ThreadID: nativeID, Field: "mcpServers",
+			Want: want, Have: strings.Join(observed, ", ")}
+	}
+	return nil
+}
+
+// mcpServerNames extracts the server names from a mcpServerStatus/list
+// result. Recognized shapes: {"servers":[…]} or a bare […]; each entry a
+// JSON string or an object with a non-empty "name" string. Anything else
+// is an error (fail closed).
+func mcpServerNames(raw json.RawMessage) ([]string, error) {
+	var top struct {
+		Servers []json.RawMessage `json:"servers"`
+	}
+	if err := json.Unmarshal(raw, &top); err != nil {
+		var arr []json.RawMessage
+		if arrErr := json.Unmarshal(raw, &arr); arrErr != nil {
+			return nil, fmt.Errorf("response is neither {\"servers\":[…]} nor an array: %w", err)
+		}
+		top.Servers = arr
+	}
+	names := make([]string, 0, len(top.Servers))
+	for i, entry := range top.Servers {
+		var name string
+		if json.Unmarshal(entry, &name) == nil && strings.TrimSpace(name) != "" {
+			names = append(names, name)
+			continue
+		}
+		var obj struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(entry, &obj) == nil && strings.TrimSpace(obj.Name) != "" {
+			names = append(names, obj.Name)
+			continue
+		}
+		return nil, fmt.Errorf("server entry %d carries no recognizable name", i)
+	}
+	return names, nil
+}
 
 // compareEffectiveConfig verifies the COMPLETE thread/resume effective
 // configuration against the frozen profile: the id-equality drift check

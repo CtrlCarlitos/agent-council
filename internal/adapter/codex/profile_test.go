@@ -38,9 +38,12 @@ func v3CodexProfile() storage.CanonicalProfile {
 						WritableRoots: []string{"/home/op/ws"},
 						NetworkAccess: false,
 					},
-					ApprovalPolicy:             storage.CodexApprovalPolicy{Kind: "string", String: "on-request"},
-					ApprovalsReviewer:          "user",
-					ExpectedMCPServers:         []string{"context7"},
+					ApprovalPolicy:    storage.CodexApprovalPolicy{Kind: "string", String: "on-request"},
+					ApprovalsReviewer: "user",
+					// The fixture child answers mcpServerStatus/list with
+					// {"servers":[]} (the .codex-fixture-mcp knob
+					// overrides it for inventory drift/match evidence).
+					ExpectedMCPServers:         []string{},
 					ExpectedInstructionSources: []string{"~/.codex/AGENTS.md"},
 					RulesEvidence: storage.CodexRulesEvidenceSpec{
 						Verified:     []string{"sandbox workspace-write"},

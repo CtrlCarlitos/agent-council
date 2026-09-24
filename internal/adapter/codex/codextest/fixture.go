@@ -21,6 +21,9 @@ package codextest
 //     codexHome derived from CODEX_HOME (never set by the adapter) or
 //     $HOME/.codex, platform from runtime (overridable via the
 //     .codex-fixture-platform knob)
+//   - mcpServerStatus/list is answered with {"servers":[]} (overridable
+//     for inventory-match and drift evidence via the
+//     .codex-fixture-mcp knob: a JSON array of server entries)
 //   - unknown methods are answered with the -32600 unknown-variant error
 //
 // Scenario directives (JSONL):
@@ -258,6 +261,23 @@ func main() {
 			continue
 		}
 
+		if req.Method == "mcpServerStatus/list" {
+			// Built-in empty inventory; a .codex-fixture-mcp knob (JSON
+			// array of server entries) overrides it for inventory-match
+			// and drift evidence. The entry shape is not pinned by
+			// committed schema evidence, so the override accepts raw
+			// entries verbatim.
+			var servers any = []any{}
+			if b, err := os.ReadFile(".codex-fixture-mcp"); err == nil {
+				var v any
+				if json.Unmarshal([]byte(strings.TrimSpace(string(b))), &v) == nil && v != nil {
+					servers = v
+				}
+			}
+			replyResult(req.ID, map[string]any{"servers": servers})
+			continue
+		}
+
 		for _, r := range onReq {
 			if !r.used && r.Method == req.Method {
 				fmt.Fprintln(os.Stdout, string(r.Line))
@@ -485,9 +505,12 @@ func buildFixtureProfile(scratch, wsRoot string) (storage.CanonicalProfile, code
 						WritableRoots: []string{wsRoot},
 						NetworkAccess: false,
 					},
-					ApprovalPolicy:             storage.CodexApprovalPolicy{Kind: "string", String: "on-request"},
-					ApprovalsReviewer:          "user",
-					ExpectedMCPServers:         []string{"context7"},
+					ApprovalPolicy:    storage.CodexApprovalPolicy{Kind: "string", String: "on-request"},
+					ApprovalsReviewer: "user",
+					// The fixture child answers mcpServerStatus/list with
+					// {"servers":[]} (the .codex-fixture-mcp knob
+					// overrides it for inventory drift/match evidence).
+					ExpectedMCPServers:         []string{},
 					ExpectedInstructionSources: []string{"~/.codex/AGENTS.md"},
 					RulesEvidence: storage.CodexRulesEvidenceSpec{
 						Verified:     []string{"sandbox workspace-write"},

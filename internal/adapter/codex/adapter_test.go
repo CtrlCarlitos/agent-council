@@ -73,11 +73,21 @@ func newAdapterHarness(t *testing.T) *adapterHarness {
 // newAdapterHarnessScenario stages exactly the given scenario lines for
 // the (single) child this harness will launch.
 func newAdapterHarnessScenario(t *testing.T, lines []string) *adapterHarness {
+	return newAdapterHarnessProfile(t, lines, nil)
+}
+
+// newAdapterHarnessProfile is the profile-parameterized harness: mutate
+// receives the v3 profile before validation/freezing (e.g. to pin an
+// ExpectedMCPServers set for the §3.8 inventory evidence).
+func newAdapterHarnessProfile(t *testing.T, lines []string, mutate func(*storage.CanonicalProfile)) *adapterHarness {
 	t.Helper()
 	scratch := t.TempDir()
 	wsRoot := t.TempDir()
 
 	profile, evidenceRoot := evidenceRootForCodex(t, v3CodexProfile())
+	if mutate != nil {
+		mutate(&profile)
+	}
 	cx := profile.Harnesses["codex"].Codex
 	cx.ExpectedCodexHome = filepath.Join(scratch, ".codex")
 	cx.Platform = storage.CodexPlatformSpec{OS: runtime.GOOS, Family: "unix"}
@@ -309,6 +319,112 @@ func withTimeoutVar(t *testing.T, target *time.Duration, d time.Duration) {
 
 // seedRollout writes a rollout fixture whose session_meta matches the
 // native thread, at the date-path shape the native home uses.
+// stageMCPInventory stages the .codex-fixture-mcp knob: the JSON the
+// fixture child answers mcpServerStatus/list with (raw entries verbatim;
+// the entry shape is not pinned by committed schema evidence).
+func stageMCPInventory(t *testing.T, scratch, raw string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(scratch, ".codex-fixture-mcp"), []byte(raw), 0o600); err != nil {
+		t.Fatalf("write mcp fixture knob: %v", err)
+	}
+}
+
+// mcpDriftScenario is the happy-path scenario used by the §3.8
+// inventory evidence: the dispatch must reach (match) or never reach
+// (drift) turn/start.
+func mcpDriftScenario(wsRoot string) []string {
+	lines := append([]string{authOKLine()}, threadStartRules(testThreadID, wsRoot, "gpt-5.6-sol")...)
+	lines = append(lines, resumeRule(testThreadID, wsRoot, "gpt-5.6-sol", nil))
+	return append(lines, turnAcceptedRules(testThreadID, testTurnID, true)...)
+}
+
+// §3.8 toolkit verification, dispatch-time: an observed MCP server that
+// the frozen profile does not pin is drift — the typed ErrProfileDrift
+// fires BEFORE the prompt is transmitted (no turn/start on the wire)
+// and the child is terminated. The reverse case is covered too: an
+// EXPECTED server missing from the observed inventory is drift.
+func TestCodexAdapter_MCPInventoryDriftFailsClosed(t *testing.T) {
+	cases := []struct {
+		name      string
+		mutate    func(*storage.CanonicalProfile)
+		inventory string // .codex-fixture-mcp content; empty = fixture default {"servers":[]}
+		wantHave  string
+	}{
+		{
+			name:      "unknown server present",
+			mutate:    nil, // frozen inventory: affirmatively empty
+			inventory: `[{"name":"context7"},{"name":"intruder"}]`,
+			wantHave:  "context7, intruder",
+		},
+		{
+			name: "expected server missing",
+			mutate: func(p *storage.CanonicalProfile) {
+				p.Harnesses["codex"].Codex.ExpectedMCPServers = []string{"context7"}
+			},
+			inventory: "",
+			wantHave:  "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newAdapterHarnessProfile(t, nil, tc.mutate)
+			writeScenario(t, h.scratch, mcpDriftScenario(h.wsRoot)...)
+			if tc.inventory != "" {
+				stageMCPInventory(t, h.scratch, tc.inventory)
+			}
+			h.createAndPersist(t)
+
+			out, err := h.dispatch(t, "t-mcp-drift", "prompt that must never be written")
+			var drift *ErrProfileDrift
+			if !errors.As(err, &drift) || drift.Field != "mcpServers" {
+				t.Fatalf("expected typed ErrProfileDrift on mcpServers, got %T: %v (outcome %+v)", err, err, out)
+			}
+			if out.Status != adapter.DispatchRejected {
+				t.Fatalf("inventory drift is a pre-acceptance rejection, got %s", out.Status)
+			}
+			if tc.wantHave != "" && !strings.Contains(drift.Have, tc.wantHave) {
+				t.Fatalf("drift Have must name the observed inventory %q, got %q", tc.wantHave, drift.Have)
+			}
+			for _, r := range requestLog(t, h.scratch) {
+				if r == "turn/start" {
+					t.Fatal("the prompt was transmitted despite inventory drift")
+				}
+			}
+			if terminatedCount(t, h.scratch) < 1 {
+				t.Fatal("inventory drift must terminate the child")
+			}
+		})
+	}
+}
+
+// §3.8 toolkit verification, dispatch-time, the MATCH case: an observed
+// inventory exactly equal to the frozen pins lets the dispatch proceed
+// to the wire (turn/start transmitted, verified terminal).
+func TestCodexAdapter_MCPInventoryMatchProceeds(t *testing.T) {
+	h := newAdapterHarnessProfile(t, nil, func(p *storage.CanonicalProfile) {
+		p.Harnesses["codex"].Codex.ExpectedMCPServers = []string{"context7"}
+	})
+	writeScenario(t, h.scratch, mcpDriftScenario(h.wsRoot)...)
+	stageMCPInventory(t, h.scratch, `[{"name":"context7"}]`)
+	h.createAndPersist(t)
+	seedRollout(t, h, testThreadID)
+
+	out, err := h.dispatch(t, "t-mcp-match", "prompt that must reach the wire")
+	if err != nil || out.Status != adapter.DispatchAccepted {
+		t.Fatalf("a matching inventory must not reject the dispatch: %+v err=%v", out, err)
+	}
+	sawTurnStart := false
+	for _, r := range requestLog(t, h.scratch) {
+		if r == "turn/start" {
+			sawTurnStart = true
+		}
+	}
+	if !sawTurnStart {
+		t.Fatalf("the prompt must be transmitted on a matching inventory, log: %v", requestLog(t, h.scratch))
+	}
+	waitAttempt(t, h, "t-mcp-match", func(a *storage.CodexTurnAttempt) bool { return a.Terminal })
+}
+
 func seedRollout(t *testing.T, h *adapterHarness, threadID string, extraLines ...string) string {
 	t.Helper()
 	dir := filepath.Join(h.scratch, ".codex", "sessions", "2026", "09", "23")
@@ -698,10 +814,10 @@ func TestCodexAdapter_DispatchAcceptedBindsNativeTurnID(t *testing.T) {
 		t.Fatalf("dispatch: status=%s err=%v", out.Status, err)
 	}
 
-	// Request order: resume verification precedes turn/start (§3.5 step
-	// 1, first turn included).
+	// Request order: resume verification and the §3.8 MCP inventory
+	// check both precede turn/start (first turn included).
 	got := requestLog(t, h.scratch)
-	want := []string{"initialize", "account/read", "thread/start", "thread/resume", "turn/start"}
+	want := []string{"initialize", "account/read", "thread/start", "thread/resume", "mcpServerStatus/list", "turn/start"}
 	if len(got) != len(want) {
 		t.Fatalf("request order must be %v, got %v", want, got)
 	}

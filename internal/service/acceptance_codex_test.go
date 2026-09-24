@@ -98,9 +98,12 @@ func codexAcceptanceProfile(t *testing.T, scratch, wsRoot string) storage.Canoni
 						WritableRoots: []string{wsRoot},
 						NetworkAccess: false,
 					},
-					ApprovalPolicy:             storage.CodexApprovalPolicy{Kind: "string", String: "on-request"},
-					ApprovalsReviewer:          "user",
-					ExpectedMCPServers:         []string{"context7"},
+					ApprovalPolicy:    storage.CodexApprovalPolicy{Kind: "string", String: "on-request"},
+					ApprovalsReviewer: "user",
+					// The fixture child answers mcpServerStatus/list
+					// with {"servers":[]}: the frozen inventory is
+					// affirmatively empty (must equal the observed).
+					ExpectedMCPServers:         []string{},
 					ExpectedInstructionSources: []string{"~/.codex/AGENTS.md"},
 					RulesEvidence: storage.CodexRulesEvidenceSpec{
 						Verified:     []string{"sandbox workspace-write"},

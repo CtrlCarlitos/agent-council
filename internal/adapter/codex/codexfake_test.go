@@ -13,6 +13,9 @@ package codex
 //     codexHome derived from CODEX_HOME (never set by the adapter) or
 //     $HOME/.codex, platform from runtime (overridable for mismatch
 //     evidence via the .codex-fixture-platform knob)
+//   - mcpServerStatus/list is answered with {"servers":[]} (overridable
+//     for inventory-match and drift evidence via the
+//     .codex-fixture-mcp knob: a JSON array of server entries)
 //   - unknown methods are answered with the -32600 unknown-variant error
 //
 // Scenario directives (JSONL, sanitized from the 0.154.0 research
@@ -240,6 +243,23 @@ func main() {
 
 		if req.Method == "initialize" {
 			replyResult(req.ID, initResult)
+			continue
+		}
+
+		if req.Method == "mcpServerStatus/list" {
+			// Built-in empty inventory; a .codex-fixture-mcp knob (JSON
+			// array of server entries) overrides it for inventory-match
+			// and drift evidence. The entry shape is not pinned by
+			// committed schema evidence, so the override accepts raw
+			// entries verbatim.
+			var servers any = []any{}
+			if b, err := os.ReadFile(".codex-fixture-mcp"); err == nil {
+				var v any
+				if json.Unmarshal([]byte(strings.TrimSpace(string(b))), &v) == nil && v != nil {
+					servers = v
+				}
+			}
+			replyResult(req.ID, map[string]any{"servers": servers})
 			continue
 		}
 
