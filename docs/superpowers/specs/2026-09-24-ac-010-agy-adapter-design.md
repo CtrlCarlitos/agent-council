@@ -141,9 +141,10 @@ scoped:
 
 - **Production-eligibility gate (binding):** authenticated production
   dispatch is eligible ONLY while a valid isolation attestation exists for
-  the exact frozen tuple (installed CLI version, binary digest, platform,
-  profile digest) — all `sibling_read` records denied AND the `approval`
-  set complete. The attestation is produced by the operator-authorized
+  the exact frozen tuple (installed CLI version, platform, toolkit manifest
+  digest, cprof-v4 profile digest — the binary digest is INSIDE the
+  profile, so it is covered by the profile digest) — all `sibling_read`
+  records denied AND the `approval` set complete. The attestation is produced by the operator-authorized
   probe suite: attempts to read a SIBLING conversation file
   (`~/.gemini/antigravity-cli/conversations/<other>.db`) through every
   enabled tool path — `view_file` (read class), `find_by_name`/`list_dir`
@@ -154,10 +155,11 @@ scoped:
   (write/append/truncate/rename/delete via `write_to_file`,
   `replace_file_content`, `sed_file`, `run_command`), each recorded with
   the enforcing capability. Encoding: **cprot-v2 reused unchanged**
-  (record classes and tool-class enum map 1:1; the tuple's `codex_version`
-  slot carries the Agy CLI version and `profile_digest` the cprof-v4
-  digest), stored in a contributor-scoped `agy_protection_attestations`
-  table. Coverage binding (AC-009 §3.7 errata) is enforced at recording
+  (record classes and tool-class enum map 1:1; the frame's version slot
+  carries the Agy CLI version, `manifest_digest` the toolkit manifest
+  digest, `profile_digest` the cprof-v4 digest), stored in a contributor-
+  scoped `agy_protection_attestations` table with the same digest-bound
+  columns. Coverage binding (AC-009 §3.7 errata) is enforced at recording
   and lookup.
 - **Approval records:** Agy has no per-variant approval wire protocol; the
   permission decision is native (`request-review` auto-deny) and surfaces
@@ -346,7 +348,7 @@ records the binary digest observed at that launch.
   boundaries; concurrent duplicate creation and dispatch.
 - **Integration (operator-invoked, sanitized):** Stage A provider-free
   (version, digest, `mcp list`, `plugin list`, empty-stdin `init` capture
-  → `expected_tools`); Stage B authenticated (≤ N turns: trivial success,
+  → `expected_tools`); Stage B authenticated (≤ 8 turns: trivial success,
   resume, denial, SIGINT, print-timeout on a healthy turn, `--mode plan`
   edit block, `denied_tools` rule); Stage C probe suite → first cprot-v2
   attestation via the journal operation.
