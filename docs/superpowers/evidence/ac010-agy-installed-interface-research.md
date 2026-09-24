@@ -281,7 +281,7 @@ inventory evidence channel but verify against the frozen expected set.
   verbatim as `ac010-agy-plugins-1.2.9.json` (sha256 in
   `SHA256SUMS-ac010`). The `init` event shape is committed as
   `ac010-agy-init-1.2.9.json` with the workspace path and conversation id
-  redacted (58 tool names verbatim). Models catalog (network): 14 entries incl. `gemini-3.8-flash-*`,
+  redacted (57 tool names verbatim). Models catalog (network): 14 entries incl. `gemini-3.8-flash-*`,
   `gemini-3.1-pro-*`, `claude-sonnet-4-6`, `claude-opus-4-6-thinking`,
   `gpt-oss-120b-medium` — model choice is per-session `--model`; provider is
   the signed-in Antigravity backend (alternative `GEMINI_API_KEY` mode exists,

@@ -1,7 +1,7 @@
 # AC-010 Design — Agy (Antigravity CLI) persistent contributor adapter
 
-Status: DRAFT v5 for review (v1: 7, v2: 5, v3: 5, v4: 4 findings — all
-addressed; change logs at the end)
+Status: DRAFT v6 for review (v1: 7, v2: 5, v3: 5, v4: 4, v5: 2 findings —
+all addressed; change logs at the end)
 Date: 2026-09-24
 Issue: #10
 Depends on: AC-003 (controller grants), AC-005 (workspaces/execution policy),
@@ -228,9 +228,7 @@ scoped:
   skills` — a deterministic filesystem fact, provider-free; plugin-
   contributed skill directories are NOT enumerated because the
   `plugin_data` layout is not pinned (recorded as a gap; their plugins
-  are captured below). `expected_plugins` is derived from a **strict
-  digest-bound provider-free capture** of `agy plugin list` stdout,
-  whose 1.2.9 shape is live-verified as
+  are captured below). `expected_plugins` is derived from a **strict digest-bound provider-free capture** of `agy plugin list` stdout, whose 1.2.9 shape is live-verified and COMMITTED as `docs/superpowers/evidence/ac010-agy-plugins-1.2.9.json` (sha256 in `docs/superpowers/evidence/SHA256SUMS-ac010`; research file §5):
   `{"imports":[{"name":"…","source":"…","importedAt":"<RFC3339>",
   "components":["hooks","skills"]}]}`: the capture is decoded strictly
   (single JSON value, no unknown or duplicate keys, trailing content
@@ -468,8 +466,7 @@ with a typed validation error):
   or `expected_plugin_tools` until such a path exists. Only empty
   inventories are launchable; the attestation coverage set is then the
   built-in classes exactly, fully derivable from the profile.
-- `init_evidence_path`/`init_evidence_digest` and
-  `tool_coverage_path`/`tool_coverage_digest`: required. **Evidence-root
+- `init_evidence_path`/`init_evidence_digest` and `tool_coverage_path`/`tool_coverage_digest`: required (a committed research capture of the 1.2.9 `init` shape with the workspace path and conversation id redacted is at `docs/superpowers/evidence/ac010-agy-init-1.2.9.json`; the operator's freeze-time capture is produced by Stage A against the frozen install). **Evidence-root
   containment contract (AC-008/AC-009 rules, applied verbatim):** the
   path is repo-relative (no absolute path, no `..`, cleaned, forward
   slashes), resolved ONLY inside the operator-owned, service-configured
@@ -535,48 +532,72 @@ mode; no backfill.
 **Binary pin (hazard 1) — three layers; the first removes the race, the
 others are mandatory defense in depth, all Gate 1 fixture-tested.**
 
-1. **Council-owned immutable launch copy (primary).** At production
-   construction the adapter reads the operator's `binary_path`, hashes
-   the FULL bytes, requires equality with `binary_digest`, and copies
-   them ONCE to `<state>/agy/bin/<digest>/agy` inside a directory and
-   file both mode `0500` owned by the service user (a copy of the
-   executable is not credential material; it carries no auth). Every
-   launch (creation, auth gate, `plugin list`, each turn child) execs
-   ONLY that copy, so the operator-path self-updater can never replace
-   what Council runs; the executor's frozen argv template pins the copy's
-   path. The copy's full sha256 is re-verified before every launch
-   (~1 s, no metadata cache) — state-dir write access is the same threat
-   boundary as the durable store itself.
-2. **Post-exec identity through `/proc/<pid>/exe` (Linux, the only
-   production platform, §3.12).** Immediately after the executor reports
-   the pid, and BEFORE any output of that child is trusted — the `models`
-   catalog, the `plugin list` capture, the creation `init`, the turn
-   `init` — and therefore before any prompt byte is written, the adapter
-   opens `/proc/<pid>/exe`, requires the `readlink` target to equal the
-   copy's path WITHOUT a ` (deleted)` suffix and its `st_dev:st_ino` to
-   equal the copy's stat, and hashes the bytes read THROUGH that handle
-   against `binary_digest`. Mismatch or unreadable ⇒ child terminated,
-   `ErrBinaryDrift`, nothing transmitted, nothing bound. **Fast-exiting
-   children:** if `/proc/<pid>` is already gone when the check runs (the
-   child exited), the check is `inconclusive`; because layer 1 makes the
-   launched path immutable and layer 3 has already verified it, the
-   child's output is accepted ONLY when layer 1 was in force for that
-   launch, and the launch row records `exe_check=inconclusive`; in
-   fixture scope without layer 1 an inconclusive check is a refusal.
-3. **Pre-launch hash of the copy** (layer 1's per-launch re-verify) and
-   the executor-observed executable identity, both recorded on the
-   launch row.
+1. **Kernel-sealed execution image (primary; removes the race).**
+   Permission bits are not immutability: the service user can `chmod`
+   and replace its own files, and the copied Agy process (and its
+   updater) run as that same user. So the launch source is a **sealed
+   anonymous memory file**: at production construction the adapter
+   reads the operator's `binary_path`, hashes the FULL bytes, requires
+   equality with `binary_digest`, writes the bytes into a
+   `memfd_create` file, applies `F_SEAL_WRITE | F_SEAL_SHRINK |
+   F_SEAL_GROW | F_SEAL_SEAL` (kernel-enforced: no process, Council and
+   the updater included, can alter the content or the seals for the
+   descriptor's lifetime), and re-hashes THROUGH the sealed descriptor
+   before accepting it. The descriptor is held for the adapter's
+   lifetime; its `st_dev:st_ino` is the launch identity. Every launch
+   (creation, auth gate, `plugin list`, each turn child) execs the image
+   through a new AC-005 executor capability, **sealed-image launch**
+   (`LaunchRequest.SealedImage{fd, digest, argv0}`): the executor
+   verifies the seals are present, re-hashes the descriptor against the
+   frozen digest, and execs `/proc/self/fd/<n>` with `argv[0]` set to
+   the frozen `binary_path` for process-list readability; the frozen
+   argv template is validated exactly as for path launches, and a path
+   launch of Agy is refused in production. The operator-path
+   self-updater can update the operator's install freely without
+   touching what Council runs; a new install becomes launchable only
+   after the operator refreshes `binary_digest` at profile freeze, never
+   implicitly. Linux-only, consistent with §3.12.
+2. **Post-exec identity through `/proc/<pid>/exe` — mandatory, with the
+   child held at the exec boundary until it completes.** The sealed-
+   image launch starts the child under an **exec-stop**: the executor
+   forks a Council-owned trampoline that requests `PTRACE_TRACEME` and
+   execs `/proc/self/fd/<n>`; the kernel stops the child at the exec
+   boundary with `PTRACE_O_EXITKILL` armed, so `/proc/<pid>/exe` is
+   populated and the child cannot run or exit until released. While it
+   is stopped and BEFORE any output of that child is trusted — the
+   `models` catalog, the `plugin list` capture, the creation `init`, the
+   turn `init` — and therefore before any prompt byte is written, the
+   adapter verifies identity: for a sealed image the `readlink` target
+   is `/memfd:<name> (deleted)` BY DESIGN, so the check is
+   `st_dev:st_ino` of `/proc/<pid>/exe` == `fstat` of the held sealed
+   descriptor, plus a hash of the bytes read THROUGH `/proc/<pid>/exe`
+   against `binary_digest`. Pass ⇒ the executor detaches and the child
+   runs. Mismatch, unreadable link, or a child not stopped at the exec
+   boundary ⇒ child killed, `ErrBinaryDrift`, nothing transmitted,
+   nothing bound. There is no `inconclusive` outcome: fast children are
+   observable by construction, and the check either passes or the launch
+   is refused.
+3. **Pre-launch re-hash of the sealed descriptor** and the executor-
+   observed executable identity (`memfd` dev:ino, digest), both recorded
+   on the launch row.
 
 This is core production evidence, not an operator obligation: Gate 1
 (§4) must prove, with Council's own fixture executable and no provider,
-(a) an in-place modification of the copy is refused pre-launch, (b) the
-`0500` copy directory rejects writes (the updater's shape), (c) a
-replaced or unlinked image after exec is refused through
-`/proc/<pid>/exe` (`(deleted)` target, dev:ino mismatch, hash mismatch),
-(d) a fast-exiting child yields `inconclusive` without a false refusal
-in production scope and a refusal in fixture scope, (e) a slow child is
-verified before its first output is consumed. Every attestation for a
-superseded digest is invalid by construction. The operator obligation to disable the auto-updater is
+(a) a sealed descriptor rejects writes/truncation after sealing and a
+descriptor missing any seal is refused, (b) a digest mismatch through
+the sealed descriptor is refused pre-launch, (c) a child whose
+`/proc/<pid>/exe` dev:ino or hash does not match the held descriptor is
+killed before its first output is consumed, (d) a fast-exiting fixture
+child is verified at the exec boundary and released — never refused,
+never trusted unverified, (e) a slow child is verified before its first
+output is consumed, (f) production construction refuses to fall back to
+a path launch. Because Agy's behavior when its executable is a memfd
+(`os.Executable()` → `/memfd:… (deleted)`; install-dir discovery;
+sidecar/updater paths) is `not verified`, Stage A (§4) must run
+`--version`, `models`, `plugin list`, and the empty-stdin `init` through
+the sealed launch and compare with path launches before any profile
+freezes; a behavioral difference blocks production until resolved.
+Every attestation for a superseded digest is invalid by construction. The operator obligation to disable the auto-updater is
 recorded as unverified; the pin is the defense either way.
 
 ### 3.8 Trust model of the durable conversation file
@@ -673,12 +694,7 @@ eligibility is limited accordingly:
   stderr markers (print timeout, ignored event), malformed lines, exit
   without result, SIGINT handling (fixture emits `interrupted`), slow
   `init`, creation with empty stdin; cprot-v2 vectors reused; crash
-  boundaries; concurrent duplicate creation and dispatch; **binary pin
-  (§3.7, mandatory Gate 1 acceptance): immutable copy creation and
-  re-verify, in-place modification refused, read-only copy dir rejects
-  writes, `/proc/<pid>/exe` replaced/unlinked/mismatched image refused
-  before first output, fast-exit inconclusive handling in both scopes,
-  slow-child verification ordering**; strict `plugin list` capture
+  boundaries; concurrent duplicate creation and dispatch; **binary pin (§3.7, mandatory Gate 1 acceptance): sealed-memfd creation, seal presence and write/truncate rejection, digest re-verify through the descriptor, exec-stop launch with `/proc/<pid>/exe` dev:ino + hash verification before first output, fast-exit child verified at the exec boundary, slow-child ordering, path-launch refusal in production scope**; strict `plugin list` capture
   parsing and drift; hooks capture parsing, `required_hooks` presence and
   disabled-marker rejection; coverage-map decoding and derivation.
 - **Integration (operator-invoked, sanitized):** Stage A provider-free
@@ -750,8 +766,7 @@ and whether a natively denied tool disappears from `init.tools`; hook
 EXECUTION and skill LOADING at the Agy layer (configured state is
 verified, §3.2); the subagent inherited tool boundary and the shared-
 browser/resource state boundary (those tools are uncovered until probed,
-§3.2); the self-updater's behavior against a read-only launch-copy
-directory (the copy is verified regardless, §3.7); the `plugin_data`
+§3.2); Agy's behavior when executed from a sealed memfd (install-dir discovery, sidecars, updater; Stage A compares sealed vs. path launches before any freeze, §3.7); the `plugin_data`
 layout for plugin-contributed skills;
 workspace-trust gating; healthy-turn print-timeout; content-block user
 messages; `AGY_ERROR` exit-3 path; MCP tool naming in `call_mcp_tool` steps;
@@ -835,3 +850,17 @@ none is claimed by the design.
    replaced/unlinked image, fast-exit inconclusive, slow-child ordering),
    moved out of the carried-forward list (§3.7, §4, §7).
 4. Stale duplicate header row removed from the coverage table (§3.2).
+
+## 12. v6 changes (review of v5)
+
+1. Binary pin: the launch source is a kernel-sealed `memfd` image
+   (`F_SEAL_WRITE|SHRINK|GROW|SEAL`) exec'd through a new AC-005
+   sealed-image launch capability; the `0500` copy is withdrawn as not
+   immutable. Post-exec `/proc/<pid>/exe` verification is mandatory with
+   the child held at the exec boundary (exec-stop) until it completes,
+   so fast children are always observable and no `inconclusive` outcome
+   exists; Gate 1 cases restated; Agy-under-memfd behavior is a Stage A
+   precondition to freeze (§3.7, §4, §7).
+2. Plugin and `init` contracts are now backed by committed, sanitized,
+   provider-free captures with SHA-256 sums; the research file records
+   the observed payload shape (§3.2, §3.7; evidence directory).
