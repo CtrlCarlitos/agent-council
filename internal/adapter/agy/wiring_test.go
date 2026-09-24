@@ -123,3 +123,37 @@ func TestNewProductionAgyAdapter_EligibilityReCheckedPerDispatch(t *testing.T) {
 		t.Fatalf("no turn child for an ineligible tuple, launches=%d", n)
 	}
 }
+
+// The service's required-tools seam reaches the production adapter
+// through WithRequiredToolsSource (Task 7): the journaled queue-time set
+// is what the attempt verifies; without the option the frozen
+// default_required_tools apply.
+func TestNewProductionAgyAdapter_WithRequiredToolsSourceHonoured(t *testing.T) {
+	requireLinux(t)
+	h := newAgyHarness(t)
+	recordAttestation(t, h.store, testRunID, h.policy, h.profile, h.profileDigest, nil)
+	src := &mapRequired{m: map[string][]string{"t1": {"view_file", "run_command"}}}
+
+	prod, err := NewProductionAgyAdapter(h.store, h.exec, h.wm, h.profile, h.evidenceRoot, filepath.Dir(h.home), t.TempDir(),
+		WithRequiredToolsSource(src))
+	if err != nil {
+		t.Fatalf("NewProductionAgyAdapter: %v", err)
+	}
+	got, err := prod.requiredTools(context.Background(), h.ref("t1"))
+	if err != nil || len(got) != 2 || got[0] != "view_file" || got[1] != "run_command" {
+		t.Fatalf("the option's source must supply the attempt's required tools, got %v err=%v", got, err)
+	}
+	// Absent for this turn: the frozen default applies.
+	got, err = prod.requiredTools(context.Background(), h.ref("t2"))
+	if err != nil || len(got) != len(h.policy.DefaultRequiredTools) {
+		t.Fatalf("an absent set falls back to default_required_tools %v, got %v err=%v", h.policy.DefaultRequiredTools, got, err)
+	}
+
+	plain, err := NewProductionAgyAdapter(h.store, h.exec, h.wm, h.profile, h.evidenceRoot, filepath.Dir(h.home), t.TempDir())
+	if err != nil {
+		t.Fatalf("NewProductionAgyAdapter without options: %v", err)
+	}
+	if plain.required != nil {
+		t.Fatalf("without the option no required-tools source is wired, got %T", plain.required)
+	}
+}

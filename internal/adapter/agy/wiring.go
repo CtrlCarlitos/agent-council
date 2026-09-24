@@ -2,8 +2,9 @@ package agy
 
 // Production wiring for the agy adapter (AC-010 spec §3.2/§3.7/§3.12).
 // NewProductionAgyAdapter is the ONLY production construction path; it
-// takes no construction options, so the test-only fixture scope is
-// structurally unreachable from it. Construction fails closed, in the
+// takes no ConstructionOption (only the distinct ProductionOption type,
+// which carries service seams and nothing else), so the test-only
+// fixture scope is structurally unreachable from it. Construction fails closed, in the
 // spec §3.2 gate order (nothing is launched before step 4):
 //
 //  1. ValidateAgyHarness: the frozen cprof-v4 agy block and its
@@ -54,6 +55,23 @@ func (e *ErrHomeDirMismatch) Error() string {
 	return fmt.Sprintf("agy homeDir %q is not the parent %q of the frozen expected_home", e.HomeDir, e.Want)
 }
 
+// ProductionOption supplies a service-owned seam to the production
+// constructor. It is a distinct type from ConstructionOption: it can
+// carry service seams only, never the test-only fixture scope.
+type ProductionOption func(*productionSettings)
+
+type productionSettings struct {
+	required RequiredToolsSource
+}
+
+// WithRequiredToolsSource wires the service's required-tools seam (spec
+// §3.5: the set validated at queue time and journaled with the dispatch
+// intent). Without it every attempt verifies the frozen
+// default_required_tools.
+func WithRequiredToolsSource(src RequiredToolsSource) ProductionOption {
+	return func(s *productionSettings) { s.required = src }
+}
+
 // NewProductionAgyAdapter builds the production agy adapter for one
 // frozen run profile. wm is the AC-005 workspace manager (the launch
 // source's allocations and the adapter's independent allocation lookup
@@ -65,7 +83,14 @@ func NewProductionAgyAdapter(
 	wm *workspace.WorkspaceManager,
 	cfgProfile storage.CanonicalProfile,
 	evidenceRoot, homeDir, scratchRoot string,
+	opts ...ProductionOption,
 ) (*AgyAdapter, error) {
+	var settings productionSettings
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&settings)
+		}
+	}
 	switch {
 	case store == nil:
 		return nil, errors.New("storage store is required")
@@ -130,7 +155,7 @@ func NewProductionAgyAdapter(
 
 	source := NewAgyTurnLaunchSource(store, wm, policy, image)
 	a, err := NewAgyAdapter(store, executor, source, wm, policy, profileDigest, image,
-		&storageDispatchIdentitySource{store: store}, nil, attestation)
+		&storageDispatchIdentitySource{store: store}, settings.required, attestation)
 	if err != nil {
 		return nil, err
 	}
