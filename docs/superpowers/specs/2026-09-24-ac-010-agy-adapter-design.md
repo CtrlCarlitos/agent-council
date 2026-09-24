@@ -1,6 +1,11 @@
 # AC-010 Design — Agy (Antigravity CLI) persistent contributor adapter
 
-Status: DRAFT v7 for review (v1: 7, v2: 5, v3: 5, v4: 4, v5: 2, v6: 3 findings — all addressed; change logs at the end)
+Status: ACCEPTED — approved for implementation planning (DRAFT v7 review,
+2026-09-24; seven review rounds, change logs at the end). Reviewer notes
+carried into the plan: `MFD_ALLOW_SEALING`, descriptor close-on-exec
+handling, ptrace cleanup with `PTRACE_O_EXITKILL`, and tracer-failure
+tests. Implementation plan:
+`docs/superpowers/plans/2026-09-24-ac-010-agy-adapter.md`.
 Date: 2026-09-24
 Issue: #10
 Depends on: AC-003 (controller grants), AC-005 (workspaces/execution policy),
