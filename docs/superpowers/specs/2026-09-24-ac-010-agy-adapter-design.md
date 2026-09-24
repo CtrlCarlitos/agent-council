@@ -884,10 +884,15 @@ none is claimed by the design.
    §3.5 acceptance (`user_input DONE`) is the durable native
    acknowledgement recorded on the attempt; a failure to record it
    surfaces as `DispatchUnknown`, never as a silent success.
-6. Forced termination of a sealed launch also kills the child's process
-   group (the sealed launch sets `Setpgid`); a descendant that changes
-   its own session or group escapes this, which the operator evidence
-   script (Task 8) observes.
+6. Termination of a sealed launch signals the child's process group
+   (the sealed launch sets `Setpgid`): SIGTERM to the group on the
+   graceful path, SIGKILL to the group on the forced path, and after the
+   leader exits on its own a peek-then-kill sequence (`waitid` with
+   `WNOWAIT`, then `kill(-pgid, SIGKILL)`, then the reap) so no same-group
+   descendant outlives the attempt and the group id cannot be reused
+   before the kill. A descendant that changes its own session or process
+   group escapes this; the operator evidence script (Task 8) observes
+   that limit.
 7. §3.8 diagnostics (conversation file size and step counts at first
    acceptance and at reconcile) are not implemented by the adapter task
    and are tracked as an acceptance-pass gap.
@@ -954,12 +959,18 @@ none is claimed by the design.
     before the adapter exists. `RecordAgyProbeAttestation` therefore
     depends only on the store, the operator credential and the
     configured agy profile and evidence root, never on a wired adapter;
-    and a server configured with `AgyBinaryPath` but without a covering
-    row starts WITHOUT the agy adapter in an explicit "awaiting
-    attestation" state (surfaced on the server status surface and
-    logged; every agy operation refuses with the typed ineligibility
+    and a server configured with `AgyBinaryPath` whose only
+    ineligibility is the missing or uncovered attestation starts WITHOUT
+    the agy adapter in an explicit "awaiting attestation" state
+    (surfaced on the server status surface and logged; birth, dispatch
+    and queue-time validation refuse with the typed ineligibility
     error). After the row is recorded, a restart constructs the adapter.
-    No child runs before eligibility in either state.
+    No child runs before eligibility in either state. This closes the
+    bootstrap for in-process callers only: `RecordAgyProbeAttestation`
+    has no HTTP or CLI surface (the same holds for the codex and claude
+    operations), so an operator running the shipped binary cannot yet
+    enable production Agy on their own. The operator surface is
+    follow-up work filed together with item 17.
 19. Evidence helpers (§4 Stage A). The sealed-vs-path comparison and the
     freeze-time canonical digests use two `-tags evidence` Go test
     helpers instead of a new binary: `TestSealedProbe`
