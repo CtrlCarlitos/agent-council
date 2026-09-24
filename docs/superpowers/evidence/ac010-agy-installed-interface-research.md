@@ -20,10 +20,14 @@ verified behavior.
 
 Safety rules followed:
 
-- **Zero model calls.** Every `--print` probe used `--input-format
-  stream-json` with EMPTY or MALFORMED stdin, which the CLI rejects or
-  ignores BEFORE any turn starts (live-verified: no `step_update`, no
-  `result`, no token usage). No prompt text was ever sent.
+- **Two phases.** Phase A (§0–§6) made zero model calls: every `--print`
+  probe used `--input-format stream-json` with EMPTY or MALFORMED stdin,
+  which the CLI rejects or ignores BEFORE any turn starts (live-verified: no
+  `step_update`, no `result`, no token usage). Phase B (§7) ran under an
+  explicit operator authorization of **at most 6 model turns** and used
+  exactly 6 (accounting in §7.0, including one unplanned turn reported
+  honestly). Phase B prompts were trivial, sent from throwaway scratch
+  workspaces, on the cheapest available model.
 - The operator's interactive shell aliases `agy` to
   `agy --dangerously-skip-permissions` (`whence -v agy`, source file not
   located in the standard rc files). **Every probe invoked the binary by
@@ -50,9 +54,15 @@ Safety rules followed:
   `d70b0c5a-a32f-46a2-9863-75e387d72a0a`, `f0522bc0-02c8-4385-ab61-df7166cca088`,
   `1b4c09bb-ae5b-463b-8a7c-d6b08d967fbb`, `47ddfd27-23f5-43b6-bc02-39ebdfcfce5f`,
   `f2d60d08-ef3e-42ce-b5d6-dd98618c8003`, `fb583d24-3cd2-4e69-add0-0bddf53f9cc8`,
-  `02fa7419-01bf-4f06-9b85-799b43927f45`. Nothing was deleted or modified
-  under `~/.gemini`; removal of these empty records is an operator purge
-  action (Council never deletes native state).
+  `02fa7419-01bf-4f06-9b85-799b43927f45`. Phase B (00:22–00:32) created
+  eleven more: five empty ones from rejected envelopes (`6f150251-…`,
+  `b0018b0b-…`, `bacc3d48-…`, `bbdc8999-…`, `c99d5833-…`), one from the
+  unplanned "x" turn (`6abd8f9a-7769-4274-8c43-34d41e3a1c89`), the rejected-
+  envelope capture (`d08b0d96-…`), the quota-failed turn (`d3bc4d46-…`), the
+  denied-tool turn (`cbd206ba-…`), the interrupted turn (`6a43d634-…`), and
+  the two-turn success/resume conversation (`51d9f9a3-…`). Nothing was
+  deleted or modified under `~/.gemini`; removal of these records is an
+  operator purge action (Council never deletes native state).
 
 ---
 
@@ -286,3 +296,121 @@ inventory evidence channel but verify against the frozen expected set.
    prompt is transmitted.
 7. Auto-update control: whether a setting or env var disables the background
    updater; otherwise the adapter's version+digest pin is the only defense.
+
+## §7 Operator-authorized live probes (Phase B, 6 turns, gpt-oss-120b-medium)
+
+### §7.0 Budget accounting (honest)
+
+| # | Purpose | Model | Outcome | Counted |
+|---|---|---|---|---|
+| 1 | UNPLANNED: an envelope-shape probe (`{"event":"user","message":{"content":"x"}}`) was the accepted shape and ran a turn; its stdout was deleted by the probe's own cleanup before it was read | default (unset) | exit 0; conversation `6abd8f9a-…` (143 KB) | yes |
+| 2 | trivial "Reply OK" | `gemini-3.8-flash-low` `--effort low` | 429 `RESOURCE_EXHAUSTED` "Individual quota reached … Resets in 19h40m" after 8 retries; **`--print-timeout 120s` fired → exit 0 with `result.status:"ERROR"`** | yes |
+| — | trivial "Reply OK" | `gpt-oss-120b-medium` `--effort low` | rejected BEFORE any turn: `--model … conflicts with --effort=low`; `result` ERROR with EMPTY `conversation_id`, `num_turns:0`, no file created, exit 1 | no (no turn) |
+| 3 | trivial "Reply OK" | `gpt-oss-120b-medium` | `SUCCESS`, `response:"OK\n"`, 5 events, exit 0 | yes |
+| 4 | `run_command echo AC010-PROBE-3` under headless `request-review` | same | tool AUTO-DENIED, `SUCCESS` with `denied_actions`, exit 0 (§7.3) | yes |
+| 5 | "Count 1–400" then SIGINT mid-stream | same | `result.status:"ERROR"`, `error:"interrupted"`, exit 1 (§7.4) | yes |
+| 6 | resume `--conversation 51d9f9a3-…`, "what word did you reply?" | same | `SUCCESS`, `response:"OK\n"`, same id, `num_turns:2` (§7.5) | yes |
+
+### §7.1 Event shapes (live-verified 1.2.9, verbatim keys)
+
+- `init`: `{"event":"init","conversation_id":"<uuid>","init":{"model":"<--model value, present only when set>","cwd":"<abs>","tools":[…],"permission_mode":"request-review"}}`.
+  Emitted BEFORE any stdin message is read (the idle probes in §2 emitted
+  it with stdin held open and nothing written) — a driver can wait for it,
+  verify identity/config, and only then transmit the prompt.
+- `step_update`: `{"event":"step_update","step_update":{"conversation_id","step_index":N,"state":"ACTIVE"|"DONE","step_type":"user_input"|"agent_response"|"system_message"|"tool"|"error_message",…}}`.
+  `agent_response` carries `text_delta` (streamed; the DONE update carries
+  the last delta plus `duration_seconds` and a per-step `usage`); `tool`
+  carries `tool_name` and `tool_info{name,parameters}` (e.g.
+  `{"CommandLine":"echo AC010-PROBE-3"}`), first `ACTIVE` then `DONE` with
+  `duration_seconds`; `error_message` steps (`duration_seconds:0`) were
+  emitted once per API retry attempt (8 of them in probe 2).
+- `result` (terminal, exactly one per process): `{"event":"result","result":{"conversation_id","status":"SUCCESS"|"ERROR","response":"<final text>","error":"<text or empty>","duration_seconds","num_turns":<CUMULATIVE for the conversation>,"usage":{"input_tokens","output_tokens","thinking_tokens","cache_read_tokens","total_tokens"},"denied_actions":[{"action":"command","display_name":"RunCommand"}]?}}`.
+  `usage` in `result` is the conversation-cumulative total (probe 6:
+  23,548 input tokens across 2 turns) while `step_update.usage` is
+  per-step. Step indices continue across resumed turns (probe 6: 2,3,4).
+- Rejected input still yields a `result` (`status:"ERROR"`,
+  `error:"stream input \"user\" message is missing the \"message\" field"`,
+  `num_turns:0`) with exit 1 — the shape is uniform.
+- The accepted user-message envelope is
+  `{"event":"user","message":{"content":"<text>"}}` (string content
+  live-verified; content-block arrays `not verified`). Every other payload
+  key (`user`, numeric/empty/array content) → `missing the "message" field`.
+
+### §7.2 Exit codes (live-verified)
+
+| Situation | exit | `result.status` |
+|---|---|---|
+| success | 0 | SUCCESS |
+| tool auto-denied, turn otherwise completed | 0 | SUCCESS + `denied_actions` |
+| `--print-timeout` fired while the turn was still failing (429 retries) | **0** | ERROR |
+| SIGINT mid-turn | 1 | ERROR `interrupted` |
+| malformed input, pre-turn validation error | 1 | ERROR |
+
+Consequence: the exit code is never the classification input; `result`
+(and its absence) is. A stderr line `[agy] print timeout after … with turn
+in progress; returning partial output` marks a bounded-but-unfinished turn.
+
+### §7.3 Headless permission behavior (decisive, live-verified)
+
+Under the default headless `permission_mode:"request-review"`, a tool that
+needs the `command` permission is **auto-denied without prompting or
+waiting**: the `tool` step still reports `state:"DONE"` with no error field,
+the `result` is `SUCCESS` with `response:""` and
+`denied_actions:[{"action":"command","display_name":"RunCommand"}]`, exit 0,
+and stderr explains: `jetski: no output produced — a tool required the
+"command" permission that headless mode cannot prompt for, so it was
+auto-denied. Add an allow-rule under permissions.allow in settings.json (e.g.
+command(<target>)). Alternatively, re-run with --dangerously-skip-permissions
+…`. The command did NOT run (no side effect in the workspace). The durable
+row for the denied step has `step_type=132`, `status=6` (vs. `3` for done
+steps) and no `permissions`/`error_details` blob. Implications: (a) the
+"denied tools keep verification incomplete regardless of exit code"
+criterion is exactly the native behavior; (b) `denied_actions` is the
+structured denial channel; (c) permission grants are operator-owned
+`settings.json` `permissions.allow` rules Council must never write; (d)
+`init.permission_mode` is the effective-policy attestation to compare
+against the frozen profile.
+
+### §7.4 Cancellation (live-verified)
+
+SIGINT to the headless process during streaming (after ~155 numbers of a
+1–400 count) produced a terminal `result` `{"status":"ERROR","error":
+"interrupted","num_turns":1,"usage":{all 0}}`, stderr `error: interrupted`,
+exit 1, within a second. The conversation's durable `steps` rows show the
+`agent_response` step as `status=3` (done) with no interruption marker —
+the interruption is NOT recoverable from the SQLite file alone. Idle
+processes (no turn) exit 0 on SIGINT/SIGTERM/EOF with no `result` (§2).
+
+### §7.5 Exact resumption (live-verified)
+
+`--conversation 51d9f9a3-…` → `init.conversation_id` equals the requested
+id, the model answered from prior context ("OK"), step indices continued,
+`num_turns:2`. Combined with §2 (absent/malformed id ⇒ silent NEW id with
+only a stderr warning), the adapter's rule is: **wait for `init`, require
+`conversation_id == requested`, transmit only then; otherwise terminate the
+child without writing the prompt and record the orphan id.**
+
+### §7.6 Durable state observations (provider-free, structure only)
+
+`steps.step_type` integers observed: `14`=user_input, `15`=agent_response,
+`101`=system_message, `132`=tool (denied instance); `status`: `3`=done,
+`6`=denied/blocked (inferred from the single denied instance). Payloads are
+protobuf blobs (500–3,000 bytes); no committed schema pins them. The file
+grew from 49 KB (empty) to 151–164 KB after one or two turns. Because
+interruption leaves no step-level marker (§7.4), the SQLite record cannot
+serve as terminal evidence; it is advisory/diagnostic only.
+
+### §7.7 Still unverified after Phase B
+
+- `--mode plan`/`accept-edits` effect on file-edit tools headlessly; the
+  denial shape for an operator `denied_tools` rule; whether workspace trust
+  gates tool execution (all Phase B ran in untrusted scratch cwds and the
+  denial came from permission mode, not trust).
+- `--print-timeout` expiry on an otherwise-healthy turn (only the
+  429-retry case was observed).
+- Content-block user messages; `--json-schema` result enforcement;
+  `AGY_ERROR:` stderr line and exit 3 on API failure (the 429 case was
+  swallowed by the print timeout instead).
+- `init.tools` vs. build-availability drift; MCP tool naming inside
+  `call_mcp_tool` steps; plugin/skill tool surfacing in `step_update`.
+- Any off switch for the background auto-updater.
