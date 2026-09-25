@@ -33,3 +33,12 @@ func killProcessGroup(pgid int) error {
 func interruptProcess(proc *os.Process) error {
 	return proc.Signal(syscall.SIGINT)
 }
+
+// terminateProcessGroup SIGTERMs every member of the process group led
+// by pgid (the graceful path of a sealed launch's Terminate).
+func terminateProcessGroup(pgid int) error {
+	if pgid <= 1 {
+		return nil
+	}
+	return syscall.Kill(-pgid, syscall.SIGTERM)
+}

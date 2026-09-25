@@ -27,3 +27,9 @@ func killProcessGroup(pgid int) error {
 func interruptProcess(proc *os.Process) error {
 	return ErrInterruptUnsupported
 }
+
+// terminateProcessGroup is a no-op on Windows: sealed launches (the only
+// callers) are Linux-only.
+func terminateProcessGroup(pgid int) error {
+	return nil
+}

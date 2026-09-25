@@ -41,13 +41,44 @@ import (
 //     the CLOEXEC test: no target should start with "/memfd:").
 //   - "--print=" (an agy-shaped argv): prints "HOME=<$HOME>" so the
 //     agy-only HomeDir env injection can be asserted.
+//   - "spawn-exit": starts a descendant copy of itself in
+//     "descendant" mode (same process group), prints its pid, and exits
+//     0 at once (a normally-ending leader).
+//   - "spawn-wait": like spawn-exit, but then sleeps 10s (default
+//     SIGTERM disposition: a graceful Terminate ends it).
+//   - "descendant": ignores SIGTERM, reports "ready" on stdout (its
+//     spawner waits for it), and sleeps 30s (only a SIGKILL ends it
+//     early).
 const fixtureSource = `package main
 
 import (
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
+	"os/signal"
+	"syscall"
 	"time"
 )
+
+func spawnDescendant() {
+	cmd := exec.Command(os.Args[0], "descendant")
+	ready, err := cmd.StdoutPipe()
+	if err == nil {
+		err = cmd.Start()
+	}
+	if err != nil {
+		fmt.Println("spawn-error:", err)
+		os.Exit(3)
+	}
+	// Wait until the descendant ignores SIGTERM before reporting it.
+	buf := make([]byte, 6)
+	if _, err := io.ReadFull(ready, buf); err != nil {
+		fmt.Println("spawn-error:", err)
+		os.Exit(3)
+	}
+	fmt.Println(cmd.Process.Pid)
+}
 
 func main() {
 	mode := "fast"
@@ -57,6 +88,16 @@ func main() {
 	switch mode {
 	case "--print=":
 		fmt.Println("HOME=" + os.Getenv("HOME"))
+	case "spawn-exit":
+		spawnDescendant()
+	case "spawn-wait":
+		spawnDescendant()
+		time.Sleep(10 * time.Second)
+	case "descendant":
+		signal.Ignore(syscall.SIGTERM)
+		fmt.Println("ready")
+		os.Stdout.Close()
+		time.Sleep(30 * time.Second)
 	case "slow":
 		time.Sleep(300 * time.Millisecond)
 		fmt.Println("slow-done", time.Now().UnixNano())

@@ -243,8 +243,12 @@ func runCapture(executor execpolicy.PolicyExecutor, req execpolicy.LaunchRequest
 	defer timer.Stop()
 	// A gate child past its bound has no work worth a graceful exit:
 	// Terminate with an already-expired context goes straight to the
-	// forced kill, which SIGKILLs the whole process group of a sealed
-	// launch (no descendant outlives the capture).
+	// forced kill (the group SIGKILL, then the leader's). Independently
+	// of Terminate, a sealed launch's wait path SIGKILLs the leader's
+	// process group after the leader exits and before it is reaped
+	// (waitid WNOWAIT), so a same-group descendant outlives neither a
+	// timed-out nor a normally-ending capture. A descendant that left
+	// the group (setsid/setpgid) is not covered (documented limit).
 	terminate := func() (captureResult, error) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
