@@ -5,8 +5,9 @@ package service
 // AC-010 spec §14.18 evidence: the attestation bootstrap state. A server
 // configured with AgyBinaryPath but without a covering cprot-v2 row
 // starts WITHOUT the agy adapter in the explicit awaiting_attestation
-// state (AgyStatus, GET /v1/status); every agy operation refuses with
-// the typed ineligibility error and no child starts; the first row is
+// state (AgyStatus, GET /v1/status); birth, release, reconcile and
+// queue-time validation refuse with the typed ineligibility error, other
+// agy operations report the harness as unavailable, no child starts; the first row is
 // recordable on that server (RecordAgyProbeAttestation needs no wired
 // adapter); a restart over the same store constructs the production
 // adapter. Every other construction error still fails the server.

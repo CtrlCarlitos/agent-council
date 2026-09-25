@@ -366,8 +366,10 @@ const (
 	// AgyAwaitingAttestation: AgyBinaryPath is configured but production
 	// construction was refused ONLY because no covering cprot-v2
 	// attestation row exists for the frozen tuple. The server runs
-	// without the agy adapter; every agy operation refuses with the typed
-	// ineligibility error and no agy child is started. Recording the row
+	// without the agy adapter; birth, release, reconcile and queue-time
+	// validation refuse with the typed ineligibility error, other agy
+	// operations report the harness as unavailable, and no agy child is
+	// started. Recording the row
 	// (RecordAgyProbeAttestation) does not hot-reload: a restart
 	// constructs the adapter.
 	AgyAwaitingAttestation = "awaiting_attestation"
@@ -422,8 +424,8 @@ type Server struct {
 	agyStatus AgyWiringStatus
 	// agyAwaitingErr is the typed construction refusal (an
 	// *agy.ErrNotEligible wrapping *agy.ErrProductionEligibilityMissing)
-	// held while agyStatus is awaiting_attestation; every agy operation
-	// returns it wrapped.
+	// held while agyStatus is awaiting_attestation; birth, release,
+	// reconcile and queue-time validation return it wrapped.
 	agyAwaitingErr error
 	teardownErr    error
 }
