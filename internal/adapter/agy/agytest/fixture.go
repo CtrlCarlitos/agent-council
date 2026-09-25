@@ -631,8 +631,9 @@ func (f *Fixture) Close() error {
 // fixture: on Linux, through SealedImage (Command == SealedImage.ArgV0,
 // so Task 3's sealed, ptrace-verified path is exercised); off Linux,
 // through an ordinary path launch of BinaryPath, authorized by the
-// explicit FixtureLaunch marker. profile.Tooling must list "agy" (or
-// its caller-supplied override) for the launch to pass the command
+// explicit FixtureLaunch marker. profile.Tooling must list the fixture
+// executable name ("agy", or "agy.exe" on Windows) or its absolute path
+// for the launch to pass the command
 // allowlist check; callers needing a different profile shape can copy
 // this and adjust rather than fight the default.
 func (f *Fixture) LaunchRequest(sessionID, runID string, args []string, paths workspace.WorkspacePaths, profile storage.CanonicalProfile) execpolicy.LaunchRequest {
@@ -655,13 +656,13 @@ func (f *Fixture) LaunchRequest(sessionID, runID string, args []string, paths wo
 // DefaultProfile is a minimal cprof-v4 profile sufficient to pass
 // execpolicy's command-allowlist and algo-version checks for a fixture
 // launch: permissive isolation, unrestricted network, tooling limited to
-// "agy".
+// the platform's fixture executable name.
 func DefaultProfile() storage.CanonicalProfile {
 	return storage.CanonicalProfile{
 		AlgoVersion:         "cprof-v4",
 		WorkspaceMode:       "none",
 		IsolationStrictness: "permissive_dev",
 		NetworkMode:         "unrestricted",
-		Tooling:             []string{"agy"},
+		Tooling:             []string{fixtureExecutableName()},
 	}
 }
