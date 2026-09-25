@@ -167,6 +167,14 @@ func resolveCodexScratchRoot(cfg ServerConfig) (string, error) {
 	if root == "" {
 		return "", fmt.Errorf("CodexScratchRoot is required when CodexBinaryPath is configured")
 	}
+	return resolveScratchRoot(cfg, root, "codex")
+}
+
+// resolveScratchRoot is the shared scratch-root preparation of the codex
+// and agy adapters (label names the adapter in errors): the root must be
+// disjoint from StateDir and WorkspaceBaseDir (resolved, pre- and
+// post-creation) and is created/secured with operator-only permissions.
+func resolveScratchRoot(cfg ServerConfig, root, label string) (string, error) {
 	root = filepath.Clean(root)
 
 	bases := map[string]string{}
@@ -183,20 +191,20 @@ func resolveCodexScratchRoot(cfg ServerConfig) (string, error) {
 
 	resolved, err := resolveExistingPath(root)
 	if err != nil {
-		return "", fmt.Errorf("resolve codex scratch root: %w", err)
+		return "", fmt.Errorf("resolve %s scratch root: %w", label, err)
 	}
 	if err := checkScratchContainment(bases, resolved); err != nil {
 		return "", err
 	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
-		return "", fmt.Errorf("create codex scratch root: %w", err)
+		return "", fmt.Errorf("create %s scratch root: %w", label, err)
 	}
 	if err := os.Chmod(root, 0o700); err != nil {
-		return "", fmt.Errorf("secure codex scratch root: %w", err)
+		return "", fmt.Errorf("secure %s scratch root: %w", label, err)
 	}
 	resolvedFinal, err := filepath.EvalSymlinks(root)
 	if err != nil {
-		return "", fmt.Errorf("resolve codex scratch root after creation: %w", err)
+		return "", fmt.Errorf("resolve %s scratch root after creation: %w", label, err)
 	}
 	if err := checkScratchContainment(bases, resolvedFinal); err != nil {
 		return "", err
@@ -351,6 +359,10 @@ const (
 	AgyNotConfigured = "not_configured"
 	// AgyWired: the production agy adapter was constructed (eligible).
 	AgyWired = "wired"
+	// AgyNotWired: AgyBinaryPath is configured but the server's
+	// contributor adapter is not the agy adapter (an injected adapter of
+	// another kind); no agy operation can run.
+	AgyNotWired = "not_wired"
 	// AgyAwaitingAttestation: AgyBinaryPath is configured but production
 	// construction was refused ONLY because no covering cprot-v2
 	// attestation row exists for the frozen tuple. The server runs
@@ -696,9 +708,8 @@ func resolveAgyHomeDir(cfg ServerConfig) (string, error) {
 }
 
 // resolveAgyScratchRoot validates and prepares the configured Agy
-// construction scratch root, mirroring resolveCodexScratchRoot: required,
-// absolute, disjoint from StateDir and WorkspaceBaseDir (resolved, pre-
-// and post-creation), operator-only permissions.
+// construction scratch root with the same rules as the codex root
+// (resolveScratchRoot), which additionally requires an absolute path.
 func resolveAgyScratchRoot(cfg ServerConfig) (string, error) {
 	root := strings.TrimSpace(cfg.AgyScratchRoot)
 	if root == "" {
@@ -707,39 +718,7 @@ func resolveAgyScratchRoot(cfg ServerConfig) (string, error) {
 	if !filepath.IsAbs(root) {
 		return "", fmt.Errorf("AgyScratchRoot %q must be absolute", root)
 	}
-	root = filepath.Clean(root)
-	bases := map[string]string{}
-	for name, base := range map[string]string{
-		"StateDir":         cfg.StateDir,
-		"WorkspaceBaseDir": cfg.WorkspaceBaseDir,
-	} {
-		base = strings.TrimSpace(base)
-		if base == "" {
-			continue
-		}
-		bases[name] = filepath.Clean(base)
-	}
-	resolved, err := resolveExistingPath(root)
-	if err != nil {
-		return "", fmt.Errorf("resolve agy scratch root: %w", err)
-	}
-	if err := checkScratchContainment(bases, resolved); err != nil {
-		return "", err
-	}
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return "", fmt.Errorf("create agy scratch root: %w", err)
-	}
-	if err := os.Chmod(root, 0o700); err != nil {
-		return "", fmt.Errorf("secure agy scratch root: %w", err)
-	}
-	resolvedFinal, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return "", fmt.Errorf("resolve agy scratch root after creation: %w", err)
-	}
-	if err := checkScratchContainment(bases, resolvedFinal); err != nil {
-		return "", err
-	}
-	return root, nil
+	return resolveScratchRoot(cfg, root, "agy")
 }
 
 func newServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerConfig, adp adapter.Adapter, wm *workspace.WorkspaceManager, pe execpolicy.PolicyExecutor) (*Server, error) {
@@ -779,11 +758,18 @@ func newServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 		startedAt:        time.Now().UTC(),
 		shutdown:         make(chan struct{}),
 	}
+	// The status reflects the adapter actually wired, not merely the
+	// configuration: AgyBinaryPath with an injected non-agy adapter is
+	// not "wired".
+	_, isAgy := adp.(*agy.AgyAdapter)
 	switch {
 	case strings.TrimSpace(cfg.AgyBinaryPath) == "":
 		srv.agyStatus = AgyWiringStatus{State: AgyNotConfigured}
-	default:
+	case isAgy:
 		srv.agyStatus = AgyWiringStatus{State: AgyWired}
+	default:
+		srv.agyStatus = AgyWiringStatus{State: AgyNotWired,
+			Reason: fmt.Sprintf("AgyBinaryPath is configured but the wired contributor adapter is %T, not the agy adapter", adp)}
 	}
 
 	mux := http.NewServeMux()

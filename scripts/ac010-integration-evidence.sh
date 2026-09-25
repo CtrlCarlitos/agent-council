@@ -275,8 +275,12 @@ assert_allowed_argv() {
     local a
     for a in "$@"; do
         case "$a" in
-            --dangerously-skip-permissions*|--continue|--continue=*|-c|-i|--prompt-interactive*|--remote-control*|install|update| \
+            --dangerously-skip-permissions*|--continue|--continue=*|--prompt-interactive*|--remote-control*|install|update| \
             --add-dir|--add-dir=*|--project|--project=*|--new-project|--new-project=*|mic-serve)
+                fail "refusing forbidden agy argument: $a (spec §5)" ;;
+            # -c / -i in every attached or clustered short spelling
+            # (-c, -c=x, -cfoo, -ic, -i=p); "--" flags are matched above.
+            -c*|-i*)
                 fail "refusing forbidden agy argument: $a (spec §5)" ;;
         esac
     done

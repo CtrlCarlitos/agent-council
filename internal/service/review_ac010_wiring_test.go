@@ -1057,6 +1057,14 @@ func TestServiceQueue_AgyRequiredToolsValidatedAtQueueTime(t *testing.T) {
 	if tools, ok, err := src.RequiredToolsFor(ctx, adapter.TurnRef{SessionID: "sess-ac010-claude", TurnKey: "t-claude-plain"}); ok || err != nil {
 		t.Fatalf("an intent with an empty set reports ok=false, nil (frozen defaults), got %v ok=%v err=%v", tools, ok, err)
 	}
+	// A stored set that does not decode is an error, never the defaults.
+	if _, err := store.DB().ExecContext(ctx, `UPDATE dispatch_intents SET required_tools_json = '["view_file"' WHERE session_id = ? AND turn_key = ?`,
+		agyWireSession, "t-ok"); err != nil {
+		t.Fatalf("corrupt: %v", err)
+	}
+	if tools, ok, err := src.RequiredToolsFor(ctx, adapter.TurnRef{SessionID: agyWireSession, TurnKey: "t-ok"}); err == nil || ok || tools != nil {
+		t.Fatalf("a malformed stored set must fail closed, got %v ok=%v err=%v", tools, ok, err)
+	}
 	// Fix round 1 (Important 3): a missing intent and a storage read
 	// failure are errors, never the defaults.
 	if _, ok, err := src.RequiredToolsFor(ctx, adapter.TurnRef{SessionID: agyWireSession, TurnKey: "t-never"}); err == nil || ok ||

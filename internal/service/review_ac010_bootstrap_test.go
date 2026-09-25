@@ -27,6 +27,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/CtrlCarlitos/agent-council/internal/adapter/adaptertest"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/agy"
 )
 
@@ -242,5 +243,21 @@ func TestServiceBootstrap_AgyNotConfiguredAndRecordNeedsNoAdapter(t *testing.T) 
 		RunID: agyWireRunID, Attestation: att,
 	}); err != nil {
 		t.Fatalf("recording depends on the store, credential and evidence root only: %v", err)
+	}
+}
+
+// The wiring status follows the adapter actually wired: AgyBinaryPath
+// with an injected non-agy adapter is not_wired, never "wired".
+func TestServiceBootstrap_AgyConfiguredWithNonAgyAdapterIsNotWired(t *testing.T) {
+	e := newAgyWireEnv(t, nil)
+	store := e.openStore(t)
+	e.seed(t, store, e.profile)
+	fake := adaptertest.NewFake(adaptertest.ScriptedFaults{})
+	srv, err := NewServerWithAdapter(store, mustLock(t, e.stateDir), e.cfg, fake)
+	if err != nil {
+		t.Fatalf("server: %v", err)
+	}
+	if st := srv.AgyStatus(); st.State != AgyNotWired || !strings.Contains(st.Reason, "not the agy adapter") {
+		t.Fatalf("a non-agy adapter with AgyBinaryPath is not_wired, got %+v", st)
 	}
 }

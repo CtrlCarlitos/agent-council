@@ -567,7 +567,8 @@ type agyRequiredToolsSource struct {
 var _ agy.RequiredToolsSource = (*agyRequiredToolsSource)(nil)
 
 // RequiredToolsFor never substitutes the defaults for an unreadable set:
-// a read error, or a turn without a durable dispatch intent, is returned
+// a read error, a stored set that does not decode, or a turn without a
+// durable dispatch intent, is returned
 // as an error (the adapter refuses the dispatch before any reservation);
 // only a present intent with an empty set reports ok=false.
 func (s *agyRequiredToolsSource) RequiredToolsFor(ctx context.Context, ref adapter.TurnRef) ([]string, bool, error) {
@@ -577,6 +578,9 @@ func (s *agyRequiredToolsSource) RequiredToolsFor(ctx context.Context, ref adapt
 	}
 	if details == nil || details.DispatchIntent == nil {
 		return nil, false, fmt.Errorf("turn %s/%s has no durable dispatch intent", ref.SessionID, ref.TurnKey)
+	}
+	if details.DispatchIntent.RequiredToolsErr != nil {
+		return nil, false, fmt.Errorf("turn %s/%s required tools: %w", ref.SessionID, ref.TurnKey, details.DispatchIntent.RequiredToolsErr)
 	}
 	if len(details.DispatchIntent.RequiredTools) == 0 {
 		return nil, false, nil

@@ -437,6 +437,7 @@ func TestAgyFixture_VersionAndModelsAndPluginList(t *testing.T) {
 		t.Helper()
 		cmd := exec.Command(fixturePath, args...)
 		cmd.Dir = scratch
+		cmd.Env = fixtureTempHomeEnv(t)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("run agy %v: %v: %s", args, err, out)
@@ -474,6 +475,7 @@ func TestAgyFixture_ModelsNotSignedInAndPluginListDrift(t *testing.T) {
 		t.Helper()
 		cmd := exec.Command(fixturePath, args...)
 		cmd.Dir = scratch
+		cmd.Env = fixtureTempHomeEnv(t)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("run agy %v: %v: %s", args, err, out)
@@ -668,6 +670,7 @@ func TestAgyFixture_ScenarioLoaderRejectsMistakes(t *testing.T) {
 
 			cmd := exec.Command(fixturePath, agyFrozenArgs("m")...)
 			cmd.Dir = scratch
+			cmd.Env = fixtureTempHomeEnv(t)
 			out, err := cmd.CombinedOutput()
 			exitErr, ok := err.(*exec.ExitError)
 			if !ok {
@@ -681,4 +684,13 @@ func TestAgyFixture_ScenarioLoaderRejectsMistakes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// fixtureTempHomeEnv is the environment of a direct fixture run: the
+// test's environment with HOME replaced by a fresh temp dir, so a
+// direct exec never sees the real home (os/exec keeps the LAST value of
+// a duplicated key).
+func fixtureTempHomeEnv(t *testing.T) []string {
+	t.Helper()
+	return append(os.Environ(), "HOME="+t.TempDir())
 }

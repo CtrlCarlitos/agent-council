@@ -68,20 +68,27 @@ var agyForbiddenArgs = map[string]bool{
 }
 
 // IsAgyLaunch reports whether req is shaped like an agy launch (AC-010
-// Global Constraints). Recognition succeeds when EITHER of two
+// Global Constraints). Recognition succeeds when ANY of three
 // independent signals holds, since a launch that is agy by binary
 // identity must not escape the production sealed-launch guard just
 // because its argv happens not to match the frozen stream-json shape
 // (e.g. a bare "agy install"), and conversely the frozen stream-json
 // shape is recognized regardless of argv order:
+//
 //   - the frozen shape: the leading "--print=" flag together with both
 //     "--input-format stream-json" and "--output-format stream-json"
-//     anywhere in argv (order among the latter two is not required); or
-//   - filepath.Base(req.Command) is "agy" or "agy.exe".
+//     anywhere in argv (order among the latter two is not required);
+//   - filepath.Base(req.Command) is "agy" or "agy.exe"; or
+//   - req.SealedImage is set: only the agy adapter pins a sealed image,
+//     so a pinned binary not named "agy" (and with any argv) still gets
+//     the forbidden-argument check and HomeDir acceptance.
 //
 // This is sufficient for recognition; the full exact-argv validation
-// belongs to the agy launch source (Task 5), not to this recognizer.
+// belongs to the agy launch source, not to this recognizer.
 func IsAgyLaunch(req LaunchRequest) bool {
+	if req.SealedImage != nil {
+		return true
+	}
 	base := filepath.Base(req.Command)
 	if base == "agy" || base == "agy.exe" {
 		return true
@@ -111,10 +118,16 @@ func IsAgyLaunch(req LaunchRequest) bool {
 // bare forms); a bare subcommand word (e.g. "install") is matched as a
 // whole token, since "=" has no meaning there and splitting it could
 // let an unrelated argument value (e.g. a path containing "=install")
-// false-positive.
+// false-positive. The single-dash short flags -c (--continue) and -i
+// (--prompt-interactive) are also refused in every attached or
+// clustered spelling: any token that starts with "-c" or "-i" and is
+// not a "--" flag ("-c=x", "-cfoo", "-ic", "-i=p").
 func agyForbiddenArg(args []string) (string, bool) {
 	for _, a := range args {
 		if agyForbiddenArgs[a] {
+			return a, true
+		}
+		if !strings.HasPrefix(a, "--") && (strings.HasPrefix(a, "-c") || strings.HasPrefix(a, "-i")) {
 			return a, true
 		}
 		if strings.HasPrefix(a, "--") {

@@ -406,13 +406,17 @@ type TurnDetails struct {
 
 // DispatchIntentDetails captures intent tracking for an attempt.
 type DispatchIntentDetails struct {
-	SessionID     string    `json:"session_id"`
-	TurnKey       string    `json:"turn_key"`
-	AttemptID     string    `json:"attempt_id"`
-	Phase         string    `json:"phase"`
-	RequiredTools []string  `json:"required_tools,omitempty"`
-	RecordedAt    time.Time `json:"recorded_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	SessionID     string   `json:"session_id"`
+	TurnKey       string   `json:"turn_key"`
+	AttemptID     string   `json:"attempt_id"`
+	Phase         string   `json:"phase"`
+	RequiredTools []string `json:"required_tools,omitempty"`
+	// RequiredToolsErr is set (and RequiredTools nil) when the stored
+	// required_tools_json does not decode: a consumer deciding a
+	// dispatch's required set must refuse, never read it as empty.
+	RequiredToolsErr error     `json:"-"`
+	RecordedAt       time.Time `json:"recorded_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 // GetTurnDetails returns authoritative turn state including dispatch intent.
@@ -452,7 +456,7 @@ SELECT session_id, turn_key, attempt_id, phase, required_tools_json, recorded_at
 FROM dispatch_intents
 WHERE session_id = ? AND turn_key = ?;`, sessionID, turnKey).Scan(&di.SessionID, &di.TurnKey, &di.AttemptID, &di.Phase, &diRequiredToolsJSON, &diRecStr, &diUpdStr)
 	if err == nil {
-		di.RequiredTools = unmarshalStrings(diRequiredToolsJSON)
+		di.RequiredTools, di.RequiredToolsErr = unmarshalRequiredTools(diRequiredToolsJSON)
 		if t, err := time.Parse(time.RFC3339Nano, diRecStr); err == nil {
 			di.RecordedAt = t
 		}

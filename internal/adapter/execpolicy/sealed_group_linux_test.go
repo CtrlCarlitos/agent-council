@@ -107,3 +107,40 @@ func TestSealedLaunch_ForcedTerminateKillsGroupDescendants(t *testing.T) {
 	_ = proc.Terminate(ctx)
 	requireDescendantGone(t, pid, "a forced Terminate of its sealed leader")
 }
+
+// A sealed image marks a launch agy-shaped whatever the pinned binary is
+// named and whatever its argv: the forbidden-argument check applies and
+// HomeDir is accepted.
+func TestIsAgyLaunch_SealedImageIsAgyShaped(t *testing.T) {
+	requireFixture(t)
+	img, err := NewSealedImage(fixturePath, fixtureDigest)
+	if err != nil {
+		t.Fatalf("NewSealedImage: %v", err)
+	}
+	defer img.Close()
+	base := LaunchRequest{
+		SessionID:   "sess-sealed-shape",
+		Command:     img.ArgV0,
+		Args:        []string{"fast"},
+		Paths:       sealedTestPaths(t),
+		Profile:     sealedTestProfile([]string{img.ArgV0}),
+		SealedImage: img,
+	}
+	if !IsAgyLaunch(base) {
+		t.Fatal("a sealed launch of a binary not named agy is agy-shaped")
+	}
+	forbidden := base
+	forbidden.Args = []string{"fast", "-c"}
+	if _, err := New().Start(context.Background(), forbidden); !errors.Is(err, ErrAgyLaunchForbiddenArg) {
+		t.Fatalf("a sealed launch carrying -c is refused ErrAgyLaunchForbiddenArg, got %v", err)
+	}
+	withHome := base
+	withHome.HomeDir = t.TempDir()
+	proc, err := New().Start(context.Background(), withHome)
+	if err != nil {
+		t.Fatalf("HomeDir is accepted on a sealed launch: %v", err)
+	}
+	if _, err := proc.Wait(); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+}

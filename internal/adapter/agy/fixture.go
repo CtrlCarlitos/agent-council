@@ -8,9 +8,9 @@ package agy
 // internal/adapter/agy/agytest — the test-only construction harness for
 // the compiled fixture `agy` executable — never production wiring.
 //
-// Task 5 adds the production constructor (NewAgyAdapter); it must route
-// its option decoding through applyConstructionOptions so the fixture
-// option fails closed there exactly as it does in codex's NewCodexAdapter.
+// The production constructor (NewAgyAdapter) routes its option decoding
+// through applyConstructionOptions, so the fixture option fails closed
+// there exactly as it does in codex's NewCodexAdapter.
 
 // ConstructionOption adjusts non-production construction. Option values
 // can only be produced inside this package (constructionSettings is

@@ -476,8 +476,9 @@ VALUES (6, 'codex_creation_uncertainty_episodes', ?, ?);`, "codex-uncertainty-v6
 // branch: launch_count is capped at 1 (0→1 only) and ReserveAgyLaunch
 // has no protected-absence second-launch path. The native_id CHECK
 // enforces a UUIDv4 shape (the version nibble fixed at 4); the
-// protection-attestation table exists for readiness probing, not for
-// gating a redispatch that does not exist.
+// protection-attestation table gates production eligibility (a covering
+// row is required before the adapter is constructed), not a redispatch,
+// which does not exist.
 const agyStateV7DDL = `
 ALTER TABLE pending_prompts ADD COLUMN required_tools_json TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE dispatch_intents ADD COLUMN required_tools_json TEXT NOT NULL DEFAULT '[]';

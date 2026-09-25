@@ -3,11 +3,11 @@ package agy
 // Production guard for the agy test-only construction mode (AC-010,
 // mirroring internal/adapter/codex/production_guard_test.go): the
 // production option-decoding seam fails closed with a typed error when
-// handed the fixture option, independent of any other state. Task 5's
-// NewAgyAdapter must route through applyConstructionOptions for this
-// guard to protect the real production constructor; until then this
-// test exercises the seam directly (package-internal: applyConstruction-
-// Options is unexported on purpose).
+// handed the fixture option, independent of any other state.
+// NewAgyAdapter routes through applyConstructionOptions, so this guard
+// protects the real production constructor; the tests exercise the seam
+// directly (package-internal: applyConstructionOptions is unexported on
+// purpose).
 
 import (
 	"context"

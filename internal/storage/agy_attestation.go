@@ -11,9 +11,11 @@ package storage
 // recreation blocked until a controller-authorized resolution of that
 // exact episode).
 //
-// The attestation table exists here for readiness probing only: unlike
-// Codex, Agy turn attempts have no redispatch branch, so nothing in
-// this adapter gates a second launch on a frozen attestation id.
+// The attestation row GATES production eligibility: the agy adapter
+// refuses to construct (and the service starts in the typed "awaiting
+// attestation" state) unless a recorded attestation covers the frozen
+// tuple. Unlike Codex, Agy turn attempts have no redispatch branch, so
+// no second launch is gated on a frozen attestation id.
 
 import (
 	"context"

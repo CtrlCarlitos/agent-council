@@ -190,6 +190,8 @@ func TestPolicyExecutor_AgyLaunch_ForbiddenArgRefused(t *testing.T) {
 		// --flag=value forms (Important 7): the forbidden-arg check must
 		// match on the part before "=", not only the exact token.
 		"--add-dir=/x", "--project=p", "--dangerously-skip-permissions=true",
+		// -c / -i attached and clustered short spellings.
+		"-c=x", "-i=p", "-cfoo", "-ic", "-ifoo",
 	} {
 		t.Run(forbidden, func(t *testing.T) {
 			sanitized := sanitizeForIdentifier(forbidden)

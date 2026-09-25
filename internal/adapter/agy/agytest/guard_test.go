@@ -47,6 +47,26 @@ func shouldSkipWalkDir(root, path string, info os.FileInfo) bool {
 	return false
 }
 
+// inPackageDir reports whether the file at path lives directly in the
+// repo-relative package directory pkgDir (exact directory match: a
+// sibling such as internal/adapter/agyx is NOT exempted, and neither is
+// a nested package below pkgDir).
+func inPackageDir(root, path, pkgDir string) bool {
+	rel, err := filepath.Rel(root, filepath.Dir(path))
+	return err == nil && filepath.ToSlash(rel) == pkgDir
+}
+
+// agyDotImported reports whether f dot-imports the agy package (its
+// exported names are then bare identifiers in f).
+func agyDotImported(f *ast.File) bool {
+	for _, imp := range f.Imports {
+		if strings.Trim(imp.Path.Value, `"`) == agyImportPath && imp.Name != nil && imp.Name.Name == "." {
+			return true
+		}
+	}
+	return false
+}
+
 // agyImportLocalNames returns the set of local identifiers f binds to
 // the agy package's import path: the alias when one is given, otherwise
 // the conventional last path segment "agy".
@@ -85,8 +105,8 @@ func TestAgyTest_ImportGuard_ProductionPackagesDoNotImportAgyTest(t *testing.T) 
 		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
-		// Skip the agytest package itself.
-		if strings.Contains(filepath.ToSlash(path), "internal/adapter/agy/agytest") {
+		// Skip the agytest package itself (exact directory).
+		if inPackageDir(root, path, "internal/adapter/agy/agytest") {
 			return nil
 		}
 		fset := token.NewFileSet()
@@ -142,7 +162,7 @@ func TestAgyTest_ImportGuard_NoFixtureConstructorReferencesOutsideAgyPackage(t *
 		}
 		// The agy package itself owns the constructors and the typed
 		// production rejection; agytest carries the fixture harness.
-		if strings.Contains(filepath.ToSlash(path), "internal/adapter/agy") {
+		if inPackageDir(root, path, "internal/adapter/agy") || inPackageDir(root, path, "internal/adapter/agy/agytest") {
 			return nil
 		}
 		fset := token.NewFileSet()
@@ -156,10 +176,17 @@ func TestAgyTest_ImportGuard_NoFixtureConstructorReferencesOutsideAgyPackage(t *
 		// recognized, and a same-named but unrelated package (e.g.
 		// codex's own FixtureMode) must not false-positive.
 		agyNames := agyImportLocalNames(f)
-		if len(agyNames) == 0 {
+		dot := agyDotImported(f)
+		if len(agyNames) == 0 && !dot {
 			return nil
 		}
 		ast.Inspect(f, func(n ast.Node) bool {
+			// A dot import makes the forbidden names bare identifiers.
+			if id, ok := n.(*ast.Ident); ok && dot && forbidden[id.Name] {
+				t.Errorf("production file %s illegally references the test-only fixture construction surface through a dot import: %s",
+					path, id.Name)
+				return true
+			}
 			sel, ok := n.(*ast.SelectorExpr)
 			if !ok {
 				return true
@@ -264,4 +291,28 @@ func TestAgyTest_FixtureSourceByteIdenticalToFakeChild(t *testing.T) {
 Sync the fixture executable source in BOTH files (or extend both together);
 a one-sided change silently no-ops staged scenarios on the agytest side.`,
 		len(fake), sha(fake), len(fixtureSource), sha(fixtureSource))
+}
+
+// The exemptions match exact package directories (a sibling like
+// internal/adapter/agyx is not exempt) and a dot import is recognized.
+func TestAgyTest_GuardHelpers_ExactDirsAndDotImport(t *testing.T) {
+	root := filepath.FromSlash("/repo")
+	for path, want := range map[string]bool{
+		"/repo/internal/adapter/agy/adapter.go":       true,
+		"/repo/internal/adapter/agyx/adapter.go":      false,
+		"/repo/internal/adapter/agy/sub/x.go":         false,
+		"/repo/other/internal/adapter/agy/adapter.go": false,
+	} {
+		if got := inPackageDir(root, filepath.FromSlash(path), "internal/adapter/agy"); got != want {
+			t.Errorf("inPackageDir(%s) = %v, want %v", path, got, want)
+		}
+	}
+	src := "package p\nimport . \"" + agyImportPath + "\"\nvar _ = FixtureOption\n"
+	f, err := parser.ParseFile(token.NewFileSet(), "p.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !agyDotImported(f) || len(agyImportLocalNames(f)) != 0 {
+		t.Fatal("a dot import of agy must be recognized (and binds no selector name)")
+	}
 }

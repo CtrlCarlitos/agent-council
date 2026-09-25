@@ -42,11 +42,15 @@ func marshalStrings(v []string) string {
 	return string(b)
 }
 
-// unmarshalStrings is the inverse of marshalStrings: "[]", "", and
-// malformed JSON all decode to nil (never an error — these columns are
-// evidence, not caller input, so a decode failure must not break reads).
-// The silent nil is the codebase convention; a caller must never read nil
-// as proof that a set was recorded empty.
+// unmarshalStrings is the inverse of marshalStrings for the EVIDENCE
+// columns (executed/missing/denied/ambiguous/unattributed/unmapped
+// tools, and the attempt's copy of its required set): "[]", "", and
+// malformed JSON all decode to nil (never an error — evidence must not
+// break reads). The silent nil is the codebase convention; a caller must
+// never read nil as proof that a set was recorded empty. The dispatch
+// intent's required_tools_json is NOT evidence — it decides which tools
+// a dispatch must verify — and decodes with unmarshalRequiredTools,
+// which fails closed.
 func unmarshalStrings(raw string) []string {
 	if strings.TrimSpace(raw) == "" || raw == "[]" {
 		return nil
@@ -56,6 +60,21 @@ func unmarshalStrings(raw string) []string {
 		return nil
 	}
 	return out
+}
+
+// unmarshalRequiredTools decodes a dispatch intent's required_tools_json
+// failing CLOSED: "" and "[]" are the empty set, malformed JSON is an
+// error (never silently the empty set, which would let the adapter fall
+// back to the frozen defaults).
+func unmarshalRequiredTools(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" || raw == "[]" {
+		return nil, nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, fmt.Errorf("malformed required_tools_json: %w", err)
+	}
+	return out, nil
 }
 
 // ── Session bindings ────────────────────────────────────────────────────
@@ -599,20 +618,53 @@ UPDATE agy_turn_attempts SET orphan_conversation_id = ?, transition_version = tr
 	return tx.Commit()
 }
 
-// SetAgyAttemptObservedStatus records the evidence-derived outcome
-// without marking the attempt terminal (e.g. a non-terminal status
-// refinement mid-flight).
+// SetAgyAttemptObservedStatus records the evidence-derived NON-terminal
+// outcome. The only allowed transition is uncertain -> missing (positive
+// pre-acceptance / pre-start evidence) on a non-terminal attempt, the
+// same guard SetAgyAttemptTerminal applies (terminal = 0 AND
+// observed_status = 'uncertain'). Re-recording missing on an attempt
+// already missing is an idempotent no-op (durable-write retries); any
+// other status, or an attempt that is terminal or already resolved
+// otherwise, is refused and changes nothing. An unknown attempt is an
+// error.
 func (s *Store) SetAgyAttemptObservedStatus(ctx context.Context, attemptID, status string) error {
-	_, err := s.DB().ExecContext(ctx, `
+	if status != "missing" {
+		return fmt.Errorf("non-terminal observed status may only be set to missing (from uncertain), got %q", status)
+	}
+	res, err := s.DB().ExecContext(ctx, `
 UPDATE agy_turn_attempts SET observed_status = ?, transition_version = transition_version + 1,
-	updated_at = ? WHERE attempt_id = ?`, status, time.Now().UTC().Format(time.RFC3339), attemptID)
-	return err
+	updated_at = ? WHERE attempt_id = ? AND terminal = 0 AND observed_status = 'uncertain'`,
+		status, time.Now().UTC().Format(time.RFC3339), attemptID)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 1 {
+		return nil
+	}
+	var terminal int
+	var current string
+	if err := s.DB().QueryRowContext(ctx,
+		`SELECT terminal, observed_status FROM agy_turn_attempts WHERE attempt_id = ?`, attemptID).Scan(&terminal, &current); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("attempt %s does not exist", attemptID)
+		}
+		return fmt.Errorf("query attempt status: %w", err)
+	}
+	if terminal == 0 && current == status {
+		return nil // idempotent replay
+	}
+	return fmt.Errorf("attempt %s is %s (terminal=%d); only an uncertain non-terminal attempt may become %s",
+		attemptID, current, terminal, status)
 }
 
 // SetAgyAttemptTerminal records the verified terminal result payload,
 // its evidence-derived observed status, and the tool-verification
 // evidence in ONE atomic write. Exactly-once guard: only the first
-// successful write wins (the WHERE clause requires terminal = 0).
+// successful write wins, and only on an attempt still uncertain (the
+// WHERE clause requires terminal = 0 AND observed_status = 'uncertain':
+// an attempt recorded missing never gains a terminal result).
 func (s *Store) SetAgyAttemptTerminal(ctx context.Context, attemptID, observedStatus, resultPayload, resultUsage string, verification AgyVerification) error {
 	if observedStatus != "completed" && observedStatus != "failed" && observedStatus != "cancelled" {
 		return fmt.Errorf("terminal observed status must be completed, failed, or cancelled, got %q", observedStatus)
@@ -627,7 +679,7 @@ UPDATE agy_turn_attempts SET terminal = 1, result_payload = ?, result_usage = ?,
 	denied_tools_json = ?, ambiguous_denials_json = ?, unattributed_denials_json = ?,
 	unmapped_denials_json = ?, verification_incomplete = ?,
 	transition_version = transition_version + 1,
-	updated_at = ? WHERE attempt_id = ? AND terminal = 0`,
+	updated_at = ? WHERE attempt_id = ? AND terminal = 0 AND observed_status = 'uncertain'`,
 		resultPayload, resultUsage, observedStatus,
 		marshalStrings(verification.Executed), marshalStrings(verification.MissingRequired),
 		marshalStrings(verification.Denied), marshalStrings(verification.Ambiguous),
@@ -641,7 +693,7 @@ UPDATE agy_turn_attempts SET terminal = 1, result_payload = ?, result_usage = ?,
 		return err
 	}
 	if n == 0 {
-		return fmt.Errorf("attempt %s already terminal; exactly-once guard prevented overwrite", attemptID)
+		return fmt.Errorf("attempt %s already terminal or no longer uncertain; exactly-once guard prevented overwrite", attemptID)
 	}
 	return nil
 }

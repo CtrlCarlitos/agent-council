@@ -467,7 +467,14 @@ func (s *Store) QueuePrompt(ctx context.Context, opID string, callerLease string
 
 	sanitized := SanitizeText(prompt.Prompt)
 	requiredToolsJSON := marshalStrings(prompt.RequiredTools)
-	fp := computeFingerprint("queue_prompt", sessionID, prompt.TurnKey, sanitized, requiredToolsJSON)
+	// The tools part joins the fingerprint only when a set is stated, so
+	// a queue_prompt op journaled before v7 (no required_tools) replays
+	// with the fingerprint it was recorded with (as ReplacePendingPrompt).
+	fpParts := []string{"queue_prompt", sessionID, prompt.TurnKey, sanitized}
+	if len(prompt.RequiredTools) > 0 {
+		fpParts = append(fpParts, requiredToolsJSON)
+	}
+	fp := computeFingerprint(fpParts...)
 
 	tx, err := s.BeginWrite(ctx)
 	if err != nil {
