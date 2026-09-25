@@ -94,9 +94,13 @@ func newProdGuardFixture(t *testing.T) *prodGuardFixture {
 	}
 	homeDir := filepath.Join(scratch, "home")
 	a := profile.Harnesses["agy"].Agy
-	a.BinaryPath = filepath.ToSlash(bin)
 	a.BinaryDigest = digestOf(binRaw)
-	a.ExpectedHome = filepath.ToSlash(filepath.Join(homeDir, ".gemini"))
+	if runtime.GOOS == "linux" {
+		a.BinaryPath = filepath.ToSlash(bin)
+		a.ExpectedHome = filepath.ToSlash(filepath.Join(homeDir, ".gemini"))
+	}
+	// Else retain the accepted Linux profile paths: production must refuse
+	// this host before attempting to access them.
 	policy, err := ValidateAgyHarness(profile, evidenceRoot)
 	if err != nil {
 		t.Fatalf("validate: %v", err)
@@ -198,6 +202,8 @@ func TestProductionGuard_NilAttestationFailsClosedPreChild(t *testing.T) {
 		if !errors.As(err, &ne) || !errors.As(err, &missing) {
 			t.Fatalf("want ErrNotEligible wrapping ErrProductionEligibilityMissing, got %T: %v", err, err)
 		}
+	} else if !errors.Is(err, execpolicy.ErrSealedLaunchUnsupported) {
+		t.Fatalf("unsupported host must refuse sealed production execution, got %v", err)
 	}
 	if n := exec.starts.Load(); n != 0 {
 		t.Fatalf("eligibility fails closed BEFORE any child (plugin list included), launches=%d", n)
@@ -228,7 +234,11 @@ func TestProductionGuard_HomeDirMustBeExpectedHomeParent(t *testing.T) {
 	exec := &refusingExecutor{}
 	_, err := NewProductionAgyAdapter(f.store, exec, f.wm, f.profile, f.evidenceRoot, filepath.Join(f.homeDir, "elsewhere"), f.scratch)
 	var mismatch *ErrHomeDirMismatch
-	if !errors.As(err, &mismatch) {
+	if runtime.GOOS != "linux" {
+		if !errors.Is(err, execpolicy.ErrSealedLaunchUnsupported) {
+			t.Fatalf("unsupported host must refuse before interpreting Linux paths, got %v", err)
+		}
+	} else if !errors.As(err, &mismatch) {
 		t.Fatalf("a homeDir that is not expected_home's parent fails closed typed, got %T: %v", err, err)
 	}
 	if n := exec.starts.Load(); n != 0 {

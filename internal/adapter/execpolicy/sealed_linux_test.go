@@ -1086,20 +1086,19 @@ func TestManagedProcess_ExecutableIdentity_PathLaunch(t *testing.T) {
 
 // --- controller ruling: strict isolation + sealed image ------------------
 
-// strictNetworkNoneUnavailable probes, with a real trial launch, whether
-// this host can actually create the new user+net namespaces strict
-// network_mode=none isolation requires — the availability check baked
-// into checkPlatformCapabilities (os.Stat on /proc/self/ns/user|net)
-// only confirms the kernel exposes namespaces at all, not that
-// unprivileged user-namespace creation is allowed (e.g. distros/hosts
-// that set kernel.unprivileged_userns_clone=0, or containers/sandboxes
-// that block CLONE_NEWUSER outright).
-func strictNetworkNoneUnavailable(t *testing.T) string {
+// Probe the combined kernel primitives independently of buildSealedCmd and
+// configureSysProcAttr. A successful ordinary namespace exec does not prove
+// a ptraced memfd exec is allowed by the host's security policy.
+func strictSealedLaunchUnavailable(t *testing.T, img *SealedImage) error {
 	t.Helper()
-	trial := exec.Command(fixturePath, "fast")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	trial := exec.CommandContext(ctx, fmt.Sprintf("/proc/self/fd/%d", img.fd), "fast")
 	trial.Stdout = io.Discard
 	trial.Stderr = io.Discard
 	trial.SysProcAttr = &syscall.SysProcAttr{
+		Ptrace:     true,
+		Setpgid:    true,
 		Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNET,
 		UidMappings: []syscall.SysProcIDMap{
 			{ContainerID: 0, HostID: os.Getuid(), Size: 1},
@@ -1109,10 +1108,42 @@ func strictNetworkNoneUnavailable(t *testing.T) string {
 		},
 		GidMappingsEnableSetgroups: false,
 	}
-	if err := trial.Run(); err != nil {
-		return err.Error()
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := trial.Start(); err != nil {
+		return err
 	}
-	return ""
+	defer func() { _ = trial.Process.Kill(); _ = trial.Wait() }()
+	var status syscall.WaitStatus
+	for {
+		_, err := syscall.Wait4(trial.Process.Pid, &status, syscall.WALL, nil)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil || !status.Stopped() || status.StopSignal() != syscall.SIGTRAP {
+			t.Fatalf("independent strict sealed probe exec-stop: %v, %v", status, err)
+		}
+		break
+	}
+	if err := syscall.PtraceDetach(trial.Process.Pid); err != nil {
+		t.Fatalf("probe detach: %v", err)
+	}
+	if err := trial.Wait(); err != nil {
+		t.Fatalf("probe completion: %v", err)
+	}
+	return nil
+}
+
+func TestRunSealedTracer_StartRefusalRetainsCause(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "not-executable")
+	if err := os.WriteFile(path, []byte("inert"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(path)
+	_, err := runSealedTracer(cmd, nil, realPtraceOps{}, true)
+	if !errors.Is(err, ErrSealedLaunch) || !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("launch refusal must retain category and kernel cause: %v", err)
+	}
 }
 
 // TestStart_SealedImage_StrictNetworkNone is the controller-ruling test:
@@ -1122,20 +1153,20 @@ func strictNetworkNoneUnavailable(t *testing.T) string {
 // verification and read fully — the strict Cloneflags merge
 // (TestBuildSealedCmd_MergesPtraceIntoStrictSysProcAttr) must actually
 // produce a working launch end to end, not just a correctly-shaped
-// SysProcAttr. Skip-guarded: not hard-required, since some hosts refuse
-// unprivileged user namespaces outright.
+// SysProcAttr. Where the independent primitive probe is refused, assert
+// the production executor fails closed with that same kernel cause.
 func TestStart_SealedImage_StrictNetworkNone(t *testing.T) {
 	requireFixture(t)
-
-	if msg := strictNetworkNoneUnavailable(t); msg != "" {
-		t.Skipf("user/network namespaces unavailable for strict network_mode=none: %s", msg)
-	}
 
 	img, err := NewSealedImage(fixturePath, fixtureDigest)
 	if err != nil {
 		t.Fatalf("NewSealedImage: %v", err)
 	}
 	defer img.Close()
+	capabilityErr := strictSealedLaunchUnavailable(t, img)
+	if capabilityErr != nil && !errors.Is(capabilityErr, syscall.EACCES) && !errors.Is(capabilityErr, syscall.EPERM) && !errors.Is(capabilityErr, syscall.ENOSYS) {
+		t.Fatalf("unexpected independent capability probe failure: %v", capabilityErr)
+	}
 
 	profile := sealedTestProfile([]string{img.ArgV0})
 	profile.IsolationStrictness = "strict"
@@ -1153,6 +1184,14 @@ func TestStart_SealedImage_StrictNetworkNone(t *testing.T) {
 		SealedImage: img,
 	}
 	proc, err := New().Start(context.Background(), req)
+	if capabilityErr != nil {
+		var errno syscall.Errno
+		if !errors.As(capabilityErr, &errno) || proc != nil || !errors.Is(err, ErrSealedLaunch) || !errors.Is(err, errno) {
+			t.Fatalf("host refusal must fail closed without a process: probe=%v, proc=%v, launch=%v", capabilityErr, proc, err)
+		}
+		t.Logf("host denies strict sealed launch; verified fail-closed refusal: %v", capabilityErr)
+		return
+	}
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}

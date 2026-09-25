@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
@@ -104,6 +105,12 @@ func NewProductionAgyAdapter(
 		return nil, errors.New("agy operator home is required")
 	case strings.TrimSpace(scratchRoot) == "" || !filepath.IsAbs(scratchRoot):
 		return nil, errors.New("an absolute agy construction scratch root is required")
+	}
+
+	// Production sealed execution is Linux-only. Refuse other hosts before
+	// interpreting the frozen profile's Linux paths using host path rules.
+	if runtime.GOOS != "linux" {
+		return nil, execpolicy.ErrSealedLaunchUnsupported
 	}
 
 	policy, err := ValidateAgyHarness(cfgProfile, evidenceRoot)

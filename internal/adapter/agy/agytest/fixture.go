@@ -33,6 +33,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/execpolicy"
@@ -532,6 +533,13 @@ var (
 	fixtureErr    error
 )
 
+func fixtureExecutableName() string {
+	if runtime.GOOS == "windows" {
+		return "agy.exe"
+	}
+	return "agy"
+}
+
 // compileFixtureExecutable builds the fake `agy` binary once per process
 // and returns the directory holding it.
 func compileFixtureExecutable() (string, error) {
@@ -551,7 +559,7 @@ func compileFixtureExecutable() (string, error) {
 			fixtureErr = err
 			return
 		}
-		build := exec.Command("go", "build", "-o", filepath.Join(dir, "agy"), src)
+		build := exec.Command("go", "build", "-o", filepath.Join(dir, fixtureExecutableName()), src)
 		build.Dir = srcDir
 		if out, err := build.CombinedOutput(); err != nil {
 			fixtureErr = fmt.Errorf("build agy fixture: %v: %s", err, out)
@@ -588,7 +596,7 @@ func NewFixture() (*Fixture, error) {
 	if err != nil {
 		return nil, err
 	}
-	path := filepath.Join(binDir, "agy")
+	path := filepath.Join(binDir, fixtureExecutableName())
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read fixture binary: %w", err)

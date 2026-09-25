@@ -312,7 +312,7 @@ var sealedPtraceHooks ptraceOps = realPtraceOps{}
 // thread locked until it returns.
 func runSealedTracer(cmd *exec.Cmd, img *SealedImage, hooks ptraceOps, detach bool) (ExeIdentity, error) {
 	if err := cmd.Start(); err != nil {
-		return ExeIdentity{}, fmt.Errorf("%w: start sealed trampoline: %v", ErrSealedLaunch, err)
+		return ExeIdentity{}, fmt.Errorf("%w: start sealed trampoline: %w", ErrSealedLaunch, err)
 	}
 	pid := cmd.Process.Pid
 
