@@ -1133,7 +1133,7 @@ func TestServiceAgySession_BindingRefusedButAlreadyBoundClosesMarker(t *testing.
 		t.Fatalf("insert binding: %v", err)
 	}
 	srv := &Server{store: store}
-	err = srv.recordAgyBindingOrphan(ctx, agyWireSession, ep, agyWireNativeID, errors.New("session already bound"))
+	err = srv.recordAgyBindingOrphan(ctx, agyWireRunID, "op-create-bound", agyWireSession, ep, agyWireNativeID, errors.New("session already bound"))
 	if err == nil || !strings.Contains(err.Error(), "already bound to the created conversation "+agyWireNativeID) ||
 		!strings.Contains(err.Error(), "closed bound") || strings.Contains(err.Error(), "orphan of") {
 		t.Fatalf("the bound branch must say the session is bound to the created conversation, got %v", err)

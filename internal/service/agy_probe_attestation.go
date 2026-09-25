@@ -207,7 +207,10 @@ func (s *Server) agyFrozenRun(ctx context.Context, runID string) (agyFrozenRunRe
 // creation marker (Episode). It is distinct from a durable creation
 // uncertainty (adapter.ErrSessionCreationUncertain), which is what the
 // same open marker means after a crash: retrying after the live birth
-// finishes is safe; no child was started for the refused call.
+// finishes is safe; no child was started for the refused call. It also
+// refuses a controller resolution of that live marker episode
+// (ResolveAgySessionCreationUncertainty): the marker belongs to the
+// running birth until it returns.
 type ErrCreationInProgress struct {
 	SessionID string
 	Episode   int64
@@ -420,7 +423,7 @@ func (s *Server) CreateAgySession(ctx context.Context, opID, controllerLease, se
 	// Step 3: bind + close the marker in one transaction.
 	receipt, err := s.store.BindAgySessionClosingEpisode(durable, opID, controllerLease, bindingRecord(binding.NativeSessionID), episode)
 	if err != nil {
-		return adapter.SessionBinding{}, storage.OperationReceipt{}, s.recordAgyBindingOrphan(durable, sessionID, episode, binding.NativeSessionID, err)
+		return adapter.SessionBinding{}, storage.OperationReceipt{}, s.recordAgyBindingOrphan(durable, runID, opID, sessionID, episode, binding.NativeSessionID, err)
 	}
 	return binding, receipt, nil
 }
@@ -432,9 +435,14 @@ func (s *Server) CreateAgySession(ctx context.Context, opID, controllerLease, se
 // orphan of the open marker episode, which stays open until a controller
 // resolves it. A failing binding lookup is retried once; if it still
 // fails the orphan is recorded anyway (conservative) with the lookup
-// error in the episode's outcome. The returned error always wraps the
-// binding refusal.
-func (s *Server) recordAgyBindingOrphan(ctx context.Context, sessionID string, episode int64, nativeID string, bindErr error) error {
+// error in the episode's outcome. If the marker episode can no longer be
+// annotated (it is no longer open), the created id is recorded through
+// storage.RecordAgyCreationUncertain instead, which opens a NEW episode
+// carrying the orphan id, the run and the causing op — the created
+// conversation is never recorded only in an error string, and the next
+// birth stays blocked. The returned error always wraps the binding
+// refusal.
+func (s *Server) recordAgyBindingOrphan(ctx context.Context, runID, causeOpID, sessionID string, episode int64, nativeID string, bindErr error) error {
 	existing, lerr := s.store.GetAgySessionBinding(ctx, sessionID)
 	if lerr != nil {
 		existing, lerr = s.store.GetAgySessionBinding(ctx, sessionID)
@@ -453,8 +461,24 @@ func (s *Server) recordAgyBindingOrphan(ctx context.Context, sessionID string, e
 		outcome += "; binding lookup failed: " + lerr.Error()
 	}
 	if jerr := s.store.SetAgyCreationUncertaintyOrphan(ctx, sessionID, episode, nativeID, outcome); jerr != nil {
-		return fmt.Errorf("persist binding: %w; the created conversation %s could not be recorded as the orphan of marker episode %d (which stays open): %v",
-			bindErr, nativeID, episode, jerr)
+		// The marker is no longer open (or cannot take the annotation):
+		// record the orphan on the session's open episode, or open a NEW
+		// one, so the created id is durable and the next birth is blocked.
+		// With the marker still open this re-attempts the same annotation
+		// and fails the same way (reported below).
+		newEp, _, rerr := s.store.RecordAgyCreationUncertain(ctx, storage.AgyCreationUncertainty{
+			RunID: runID, SessionID: sessionID,
+			Reason: fmt.Sprintf("orphan of a creation whose marker episode %d could not be annotated (%v): %s",
+				episode, jerr, outcome),
+			RecordedBy: agyCreationRecorder, CauseOpID: causeOpID,
+			OrphanNativeID: nativeID,
+		})
+		if rerr != nil {
+			return fmt.Errorf("persist binding: %w; the created conversation %s could not be recorded as the orphan of marker episode %d (%v) nor of a new episode: %v",
+				bindErr, nativeID, episode, jerr, rerr)
+		}
+		return fmt.Errorf("persist binding: %w; marker episode %d could not take the orphan (%v); the created conversation %s is recorded as the orphan of creation-uncertainty episode %d",
+			bindErr, episode, jerr, nativeID, newEp)
 	}
 	return fmt.Errorf("persist binding: %w; the created conversation %s is recorded as the orphan of creation-uncertainty episode %d",
 		bindErr, nativeID, episode)
@@ -500,7 +524,10 @@ type AgyCreationUncertaintyResolution struct {
 // ResolveAgySessionCreationUncertainty records the controller-authorized
 // resolution journal entry FIRST (durable truth, authority re-validated
 // in the transaction) and only then clears the wired agy adapter's
-// in-process tombstone.
+// in-process tombstone. The in-flight marker of a creation THIS process
+// is still running is refused with the typed ErrCreationInProgress
+// (checked and resolved under agyBirthMu): resolving it would orphan the
+// conversation the live creation is about to bind.
 func (s *Server) ResolveAgySessionCreationUncertainty(ctx context.Context, req AgyCreationUncertaintyResolution) (storage.OperationReceipt, error) {
 	if s.store == nil {
 		return storage.OperationReceipt{}, errors.New("storage store is required")
@@ -511,8 +538,14 @@ func (s *Server) ResolveAgySessionCreationUncertainty(ctx context.Context, req A
 	if strings.TrimSpace(req.ControllerLease) == "" {
 		return storage.OperationReceipt{}, errors.New("creation-uncertainty resolution requires the controller lease")
 	}
+	s.agyBirthMu.Lock()
+	if ep, live := s.agyInFlight[req.SessionID]; live && ep == req.Episode {
+		s.agyBirthMu.Unlock()
+		return storage.OperationReceipt{}, &ErrCreationInProgress{SessionID: req.SessionID, Episode: ep}
+	}
 	receipt, err := s.store.ResolveAgyCreationUncertainty(ctx, req.OpID, req.ControllerLease, req.ExpectedGeneration,
 		req.SessionID, req.Episode, req.Disposition, req.Reason)
+	s.agyBirthMu.Unlock()
 	if err != nil {
 		return storage.OperationReceipt{}, fmt.Errorf("resolve creation uncertainty: %w", err)
 	}
