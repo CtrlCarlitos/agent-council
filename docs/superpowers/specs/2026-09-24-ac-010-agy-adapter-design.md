@@ -943,17 +943,24 @@ none is claimed by the design.
 16. Attestation recording authority (§3.2) is the operator credential,
     matching the codex precedent; the tuple written to the row comes
     from the run's frozen profile and coverage, never from the request.
-17. Turn-attempt disposition surface (§3.10, §6.1 rows 2–3) — an
-    acceptance-pass GAP, like 7. An Uncertain turn attempt blocks the
-    native conversation durably (across restarts) exactly as specified,
-    but no controller operation that records its disposition is
-    shipped: the service has no endpoint or method that writes
-    `agy_turn_attempts.uncertainty_disposition`, and the service turn
-    stays non-terminal. The Task 8 acceptance test for row 3 writes the
-    disposition directly to show the specified post-disposition behavior
-    (a new process on the same conversation after `init` equality) and
-    says so; the operator surface is follow-up work (AC-008/AC-009 share
-    the same gap).
+17. Turn-attempt disposition surface (§3.10, §6.1 rows 2–3), completed
+    following the operator's P1 review request. The connected controller
+    may POST `abandoned` with a retirement reason to
+    `/v1/runs/{run_id}/sessions/{session_id}/turns/{turn_key}/agy-disposition`.
+    The request includes `op_id`, `controller_lease`, `expected_generation`,
+    `expected_version` and the exact `attempt_id`. Current authority and
+    generation are checked before replay; new decisions also require the
+    current connection, session version and unresolved execution identity.
+    Locally live launches are refused, including the pre-init interval.
+    After host loss the controller is responsible for confirming retirement
+    of the old execution before abandonment. One transaction records the
+    disposition, interrupts the Council turn, resolves its dispatch intent,
+    parks the session, closes its recovery episode and journals the reason,
+    attempt and controller generation. Native status remains Uncertain;
+    no native terminal result or successful cancellation is invented.
+    Replacement work needs a new queue/release. The acceptance test uses
+    HTTP for disposition and the next release, both before and after restart.
+    AC-008/AC-009 disposition surfaces remain outside this change.
 18. Attestation bootstrap (§3.2, §4). Production construction requires
     a covering attestation row, and the first row must be recordable
     before the adapter exists. `RecordAgyProbeAttestation` therefore
@@ -966,12 +973,14 @@ none is claimed by the design.
     reconcile and queue-time validation refuse with the typed
     ineligibility error; other operations report the harness as
     unavailable). After the row is recorded, a restart constructs the adapter.
-    No child runs before eligibility in either state. This closes the
-    bootstrap for in-process callers only: `RecordAgyProbeAttestation`
-    has no HTTP or CLI surface (the same holds for the codex and claude
-    operations), so an operator running the shipped binary cannot yet
-    enable production Agy on their own. The operator surface is
-    follow-up work filed together with item 17.
+    No child runs before eligibility in either state. Following the
+    operator's P1 review request, POST `/v1/runs/{run_id}/agy/attestations`
+    exposes `RecordAgyProbeAttestation` using the operator bearer credential.
+    Its JSON envelope contains `op_id`, `actor`, optional `attestation_id`
+    and the typed `attestation`; the run and tuple cannot be overridden in
+    the body. The restricted controller bridge exposes no attestation or
+    arbitrary-route operation. The existing coverage validation and
+    journaled receipt replay apply; there is still no hot reload.
 19. Evidence helpers (§4 Stage A). The sealed-vs-path comparison and the
     freeze-time canonical digests use two `-tags evidence` Go test
     helpers instead of a new binary: `TestSealedProbe`

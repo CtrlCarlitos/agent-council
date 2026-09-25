@@ -23,8 +23,8 @@ column is **open**.
 | # | Scenario (§6.1; §14 deltas applied) | Committed tests (acceptance → supporting) | Unverified live |
 |---|---|---|---|
 | 1 | Concurrent duplicate dispatch: one process, shared verdict | `service/acceptance_agy_test.go:TestAcceptance_Agy_S01_ConcurrentDuplicateDispatch` (4 concurrent releases over HTTP → 1 accepted, 1 turn process, 1 stdin line, identical collected verdicts); `adapter/agy/dispatch_test.go:TestAgyDispatch_SingleFlightPerConversation`; `adapter/agy/adapter_test.go:TestAgyAdapter_CreateSessionConcurrentDuplicatesShareOneReservation`; `storage/agy_state_test.go:TestAgyState_LaunchCountCheckRejectsTwo` | — |
-| 2 | Crash after the stdin write, result lost: Uncertain; block persists across restart; disposition required | `service/acceptance_agy_test.go:TestAcceptance_Agy_S02_CrashAfterStdinWriteResultLost` (prompt written, no result: Uncertain; the service records no terminal; after a restart with a fresh adapter, Reconcile is Uncertain, `HasAgyUnresolvedAttempts` holds, the next release is refused, and no new process starts); `adapter/agy/reconcile_test.go:TestAgyCrashGap_FirstByteBeforeUserInput`, `TestAgyCrashGap_AcceptedBeforeTerminal`, `TestAgyReconcile_Matrix`; `storage/agy_state_test.go:TestAgyState_CrashAfterFirstByteBeforeUserInput` | A real service-process crash (simulated by cancelling workers and closing the service). **Gap §14.17:** no controller-disposition operation is shipped. |
-| 3 | Process death mid-turn: Uncertain, BLOCKS; only after a disposition does the next turn start as a new process on the same conversation after `init` equality | `service/acceptance_agy_test.go:TestAcceptance_Agy_S03_ProcessDeathBlocksUntilDisposition` (accepted, then exit without result: Uncertain; the next dispatch is rejected "unresolved attempt" with no process; after the disposition, the next turn is launch #3 with `--conversation <id>` and the prompt is written after `init`); `adapter/agy/dispatch_test.go:TestAgyDispatch_ExitWithoutResultUncertain` | **Gap §14.17:** the test writes the disposition to the row directly, because no operator surface exists. |
+| 2 | Crash after the stdin write, result lost: Uncertain; block persists across restart; disposition required | `service/acceptance_agy_test.go:TestAcceptance_Agy_S02_CrashAfterStdinWriteResultLost` (prompt written, no result: Uncertain; the service records no terminal; after a restart with a fresh adapter, Reconcile is Uncertain, `HasAgyUnresolvedAttempts` holds, the next release is refused, and no new process starts); `adapter/agy/reconcile_test.go:TestAgyCrashGap_FirstByteBeforeUserInput`, `TestAgyCrashGap_AcceptedBeforeTerminal`, `TestAgyReconcile_Matrix`; `storage/agy_state_test.go:TestAgyState_CrashAfterFirstByteBeforeUserInput` | A real service-process crash (simulated by cancelling workers and closing the service). |
+| 3 | Process death mid-turn: Uncertain, BLOCKS; only after a disposition does the next turn start as a new process on the same conversation after `init` equality | `service/acceptance_agy_test.go:TestAcceptance_Agy_S03_ProcessDeathBlocksUntilDisposition` (before and after restart: HTTP release blocked, HTTP disposition and replay, next HTTP release uses the same conversation); `storage/agy_disposition_test.go:TestAgyDisposition_AtomicReplayAndAuthority`; `service/agy_commands_test.go:TestAgyDispositionHTTP_RejectsLiveStaleAndDisconnected` | Real process-loss recovery and controller retirement assessment remain unverified. |
 | 4 | Controller disconnect: the turn continues; the observer re-attaches | `service/acceptance_agy_test.go:TestAcceptance_Agy_S04_ControllerDisconnectObserverReattaches` (SSE observer and controller both disconnect while the gated child runs; the child is alive per the `/proc` cwd scan and launch state `started`; the turn completes; a re-attached SSE observer gets the durable terminal); `…:TestAcceptance_Agy_Lifecycle` step 5; `adapter/agy/dispatch_test.go:TestAgyDispatch_ObserverDetachDoesNotCancelTurn`; `service/agy_creation_transitions_test.go:TestServiceAgySession_CancelledRequestStillRecordsTheCreatedConversation` (§14.14) | — |
 | 5 | Exact identity: absent/malformed id ⇒ `ErrConversationDrift`, prompt never written, orphan recorded; non-UUID never transmitted | `service/acceptance_agy_test.go:TestAcceptance_Agy_S05_ExactIdentity` (the 1.2.9 silent fallback to a new UUID, and a malformed id: the turn fails "agy conversation drift"; 0 stdin lines; orphan id durable; attempt `missing`; only the bound UUID is ever passed as `--conversation`; a non-UUID binding is refused by the schema CHECK); `adapter/agy/dispatch_test.go:TestAgyDispatch_FallbackIDDriftNeverWritesPrompt`; `adapter/agy/durability_test.go:TestAgyDispatch_OrphanConversationDurableAcrossRestart`; creation side: `…:TestAcceptance_Agy_Lifecycle` step 10, `service/review_ac010_wiring_test.go:TestServiceAgySession_UncertainCreationEpisodeAndResolution`, `adapter/agy/adapter_test.go:TestAgyAdapter_CreateSessionNonUUIDConversationUncertain` | Stage B b2 (live resume, init id equality) |
 | 6 | Permission-requiring tool auto-denied natively; `tool_denied`; `verification_incomplete`; exit 0 does not verify | `service/acceptance_agy_test.go:TestAcceptance_Agy_S06_PermissionToolAutoDeniedIncomplete` (a live SSE `tool_denied` progress event; terminal `completed`; every required tool ran, yet verification is incomplete; launch `exit_code` = 0; raw evidence has `verification_incomplete:true`); `…:TestAcceptance_Agy_Lifecycle` step 6; `adapter/agy/dispatch_test.go:TestAgyDispatch_DeniedToolEmitsToolDeniedAndIncomplete`, `TestAgyDispatch_DenialClassesRecorded`, `TestAgyDispatch_RequiredToolSkippedIncomplete` | Stage B b3 (live `denied_actions` under `request-review`, re-observed on the frozen build) |
@@ -57,7 +57,7 @@ column is **open**.
 | Auth gate provider-free; `none` rows fixture-only | `adapter/agy/authgate.go`, capability checker | not signed in ⇒ `ErrAgyAuthRequired`; network failure ⇒ inconclusive; production `none` refused | `adapter/agy/authgate_test.go` (all); `adapter/agy/adapter_test.go:TestAgyAdapter_LaunchMatrix`; `…:TestAcceptance_Agy_Lifecycle` (the `models` gate runs before the first turn child and not at creation) | Stage A A.5: the real `models` layout (§14.12). The gate fails closed on any layout other than one id per row. |
 | Coverage derived from `expected_tools` ∩ map; uncovered ⇒ rejected | `adapter/agy/coverage.go`, `ValidateAgyHarness` | subagent/browser tools ⇒ freeze refused; an attestation missing a mapped tool ⇒ refused at record and lookup | `adapter/agy/coverage_test.go` (all); `adapter/agy/eligibility_test.go:TestAttestationLookup_UncoveredRowIneligible`; `service/review_ac010_wiring_test.go:TestServiceAttestation_AgyAuthorityIdempotencyCoverage` ("missing mapped tool", "extra record"); `…:TestAcceptance_Agy_ProductionConstructionUnlockedByServiceRecordedAttestation` | Stage C probe outcomes. |
 | Toolkit configured state re-derived at every launch | `adapter/agy/toolkit.go` | plugin/skills/hooks drift; disabled marker; canonical-bytes mismatch | `adapter/agy/toolkit_test.go` (all); `adapter/agy/wiring_test.go:TestNewProductionAgyAdapter_ToolkitDriftAtConstruction` | Stage A A.6/A.8 (the live captures). Hook execution is not claimed (§7). |
-| Bounded cancellation; Uncertain until disposition; no fallback harness | `Cancel`, `Reconcile`, episodes | SIGINT ⇒ interrupted ⇒ confirmed; grace ⇒ Uncertain; blocked across restart until resolution | `adapter/agy/cancel_test.go` (all); `…:TestAcceptance_Agy_S02_…`, `…_S03_…`, `…_Lifecycle` (creation episode → restart → blocked → resolved → birth); `service/agy_creation_transitions_test.go:TestServiceAgySession_CrashBetweenCreateAndBindIsBlockedByTheMarker` (§14.13); `service/agy_live_marker_test.go:TestServiceAgySession_ResolveLiveCreationMarkerRefusedTyped` (a live creation's marker cannot be resolved: typed `ErrCreationInProgress`), `TestServiceAgySession_OrphanFallbackOpensNewEpisodeWhenMarkerGone` (a created id whose marker is gone opens a NEW episode; the next birth is blocked); `storage/agy_uncertainty_test.go` (all); `storage/agy_inflight_test.go` (all) | Stage B b4. **Gap §14.17:** no turn-attempt disposition surface. |
+| Bounded cancellation; Uncertain until disposition; no fallback harness | `Cancel`, `Reconcile`, episodes | SIGINT ⇒ interrupted ⇒ confirmed; grace ⇒ Uncertain; blocked across restart until resolution | `adapter/agy/cancel_test.go` (all); `…:TestAcceptance_Agy_S02_…`, `…_S03_…`, `…_Lifecycle` (creation episode → restart → blocked → resolved → birth); `service/agy_creation_transitions_test.go:TestServiceAgySession_CrashBetweenCreateAndBindIsBlockedByTheMarker` (§14.13); `service/agy_live_marker_test.go:TestServiceAgySession_ResolveLiveCreationMarkerRefusedTyped` (a live creation's marker cannot be resolved: typed `ErrCreationInProgress`), `TestServiceAgySession_OrphanFallbackOpensNewEpisodeWhenMarkerGone` (a created id whose marker is gone opens a NEW episode; the next birth is blocked); `storage/agy_uncertainty_test.go` (all); `storage/agy_inflight_test.go` (all) | Stage B b4. |
 
 ## Production path through the attestation bootstrap (spec §14.18)
 
@@ -91,35 +91,22 @@ the awaiting server; the restart constructing the production adapter;
 and a non-attestation construction error (a wrong `AgyHomeDir`) still
 failing the server.
 
-Limit: `RecordAgyProbeAttestation` is a Go method on the running
-`Server`; like the codex and claude attestation operations it has no HTTP
-route or CLI command in this branch. The sequence above is therefore
-proven for **in-process callers only**: an operator running the shipped
-binary cannot record the first row, so this PR cannot enable production
-agy on its own. Operator enablement needs a follow-up surface, filed
-alongside §14.17.
+`TestServiceBootstrap_AgyAwaitingAttestationRecordRestart` now records the
+first row over `POST /v1/runs/{run_id}/agy/attestations`, then restarts into
+the production adapter using the fixture executable.
+`TestAgyAttestationHTTP_AuthorityValidationAndReplay` covers missing/wrong
+operator credentials (including a controller lease), invalid evidence,
+receipt replay and conflicting evidence. See
+[operator operations](ac010-operator-operations.md) for the transport contract.
+This remains fixture evidence, not proof of live provider mediation.
 
 ## Unresolved gaps (recorded in spec §14; not closed by this PR)
 
 - **§14.7:** the §3.8 conversation-file diagnostics are not implemented.
-- **§14.17:** no controller operation records a disposition for an
-  Uncertain turn attempt. The block is durable and specified, but it can
-  only be cleared by editing storage by hand. AC-008 and AC-009 have the
-  same gap.
-
-- **§14.18 operator surface:** the attestation bootstrap is closed for
-  **in-process callers only**. A server configured with `AgyBinaryPath`
-  but without a covering row starts in the typed `awaiting_attestation`
-  state (status surface + log; no agy child). Birth, release (dispatch),
-  reconcile and queue-time `required_tools` validation refuse typed with
-  `ErrNotEligible`; the other operations are not agy-gated and, with no
-  adapter wired, act on durable state only or report the harness
-  unavailable. The first row can be recorded on that server through
-  `RecordAgyProbeAttestation` (no wired adapter needed) and a restart
-  constructs the adapter — but only from Go code in the service process:
-  there is no HTTP route or CLI command, so operator enablement needs a
-  follow-up surface (filed alongside §14.17), and this PR cannot enable
-  production agy on its own. See "Production path" above.
+- The P1 review fixes close Agy's §14.17–18 transport gaps. The corresponding
+  AC-008/AC-009 surfaces remain outside this change. For a lost host, safe
+  administrative abandonment depends on the controller confirming retirement
+  of the prior execution; it is not a native cancellation attestation.
 
 ## What only the operator's stages can establish (all open)
 
@@ -145,9 +132,7 @@ alongside §14.17.
 - structured denial of every `sibling_read_path` tool and every
   `own_mutation_path` tool in the frozen inventory;
 - the first cprot-v2 attestation, recorded through
-  `RecordAgyProbeAttestation` on the awaiting server, then a restart —
-  which needs the follow-up operator surface (§14.18 is closed for
-  in-process callers only).
+  the operator HTTP route on the awaiting server, then a restart.
 - Write/append self-mutation is judged on the structured `denied_actions`
   marker alone, because the CLI rewrites its own conversation file on
   every turn.

@@ -211,7 +211,7 @@ func TestServiceAgySession_CleanRejectionClosesTheMarker(t *testing.T) {
 }
 
 // Important 3 at the service seam: a turn without a durable dispatch
-// intent is refused DispatchRejected (typed) before any reservation —
+// intent is refused DispatchRejected before any reservation —
 // no attempt row, no child — never dispatched against the defaults.
 func TestServiceAgyDispatch_MissingIntentRefusedBeforeReservation(t *testing.T) {
 	e := newAgyWireEnv(t, nil)
@@ -224,10 +224,15 @@ func TestServiceAgyDispatch_MissingIntentRefusedBeforeReservation(t *testing.T) 
 		t.Fatalf("create: %v", err)
 	}
 	before := w.creationLaunches()
-	out, err := w.adp.Dispatch(ctx, adapter.TurnRef{SessionID: agyWireSession, TurnKey: "t-no-intent"}, "review")
-	var typed *agy.ErrRequiredToolsUnavailable
-	if !errors.As(err, &typed) || out.Status != adapter.DispatchRejected {
-		t.Fatalf("a missing intent is a typed pre-transmission rejection, got %+v err=%v", out, err)
+	ref := adapter.TurnRef{SessionID: agyWireSession, TurnKey: "t-no-intent"}
+	// Both production seams refuse missing intent. With real attempt
+	// identities the adapter now rejects at identity lookup first.
+	if _, _, err := (&agyRequiredToolsSource{store: store}).RequiredToolsFor(ctx, ref); err == nil {
+		t.Fatal("required-tools lookup must refuse a missing intent")
+	}
+	out, err := w.adp.Dispatch(ctx, ref, "review")
+	if err == nil || !strings.Contains(out.Reason, "no attempt identity") || out.Status != adapter.DispatchRejected {
+		t.Fatalf("a missing intent is a pre-transmission rejection, got %+v err=%v", out, err)
 	}
 	if n := w.creationLaunches(); n != before {
 		t.Fatalf("no child, launches %d -> %d", before, n)

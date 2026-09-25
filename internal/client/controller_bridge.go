@@ -116,6 +116,18 @@ func (b *ControllerBridge) CancelTurn(ctx context.Context, opID, sessionID, turn
 	return &resp, nil
 }
 
+// ResolveAgyTurnUncertainty administratively abandons an uncertain Agy
+// attempt. The controller must have retired the old execution; this does
+// not attest a native result or release replacement work.
+func (b *ControllerBridge) ResolveAgyTurnUncertainty(ctx context.Context, opID, sessionID, turnKey, attemptID, reason string, expectedGeneration uint64, expectedVersion int64) (*service.AgyOperationResponse, error) {
+	req := service.AgyTurnDispositionRequest{OpID: opID, ControllerLease: b.lease, ExpectedGeneration: expectedGeneration, ExpectedVersion: expectedVersion, AttemptID: attemptID, Disposition: "abandoned", Reason: reason}
+	var resp service.AgyOperationResponse
+	if err := b.c.do(ctx, "POST", fmt.Sprintf("/v1/runs/%s/sessions/%s/turns/%s/agy-disposition", b.runID, sessionID, turnKey), req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // RecordDecision records a controller decision for the bridge's run.
 func (b *ControllerBridge) RecordDecision(ctx context.Context, opID, artifactID string, revision int64, decisionPayload string) (*service.RecordDecisionResponse, error) {
 	req := service.RecordDecisionRequest{

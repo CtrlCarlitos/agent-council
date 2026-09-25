@@ -782,9 +782,8 @@ func TestAcceptance_Agy_S01_ConcurrentDuplicateDispatch(t *testing.T) {
 // is lost to Council); the service then dies and restarts. No
 // fabricated terminal exists before or after the restart, the restarted
 // adapter reconciles Uncertain, the conversation stays durably blocked,
-// and the next turn cannot be released or transmitted. The disposition
-// operation itself is NOT a shipped service surface (see the evidence
-// matrix "unresolved gaps"); S03 exercises what happens after one.
+// and the next turn cannot be released or transmitted. S03 exercises the
+// controller disposition and the next release through the HTTP bridge.
 // Crash-gap durability per boundary: TestAgyCrashGap_* (reconcile_test.go).
 func TestAcceptance_Agy_S02_CrashAfterStdinWriteResultLost(t *testing.T) {
 	acc := newAgyAcceptance(t, nil, nil)
@@ -835,29 +834,22 @@ func TestAcceptance_Agy_S02_CrashAfterStdinWriteResultLost(t *testing.T) {
 	}
 }
 
-// agyDefaultsRequired is the RequiredToolsSource for turns dispatched
-// directly on the adapter (no service dispatch intent): the frozen
-// defaults apply.
-type agyDefaultsRequired struct{}
-
-func (agyDefaultsRequired) RequiredToolsFor(context.Context, adapter.TurnRef) ([]string, bool, error) {
-	return nil, false, nil
-}
-
 // §6.1 row 3 — Process death mid-turn: the lost attempt is Uncertain and
 // BLOCKS the conversation; only after a controller disposition does the
 // next turn start, as a NEW process on the SAME conversation after init
-// equality. The turn is accepted (user_input DONE) and the child dies
-// without a result. Because no controller-disposition operation for
-// turn attempts is shipped (gap recorded in the evidence matrix), the
-// disposition is written to the attempt row directly — ONE of two places
-// in this file that edit storage by hand (the other is
-// TestAcceptance_Agy_S11_…'s attestation-row purge), each a labelled
-// stand-in for a missing operator surface: here, the missing turn-
-// attempt disposition endpoint. The next turn is dispatched on the
-// adapter over the service's store.
+// equality. Both the disposition and the next release use the HTTP bridge.
+// The native evidence stays uncertain; the controller interrupts the
+// Council turn administratively without claiming a native result.
 func TestAcceptance_Agy_S03_ProcessDeathBlocksUntilDisposition(t *testing.T) {
-	acc := newAgyAcceptance(t, nil, agyDefaultsRequired{})
+	for _, restart := range []bool{false, true} {
+		t.Run(fmt.Sprintf("restart=%v", restart), func(t *testing.T) {
+			testAgyDispositionLifecycle(t, restart)
+		})
+	}
+}
+
+func testAgyDispositionLifecycle(t *testing.T, restart bool) {
+	acc := newAgyAcceptance(t, nil, nil)
 	acc.create()
 	ctx := context.Background()
 	acc.w.stage(t, agyKnown(agyWireNativeID), agyUserInputDone, `{"exit_without_result": true}`)
@@ -867,23 +859,40 @@ func TestAcceptance_Agy_S03_ProcessDeathBlocksUntilDisposition(t *testing.T) {
 		t.Fatalf("accepted then process death ⇒ Uncertain, got %+v", att)
 	}
 	acc.requireUncertainReason("t-dead", "process exited without a result")
-	next := adapter.TurnRef{SessionID: agyWireSession, TurnKey: "t-next"}
-	out, _ := acc.w.adp.Dispatch(ctx, next, "next prompt")
-	if out.Status != adapter.DispatchRejected || !strings.Contains(out.Reason, "unresolved attempt") {
-		t.Fatalf("the Uncertain attempt blocks the conversation, got %+v", out)
+	if restart {
+		acc.restart()
+	}
+	version := acc.queue(agyWireSession, "t-next", "next prompt", nil)
+	if code := acc.release(agyWireSession, "t-next", version); code != http.StatusBadRequest {
+		t.Fatalf("the uncertain Council turn blocks release: %d", code)
 	}
 	if args := acc.streamArgs(); len(args) != 2 {
 		t.Fatalf("no process while blocked, launches=%d", len(args))
 	}
 
-	// Controller disposition (missing surface — see the doc comment).
-	if _, err := acc.store.DB().Exec(`UPDATE agy_turn_attempts SET uncertainty_disposition = 'abandoned' WHERE attempt_id = ?`, att.AttemptID); err != nil {
-		t.Fatalf("disposition: %v", err)
+	path := "/v1/runs/" + agyWireRunID + "/sessions/" + agyWireSession + "/turns/t-dead/agy-disposition"
+	body := fmt.Sprintf(`{"op_id":"op-dispose-dead","controller_lease":%q,"expected_generation":1,"expected_version":%d,"attempt_id":%q,"disposition":"abandoned","reason":"process is gone; abandon unknown outcome"}`, agyWireLease, version, att.AttemptID)
+	code, response := acc.bridge.do("POST", path, body)
+	if code != http.StatusOK {
+		t.Fatalf("controller disposition through bridge: %d %v", code, response)
+	}
+	if code, replay := acc.bridge.do("POST", path, body); code != http.StatusOK || fmt.Sprint(replay) != fmt.Sprint(response) {
+		t.Fatalf("disposition replay: %d %v, original %v", code, replay, response)
+	}
+	details, err := acc.store.GetTurnDetails(ctx, agyWireSession, "t-dead")
+	if err != nil || details.Status != council.TurnInterrupted || details.DispatchIntent.Phase != "resolved" {
+		t.Fatalf("Council turn must be resolved: %+v err=%v", details, err)
+	}
+	att, err = acc.store.GetLatestAgyTurnAttempt(ctx, agyWireSession, "t-dead")
+	if err != nil || att.Terminal || att.ObservedStatus != "uncertain" || att.UncertaintyDisposition == nil || *att.UncertaintyDisposition != "abandoned" {
+		t.Fatalf("disposition must preserve native uncertainty: %+v err=%v", att, err)
 	}
 	acc.w.stage(t, agyKnown(agyWireNativeID), agyUserInputDone, agySuccess("after disposition"))
-	if out, err := acc.w.adp.Dispatch(ctx, next, "next prompt"); err != nil || out.Status != adapter.DispatchAccepted {
-		t.Fatalf("after the disposition the next turn starts, got %+v err=%v", out, err)
+	version, _ = acc.store.GetSessionVersion(ctx, agyWireSession)
+	if code := acc.release(agyWireSession, "t-next", version); code != http.StatusAccepted {
+		t.Fatalf("next release through bridge: %d", code)
 	}
+	acc.waitTurn("t-next", isTerminalStatus)
 	a := acc.waitAttemptDead("t-next")
 	if !a.Terminal || a.ObservedStatus != "completed" {
 		t.Fatalf("the next turn completes, got %+v", a)
@@ -894,6 +903,13 @@ func TestAcceptance_Agy_S03_ProcessDeathBlocksUntilDisposition(t *testing.T) {
 	}
 	if in := acc.inputs(); len(in) != 2 || !strings.Contains(in[1], "next prompt") {
 		t.Fatalf("the next prompt was written only after init equality, got %q", in)
+	}
+	deadline := time.Now().Add(agyAccDeadline)
+	for acc.w.srv.Coordinator().LiveWorkerKeys()[agyWireSession+":t-dead"] {
+		if time.Now().After(deadline) {
+			t.Fatal("resolved uncertainty left its supervisor polling")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -1174,9 +1190,8 @@ func TestAcceptance_Agy_S10_BinaryDriftStartsNoProcess(t *testing.T) {
 // child);
 // (b) a row that disappears after construction (an operator purge)
 // fails the NEXT launch before any child, through the bridge. The purge
-// below (DELETE FROM agy_protection_attestations) is the OTHER of the
-// two hand storage edits in this file (see TestAcceptance_Agy_S03_…'s
-// comment) — a labelled stand-in for a real operator purge action.
+// below (DELETE FROM agy_protection_attestations) is a hand-edited fixture
+// for missing evidence, not a claimed shipped revocation endpoint.
 func TestAcceptance_Agy_S11_UnattestedDispatchRefusedBeforeAnyChild(t *testing.T) {
 	acc, err := newAgyProductionAcceptance(t, false)
 	var ne *agy.ErrNotEligible

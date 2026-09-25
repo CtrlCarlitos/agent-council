@@ -307,7 +307,7 @@ func (e *agyWireEnv) fixtureServerWith(t *testing.T, store *storage.Store, exec 
 		required = &agyRequiredToolsSource{store: store}
 	}
 	src := agy.NewAgyTurnLaunchSource(store, wm, e.policy, e.fx.SealedImage)
-	identity := agyWireIdentity{}
+	identity := agyWireIdentity{store: store}
 	adp, err := agy.NewFixtureScopedAdapter(store, exec, src, wm, e.policy, e.digest, e.fx.SealedImage,
 		identity, required, agy.FixtureMode{})
 	if err != nil {
@@ -330,10 +330,14 @@ func (e *agyWireEnv) fixtureServerWith(t *testing.T, store *storage.Store, exec 
 	return &agyWireServer{srv: srv, adp: adp, wm: wm, root: paths.Root}
 }
 
-type agyWireIdentity struct{}
+type agyWireIdentity struct{ store *storage.Store }
 
-func (agyWireIdentity) AttemptFor(_ context.Context, ref adapter.TurnRef) (string, bool) {
-	return "att-" + ref.TurnKey, true
+func (s agyWireIdentity) AttemptFor(ctx context.Context, ref adapter.TurnRef) (string, bool) {
+	details, err := s.store.GetTurnDetails(ctx, string(ref.SessionID), ref.TurnKey)
+	if err != nil || details == nil || details.DispatchIntent == nil {
+		return "", false
+	}
+	return details.DispatchIntent.AttemptID, details.DispatchIntent.AttemptID != ""
 }
 
 // stage writes the fixture scenario into the allocation (the child's
@@ -936,7 +940,7 @@ func (e *agyWireEnv) fixtureServerSharing(t *testing.T, store *storage.Store, pr
 	exec := &agyWireExecutor{inner: execpolicy.New()}
 	src := agy.NewAgyTurnLaunchSource(store, prev.wm, e.policy, e.fx.SealedImage)
 	adp, err := agy.NewFixtureScopedAdapter(store, exec, src, prev.wm, e.policy, e.digest, e.fx.SealedImage,
-		agyWireIdentity{}, &agyRequiredToolsSource{store: store}, agy.FixtureMode{})
+		agyWireIdentity{store: store}, &agyRequiredToolsSource{store: store}, agy.FixtureMode{})
 	if err != nil {
 		t.Fatalf("fixture-scoped adapter: %v", err)
 	}

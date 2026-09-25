@@ -31,8 +31,12 @@ issue #10. It follows the approved design,
      refuse typed (`ErrNotEligible`), and the other operations, which
      are not agy-gated, act on durable state only or report
      `harness_unavailable`; a restart after recording constructs the
-     adapter. Recording is in-process only (see "Unresolved gaps");
+     adapter. The operator records the first row through
+     `POST /v1/runs/{run_id}/agy/attestations`;
    - `ResolveAgySessionCreationUncertainty`;
+   - controller-authorized turn abandonment through the bridge: generation
+     and version fenced, idempotent and atomic with Council turn/session
+     resolution, preserving native uncertainty;
    - queue-time `required_tools` validation.
 8. The acceptance story, the operator evidence script, and the evidence
    matrix.
@@ -66,8 +70,8 @@ table to committed tests, and has an explicit "unverified live" column.
   - the prompt goes only on stdin, and only after `init` equality;
   - production launches need a covering cprot-v2 attestation; until one
     is recorded the service runs in `awaiting_attestation` with no agy
-    adapter and no agy child (§14.18). With this PR alone no operator
-    path records one (in-process only; see "Unresolved gaps").
+    adapter and no agy child (§14.18). The operator-authenticated HTTP
+    route validates coverage and journals the first row; restart is required.
 - **Native self-update** (research §0 hazard 1). A changed binary fails
   closed at the sealed-image digest check (`TestAcceptance_Agy_S10_…`). An
   update mid-run makes every attestation stale by construction.
@@ -76,19 +80,14 @@ table to committed tests, and has an explicit "unverified live" column.
   and the orphan id is recorded (`TestAcceptance_Agy_S05_…`).
 - **Unresolved gaps** (spec §14, also in the matrix):
   - §14.7: the §3.8 diagnostics are not implemented.
-  - §14.17: no controller operation records a disposition for an
-    Uncertain turn attempt. The durable block holds; clearing it needs
-    follow-up work. AC-008 and AC-009 have the same gap.
-  - §14.18 (attestation bootstrap) is closed **for in-process callers
-    only**: the first row can be recorded through
-    `RecordAgyProbeAttestation` on a server in the `awaiting_attestation`
-    state, and a restart constructs the adapter (no hot reload); the
-    production-path acceptance test goes through exactly that sequence.
-    Like the codex and claude operations, the recording is a Go method
-    on the running `Server`, with no HTTP route or CLI command, so an
-    operator running the shipped binary cannot record the first row.
-    Operator enablement needs a follow-up surface, filed alongside
-    §14.17. **This PR cannot enable production agy on its own.**
+- **P1 review fixes (§14.17–18):** disposition and attestation bootstrap
+  now have HTTP surfaces. Tests cover next release before/after restart,
+  atomic rollback, receipt replay, stale generation/version/attempt,
+  active-execution refusal and negative authority. Abandonment interrupts
+  the Council turn without claiming a native result. For a lost host the
+  controller must confirm the old execution has retired before abandoning.
+  The operator route is excluded from the restricted controller bridge.
+  AC-008/AC-009 disposition and attestation surfaces are unchanged.
 - **Descendants.** For sealed launches the child leads its own process
   group. Terminate's graceful path sends SIGTERM to the whole group as
   well as the leader, and its forced path SIGKILLs the group. Whenever
@@ -128,6 +127,28 @@ table to committed tests, and has an explicit "unverified live" column.
     operator's `~/.gemini`.
 
 ## Tests (what actually ran)
+
+P1 review follow-up verification on the current worktree:
+
+- `CGO_ENABLED=0 go test ./... -count=1`: all 16 tested packages pass.
+- `go vet ./...`, `go build ./...`, Windows/Darwin `go vet ./internal/...`,
+  formatting and `git diff --check`: pass.
+- `go test -race ./... -count=1`: service, storage, client, Agy and every
+  other tested package passed except one intermittent Codex assertion in
+  `TestConn_OversizedFramePoisonsConnection` (caller wakes before `Done`
+  closes). The unchanged test subsequently passed `-race -count=10`, and
+  the complete Codex package passed a separate `-race -count=1` run.
+  The initial full race invocation therefore exited nonzero; Codex code
+  and assertions were not changed.
+- Seed validation and all 16 Python tests, `bash -n`, `shellcheck -x`, and
+  the evidence script's `--dry-run all`: pass. Dry-run used nonexistent
+  provider/home paths and created no evidence directory. No live stage ran.
+- New regressions cover disposition rollback, concurrent and restart
+  replay, controller generation/connection/version/attempt fences, pre-init
+  live-execution refusal, bridge next release on the same conversation,
+  operator HTTP bootstrap/restart, and negative attestation authority.
+
+Earlier implementation-wave verification (historical):
 
 All runs were on the implementation host (Linux, WSL2 kernel 6.18),
 fixture only:

@@ -79,7 +79,7 @@ func TestServiceBootstrap_AgyAwaitingAttestationRecordRestart(t *testing.T) {
 	}
 	st := srv.AgyStatus()
 	if st.State != AgyAwaitingAttestation || !strings.Contains(st.Reason, "attestation") || !strings.Contains(st.Reason, "restart") ||
-		!strings.Contains(st.Reason, "no HTTP/CLI route") || !strings.Contains(st.Reason, "follow-up operator surface") {
+		!strings.Contains(st.Reason, "/agy/attestations") {
 		t.Fatalf("want the awaiting_attestation state naming the restart, got %+v", st)
 	}
 	if srv.adapter != nil {
@@ -158,12 +158,18 @@ func TestServiceBootstrap_AgyAwaitingAttestationRecordRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("digest: %v", err)
 	}
-	receipt, err := srv.RecordAgyProbeAttestation(ctx, AgyProbeAttestationRequest{
-		OpID: "op-att-boot", OperatorToken: e.cfg.AuthToken, Actor: "operator-boot",
-		RunID: agyWireRunID, AttestationID: id, Attestation: att,
-	})
-	if err != nil || receipt.Payload != id {
-		t.Fatalf("recording on the awaiting server: %+v err=%v", receipt, err)
+	body, err := json.Marshal(map[string]any{"op_id": "op-att-boot", "actor": "operator-boot", "attestation_id": id, "attestation": att})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/v1/runs/" + agyWireRunID + "/agy/attestations"
+	code, recorded := agyServeJSON(t, srv, "POST", path, string(body))
+	receipt, _ := recorded["receipt"].(map[string]any)
+	if code != http.StatusOK || receipt["payload"] != id {
+		t.Fatalf("recording over HTTP on the awaiting server: %d %v", code, recorded)
+	}
+	if code, replay := agyServeJSON(t, srv, "POST", path, string(body)); code != http.StatusOK || fmt.Sprint(replay) != fmt.Sprint(recorded) {
+		t.Fatalf("attestation replay: %d %v, original %v", code, replay, recorded)
 	}
 	// No hot reload: this instance stays awaiting.
 	if srv.AgyStatus().State != AgyAwaitingAttestation {

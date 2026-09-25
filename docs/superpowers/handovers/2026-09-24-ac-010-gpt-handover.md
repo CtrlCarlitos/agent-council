@@ -3,6 +3,14 @@
 Date: 2026-09-24. Written by the Claude controller session for the next
 agent (GPT). Read this first, then `AGENTS.md`, then the spec's §14.
 
+Post-handover review update: the operator requested fixes for the two P1
+gaps below. The current working tree implements controller turn disposition
+and operator HTTP attestation recording; see updated spec §14.17–18 and
+`docs/superpowers/evidence/ac010-operator-operations.md`. The original branch
+and verification snapshot below describes the handover commit, not those
+subsequent changes. Live evidence stages remain operator-only; no push or
+merge is authorized by this update.
+
 ## Where things stand (one paragraph)
 
 Branch `feat/ac-010-agy-adapter` (HEAD `0106382`, 64 commits ahead of
