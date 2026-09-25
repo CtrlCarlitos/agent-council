@@ -77,7 +77,8 @@ func TestServiceBootstrap_AgyAwaitingAttestationRecordRestart(t *testing.T) {
 		t.Fatalf("a missing attestation must not fail the server: %v", err)
 	}
 	st := srv.AgyStatus()
-	if st.State != AgyAwaitingAttestation || !strings.Contains(st.Reason, "attestation") || !strings.Contains(st.Reason, "restart") {
+	if st.State != AgyAwaitingAttestation || !strings.Contains(st.Reason, "attestation") || !strings.Contains(st.Reason, "restart") ||
+		!strings.Contains(st.Reason, "no HTTP/CLI route") || !strings.Contains(st.Reason, "follow-up operator surface") {
 		t.Fatalf("want the awaiting_attestation state naming the restart, got %+v", st)
 	}
 	if srv.adapter != nil {

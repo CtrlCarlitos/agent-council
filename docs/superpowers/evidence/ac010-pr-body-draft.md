@@ -25,9 +25,13 @@ issue #10. It follows the approved design,
    - the run-bound cprot-v2 `RecordAgyProbeAttestation` operation,
      which needs no wired adapter;
    - the §14.18 `awaiting_attestation` server state: a service configured
-     for agy without a covering attestation starts without the adapter,
-     reports the state on `GET /v1/status`, and refuses every agy
-     operation typed; a restart after recording constructs the adapter;
+     for agy without a covering attestation starts without the adapter
+     and reports the state on `GET /v1/status`; birth, release
+     (dispatch), reconcile and queue-time `required_tools` validation
+     refuse typed (`ErrNotEligible`), and the other operations, which
+     are not agy-gated, act on durable state only or report
+     `harness_unavailable`; a restart after recording constructs the
+     adapter. Recording is in-process only (see "Unresolved gaps");
    - `ResolveAgySessionCreationUncertainty`;
    - queue-time `required_tools` validation.
 8. The acceptance story, the operator evidence script, and the evidence
@@ -56,11 +60,14 @@ table to committed tests, and has an explicit "unverified live" column.
   - the binary is pinned by version and digest and runs as a sealed memfd
     image;
   - the executor refuses forbidden flags (`--dangerously-skip-permissions`,
-    `--continue`, `-i`, `--remote-control`, `install`, `update`);
+    `--continue`, `-c`/`-i` in every attached or clustered short spelling,
+    `--remote-control`, `install`, `update`) on every agy-shaped launch,
+    which includes every sealed-image launch;
   - the prompt goes only on stdin, and only after `init` equality;
   - production launches need a covering cprot-v2 attestation; until one
     is recorded the service runs in `awaiting_attestation` with no agy
-    adapter and no agy child (§14.18).
+    adapter and no agy child (§14.18). With this PR alone no operator
+    path records one (in-process only; see "Unresolved gaps").
 - **Native self-update** (research §0 hazard 1). A changed binary fails
   closed at the sealed-image digest check (`TestAcceptance_Agy_S10_…`). An
   update mid-run makes every attestation stale by construction.
@@ -72,15 +79,27 @@ table to committed tests, and has an explicit "unverified live" column.
   - §14.17: no controller operation records a disposition for an
     Uncertain turn attempt. The durable block holds; clearing it needs
     follow-up work. AC-008 and AC-009 have the same gap.
-  - §14.18 (attestation bootstrap) is closed in this branch: the first
-    row is recorded through `RecordAgyProbeAttestation` on a server in
-    the `awaiting_attestation` state, and a restart constructs the
-    adapter (no hot reload). The production-path acceptance test goes
-    through exactly that sequence. Like the codex and claude operations,
-    the recording is a Go method on the running `Server`, with no HTTP
-    route or CLI command yet.
-- **Descendants.** A descendant that leaves the child's process group
-  escapes the forced kill (§14.6).
+  - §14.18 (attestation bootstrap) is closed **for in-process callers
+    only**: the first row can be recorded through
+    `RecordAgyProbeAttestation` on a server in the `awaiting_attestation`
+    state, and a restart constructs the adapter (no hot reload); the
+    production-path acceptance test goes through exactly that sequence.
+    Like the codex and claude operations, the recording is a Go method
+    on the running `Server`, with no HTTP route or CLI command, so an
+    operator running the shipped binary cannot record the first row.
+    Operator enablement needs a follow-up surface, filed alongside
+    §14.17. **This PR cannot enable production agy on its own.**
+- **Descendants.** For sealed launches the child leads its own process
+  group. Terminate's graceful path sends SIGTERM to the whole group as
+  well as the leader, and its forced path SIGKILLs the group. Whenever
+  the leader exits (on its own, on SIGTERM, or on SIGKILL), the wait
+  path first waits for the exit without reaping
+  (`waitid(P_PID, pid, WEXITED|WNOWAIT)`), then SIGKILLs the group
+  (`pgid > 1`), and only then reaps. The unreaped zombie keeps the pgid
+  from being reused, so the group kill can reach only this group. Every
+  group signal is ordered against the reap, so no signal is sent after
+  it. A descendant that leaves the group (`setsid`/`setpgid`) escapes;
+  that is the remaining limit (§14.6). Path launches are unchanged.
 
 ## Permissions
 
@@ -118,8 +137,9 @@ fixture only:
   `GOOS=darwin go vet ./internal/...`: clean.
 - `go vet -tags evidence` on the two evidence helpers: clean.
 - `CGO_ENABLED=0 go test ./... -count=1`: all packages ok.
-- `go test -race ./internal/adapter/execpolicy/ ./internal/adapter/agy/ ./internal/storage/ ./internal/service/ -count=3`:
-  ok.
+- `go test -race ./internal/adapter/execpolicy/ ./internal/adapter/agy/ ./internal/storage/ ./internal/service/`:
+  ok. The controller ran it with `-count=2` on the pre-fix-wave head;
+  the final fix wave ran it with `-count=3`.
 - `bash -n` and `shellcheck -x` on `scripts/ac010-integration-evidence.sh`:
   clean.
 - `scripts/ac010-integration-evidence.sh --dry-run a|b|c|all` ran against
@@ -135,6 +155,9 @@ fixture only:
 - Mutation checks run during development: removing the print-timeout
   marker, the ignored-input marker, the denial ⇒ incomplete rule, or the
   unresolved-attempt block each fails the corresponding acceptance test.
+  In the final fix wave: removing the post-exit group kill fails the
+  normal-exit and graceful-Terminate descendant tests; removing the
+  live-marker refusal or the orphan fallback fails its service test.
 
 Exact command outputs are in the Task 8 report.
 

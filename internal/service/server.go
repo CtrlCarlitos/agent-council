@@ -540,8 +540,9 @@ func NewServerWithAdapter(store *storage.Store, lock *ServiceLock, cfg ServerCon
 	// covering attestation (agy.ErrNotEligible wrapping
 	// agy.ErrProductionEligibilityMissing) does not fail the server — it
 	// starts WITHOUT the agy adapter in the explicit awaiting_attestation
-	// state, so the operator can record the first row through
-	// RecordAgyProbeAttestation and restart. Every other construction
+	// state, so an in-process caller can record the first row through
+	// RecordAgyProbeAttestation and restart (no HTTP/CLI route exists for
+	// it in this build: operator enablement is a follow-up surface). Every other construction
 	// error (configuration, platform, sealed image, other ineligibility
 	// rules a row cannot fix) still fails the server.
 	var agyAwaitingErr error
@@ -581,8 +582,12 @@ func isAgyAwaitingAttestation(err error) bool {
 	return errors.As(err, &ne) && errors.As(err, &missing)
 }
 
+// agyAwaitingReason is the operator-facing awaiting reason. Spec §14.18
+// is closed for in-process callers only: RecordAgyProbeAttestation has
+// no HTTP route or CLI command in this build, so the reason says that
+// operator enablement needs the follow-up surface.
 func agyAwaitingReason(err error) string {
-	return err.Error() + "; record a covering attestation with RecordAgyProbeAttestation and restart the service (no hot reload)"
+	return err.Error() + "; a covering cprot-v2 attestation must be recorded (RecordAgyProbeAttestation, an in-process service operation with no HTTP/CLI route in this build: operator enablement needs the follow-up operator surface) and the service restarted (no hot reload)"
 }
 
 // AgyStatus reports the agy adapter wiring state fixed at construction

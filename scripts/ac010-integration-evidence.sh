@@ -331,7 +331,7 @@ argv_with() {
     local flag="$1" value="$2" i
     for ((i = 0; i < ${#ARGV[@]}; i++)); do
         if [ "${ARGV[$i]}" = "$flag" ]; then
-            ARGV[$((i + 1))]="$value"
+            ARGV[i + 1]="$value"
             return 0
         fi
     done
@@ -904,11 +904,14 @@ stage_c() {
     note "  observed denial evidence from c-probe-records.DRAFT.jsonl) plus the denied_actions"
     note "  native_refusal_enum approval_deny record. The service refuses anything that does not cover"
     note "  the frozen profile exactly (missing, extra, version, platform, manifest, profile digest)."
-    note "  Bootstrap closed in this branch's final wave (see spec §14.18): RecordAgyProbeAttestation"
-    note "  depends only on the store, the operator credential, and the configured agy profile and"
-    note "  evidence root — never on a wired adapter — so the FIRST row can be recorded this way before"
-    note "  the adapter exists. Never hand-edit storage rows; never invent an HTTP entry point: deliver"
-    note "  this capture for review and record it through the operator-authorized service operation."
+    note "  Spec §14.18 is closed for IN-PROCESS callers only: RecordAgyProbeAttestation is a Go method"
+    note "  on the running Server that depends only on the store, the operator credential, and the"
+    note "  configured agy profile and evidence root (never on a wired adapter). This branch ships NO"
+    note "  HTTP route or CLI command for it, so an operator running the shipped binary CANNOT record"
+    note "  the first row yet: operator enablement needs a follow-up surface (filed alongside §14.17),"
+    note "  and this PR cannot enable production agy on its own. Never hand-edit storage rows; never"
+    note "  invent an entry point: deliver this capture for review; it is recorded once that operator"
+    note "  surface exists (then restart the service — no hot reload)."
     note "Stage C complete."
 }
 
