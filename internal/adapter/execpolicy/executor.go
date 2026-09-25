@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/workspace"
@@ -28,7 +29,115 @@ var (
 
 	// ErrInvalidLaunchRequest is returned when the launch request parameters fail validation.
 	ErrInvalidLaunchRequest = errors.New("invalid launch request")
+
+	// ErrAgyLaunchNotSealed is returned (wrapped in ErrInvalidLaunchRequest)
+	// when an agy-shaped launch request (IsAgyLaunch) carries neither a
+	// SealedImage nor the explicit FixtureLaunch marker. Production agy
+	// launches must always go through the sealed-image path (AC-010);
+	// only the agytest fixture harness may bypass it, and only via the
+	// explicit marker.
+	ErrAgyLaunchNotSealed = errors.New("agy launch requires a sealed image or the explicit fixture-launch marker")
+
+	// ErrAgyLaunchForbiddenArg is returned (wrapped in
+	// ErrInvalidLaunchRequest) when an agy-shaped launch request's argv
+	// carries a flag or subcommand the frozen launch source must never
+	// pass: an auth/permission bypass, identity-losing resumption,
+	// interactive/remote control, or project/installation management
+	// surface (AC-010 Global Constraints).
+	ErrAgyLaunchForbiddenArg = errors.New("agy launch argv carries a forbidden argument")
 )
+
+// agyForbiddenArgs is the closed set of agy CLI flags/subcommands a
+// Council-driven launch must never carry (AC-010 Global Constraints,
+// verbatim): auth/permission bypass, identity-losing resumption,
+// interactive/remote control, and project/installation/update/mic
+// management surfaces.
+var agyForbiddenArgs = map[string]bool{
+	"--dangerously-skip-permissions": true,
+	"-c":                             true,
+	"--continue":                     true,
+	"-i":                             true,
+	"--prompt-interactive":           true,
+	"--remote-control":               true,
+	"--add-dir":                      true,
+	"--project":                      true,
+	"--new-project":                  true,
+	"install":                        true,
+	"update":                         true,
+	"mic-serve":                      true,
+}
+
+// IsAgyLaunch reports whether req is shaped like an agy launch (AC-010
+// Global Constraints). Recognition succeeds when ANY of three
+// independent signals holds, since a launch that is agy by binary
+// identity must not escape the production sealed-launch guard just
+// because its argv happens not to match the frozen stream-json shape
+// (e.g. a bare "agy install"), and conversely the frozen stream-json
+// shape is recognized regardless of argv order:
+//
+//   - the frozen shape: the leading "--print=" flag together with both
+//     "--input-format stream-json" and "--output-format stream-json"
+//     anywhere in argv (order among the latter two is not required);
+//   - filepath.Base(req.Command) is "agy" or "agy.exe"; or
+//   - req.SealedImage is set: only the agy adapter pins a sealed image,
+//     so a pinned binary not named "agy" (and with any argv) still gets
+//     the forbidden-argument check and HomeDir acceptance.
+//
+// This is sufficient for recognition; the full exact-argv validation
+// belongs to the agy launch source, not to this recognizer.
+func IsAgyLaunch(req LaunchRequest) bool {
+	if req.SealedImage != nil {
+		return true
+	}
+	base := filepath.Base(req.Command)
+	if base == "agy" || base == "agy.exe" {
+		return true
+	}
+
+	args := req.Args
+	if len(args) == 0 || args[0] != "--print=" {
+		return false
+	}
+	hasInputStreamJSON := false
+	hasOutputStreamJSON := false
+	for i, a := range args {
+		if a == "--input-format" && i+1 < len(args) && args[i+1] == "stream-json" {
+			hasInputStreamJSON = true
+		}
+		if a == "--output-format" && i+1 < len(args) && args[i+1] == "stream-json" {
+			hasOutputStreamJSON = true
+		}
+	}
+	return hasInputStreamJSON && hasOutputStreamJSON
+}
+
+// agyForbiddenArg returns the first forbidden argv entry present, if
+// any. A "--" flag is matched on the part before its first "=" (so
+// "--add-dir=/x", "--project=p", and
+// "--dangerously-skip-permissions=true" are refused exactly like their
+// bare forms); a bare subcommand word (e.g. "install") is matched as a
+// whole token, since "=" has no meaning there and splitting it could
+// let an unrelated argument value (e.g. a path containing "=install")
+// false-positive. The single-dash short flags -c (--continue) and -i
+// (--prompt-interactive) are also refused in every attached or
+// clustered spelling: any token that starts with "-c" or "-i" and is
+// not a "--" flag ("-c=x", "-cfoo", "-ic", "-i=p").
+func agyForbiddenArg(args []string) (string, bool) {
+	for _, a := range args {
+		if agyForbiddenArgs[a] {
+			return a, true
+		}
+		if !strings.HasPrefix(a, "--") && (strings.HasPrefix(a, "-c") || strings.HasPrefix(a, "-i")) {
+			return a, true
+		}
+		if strings.HasPrefix(a, "--") {
+			if flag, _, found := strings.Cut(a, "="); found && agyForbiddenArgs[flag] {
+				return a, true
+			}
+		}
+	}
+	return "", false
+}
 
 // LaunchRequest encapsulates all parameters required to launch a supervised process.
 type LaunchRequest struct {
@@ -68,6 +177,40 @@ type LaunchRequest struct {
 	// ProfileDigest is the frozen run-profile digest in force for this
 	// launch (AC-008 §3.6 manifest-digest binding for attestations).
 	ProfileDigest string
+	// SealedImage, when set, pins the exact executable Start launches:
+	// a kernel-sealed memfd copy of the binary, verified at the ptrace
+	// exec-stop against /proc/<pid>/exe before the child runs a single
+	// instruction (Linux only; ErrSealedLaunchUnsupported elsewhere).
+	// Command must equal SealedImage.ArgV0 exactly.
+	SealedImage *SealedImage
+	// FixtureLaunch is the explicit, construction-time marker (AC-010,
+	// mirroring the codex/opencode fixture-scope discipline: never
+	// inferred from absent state) that authorizes an agy-shaped launch
+	// (IsAgyLaunch) to proceed WITHOUT a SealedImage — OFF LINUX ONLY.
+	// Its only reason to exist: NewSealedImage is Linux-only
+	// (ErrSealedLaunchUnsupported elsewhere), so the agytest fixture
+	// harness cannot build a sealed image off Linux and needs an
+	// explicit, auditable bypass instead of a platform-sniffed one. On
+	// Linux the marker is IGNORED: an agy-shaped launch without a
+	// SealedImage is refused (ErrAgyLaunchNotSealed) marker or not, and
+	// agytest always launches through a real SealedImage there. Only the
+	// internal/adapter/agy/agytest package may set it — production
+	// packages never do (enforced by
+	// TestFixtureLaunch_NeverForgedOutsideExecpolicyAndAgytest in
+	// executor_agy_test.go, mirroring the codex/codextest import/reference
+	// guards). It is not a substitute for SealedImage, only the
+	// documented escape hatch where SealedImage cannot exist.
+	FixtureLaunch bool
+	// HomeDir, when set, is emitted as HOME INSTEAD of Paths.Config. It
+	// exists for one launch shape only: an agy launch (IsAgyLaunch) must
+	// run against the operator's authenticated native home (AC-010 spec
+	// §3.1/§3.2: HOME is NOT overridden for authenticated runs; a
+	// relocated HOME is unauthenticated). The executor accepts it only
+	// when the request is agy-shaped, the launch is sealed (or the
+	// explicit fixture marker applies off Linux), and HomeDir is an
+	// absolute, clean path; anything else is ErrInvalidLaunchRequest.
+	// Every other launch keeps HOME=Paths.Config.
+	HomeDir string
 }
 
 // CapabilityChecker verifies whether the host environment supports required isolation capabilities.
@@ -144,9 +287,9 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 		return nil, fmt.Errorf("%w: root %q does not exist or is not a directory", ErrInvalidDirectory, req.Paths.Root)
 	}
 
-	// 2. Validate profile algorithm version (v3 is additive: manifest
-	// and codex block are carried, not acted on, by this gate)
-	if req.Profile.AlgoVersion != "" && req.Profile.AlgoVersion != "cprof-v1" && req.Profile.AlgoVersion != "cprof-v2" && req.Profile.AlgoVersion != "cprof-v3" {
+	// 2. Validate profile algorithm version (v3/v4 are additive: manifest,
+	// codex block, and agy block are carried, not acted on, by this gate)
+	if req.Profile.AlgoVersion != "" && req.Profile.AlgoVersion != "cprof-v1" && req.Profile.AlgoVersion != "cprof-v2" && req.Profile.AlgoVersion != "cprof-v3" && req.Profile.AlgoVersion != "cprof-v4" {
 		return nil, fmt.Errorf("%w: invalid profile algo_version %q", ErrInvalidLaunchRequest, req.Profile.AlgoVersion)
 	}
 
@@ -233,6 +376,15 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 		}
 	}
 
+	// 6b. The agy-only HOME override (never for any other launch shape).
+	home := req.Paths.Config
+	if req.HomeDir != "" {
+		if err := validateHomeDir(req); err != nil {
+			return nil, err
+		}
+		home = req.HomeDir
+	}
+
 	// 7. Construct sanitized environment allowlist
 	var env []string
 	baseKeys := []string{"PATH", "TMPDIR", "TERM", "LANG", "LC_ALL", "USER"}
@@ -246,7 +398,7 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 			}
 		}
 	}
-	env = append(env, "HOME="+req.Paths.Config)
+	env = append(env, "HOME="+home)
 	env = append(env, "COUNCIL_WORKSPACE_ROOT="+req.Paths.Root)
 	if runID != "" {
 		env = append(env, "COUNCIL_RUN_ID="+runID)
@@ -335,6 +487,50 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 		scrubbedEnv = append(scrubbedEnv, "CLAUDE_CONFIG_DIR="+req.ClaudeConfigDir)
 	}
 
+	cleanup := func() {
+		if proxyToClose != nil {
+			_ = proxyToClose.Close()
+		}
+	}
+
+	// agy-shaped launches (AC-010): forbidden argv is refused
+	// regardless of sealing, and production (no SealedImage) is refused
+	// outright — an agy launch must always run the sealed, ptrace-
+	// verified binary except for the agytest fixture harness, which is
+	// the only caller authorized to set FixtureLaunch. On Linux,
+	// NewSealedImage is always available, so the FixtureLaunch marker
+	// NEVER relaxes the sealed-image requirement there: an agy-shaped
+	// launch without a SealedImage is refused unconditionally, marker or
+	// not (controller ruling). FixtureLaunch only matters off Linux,
+	// where NewSealedImage is unsupported and the agytest fixture
+	// harness has no other way to launch its fixture binary.
+	if IsAgyLaunch(req) {
+		if arg, found := agyForbiddenArg(req.Args); found {
+			cleanup()
+			return nil, fmt.Errorf("%w: %w: %q", ErrInvalidLaunchRequest, ErrAgyLaunchForbiddenArg, arg)
+		}
+		if req.SealedImage == nil {
+			fixtureBypassAllowed := req.FixtureLaunch && runtime.GOOS != "linux"
+			if !fixtureBypassAllowed {
+				cleanup()
+				return nil, fmt.Errorf("%w: %w", ErrInvalidLaunchRequest, ErrAgyLaunchNotSealed)
+			}
+		}
+	}
+
+	if req.SealedImage != nil {
+		if req.Command != req.SealedImage.ArgV0 {
+			cleanup()
+			return nil, fmt.Errorf("%w: command %q does not match sealed image argv0 %q", ErrInvalidLaunchRequest, req.Command, req.SealedImage.ArgV0)
+		}
+		proc, err := startSealed(ctx, req, scrubbedEnv, cleanup)
+		if err != nil {
+			cleanup()
+			return nil, err
+		}
+		return proc, nil
+	}
+
 	cmd := exec.CommandContext(ctx, req.Command, req.Args...)
 	cmd.Dir = req.Paths.Root
 	cmd.Env = scrubbedEnv
@@ -376,16 +572,30 @@ func (e *defaultPolicyExecutor) Start(ctx context.Context, req LaunchRequest) (M
 	}
 
 	return &managedProcess{
-		cmd:       cmd,
-		stdinPipe: stdinPipe,
-		stdout:    stdoutPipe,
-		stderr:    stderrPipe,
-		cleanup: func() {
-			if proxyToClose != nil {
-				_ = proxyToClose.Close()
-			}
-		},
+		cmd:         cmd,
+		stdinPipe:   stdinPipe,
+		stdout:      stdoutPipe,
+		stderr:      stderrPipe,
+		cleanup:     cleanup,
+		exeIdentity: ExeIdentity{Path: req.Command},
 	}, nil
+}
+
+// validateHomeDir admits LaunchRequest.HomeDir only on an agy-shaped,
+// sealed (or off-Linux fixture-marked) launch with an absolute, clean
+// path.
+func validateHomeDir(req LaunchRequest) error {
+	if !IsAgyLaunch(req) {
+		return fmt.Errorf("%w: HomeDir is accepted only on an agy launch", ErrInvalidLaunchRequest)
+	}
+	sealed := req.SealedImage != nil || (req.FixtureLaunch && runtime.GOOS != "linux")
+	if !sealed {
+		return fmt.Errorf("%w: HomeDir requires a sealed agy launch", ErrInvalidLaunchRequest)
+	}
+	if !filepath.IsAbs(req.HomeDir) || filepath.Clean(req.HomeDir) != req.HomeDir {
+		return fmt.Errorf("%w: HomeDir %q must be an absolute, clean path", ErrInvalidLaunchRequest, req.HomeDir)
+	}
+	return nil
 }
 
 func validateGitCommand(req LaunchRequest, runID string) error {

@@ -44,15 +44,16 @@ func (e *ErrUnsupportedProfile) Error() string {
 }
 
 // ValidateForClaude fails closed for any profile that does not carry the
-// cprof-v2 or cprof-v3 algorithm with a complete toolkit manifest. The
-// additive codex block (cprof-v3 only) is ignored here: one run profile
-// serves all four harnesses, and Claude contributors on a v3 run remain
-// valid (AC-009 spec §3.8 compatibility matrix).
+// cprof-v2, cprof-v3, or cprof-v4 algorithm with a complete toolkit
+// manifest. The additive codex block (cprof-v3+) and agy block
+// (cprof-v4 only) are ignored here: one run profile serves all four
+// harnesses, and Claude contributors on a v3 or v4 run remain valid
+// (AC-009 spec §3.8 / AC-010 spec §3.7 compatibility matrix).
 func (p CanonicalProfile) ValidateForClaude() error {
-	if p.AlgoVersion != "cprof-v2" && p.AlgoVersion != "cprof-v3" {
+	if p.AlgoVersion != "cprof-v2" && p.AlgoVersion != "cprof-v3" && p.AlgoVersion != "cprof-v4" {
 		return &ErrUnsupportedProfile{
 			AlgoVersion: p.AlgoVersion,
-			Reason:      "the Claude adapter requires cprof-v2 or cprof-v3 with a frozen toolkit manifest",
+			Reason:      "the Claude adapter requires cprof-v2, cprof-v3, or cprof-v4 with a frozen toolkit manifest",
 		}
 	}
 	if p.ToolkitManifest == nil {

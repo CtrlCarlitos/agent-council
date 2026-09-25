@@ -112,6 +112,12 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Spec §14.18: an agy session on a server awaiting attestation is
+	// refused typed before the release is committed; no child runs.
+	if err := s.agyAwaitingForSession(r.Context(), sessionID); err != nil {
+		writeAgyAwaitingError(w, err, req.OpID)
+		return
+	}
 	// Verify required harness adapter is available.
 	if s.adapter == nil {
 		writeError(w, http.StatusServiceUnavailable, "harness_unavailable", "harness adapter is unavailable", req.OpID)

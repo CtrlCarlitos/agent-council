@@ -15,3 +15,21 @@ func terminateGracefully(proc *os.Process) error {
 func terminateForcefully(proc *os.Process) error {
 	return proc.Kill()
 }
+
+// killProcessGroup is a no-op on Windows: sealed launches (the only
+// callers) are Linux-only.
+func killProcessGroup(pgid int) error {
+	return nil
+}
+
+// interruptProcess has no Windows equivalent: there is no
+// process-scoped graceful interrupt signal analogous to SIGINT.
+func interruptProcess(proc *os.Process) error {
+	return ErrInterruptUnsupported
+}
+
+// terminateProcessGroup is a no-op on Windows: sealed launches (the only
+// callers) are Linux-only.
+func terminateProcessGroup(pgid int) error {
+	return nil
+}

@@ -29,3 +29,6 @@ ac008-evidence/
 
 # AC-009 manual integration evidence (native output, prompts, paths — never repository content)
 ac009-evidence/
+
+# AC-010 manual integration evidence (native output, prompts, paths — never repository content)
+ac010-evidence/

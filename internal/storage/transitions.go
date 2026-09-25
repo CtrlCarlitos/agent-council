@@ -406,12 +406,17 @@ type TurnDetails struct {
 
 // DispatchIntentDetails captures intent tracking for an attempt.
 type DispatchIntentDetails struct {
-	SessionID  string    `json:"session_id"`
-	TurnKey    string    `json:"turn_key"`
-	AttemptID  string    `json:"attempt_id"`
-	Phase      string    `json:"phase"`
-	RecordedAt time.Time `json:"recorded_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	SessionID     string   `json:"session_id"`
+	TurnKey       string   `json:"turn_key"`
+	AttemptID     string   `json:"attempt_id"`
+	Phase         string   `json:"phase"`
+	RequiredTools []string `json:"required_tools,omitempty"`
+	// RequiredToolsErr is set (and RequiredTools nil) when the stored
+	// required_tools_json does not decode: a consumer deciding a
+	// dispatch's required set must refuse, never read it as empty.
+	RequiredToolsErr error     `json:"-"`
+	RecordedAt       time.Time `json:"recorded_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 // GetTurnDetails returns authoritative turn state including dispatch intent.
@@ -445,12 +450,13 @@ WHERE session_id = ? AND turn_key = ?;`, sessionID, turnKey).Scan(&td.SessionID,
 	}
 
 	var di DispatchIntentDetails
-	var diRecStr, diUpdStr string
+	var diRecStr, diUpdStr, diRequiredToolsJSON string
 	err = s.readDB.QueryRowContext(ctx, `
-SELECT session_id, turn_key, attempt_id, phase, recorded_at, updated_at
+SELECT session_id, turn_key, attempt_id, phase, required_tools_json, recorded_at, updated_at
 FROM dispatch_intents
-WHERE session_id = ? AND turn_key = ?;`, sessionID, turnKey).Scan(&di.SessionID, &di.TurnKey, &di.AttemptID, &di.Phase, &diRecStr, &diUpdStr)
+WHERE session_id = ? AND turn_key = ?;`, sessionID, turnKey).Scan(&di.SessionID, &di.TurnKey, &di.AttemptID, &di.Phase, &diRequiredToolsJSON, &diRecStr, &diUpdStr)
 	if err == nil {
+		di.RequiredTools, di.RequiredToolsErr = unmarshalRequiredTools(diRequiredToolsJSON)
 		if t, err := time.Parse(time.RFC3339Nano, diRecStr); err == nil {
 			di.RecordedAt = t
 		}
@@ -541,10 +547,12 @@ WHERE s.session_id = ?;`, sessionID).Scan(&runID, &runLease, &currentVer, &state
 		return ReleaseResult{}, fmt.Errorf("session %s is not parked or already has active turn %v", sessionID, activeKey)
 	}
 
-	// Fetch EXACT pending prompt for turnKey
-	var rawPrompt string
+	// Fetch EXACT pending prompt for turnKey, including the dispatch-time
+	// tool allow-list, so it survives the pending_prompts row deletion
+	// below and carries forward onto the dispatch intent.
+	var rawPrompt, requiredToolsJSON string
 	err = tx.Tx().QueryRowContext(ctx, `
-SELECT prompt FROM pending_prompts WHERE session_id = ? AND turn_key = ?;`, sessionID, turnKey).Scan(&rawPrompt)
+SELECT prompt, required_tools_json FROM pending_prompts WHERE session_id = ? AND turn_key = ?;`, sessionID, turnKey).Scan(&rawPrompt, &requiredToolsJSON)
 	if err == sql.ErrNoRows {
 		return ReleaseResult{}, ErrPromptNotQueued
 	}
@@ -572,10 +580,12 @@ VALUES (?, ?, ?, 'running', '', ?, ?);`, sessionID, turnKey, sanitizedPrompt, at
 	}
 
 	// Insert into dispatch_intents, stamped with the issuing controller
-	// generation that authorized this execution (AC-004 §6).
+	// generation that authorized this execution (AC-004 §6), carrying
+	// forward the dispatch-time required-tools allow-list from the
+	// now-deleted pending_prompts row.
 	_, err = tx.Tx().ExecContext(ctx, `
-INSERT INTO dispatch_intents (session_id, turn_key, attempt_id, phase, issuing_controller_generation, recorded_at, updated_at)
-VALUES (?, ?, ?, 'intent_recorded', ?, ?, ?);`, sessionID, turnKey, attemptID, issuingGeneration, now, now)
+INSERT INTO dispatch_intents (session_id, turn_key, attempt_id, phase, required_tools_json, issuing_controller_generation, recorded_at, updated_at)
+VALUES (?, ?, ?, 'intent_recorded', ?, ?, ?, ?);`, sessionID, turnKey, attemptID, requiredToolsJSON, issuingGeneration, now, now)
 	if err != nil {
 		return ReleaseResult{}, fmt.Errorf("insert dispatch intent: %w", err)
 	}

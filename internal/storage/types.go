@@ -21,6 +21,9 @@ var (
 	ErrSessionArchived            = errors.New("session archived")
 	ErrControllerDisconnected     = errors.New("controller disconnected")
 	ErrPromptNotQueued            = errors.New("prompt not queued")
+	// ErrRequiredToolsImmutable: a queued prompt's required_tools are
+	// validated at queue time and immutable thereafter (AC-010 §3.5).
+	ErrRequiredToolsImmutable     = errors.New("required_tools of a queued prompt are immutable")
 	ErrInvalidExpectedVersion     = errors.New("invalid expected version: must be positive")
 	ErrArtifactOversized          = errors.New("artifact exceeds maximum permitted size")
 	ErrDisallowedToolingConfig    = errors.New("tooling configuration violates security policy")

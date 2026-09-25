@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/CtrlCarlitos/agent-council/internal/adapter"
 	"github.com/CtrlCarlitos/agent-council/internal/adapter/adaptertest"
 	"github.com/CtrlCarlitos/agent-council/internal/client"
 	"github.com/CtrlCarlitos/agent-council/internal/service"
@@ -62,6 +63,11 @@ func (f *adminBridgeFixture) post(t *testing.T, path, body string) (int, string)
 
 func newBridgeTestServer(t *testing.T) *adminBridgeFixture {
 	t.Helper()
+	return newBridgeTestServerWithAdapter(t, adaptertest.NewFakeAdapter("codex"))
+}
+
+func newBridgeTestServerWithAdapter(t *testing.T, adp adapter.Adapter) *adminBridgeFixture {
+	t.Helper()
 	dir, dirErr := os.MkdirTemp("/tmp", "ac-br-")
 	if dirErr != nil {
 		t.Fatalf("state dir: %v", dirErr)
@@ -77,7 +83,7 @@ func newBridgeTestServer(t *testing.T) *adminBridgeFixture {
 		t.Fatalf("store: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	srv, err := service.NewServerWithAdapter(store, lock, service.ServerConfig{StateDir: dir, InstanceID: "inst-br", AuthToken: "tok-br"}, adaptertest.NewFakeAdapter("codex"))
+	srv, err := service.NewServerWithAdapter(store, lock, service.ServerConfig{StateDir: dir, InstanceID: "inst-br", AuthToken: "tok-br"}, adp)
 	if err != nil {
 		t.Fatalf("server: %v", err)
 	}
@@ -97,6 +103,51 @@ func newBridgeTestServer(t *testing.T) *adminBridgeFixture {
 	}
 	t.Cleanup(func() { _ = srv.Close() })
 	return &adminBridgeFixture{srv: srv, store: store, dir: dir, token: "tok-br"}
+}
+
+func TestAC010_BridgeAgyDisposition(t *testing.T) {
+	f := newBridgeTestServerWithAdapter(t, nil)
+	ctx := context.Background()
+	if _, err := f.store.CreateRun(ctx, "run-agy", "run-agy", "b", "s", "p", "bootstrap"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.CreateSession(ctx, "sess-agy", "bootstrap", storage.SessionRecord{ID: "sess-agy", RunID: "run-agy", Contributor: "agy", Role: "worker", State: "parked", Visibility: "reachable"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.AdoptController(ctx, "adopt-agy", "run-agy", "agy", "controller", "bootstrap", nil, "lease-agy"); err != nil {
+		t.Fatal(err)
+	}
+	b, err := client.NewControllerBridge(f.dir, "run-agy", "lease-agy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Connect(ctx, "connect-agy", 1); err != nil {
+		t.Fatal(err)
+	}
+	v, _ := f.store.GetSessionVersion(ctx, "sess-agy")
+	q, err := b.QueuePrompt(ctx, "queue-agy", "sess-agy", "lost", "p", v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Seed a lost execution; no fake or native adapter is wired here.
+	rel, err := f.store.ReleaseTurn(ctx, "release-agy", "lease-agy", "sess-agy", q.CommittedVersion, "lost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.InsertAgyTurnAttempt(ctx, storage.AgyTurnAttempt{AttemptID: rel.Receipt.AttemptID, SessionID: "sess-agy", TurnKey: "lost", PromptDigest: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := b.ResolveAgyTurnUncertainty(ctx, "dispose-agy", "sess-agy", "lost", rel.Receipt.AttemptID, "retired old execution", 1, rel.Receipt.CommittedVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := b.ResolveAgyTurnUncertainty(ctx, "dispose-agy", "sess-agy", "lost", rel.Receipt.AttemptID, "retired old execution", 1, rel.Receipt.CommittedVersion)
+	if err != nil || replay.Receipt != r.Receipt {
+		t.Fatalf("replay: %+v %v", replay, err)
+	}
+	if err := b.RawRequest(ctx, "POST", "/v1/runs/run-agy/agy/attestations", nil); err == nil {
+		t.Fatal("controller bridge exposed operator attestation route")
+	}
 }
 
 func TestAC004_RestrictedBridgePositiveAndEscalation(t *testing.T) {

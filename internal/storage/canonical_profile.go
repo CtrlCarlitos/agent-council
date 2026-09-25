@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -23,6 +24,10 @@ type HarnessProfileSpec struct {
 	// codex block is a validation error). See CodexHarnessSpec and the
 	// AC-009 spec §3.8 for the frozen encoding.
 	Codex *CodexHarnessSpec `json:"codex,omitempty"`
+	// Agy is additive in cprof-v4 (absent in v1/v2/v3 encodings, where an
+	// agy block is a validation error). See AgyHarnessSpec and the
+	// AC-010 spec §3.7 for the frozen encoding.
+	Agy *AgyHarnessSpec `json:"agy,omitempty"`
 }
 
 // CodexPlatformSpec is the frozen platform identity compared against the
@@ -184,6 +189,53 @@ type CodexHarnessSpec struct {
 	ToolInventoryDigest string `json:"tool_inventory_digest"`
 }
 
+// AgyPlatformSpec is the frozen platform identity compared against the
+// Agy install (AC-010 spec §3.7).
+type AgyPlatformSpec struct {
+	OS     string `json:"os"`
+	Family string `json:"family"`
+}
+
+// AgyHooksEvidenceSpec records what Council verified about the Agy hooks
+// layer and what stays an explicit, unclaimed gap (spec §3.2).
+type AgyHooksEvidenceSpec struct {
+	Verified     []string `json:"verified"`
+	Unverifiable []string `json:"unverifiable"`
+}
+
+// AgyHarnessSpec is the frozen per-run agy block added by cprof-v4
+// (AC-010 spec §3.7). Every value the design freezes and compares
+// appears here and is covered by the profile digest.
+type AgyHarnessSpec struct {
+	CLIVersion   string          `json:"cli_version"`
+	BinaryPath   string          `json:"binary_path"`
+	BinaryDigest string          `json:"binary_digest"`
+	ExpectedHome string          `json:"expected_home"`
+	Platform     AgyPlatformSpec `json:"platform"`
+	// PermissionMode ∈ {request-review, strict}: no bypass value is
+	// representable (spec §3.7).
+	PermissionMode string `json:"permission_mode"`
+	// ExecutionMode ∈ {default, accept-edits, plan}.
+	ExecutionMode               string               `json:"execution_mode"`
+	Sandbox                     bool                 `json:"sandbox"`
+	PrintTimeoutBackstopSeconds int                  `json:"print_timeout_backstop_seconds"`
+	ExpectedTools               []string             `json:"expected_tools"`
+	ExpectedMCPServers          []string             `json:"expected_mcp_servers"`
+	ExpectedMCPTools            []string             `json:"expected_mcp_tools"`
+	ExpectedPluginTools         []string             `json:"expected_plugin_tools"`
+	DefaultRequiredTools        []string             `json:"default_required_tools"`
+	HooksEvidence               AgyHooksEvidenceSpec `json:"hooks_evidence"`
+	ExpectedSkills              []string             `json:"expected_skills"`
+	PluginsEvidencePath         string               `json:"plugins_evidence_path"`
+	PluginsEvidenceDigest       string               `json:"plugins_evidence_digest"`
+	HooksConfigDigest           string               `json:"hooks_config_digest"`
+	RequiredHooks               []string             `json:"required_hooks"`
+	InitEvidencePath            string               `json:"init_evidence_path"`
+	InitEvidenceDigest          string               `json:"init_evidence_digest"`
+	ToolCoveragePath            string               `json:"tool_coverage_path"`
+	ToolCoverageDigest          string               `json:"tool_coverage_digest"`
+}
+
 // CanonicalProfile defines the frozen execution profile parameters for a Council run.
 type CanonicalProfile struct {
 	AlgoVersion         string                        `json:"algo_version"`
@@ -294,8 +346,25 @@ func normalizeStringSlice(slice []string, lower bool, cleanPath bool) []string {
 	return out
 }
 
+// NormalizePathScalar applies the family's scalar path normalization
+// (BOM trim, ToSlash/Clean, no trailing slash, NFC) to a single path
+// field (e.g. binary_path, expected_home) — the scalar counterpart of
+// normalizeStringSlice(slice, false, true). Exported so every adapter
+// that re-validates a frozen path field independently (e.g.
+// internal/adapter/agy) shares this exact normalization instead of
+// forking it, keeping the frozen digest and the adapter's re-validated
+// value provably identical for every input, including non-NFC Unicode.
+func NormalizePathScalar(p string) string {
+	s := strings.Trim(p, "\ufeff")
+	s = filepath.ToSlash(filepath.Clean(s))
+	if s != "/" {
+		s = strings.TrimSuffix(s, "/")
+	}
+	return norm.NFC.String(s)
+}
+
 // ComputeProfileDigest computes the canonical profile digest and normalized JSON representation:
-// "cprof-v1:sha256:" / "cprof-v2:sha256:" / "cprof-v3:sha256:" + hex(sha256(canonical_profile_json))
+// "cprof-v1:sha256:" / "cprof-v2:sha256:" / "cprof-v3:sha256:" / "cprof-v4:sha256:" + hex(sha256(canonical_profile_json))
 func ComputeProfileDigest(profile CanonicalProfile) (string, []byte, error) {
 	switch profile.AlgoVersion {
 	case "cprof-v1":
@@ -305,22 +374,44 @@ func ComputeProfileDigest(profile CanonicalProfile) (string, []byte, error) {
 		if err := profile.validateNoCodexBlocks(); err != nil {
 			return "", nil, err
 		}
-	case "cprof-v2", "cprof-v3":
+		if err := profile.validateNoAgyBlocks(); err != nil {
+			return "", nil, err
+		}
+	case "cprof-v2", "cprof-v3", "cprof-v4":
 		if profile.ToolkitManifest == nil {
 			return "", nil, fmt.Errorf("algo_version %q requires toolkit_manifest", profile.AlgoVersion)
 		}
 		if err := profile.ValidateForClaude(); err != nil {
 			return "", nil, err
 		}
-		if profile.AlgoVersion == "cprof-v2" {
+		switch profile.AlgoVersion {
+		case "cprof-v2":
 			if err := profile.validateNoCodexBlocks(); err != nil {
 				return "", nil, err
 			}
-		} else if err := profile.validateCodexBlocks(); err != nil {
-			return "", nil, err
+			if err := profile.validateNoAgyBlocks(); err != nil {
+				return "", nil, err
+			}
+		case "cprof-v3":
+			if err := profile.validateCodexBlocks(); err != nil {
+				return "", nil, err
+			}
+			if err := profile.validateNoAgyBlocks(); err != nil {
+				return "", nil, err
+			}
+		case "cprof-v4":
+			// cprof-v4 requires toolkit_manifest (inherited above) and,
+			// when a codex block is present, validates it exactly as v3
+			// does; the additive agy block is validated by its own gates.
+			if err := profile.validateCodexBlocks(); err != nil {
+				return "", nil, err
+			}
+			if err := profile.validateAgyBlocks(); err != nil {
+				return "", nil, err
+			}
 		}
 	default:
-		return "", nil, fmt.Errorf("unsupported profile algo_version: %q (expected %q, %q or %q)", profile.AlgoVersion, "cprof-v1", "cprof-v2", "cprof-v3")
+		return "", nil, fmt.Errorf("unsupported profile algo_version: %q (expected %q, %q, %q or %q)", profile.AlgoVersion, "cprof-v1", "cprof-v2", "cprof-v3", "cprof-v4")
 	}
 
 	switch profile.WorkspaceMode {
@@ -360,6 +451,9 @@ func ComputeProfileDigest(profile CanonicalProfile) (string, []byte, error) {
 			}
 			entry["codex"] = block
 		}
+		if hSpec.Agy != nil {
+			entry["agy"] = canonicalAgyBlock(hSpec.Agy)
+		}
 		harnessesMap[cleanedHName] = entry
 	}
 
@@ -374,7 +468,7 @@ func ComputeProfileDigest(profile CanonicalProfile) (string, []byte, error) {
 		"workspace_mode":       profile.WorkspaceMode,
 	}
 
-	if profile.AlgoVersion == "cprof-v2" || profile.AlgoVersion == "cprof-v3" {
+	if profile.AlgoVersion == "cprof-v2" || profile.AlgoVersion == "cprof-v3" || profile.AlgoVersion == "cprof-v4" {
 		canonicalMap["toolkit_manifest"] = canonicalToolkitManifestMap(profile.ToolkitManifest.ToolkitManifest)
 	}
 
@@ -607,6 +701,220 @@ func validateCodexHarnessBlock(c *CodexHarnessSpec) error {
 	return nil
 }
 
+// canonicalAgyBlock builds the canonical agy-block map (§3.7): scalars
+// trimmed + NFC; arrays BOM-trimmed, NFC, deduped, byte-wise sorted
+// without lowercasing; binary_path/expected_home/plugins_evidence_path/
+// init_evidence_path/tool_coverage_path path-normalized; digests
+// lowercased; booleans/integers verbatim.
+func canonicalAgyBlock(a *AgyHarnessSpec) map[string]any {
+	return map[string]any{
+		"cli_version":                    codexScalar(a.CLIVersion),
+		"binary_path":                    NormalizePathScalar(a.BinaryPath),
+		"binary_digest":                  strings.ToLower(strings.TrimSpace(a.BinaryDigest)),
+		"expected_home":                  NormalizePathScalar(a.ExpectedHome),
+		"platform":                       map[string]any{"family": codexScalar(a.Platform.Family), "os": codexScalar(a.Platform.OS)},
+		"permission_mode":                codexScalar(a.PermissionMode),
+		"execution_mode":                 codexScalar(a.ExecutionMode),
+		"sandbox":                        a.Sandbox,
+		"print_timeout_backstop_seconds": a.PrintTimeoutBackstopSeconds,
+		"expected_tools":                 normalizeStringSlice(a.ExpectedTools, false, false),
+		"expected_mcp_servers":           normalizeStringSlice(a.ExpectedMCPServers, false, false),
+		"expected_mcp_tools":             normalizeStringSlice(a.ExpectedMCPTools, false, false),
+		"expected_plugin_tools":          normalizeStringSlice(a.ExpectedPluginTools, false, false),
+		"default_required_tools":         normalizeStringSlice(a.DefaultRequiredTools, false, false),
+		"hooks_evidence": map[string]any{
+			"verified":     normalizeStringSlice(a.HooksEvidence.Verified, false, false),
+			"unverifiable": normalizeStringSlice(a.HooksEvidence.Unverifiable, false, false),
+		},
+		"expected_skills":         normalizeStringSlice(a.ExpectedSkills, false, false),
+		"plugins_evidence_path":   NormalizePathScalar(a.PluginsEvidencePath),
+		"plugins_evidence_digest": strings.ToLower(strings.TrimSpace(a.PluginsEvidenceDigest)),
+		"hooks_config_digest":     strings.ToLower(strings.TrimSpace(a.HooksConfigDigest)),
+		"required_hooks":          normalizeStringSlice(a.RequiredHooks, false, false),
+		"init_evidence_path":      NormalizePathScalar(a.InitEvidencePath),
+		"init_evidence_digest":    strings.ToLower(strings.TrimSpace(a.InitEvidenceDigest)),
+		"tool_coverage_path":      NormalizePathScalar(a.ToolCoveragePath),
+		"tool_coverage_digest":    strings.ToLower(strings.TrimSpace(a.ToolCoverageDigest)),
+	}
+}
+
+// validateNoAgyBlocks rejects an agy block under any algo_version other
+// than cprof-v4.
+func (p CanonicalProfile) validateNoAgyBlocks() error {
+	for _, h := range p.Harnesses {
+		if h.Agy != nil {
+			return fmt.Errorf("an agy harness block requires algo_version %q, not %q", "cprof-v4", p.AlgoVersion)
+		}
+	}
+	return nil
+}
+
+// validateAgyBlocks freezes every agy harness block present (an agy
+// block is optional even under cprof-v4: one run profile serves all
+// four harnesses, and a v4 run without an Agy contributor remains
+// valid).
+func (p CanonicalProfile) validateAgyBlocks() error {
+	for _, h := range p.Harnesses {
+		if h.Agy == nil {
+			continue
+		}
+		if err := validateAgyHarnessBlock(h.Agy); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+var semverPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+
+// isJSONPointer accepts the empty pointer (whole document) or a pointer
+// starting with "/" (RFC 6901). Accepting "" is deliberate: RFC 6901 §5
+// defines it as the whole-document pointer.
+func isJSONPointer(s string) bool {
+	return s == "" || strings.HasPrefix(s, "/")
+}
+
+func requireDistinctSHA256(field, digest string) error {
+	if err := ValidateSHA256Digest(digest); err != nil {
+		return fmt.Errorf("agy block %s: %w", field, err)
+	}
+	return nil
+}
+
+func requireNoDuplicates(field string, items []string) error {
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if _, dup := seen[item]; dup {
+			return fmt.Errorf("agy block %s contains duplicate entry %q", field, item)
+		}
+		seen[item] = struct{}{}
+	}
+	return nil
+}
+
+// validateAgyHarnessBlock enforces the freeze-time agy gates (AC-010
+// spec §3.7): shape and enum rules only — evidence-root I/O (re-hashing
+// and strictly decoding init_evidence_path/tool_coverage_path/
+// plugins_evidence_path, resolving required_hooks against the live
+// hooks.json) is the adapter's job (internal/adapter/agy.ValidateAgyHarness),
+// mirroring how the codex family splits freeze-time shape checks from
+// adapter-time evidence checks.
+func validateAgyHarnessBlock(a *AgyHarnessSpec) error {
+	if !semverPattern.MatchString(codexScalar(a.CLIVersion)) {
+		return fmt.Errorf("agy block cli_version %q must be MAJOR.MINOR.PATCH", a.CLIVersion)
+	}
+	binaryPath := NormalizePathScalar(a.BinaryPath)
+	if binaryPath == "" || !strings.HasPrefix(binaryPath, "/") {
+		return fmt.Errorf("agy block binary_path %q must be absolute", a.BinaryPath)
+	}
+	if err := requireDistinctSHA256("binary_digest", a.BinaryDigest); err != nil {
+		return err
+	}
+	expectedHome := NormalizePathScalar(a.ExpectedHome)
+	if expectedHome == "" || !strings.HasPrefix(expectedHome, "/") {
+		return fmt.Errorf("agy block expected_home %q must be absolute", a.ExpectedHome)
+	}
+	if codexScalar(a.Platform.OS) == "" {
+		return fmt.Errorf("agy block lacks the platform os")
+	}
+	if codexScalar(a.Platform.Family) == "" {
+		return fmt.Errorf("agy block lacks the platform family")
+	}
+	switch codexScalar(a.PermissionMode) {
+	case "request-review", "strict":
+	default:
+		return fmt.Errorf("unsupported permission_mode %q (expected request-review or strict; no bypass value is representable)", a.PermissionMode)
+	}
+	switch codexScalar(a.ExecutionMode) {
+	case "default", "accept-edits", "plan":
+	default:
+		return fmt.Errorf("unsupported execution_mode %q (expected default, accept-edits, or plan)", a.ExecutionMode)
+	}
+	if a.PrintTimeoutBackstopSeconds < 60 {
+		return fmt.Errorf("agy block print_timeout_backstop_seconds %d must be >= 60", a.PrintTimeoutBackstopSeconds)
+	}
+	if len(a.ExpectedTools) == 0 {
+		return fmt.Errorf("agy block requires a non-empty expected_tools inventory")
+	}
+	if err := requireNoDuplicates("expected_tools", a.ExpectedTools); err != nil {
+		return err
+	}
+	if a.ExpectedMCPServers == nil || a.ExpectedMCPTools == nil || a.ExpectedPluginTools == nil {
+		return fmt.Errorf("agy block requires expected_mcp_servers, expected_mcp_tools, and expected_plugin_tools ([] when none)")
+	}
+	// Inventory-evidence gate AT FREEZE (spec §3.7): no committed
+	// evidence path proves a non-empty native MCP/plugin tool inventory
+	// for Agy either, so only empty inventories freeze.
+	if len(a.ExpectedMCPServers) > 0 || len(a.ExpectedMCPTools) > 0 || len(a.ExpectedPluginTools) > 0 {
+		return fmt.Errorf("expected_mcp_servers, expected_mcp_tools, and expected_plugin_tools must be empty: no committed evidence path proves a non-empty native tool inventory, so such a profile is not launchable and must not be frozen")
+	}
+	if a.DefaultRequiredTools == nil {
+		return fmt.Errorf("agy block requires default_required_tools ([] when none)")
+	}
+	if err := requireNoDuplicates("default_required_tools", a.DefaultRequiredTools); err != nil {
+		return err
+	}
+	toolSet := make(map[string]struct{}, len(a.ExpectedTools))
+	for _, t := range a.ExpectedTools {
+		toolSet[t] = struct{}{}
+	}
+	for _, t := range a.DefaultRequiredTools {
+		if _, ok := toolSet[t]; !ok {
+			return fmt.Errorf("agy block default_required_tools entry %q is not in expected_tools", t)
+		}
+	}
+	if a.ExpectedSkills == nil {
+		return fmt.Errorf("agy block requires expected_skills ([] when none)")
+	}
+	if err := requireNoDuplicates("expected_skills", a.ExpectedSkills); err != nil {
+		return err
+	}
+	for _, s := range a.ExpectedSkills {
+		if s == "" || strings.ContainsAny(s, "/\\") {
+			return fmt.Errorf("agy block expected_skills entry %q must be a bare directory name (no separators)", s)
+		}
+	}
+	if strings.TrimSpace(a.InitEvidencePath) == "" {
+		return fmt.Errorf("agy block requires init_evidence_path")
+	}
+	if err := requireDistinctSHA256("init_evidence_digest", a.InitEvidenceDigest); err != nil {
+		return err
+	}
+	if strings.TrimSpace(a.ToolCoveragePath) == "" {
+		return fmt.Errorf("agy block requires tool_coverage_path")
+	}
+	if err := requireDistinctSHA256("tool_coverage_digest", a.ToolCoverageDigest); err != nil {
+		return err
+	}
+	if strings.TrimSpace(a.PluginsEvidencePath) == "" {
+		return fmt.Errorf("agy block requires plugins_evidence_path")
+	}
+	if err := requireDistinctSHA256("plugins_evidence_digest", a.PluginsEvidenceDigest); err != nil {
+		return err
+	}
+	if err := requireDistinctSHA256("hooks_config_digest", a.HooksConfigDigest); err != nil {
+		return err
+	}
+	if len(a.RequiredHooks) == 0 {
+		return fmt.Errorf("agy block requires a non-empty required_hooks list")
+	}
+	if err := requireNoDuplicates("required_hooks", a.RequiredHooks); err != nil {
+		return err
+	}
+	for i, ptr := range a.RequiredHooks {
+		if !isJSONPointer(ptr) {
+			return fmt.Errorf("agy block required_hooks entry %q is not an RFC 6901 JSON pointer", ptr)
+		}
+		if i > 0 && a.RequiredHooks[i-1] > ptr {
+			return fmt.Errorf("agy block required_hooks must be sorted, %q precedes %q", a.RequiredHooks[i-1], ptr)
+		}
+	}
+	if len(a.HooksEvidence.Verified) == 0 && len(a.HooksEvidence.Unverifiable) == 0 {
+		return fmt.Errorf("agy block hooks_evidence requires at least one of verified/unverifiable to be present")
+	}
+	return nil
+}
+
 // ParseCanonicalProfileJSON unmarshals and validates profile JSON, rejecting unknown fields.
 func ParseCanonicalProfileJSON(data []byte) (CanonicalProfile, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
@@ -625,6 +933,9 @@ func ParseCanonicalProfileJSON(data []byte) (CanonicalProfile, error) {
 		if err := prof.validateNoCodexBlocks(); err != nil {
 			return CanonicalProfile{}, err
 		}
+		if err := prof.validateNoAgyBlocks(); err != nil {
+			return CanonicalProfile{}, err
+		}
 	case "cprof-v2", "cprof-v3":
 		if prof.ToolkitManifest == nil {
 			return CanonicalProfile{}, fmt.Errorf("algo_version %q requires toolkit_manifest", prof.AlgoVersion)
@@ -634,8 +945,15 @@ func ParseCanonicalProfileJSON(data []byte) (CanonicalProfile, error) {
 				return CanonicalProfile{}, err
 			}
 		}
+		if err := prof.validateNoAgyBlocks(); err != nil {
+			return CanonicalProfile{}, err
+		}
+	case "cprof-v4":
+		if prof.ToolkitManifest == nil {
+			return CanonicalProfile{}, fmt.Errorf("algo_version %q requires toolkit_manifest", prof.AlgoVersion)
+		}
 	default:
-		return CanonicalProfile{}, fmt.Errorf("unsupported profile algo_version: %q (expected %q, %q or %q)", prof.AlgoVersion, "cprof-v1", "cprof-v2", "cprof-v3")
+		return CanonicalProfile{}, fmt.Errorf("unsupported profile algo_version: %q (expected %q, %q, %q or %q)", prof.AlgoVersion, "cprof-v1", "cprof-v2", "cprof-v3", "cprof-v4")
 	}
 	switch prof.WorkspaceMode {
 	case "none", "readonly", "isolated_branch":

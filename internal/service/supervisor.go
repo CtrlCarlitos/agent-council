@@ -155,7 +155,7 @@ func (s *ExecutionSupervisor) Run(ctx context.Context) {
 	// a terminal result is verified or the service terminates.
 	turnResult, err := s.collectUntilTerminal(ctx, ref)
 	if err != nil {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || s.turnAlreadyCommittedTerminal() {
 			return
 		}
 		// Transport or collection error must NOT record TurnFailed; preserve uncertainty
@@ -247,6 +247,11 @@ func (s *ExecutionSupervisor) collectUntilTerminal(ctx context.Context, ref adap
 	for {
 		if ctx.Err() != nil {
 			return adapter.TurnResult{}, ctx.Err()
+		}
+		// A controller can retire an uncertain attempt without fabricating
+		// a native result. Stop observing after that durable transition.
+		if s.turnAlreadyCommittedTerminal() {
+			return adapter.TurnResult{}, errors.New("Council turn already resolved")
 		}
 		res, err := s.adapter.Collect(ctx, ref)
 		if err != nil {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/CtrlCarlitos/agent-council/internal/adapter"
+	"github.com/CtrlCarlitos/agent-council/internal/adapter/agy"
 	"github.com/CtrlCarlitos/agent-council/internal/council"
 	"github.com/CtrlCarlitos/agent-council/internal/storage"
 )
@@ -62,6 +63,11 @@ type QueuePromptRequest struct {
 	ExpectedVersion int64  `json:"expected_version"`
 	TurnKey         string `json:"turn_key"`
 	Prompt          string `json:"prompt"`
+	// RequiredTools is the optional AC-010 required-tool set for an agy
+	// session's turn: validated here against the run's frozen
+	// expected_tools, journaled with the prompt, immutable thereafter.
+	// Absent/empty means the frozen default_required_tools apply.
+	RequiredTools []string `json:"required_tools,omitempty"`
 }
 
 type QueuePromptResponse struct {
@@ -494,6 +500,10 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 
 	// Step 4: Load the saved native-session binding and attach to the
 	// original execution. Recovery must never substitute a fresh session.
+	if err := s.agyAwaitingForSession(r.Context(), sessionID); err != nil {
+		writeAgyAwaitingError(w, err, req.OpID)
+		return
+	}
 	if s.adapter == nil {
 		writeError(w, http.StatusServiceUnavailable, "harness_unavailable", "harness adapter unavailable", req.OpID)
 		return
@@ -728,10 +738,17 @@ func (s *Server) handleQueuePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := s.validateQueuedRequiredTools(r.Context(), sessionID, req.RequiredTools); err != nil {
+		status, code := queuedRequiredToolsErrorStatus(err)
+		writeError(w, status, code, err.Error(), req.OpID)
+		return
+	}
+
 	receipt, err := s.store.QueuePrompt(r.Context(), req.OpID, req.ControllerLease, sessionID, req.ExpectedVersion, storage.PendingPrompt{
-		SessionID: sessionID,
-		TurnKey:   req.TurnKey,
-		Prompt:    req.Prompt,
+		SessionID:     sessionID,
+		TurnKey:       req.TurnKey,
+		Prompt:        req.Prompt,
+		RequiredTools: req.RequiredTools,
 	})
 	if err != nil {
 		if errors.Is(err, storage.ErrStaleUpdate) {
@@ -756,6 +773,91 @@ func (s *Server) handleQueuePrompt(w http.ResponseWriter, r *http.Request) {
 		OpID:       req.OpID,
 		Receipt:    receipt,
 	})
+}
+
+// queuedRequiredToolsErrorStatus maps a validateQueuedRequiredTools
+// failure to its HTTP status: a caller error is 400
+// invalid_required_tools; a session (or its run) that vanished between
+// the path check and the validation is the same 404 session_not_found
+// the queue path returns for an unknown session; anything else is a
+// storage error.
+func queuedRequiredToolsErrorStatus(err error) (int, string) {
+	var invalid *invalidRequiredToolsError
+	var notEligible *agy.ErrNotEligible
+	switch {
+	case errors.As(err, &invalid):
+		return http.StatusBadRequest, "invalid_required_tools"
+	case errors.As(err, &notEligible):
+		return http.StatusServiceUnavailable, "agy_not_eligible"
+	case errors.Is(err, storage.ErrSessionNotFound), errors.Is(err, storage.ErrRunSessionMismatch), errors.Is(err, storage.ErrRunNotFound):
+		return http.StatusNotFound, "session_not_found"
+	default:
+		return http.StatusInternalServerError, "storage_error"
+	}
+}
+
+// invalidRequiredToolsError is a queue-time required_tools refusal (a
+// caller error, HTTP 400 invalid_required_tools).
+type invalidRequiredToolsError struct{ msg string }
+
+func (e *invalidRequiredToolsError) Error() string { return e.msg }
+
+// validateQueuedRequiredTools enforces the AC-010 §3.5 queue-time rule:
+// required_tools is accepted only for an agy session; every name must be
+// in the run's frozen harnesses.agy expected_tools (native tool names),
+// and names must be non-empty and unique (the adapter refuses a
+// duplicated set at dispatch, so it is refused here, before it can be
+// journaled). Absent/empty needs no check.
+func (s *Server) validateQueuedRequiredTools(ctx context.Context, sessionID string, tools []string) error {
+	if len(tools) == 0 {
+		return nil
+	}
+	meta, err := s.store.GetSessionMetadata(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("session lookup: %w", err)
+	}
+	if meta.Contributor != string(council.Agy) {
+		return &invalidRequiredToolsError{msg: fmt.Sprintf(
+			"required_tools is only supported for agy sessions; session %s contributor is %q", sessionID, meta.Contributor)}
+	}
+	// Spec §14.18: no agy operation proceeds while awaiting attestation.
+	if err := s.agyAwaiting(); err != nil {
+		return err
+	}
+	rec, err := s.store.GetRunProfile(ctx, meta.RunID)
+	if err != nil {
+		return fmt.Errorf("run profile lookup: %w", err)
+	}
+	spec, ok := rec.Profile.Harnesses["agy"]
+	if !ok || spec.Agy == nil {
+		return &invalidRequiredToolsError{msg: fmt.Sprintf(
+			"run %s has no frozen agy harness block; required_tools cannot be validated", meta.RunID)}
+	}
+	expected := make(map[string]struct{}, len(spec.Agy.ExpectedTools))
+	for _, t := range spec.Agy.ExpectedTools {
+		expected[t] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(tools))
+	var unknown, dups []string
+	for _, t := range tools {
+		if _, dup := seen[t]; dup {
+			dups = append(dups, t)
+			continue
+		}
+		seen[t] = struct{}{}
+		if _, ok := expected[t]; !ok || strings.TrimSpace(t) == "" {
+			unknown = append(unknown, fmt.Sprintf("%q", t))
+		}
+	}
+	switch {
+	case len(unknown) > 0:
+		return &invalidRequiredToolsError{msg: fmt.Sprintf(
+			"required_tools names not in the run's frozen expected_tools: %s", strings.Join(unknown, ", "))}
+	case len(dups) > 0:
+		return &invalidRequiredToolsError{msg: fmt.Sprintf(
+			"required_tools lists duplicate names: %s", strings.Join(dups, ", "))}
+	}
+	return nil
 }
 
 func (s *Server) handleReplacePrompt(w http.ResponseWriter, r *http.Request) {
@@ -942,4 +1044,16 @@ func (s *Server) handleRecordDecision(w http.ResponseWriter, r *http.Request) {
 		OpID:       req.OpID,
 		Receipt:    receipt,
 	})
+}
+
+// writeAgyAwaitingError maps a spec §14.18 awaiting-attestation refusal
+// (a wrapped *agy.ErrNotEligible) to 503 agy_not_eligible; any other
+// error (a session lookup failure) is a storage error.
+func writeAgyAwaitingError(w http.ResponseWriter, err error, opID string) {
+	var notEligible *agy.ErrNotEligible
+	if errors.As(err, &notEligible) {
+		writeError(w, http.StatusServiceUnavailable, "agy_not_eligible", err.Error(), opID)
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "storage_error", err.Error(), opID)
 }
