@@ -887,7 +887,7 @@ none is claimed by the design.
 6. Termination of a sealed launch signals the child's process group
    (the sealed launch sets `Setpgid`): SIGTERM to the group on the
    graceful path, SIGKILL to the group on the forced path, and after the
-   leader exits on its own a peek-then-kill sequence (`waitid` with
+   leader exits (for any reason) a peek-then-kill sequence (`waitid` with
    `WNOWAIT`, then `kill(-pgid, SIGKILL)`, then the reap) so no same-group
    descendant outlives the attempt and the group id cannot be reused
    before the kill. A descendant that changes its own session or process
@@ -962,9 +962,10 @@ none is claimed by the design.
     and a server configured with `AgyBinaryPath` whose only
     ineligibility is the missing or uncovered attestation starts WITHOUT
     the agy adapter in an explicit "awaiting attestation" state
-    (surfaced on the server status surface and logged; birth, dispatch
-    and queue-time validation refuse with the typed ineligibility
-    error). After the row is recorded, a restart constructs the adapter.
+    (surfaced on the server status surface and logged; birth, dispatch,
+    reconcile and queue-time validation refuse with the typed
+    ineligibility error; other operations report the harness as
+    unavailable). After the row is recorded, a restart constructs the adapter.
     No child runs before eligibility in either state. This closes the
     bootstrap for in-process callers only: `RecordAgyProbeAttestation`
     has no HTTP or CLI surface (the same holds for the codex and claude
