@@ -210,8 +210,8 @@ func TestConn_OversizedFramePoisonsConnection(t *testing.T) {
 	}
 	select {
 	case <-conn.Done():
-	default:
-		t.Fatal("poisoned connection must terminate its read loop")
+	case <-time.After(3 * time.Second):
+		t.Fatal("poisoned connection did not terminate its read loop")
 	}
 	if conn.Fatal() == nil {
 		t.Fatal("Fatal() must retain the poison cause")

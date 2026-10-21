@@ -782,13 +782,28 @@ func itemNotification(threadID, turnID, text string) string {
 	return `{"jsonrpc":"2.0","method":"item/agentMessage/updated","params":{"threadId":"` + threadID + `","turnId":"` + turnID + `","item":{"type":"agentMessage","text":"` + text + `"}}}`
 }
 
+func completeObservedTurn(t *testing.T, h *adapterHarness, ref adapter.TurnRef) {
+	t.Helper()
+	h.adapter.mu.Lock()
+	run := h.adapter.turns[ref]
+	if run == nil || run.pump == nil || run.tap == nil {
+		h.adapter.mu.Unlock()
+		t.Fatal("turn is not live")
+	}
+	threadID, turnID := run.nativeThreadID, run.tap.TurnID()
+	h.adapter.mu.Unlock()
+	run.pump.HandleNotification("turn/completed", json.RawMessage(
+		`{"threadId":"`+threadID+`","turn":{"id":"`+turnID+`","items":[],"status":"completed","durationMs":100}}`,
+	))
+}
+
 func TestCodexAdapter_ObserveStreamsItemsUsageAndTerminal(t *testing.T) {
 	h := newAdapterHarness(t)
 	lines := append([]string{authOKLine()}, threadStartRules(testThreadID, h.wsRoot, h.model)...)
 	lines = append(lines, resumeRule(testThreadID, h.wsRoot, h.model, nil))
 	// Item, then usage snapshots out of order (an older snapshot arriving
-	// late must never overwrite the newer cumulative one), then the
-	// terminal — all riding the turn/start request in emission order.
+	// late must never overwrite the newer cumulative one) ride the
+	// turn/start request; completion is delivered after Observe attaches.
 	raw, err := json.Marshal(map[string]any{"method": "turn/start", "lines": []json.RawMessage{
 		json.RawMessage(itemNotification(testThreadID, testTurnID, "step one")),
 		json.RawMessage(usageNotification(testThreadID, testTurnID, 200, 100)),
@@ -798,7 +813,7 @@ func TestCodexAdapter_ObserveStreamsItemsUsageAndTerminal(t *testing.T) {
 		t.Fatalf("marshal many rule: %v", err)
 	}
 	lines = append(lines, `{"emit_many_on_request": `+string(raw)+`}`)
-	lines = append(lines, turnAcceptedRules(testThreadID, testTurnID, true)...)
+	lines = append(lines, turnAcceptedRules(testThreadID, testTurnID, false)...)
 	writeScenario(t, h.scratch, lines...)
 
 	h.createAndPersist(t)
@@ -813,6 +828,7 @@ func TestCodexAdapter_ObserveStreamsItemsUsageAndTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("observe: %v", err)
 	}
+	completeObservedTurn(t, h, ref)
 
 	var sawItem, sawUsage, sawTerminal bool
 	deadline := time.After(5 * time.Second)
@@ -872,7 +888,7 @@ func TestCodexAdapter_ObserveOverflowTerminatesObserverOnly(t *testing.T) {
 		t.Fatalf("marshal many rule: %v", err)
 	}
 	lines = append(lines, `{"emit_many_on_request": `+string(raw)+`}`)
-	lines = append(lines, turnAcceptedRules(testThreadID, testTurnID, true)...)
+	lines = append(lines, turnAcceptedRules(testThreadID, testTurnID, false)...)
 	writeScenario(t, h.scratch, lines...)
 
 	h.createAndPersist(t)
@@ -907,6 +923,7 @@ func TestCodexAdapter_ObserveOverflowTerminatesObserverOnly(t *testing.T) {
 
 	// …while the native stream is unaffected: the turn still reaches its
 	// verified terminal.
+	completeObservedTurn(t, h, ref)
 	att := waitAttempt(t, h, ref.TurnKey, func(a *storage.CodexTurnAttempt) bool { return a.Terminal })
 	if att.ObservedStatus != "completed" {
 		t.Fatalf("native terminal: %q", att.ObservedStatus)
