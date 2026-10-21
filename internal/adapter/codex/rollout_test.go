@@ -782,6 +782,19 @@ func itemNotification(threadID, turnID, text string) string {
 	return `{"jsonrpc":"2.0","method":"item/agentMessage/updated","params":{"threadId":"` + threadID + `","turnId":"` + turnID + `","item":{"type":"agentMessage","text":"` + text + `"}}}`
 }
 
+func completeObservedTurn(t *testing.T, h *adapterHarness, ref adapter.TurnRef) {
+	t.Helper()
+	h.adapter.mu.Lock()
+	run := h.adapter.turns[ref]
+	h.adapter.mu.Unlock()
+	if run == nil || run.pump == nil {
+		t.Fatal("turn is not live")
+	}
+	run.pump.HandleNotification("turn/completed", json.RawMessage(
+		`{"threadId":"`+testThreadID+`","turn":{"id":"`+testTurnID+`","items":[],"status":"completed","durationMs":100}}`,
+	))
+}
+
 func TestCodexAdapter_ObserveStreamsItemsUsageAndTerminal(t *testing.T) {
 	h := newAdapterHarness(t)
 	lines := append([]string{authOKLine()}, threadStartRules(testThreadID, h.wsRoot, h.model)...)
@@ -798,7 +811,7 @@ func TestCodexAdapter_ObserveStreamsItemsUsageAndTerminal(t *testing.T) {
 		t.Fatalf("marshal many rule: %v", err)
 	}
 	lines = append(lines, `{"emit_many_on_request": `+string(raw)+`}`)
-	lines = append(lines, turnAcceptedRules(testThreadID, testTurnID, true)...)
+	lines = append(lines, turnAcceptedRules(testThreadID, testTurnID, false)...)
 	writeScenario(t, h.scratch, lines...)
 
 	h.createAndPersist(t)
@@ -813,6 +826,7 @@ func TestCodexAdapter_ObserveStreamsItemsUsageAndTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("observe: %v", err)
 	}
+	completeObservedTurn(t, h, ref)
 
 	var sawItem, sawUsage, sawTerminal bool
 	deadline := time.After(5 * time.Second)
@@ -872,7 +886,7 @@ func TestCodexAdapter_ObserveOverflowTerminatesObserverOnly(t *testing.T) {
 		t.Fatalf("marshal many rule: %v", err)
 	}
 	lines = append(lines, `{"emit_many_on_request": `+string(raw)+`}`)
-	lines = append(lines, turnAcceptedRules(testThreadID, testTurnID, true)...)
+	lines = append(lines, turnAcceptedRules(testThreadID, testTurnID, false)...)
 	writeScenario(t, h.scratch, lines...)
 
 	h.createAndPersist(t)
@@ -907,6 +921,7 @@ func TestCodexAdapter_ObserveOverflowTerminatesObserverOnly(t *testing.T) {
 
 	// …while the native stream is unaffected: the turn still reaches its
 	// verified terminal.
+	completeObservedTurn(t, h, ref)
 	att := waitAttempt(t, h, ref.TurnKey, func(a *storage.CodexTurnAttempt) bool { return a.Terminal })
 	if att.ObservedStatus != "completed" {
 		t.Fatalf("native terminal: %q", att.ObservedStatus)
