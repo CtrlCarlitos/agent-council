@@ -786,12 +786,14 @@ func completeObservedTurn(t *testing.T, h *adapterHarness, ref adapter.TurnRef) 
 	t.Helper()
 	h.adapter.mu.Lock()
 	run := h.adapter.turns[ref]
-	h.adapter.mu.Unlock()
-	if run == nil || run.pump == nil {
+	if run == nil || run.pump == nil || run.tap == nil {
+		h.adapter.mu.Unlock()
 		t.Fatal("turn is not live")
 	}
+	threadID, turnID := run.nativeThreadID, run.tap.TurnID()
+	h.adapter.mu.Unlock()
 	run.pump.HandleNotification("turn/completed", json.RawMessage(
-		`{"threadId":"`+testThreadID+`","turn":{"id":"`+testTurnID+`","items":[],"status":"completed","durationMs":100}}`,
+		`{"threadId":"`+threadID+`","turn":{"id":"`+turnID+`","items":[],"status":"completed","durationMs":100}}`,
 	))
 }
 
@@ -800,8 +802,8 @@ func TestCodexAdapter_ObserveStreamsItemsUsageAndTerminal(t *testing.T) {
 	lines := append([]string{authOKLine()}, threadStartRules(testThreadID, h.wsRoot, h.model)...)
 	lines = append(lines, resumeRule(testThreadID, h.wsRoot, h.model, nil))
 	// Item, then usage snapshots out of order (an older snapshot arriving
-	// late must never overwrite the newer cumulative one), then the
-	// terminal — all riding the turn/start request in emission order.
+	// late must never overwrite the newer cumulative one) ride the
+	// turn/start request; completion is delivered after Observe attaches.
 	raw, err := json.Marshal(map[string]any{"method": "turn/start", "lines": []json.RawMessage{
 		json.RawMessage(itemNotification(testThreadID, testTurnID, "step one")),
 		json.RawMessage(usageNotification(testThreadID, testTurnID, 200, 100)),
