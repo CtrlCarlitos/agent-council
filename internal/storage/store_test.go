@@ -17,13 +17,13 @@ func TestStore_OpenCloseAndPRAGMAs(t *testing.T) {
 	}
 	defer store.Close()
 
-	// Assert exact pinned SQLite engine version 3.53.4
+	// Assert exact pinned SQLite engine version 3.54.1
 	var sqliteVersion string
 	if err := store.DB().QueryRow("SELECT sqlite_version();").Scan(&sqliteVersion); err != nil {
 		t.Fatalf("failed to query sqlite_version: %v", err)
 	}
-	if sqliteVersion != "3.53.4" {
-		t.Fatalf("expected SQLite engine version 3.53.4, got %s", sqliteVersion)
+	if sqliteVersion != "3.54.1" {
+		t.Fatalf("expected SQLite engine version 3.54.1, got %s", sqliteVersion)
 	}
 
 	// Verify PRAGMAs on initial connection
