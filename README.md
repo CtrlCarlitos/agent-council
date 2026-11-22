@@ -1,5 +1,13 @@
 # Agent Council
 
+> **Archived (2026-11-21).** Work on this Go service has stopped. The goal is now
+> pursued by a no-code `council` skill in
+> [CtrlCarlitos/skills](https://github.com/CtrlCarlitos/skills): the current agent
+> launches other agents as one-shot commands and collects their replies as markdown
+> files. The skill is being built and is not yet released. See the
+> [design](docs/superpowers/specs/2026-11-21-council-skill-design.md) for why.
+> Everything below describes the service as it was planned and is kept for reference.
+
 **Keep your preferred agent. Let Council coordinate the other perspectives.**
 
 Agent Council is a local-first orchestration project for four independent native
@@ -8,15 +16,19 @@ GLM, Claude, Codex, or Antigravity conversation can be the controller. It invoke
 Council explicitly through a skill and MCP tools instead of asking you to copy
 prompts and answers between terminals.
 
-## Status: foundation, not a working orchestrator
+## Status: stopped before a first council
 
-This repository currently contains a tested, dependency-free Go domain kernel,
-architecture decisions, contribution and security policies, and a provisionable
-issue roadmap. The daemon, durable database, MCP bridge, native harness adapters,
-and graphical interface are **not implemented**. There are no production install
-commands or native-provider compatibility claims yet.
+What was built (AC-001 to AC-010): the domain kernel, a durable SQLite store, the
+background service, controller leases, worker isolation, and persistent contributor
+adapters for OpenCode, Claude, Codex and Agy. The adapters were tested against
+fixtures; the Agy adapter's live evidence stages were never run.
 
-Run the foundation checks:
+What was never built: the MCP bridge and CLI (AC-011), the controller skill
+(AC-012), proposals, ballots and synthesis (AC-013), budgets (AC-014), and
+completion events (AC-015). **No council ever ran end to end.** There are no
+install commands and no native-provider compatibility claims.
+
+The checks that passed at the time of archiving:
 
 ```sh
 go test -race ./...
